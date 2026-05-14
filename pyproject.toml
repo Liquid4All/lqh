@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lqh"
+version = "0.0.1"
+description = "Liquid Harness – customize Liquid AI foundation models into task-specific models."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+    { name = "Liquid AI", email = "hello@liquid.ai" },
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "prompt_toolkit>=3.0",
+    "rich>=13.0",
+    "openai>=1.0",
+    "httpx>=0.27",
+    "liquidrandom",
+    "datasets",
+    "huggingface_hub>=0.20",
+    "pyarrow",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch",
+    "transformers>=5.0,<6",
+    "trl>=1.0",
+    "peft>=0.15",
+    # Constrained JSON-schema decoding for local eval; integrates with HF
+    # transformers via prefix_allowed_tokens_fn. Pure Python, small.
+    # NOTE: lm-format-enforcer ≤0.11.3 ships a broken transformers shim that
+    # imports ``PreTrainedTokenizerBase`` from the v4 path. We work around it
+    # in ``lqh/infer/__main__.py`` so any version compatible with v5 works.
+    "lm-format-enforcer>=0.11",
+]
+
+[project.urls]
+Homepage = "https://liquid.ai"
+
+[project.scripts]
+lqh = "lqh.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lqh"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"lqh/skills" = "lqh/skills"

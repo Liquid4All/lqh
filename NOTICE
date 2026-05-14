@@ -1,0 +1,12 @@
+Liquid Harness (lqh)
+Copyright 2026 Liquid AI, Inc.
+
+This product is powered by Liquid AI (https://liquid.ai/) and is designed
+to customize Liquid Foundation Models (LFMs) via the api.lqh.ai service.
+
+"Liquid AI", "Liquid Foundation Models", and "LFM" are trademarks of
+Liquid AI, Inc. Use of these names is governed by Liquid AI's trademark
+policy and is not granted by the Apache License 2.0.
+
+This product includes third-party software. Attributions for bundled
+third-party components are listed in THIRD_PARTY_NOTICES.md (if present).

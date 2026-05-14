@@ -1,0 +1,18 @@
+{
+  "type": "json_schema",
+  "json_schema": {
+    "name": "spam_filter",
+    "strict": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "match": {
+          "type": "string",
+          "enum": ["yes", "no"]
+        }
+      },
+      "required": ["match"],
+      "additionalProperties": false
+    }
+  }
+}

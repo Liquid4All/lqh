@@ -1,0 +1,4 @@
+# Harness output: runs/ holds checkpoints, predictions, reports — all
+# regenerable. datasets/ holds generated parquets — also regenerable.
+*/runs/
+*/datasets/

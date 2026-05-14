@@ -1,0 +1,33 @@
+{
+  "task_kind": "json",
+  "base_model": "LiquidAI/LFM2.5-1.2B-Instruct",
+  "train_samples": 2000,
+  "eval_samples": 200,
+  "filter_threshold": 7.0,
+  "datagen_pipeline": "data_gen/pipeline.py",
+  "system_prompt": "prompts/system.md",
+  "schema": "prompts/schema.json",
+  "scorer": "evals/scorers/scorer.md",
+  "sft": {
+    "num_epochs": 3,
+    "learning_rate": 2e-5,
+    "lora_r": 32,
+    "lora_alpha": 64,
+    "per_device_batch_size": 4,
+    "gradient_accumulation_steps": 4,
+    "max_seq_length": 2048
+  },
+  "dpo": {
+    "num_iterations": 3,
+    "beta": 0.1,
+    "learning_rate": 5e-6,
+    "per_device_batch_size": 2,
+    "selection": {
+      "top_quantile": 0.2,
+      "min_gap": 0.5,
+      "min_pairs_per_iter": 50
+    }
+  },
+  "max_new_tokens": 64,
+  "regression_threshold": -0.5
+}

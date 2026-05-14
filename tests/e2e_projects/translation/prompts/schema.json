@@ -1,0 +1,25 @@
+{
+  "type": "json_schema",
+  "json_schema": {
+    "name": "business_chat_translation",
+    "strict": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "source_lang": {
+          "type": "string",
+          "enum": ["en", "de", "ja"]
+        },
+        "target_lang": {
+          "type": "string",
+          "enum": ["en", "de", "ja"]
+        },
+        "translation": {
+          "type": "string"
+        }
+      },
+      "required": ["source_lang", "target_lang", "translation"],
+      "additionalProperties": false
+    }
+  }
+}

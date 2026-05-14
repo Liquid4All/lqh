@@ -1,0 +1,2 @@
+# lqh.train — subprocess-side training package.
+# This package imports torch/transformers and must NEVER be imported by the main lqh process.

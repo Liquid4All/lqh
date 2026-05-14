@@ -1,0 +1,34 @@
+{
+  "type": "json_schema",
+  "json_schema": {
+    "name": "email_extraction",
+    "strict": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "sender_name": {
+          "type": "string"
+        },
+        "intent": {
+          "type": "string",
+          "enum": ["question", "complaint", "request", "cancellation"]
+        },
+        "mentioned_products": {
+          "type": "array",
+          "items": {"type": "string"},
+          "maxItems": 10
+        },
+        "urgency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": ["sender_name", "intent", "mentioned_products", "urgency", "summary"],
+      "additionalProperties": false
+    }
+  }
+}
