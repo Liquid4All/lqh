@@ -38,8 +38,10 @@ def _validate_path(project_dir: Path, rel_path: str) -> Path:
     """Validate and resolve a path within the project directory."""
     resolved = (project_dir / rel_path).resolve()
     project_resolved = project_dir.resolve()
-    if not str(resolved).startswith(str(project_resolved)):
-        raise ValueError(f"Path '{rel_path}' is outside the project directory")
+    try:
+        resolved.relative_to(project_resolved)
+    except ValueError as exc:
+        raise ValueError(f"Path '{rel_path}' is outside the project directory") from exc
     return resolved
 
 
