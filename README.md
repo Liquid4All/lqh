@@ -1,7 +1,9 @@
 > **Closed beta** — visit [lqh.ai](https://lqh.ai) to request access.
 
 <p align="center">
-  <img src="misc/image.png" alt="Liquid Harness" />
+  <a href="https://youtu.be/suC4VlY8z6Y">
+    <img src="misc/image.png" alt="Liquid Harness — watch the demo" />
+  </a>
 </p>
 
 # lqh — Liquid Harness
