@@ -442,7 +442,11 @@ class TestFullEvalWorkflowIntegration:
         make_scorer,
         model: str,
     ) -> None:
-        """Run the same eval with each model and verify it stores the model id."""
+        """Run the same eval with each model and verify it stores the model id.
+
+        Per-parameter; ``test_two_models_coexist_in_same_project`` covers
+        the cross-run filesystem layout.
+        """
         make_eval_dataset(tmp_path, [
             [
                 {"role": "user", "content": "Explain what photosynthesis is in one sentence."},
@@ -476,6 +480,35 @@ class TestFullEvalWorkflowIntegration:
         assert summary["inference_model"] == model
         assert summary["num_scored"] > 0
         assert summary["scores"]["mean"] > 0
+
+    async def test_two_models_coexist_in_same_project(
+        self, tmp_path: Path, make_eval_dataset, make_scorer,
+    ) -> None:
+        """Two ``model_eval`` runs in the same project_dir produce sibling run dirs."""
+        make_eval_dataset(tmp_path, [[
+            {"role": "user", "content": "What causes rain?"},
+            {"role": "assistant", "content": "Water vapor condensing in clouds."},
+        ]], name="coexist_eval")
+
+        make_scorer(tmp_path, "explain.md", "Score 1-10.")
+
+        for model in ("small", "medium"):
+            result = await handle_run_scoring(
+                tmp_path,
+                dataset="datasets/coexist_eval",
+                scorer="evals/scorers/explain.md",
+                mode="model_eval",
+                run_name=f"run_{model}",
+                inference_model=model,
+                inference_system_prompt="Be brief.",
+            )
+            assert "Model evaluation complete" in result.content
+
+        for model in ("small", "medium"):
+            summary = json.loads(
+                (tmp_path / "evals" / "runs" / f"run_{model}" / "summary.json").read_text()
+            )
+            assert summary["inference_model"] == model
 
     async def test_different_system_prompts_same_model(
         self, tmp_path: Path, make_eval_dataset, make_scorer,

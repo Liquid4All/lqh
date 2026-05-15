@@ -5,11 +5,7 @@ Requires:
     - ``pip install lqh[train]``
     - Internet access (downloads dataset + model from HuggingFace)
 
-Run directly::
-
-    python -m tests.test_training_e2e
-
-Or via pytest::
+Run via pytest::
 
     pytest tests/test_training_e2e.py -v -s
 
