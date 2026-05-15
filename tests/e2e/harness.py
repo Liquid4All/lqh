@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from openai import AsyncOpenAI
 
 from lqh.agent import Agent, AgentCallbacks
 from lqh.auth import require_token

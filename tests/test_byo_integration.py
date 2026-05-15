@@ -10,14 +10,12 @@ output, and the lqh.sources helpers.
 from __future__ import annotations
 
 import asyncio
-import csv
 import json
 from pathlib import Path
 from textwrap import dedent
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lqh.engine import run_pipeline

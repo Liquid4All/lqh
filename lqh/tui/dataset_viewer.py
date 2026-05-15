@@ -152,7 +152,7 @@ class DatasetViewer:
 
             # Audio indicator
             if audio and str(i) in audio:
-                console.print(Text(f"    🔊 audio attached", style="dim magenta"))
+                console.print(Text("    🔊 audio attached", style="dim magenta"))
 
             console.print()  # spacing between messages
 

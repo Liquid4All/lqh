@@ -18,8 +18,6 @@ Usage::
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 from pathlib import Path
 
@@ -186,6 +184,6 @@ class TestToolCallingE2E:
         scores_table = pq.read_table(str(scores_path))
         assert len(scores_table) == scoring_result.total
 
-        print(f"\n  All checks passed!")
+        print("\n  All checks passed!")
         print(f"  Summary: {result.succeeded} samples generated, "
               f"mean score = {scoring_result.mean_score:.2f}/10")

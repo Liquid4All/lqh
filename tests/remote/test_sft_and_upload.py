@@ -48,7 +48,7 @@ def _download_and_prepare(project_dir: Path) -> tuple[Path, Path]:
 
     raw_path = project_dir / "shell_helper_raw.parquet"
     if not raw_path.exists():
-        print(f"  Downloading dataset...")
+        print("  Downloading dataset...")
         urllib.request.urlretrieve(DATASET_URL, raw_path)
         print(f"  Downloaded {raw_path.stat().st_size / 1024:.0f} KB")
 
@@ -384,4 +384,4 @@ class TestSFTAndUpload:
             f"Failed to verify HF repo: stdout={stdout}, stderr={stderr}"
         )
         assert "private=True" in stdout, "Repo should be private"
-        print(f"[upload] Verified on HuggingFace ✓")
+        print("[upload] Verified on HuggingFace ✓")

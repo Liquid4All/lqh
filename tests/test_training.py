@@ -19,14 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -506,7 +505,6 @@ class TestTrainingToolValidation(unittest.TestCase):
         self.assertIn("not found", result.content)
 
     def test_stop_training_not_running(self) -> None:
-        from lqh.subprocess_manager import SubprocessManager
         from lqh.tools.handlers import handle_stop_training
         from lqh.train.progress import write_status
 

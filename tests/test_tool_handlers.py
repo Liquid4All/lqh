@@ -16,7 +16,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lqh.tools.handlers import (
-    ToolResult,
     handle_create_file,
     handle_edit_file,
     handle_get_eval_failures,

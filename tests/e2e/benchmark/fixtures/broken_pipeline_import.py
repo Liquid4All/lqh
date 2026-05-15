@@ -1,7 +1,6 @@
 """Broken pipeline: wrong import path (ModuleNotFoundError)."""
 
-from data_gen.base import Pipeline, ChatMLMessage, Conversation, GenerationError, step
-import json
+from data_gen.base import Pipeline, ChatMLMessage, Conversation
 import liquidrandom
 
 
