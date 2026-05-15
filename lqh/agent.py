@@ -123,7 +123,8 @@ model inference.
 
 When showing generated data to the user for review, use show_file on the parquet \
 file (opens an interactive dataset viewer) followed by ask_user to get feedback. \
-These can be called together in one response.
+These can be called together in one response. If no user is attached to the \
+session (headless runs), skip show_file and inspect files with read_file instead.
 
 ### prompts/
 System prompts for model inference, managed separately from the data:
@@ -674,6 +675,18 @@ class Agent:
 
     async def _handle_tool_call(self, tool_name: str, arguments: dict) -> ToolResult:
         """Handle a single tool call, including user interaction tools."""
+        # Auto mode: show_file has no audience. Nudge the agent toward read_file
+        # instead of running the handler (which would set show_file_path and
+        # trigger the blocking TUI viewer callback at the bottom of this method).
+        if tool_name == "show_file" and self.auto_mode:
+            return ToolResult(
+                content=(
+                    "[Auto mode] No user is attached to view the file. "
+                    "Use `read_file` (supports offset/limit pagination) to "
+                    "inspect the contents yourself. Do not call show_file "
+                    "again in this run."
+                ),
+            )
         extra: dict[str, Any] = {}
         if tool_name in ("run_data_gen_pipeline", "run_scoring", "run_data_filter"):
             extra = self._pipeline_kwargs()
