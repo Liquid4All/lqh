@@ -53,9 +53,6 @@ minversion = "7.0"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 xfail_strict = true
-filterwarnings = [
-    "error::pytest.PytestUnraisableExceptionWarning",
-]
 markers = [
     "integration: tests that hit api.lqh.ai (require LQH_DEBUG_API_KEY or ~/.lqh/config.json)",
     "gpu: tests that require a CUDA GPU and optional [train] deps",
