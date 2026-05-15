@@ -1,4 +1,4 @@
-"""Tests for lqh.sources — BYO-data helpers used in pipeline source() methods."""
+"""Tests for ``lqh.sources`` — BYO-data helpers used in pipeline ``source()`` methods."""
 
 from __future__ import annotations
 
@@ -6,29 +6,29 @@ import csv
 import json
 from pathlib import Path
 
-import pytest
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from lqh import sources
 
 
+# ``project`` is an alias for the ``chdir_to_tmp`` fixture from conftest.
 @pytest.fixture
-def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Create a tmp project dir and chdir into it (lqh always runs with cwd=project)."""
-    monkeypatch.chdir(tmp_path)
-    return tmp_path
+def project(chdir_to_tmp: Path) -> Path:
+    """Project directory pinned as the process cwd."""
+    return chdir_to_tmp
+
+
+def _make_image(path: Path) -> None:
+    """Minimal 1x1 PNG — enough for ``read_bytes`` / ``mime_type``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
 
 
 # ---------------------------------------------------------------------------
 # image_folder
 # ---------------------------------------------------------------------------
-
-
-def _make_image(path: Path) -> None:
-    # Minimal 1x1 PNG — just enough for read_bytes / mime_type to work.
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
 
 
 def test_image_folder_flat(project: Path) -> None:

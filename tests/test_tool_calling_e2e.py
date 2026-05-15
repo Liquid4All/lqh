@@ -1,15 +1,17 @@
-"""API-only integration test for tool calling pipeline.
+"""API-only integration test for the tool-calling pipeline.
 
-Tests the full data generation + scoring flow for tool-calling data
-without requiring a GPU.  Exercises:
+Exercises the full data generation + scoring flow for tool-calling data
+without requiring a GPU:
 
-1. Generate ~10 samples with tool calls using the pipeline engine
-2. Verify parquet has the ``tools`` column and messages contain ``tool_calls``
-3. Score the generated data using the tool-call-aware scorer
-4. Verify scoring produces meaningful results
+1. Generate ~10 samples with tool calls using the pipeline engine.
+2. Verify the parquet has the ``tools`` column and messages contain
+   ``tool_calls``.
+3. Score the generated data using the tool-call-aware scorer.
+4. Verify scoring produces meaningful results.
 
-Requires:
-  - LQH API access (api.lqh.ai)
+Requires LQH API access (``api.lqh.ai``).  Opt in via
+``@pytest.mark.integration``; the suite skips when no credentials are
+present.
 
 Usage::
 
@@ -18,16 +20,14 @@ Usage::
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
+from typing import Any
 
 import pyarrow.parquet as pq
 import pytest
 
 from lqh.engine import load_dataset_with_tools, run_pipeline
 from lqh.scoring import run_data_scoring
-
-logger = logging.getLogger(__name__)
 
 NUM_SAMPLES = 10
 
@@ -60,37 +60,14 @@ The conversation includes:
 """
 
 
-def _has_api_access() -> bool:
-    try:
-        from lqh.auth import get_token
-        return get_token() is not None
-    except Exception:
-        return False
-
-
-@pytest.fixture
-def api_client():
-    """Create an authenticated API client."""
-    from lqh.auth import require_token
-    from lqh.client import create_client
-    from lqh.config import load_config
-
-    config = load_config()
-    token = require_token()
-    return create_client(token, config.api_base_url)
-
-
-@pytest.mark.skipif(not _has_api_access(), reason="No API access")
+@pytest.mark.integration
 class TestToolCallingE2E:
     """End-to-end test for tool calling data generation and scoring."""
 
-    @pytest.mark.asyncio
     async def test_generate_and_score_tool_calling_data(
-        self, tmp_path: Path, api_client,
-    ):
-        # ---- Step 1: Generate tool-calling samples ----
-        print(f"\n[1/4] Generating {NUM_SAMPLES} tool-calling samples...")
-
+        self, tmp_path: Path, api_client: Any,
+    ) -> None:
+        # ---- 1. Generate tool-calling samples ----
         pipeline_path = Path(__file__).parent.parent / "data_gen" / "tool_calling.py"
         assert pipeline_path.exists(), f"Pipeline not found: {pipeline_path}"
 
@@ -103,14 +80,11 @@ class TestToolCallingE2E:
             concurrency=3,
             max_retries=5,
         )
-        print(f"  Generated: {result.succeeded}/{result.total} succeeded")
         assert result.succeeded >= NUM_SAMPLES * 0.7, (
             f"Too many failures: {result.failed}/{result.total}"
         )
 
-        # ---- Step 2: Verify parquet structure ----
-        print("\n[2/4] Verifying parquet structure...")
-
+        # ---- 2. Verify parquet structure ----
         data_path = output_dir / "data.parquet"
         assert data_path.exists()
 
@@ -121,42 +95,28 @@ class TestToolCallingE2E:
         conversations, tools_list = load_dataset_with_tools(data_path)
         assert len(conversations) == result.succeeded
 
-        # Check that samples have tool calls and tool definitions
         samples_with_tools = sum(1 for t in tools_list if t is not None)
-        samples_with_tool_calls = 0
-        for conv in conversations:
-            has_tc = any(msg.get("tool_calls") for msg in conv)
-            if has_tc:
-                samples_with_tool_calls += 1
+        samples_with_tool_calls = sum(
+            1 for conv in conversations if any(msg.get("tool_calls") for msg in conv)
+        )
 
-        print(f"  Samples with tools column: {samples_with_tools}/{len(conversations)}")
-        print(f"  Samples with tool_calls: {samples_with_tool_calls}/{len(conversations)}")
+        assert samples_with_tools == len(conversations)
+        assert samples_with_tool_calls == len(conversations)
 
-        assert samples_with_tools == len(conversations), "All samples should have tools"
-        assert samples_with_tool_calls == len(conversations), "All samples should have tool_calls"
-
-        # Spot-check a conversation
+        # Spot-check a conversation.
         conv = conversations[0]
         tools = tools_list[0]
-
-        # Should have system, user, assistant (with tool call), tool result, assistant
         roles = [msg["role"] for msg in conv]
         assert "system" in roles
         assert "user" in roles
         assert "tool" in roles
         assert roles.count("assistant") >= 2  # pre-tool and post-tool
 
-        # Tools should be in OpenAI format
         assert tools is not None
         assert all("function" in t for t in tools)
         assert all("name" in t["function"] for t in tools)
 
-        print(f"  Sample tools: {[t['function']['name'] for t in tools[:3]]}...")
-        print(f"  Sample roles: {roles}")
-
-        # ---- Step 3: Score the data ----
-        print("\n[3/4] Scoring tool-calling data...")
-
+        # ---- 3. Score the data ----
         scorer_path = tmp_path / "scorer.md"
         scorer_path.write_text(_TOOL_CALLING_SCORER)
 
@@ -167,23 +127,11 @@ class TestToolCallingE2E:
             model_size="small",
             concurrency=3,
         )
-        print(f"  Scored: {scoring_result.scored}/{scoring_result.total}")
-        print(f"  Mean score: {scoring_result.mean_score:.2f}/10")
-        print(f"  Median score: {scoring_result.median_score:.2f}/10")
 
-        # ---- Step 4: Verify results ----
-        print("\n[4/4] Verifying results...")
-
+        # ---- 4. Verify results ----
         assert scoring_result.scored > 0, "No samples were scored"
         assert scoring_result.mean_score > 0, "Mean score should be positive"
 
-        # Check scores.parquet was written
         scores_path = output_dir / "scores.parquet"
-        assert scores_path.exists(), "scores.parquet not written"
-
-        scores_table = pq.read_table(str(scores_path))
-        assert len(scores_table) == scoring_result.total
-
-        print("\n  All checks passed!")
-        print(f"  Summary: {result.succeeded} samples generated, "
-              f"mean score = {scoring_result.mean_score:.2f}/10")
+        assert scores_path.exists()
+        assert len(pq.read_table(str(scores_path))) == scoring_result.total
