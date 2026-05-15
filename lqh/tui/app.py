@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from prompt_toolkit import Application
 from prompt_toolkit.application import run_in_terminal
@@ -37,6 +37,9 @@ from lqh.tui.renderer import (
 )
 from lqh.tui.background_tasks import BackgroundTask, BackgroundTaskRegistry
 from lqh.tui.status_bar import StatusBar
+
+if TYPE_CHECKING:
+    from lqh.subprocess_manager import SubprocessManager
 
 
 TUI_STYLE = Style.from_dict({
@@ -1161,8 +1164,6 @@ class LqhApp:
         probed over SSH via the backend's ``poll_status``.
         """
         import json
-
-        from lqh.subprocess_manager import SubprocessManager  # noqa: F401 (type)
 
         runs_dir = self.project_dir / "runs"
         if not runs_dir.is_dir():

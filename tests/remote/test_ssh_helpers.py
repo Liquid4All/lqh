@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -63,16 +64,18 @@ class TestSSHRun:
         assert bash_arg, f"Expected 'echo hello' in args: {call_args}"
 
     @pytest.mark.asyncio
-    async def test_command_failure(self):
+    async def test_command_failure(self, caplog):
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(return_value=(b"", b"not found\n"))
         mock_proc.returncode = 127
 
+        caplog.set_level(logging.DEBUG, logger="lqh.remote.ssh_helpers")
         with patch("lqh.remote.ssh_helpers.asyncio.create_subprocess_exec", return_value=mock_proc):
             stdout, stderr, rc = await ssh_run("host", "bad-command")
 
         assert rc == 127
         assert "not found" in stderr
+        assert "SSH host exit 127: stderr=not found" in caplog.text
 
     @pytest.mark.asyncio
     async def test_timeout(self):

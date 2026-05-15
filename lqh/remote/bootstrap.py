@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from lqh.remote.ssh_helpers import rsync_push, ssh_run
+from lqh.remote.ssh_helpers import ssh_run
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ async def bootstrap_remote(
     if not env["python3"]:
         raise RuntimeError(
             f"python3 not found on {hostname}. "
-            "Please install Python 3.10+ before running setup."
+            "Please install Python 3.11+ before running setup."
         )
 
     # Step 2: Create directory structure

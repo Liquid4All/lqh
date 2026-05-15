@@ -307,12 +307,12 @@ async def _process_sample(
 
 
 def _print_sample(r: SampleResult) -> None:
-    print(f"  prompt (chat-templated, last 240 chars):")
+    print("  prompt (chat-templated, last 240 chars):")
     print(f"    …{r.prompt_text[-240:]!r}")
     print(f"  API   ({'json✓' if r.api_parse_ok else 'json✗'}): {r.api_output!r}")
     print(f"  local ({'json✓' if r.local_parse_ok else 'json✗'}): {r.local_output!r}")
     if r.first_diverge < 0:
-        print(f"  ⇒ outputs IDENTICAL")
+        print("  ⇒ outputs IDENTICAL")
     else:
         i = r.first_diverge
         before = r.api_output[max(0, i - 20):i]

@@ -15,7 +15,7 @@
         },
         "mentioned_products": {
           "type": "array",
-          "items": {"type": "string"},
+          "items": { "type": "string" },
           "maxItems": 10
         },
         "urgency": {
@@ -27,7 +27,13 @@
           "type": "string"
         }
       },
-      "required": ["sender_name", "intent", "mentioned_products", "urgency", "summary"],
+      "required": [
+        "sender_name",
+        "intent",
+        "mentioned_products",
+        "urgency",
+        "summary"
+      ],
       "additionalProperties": false
     }
   }

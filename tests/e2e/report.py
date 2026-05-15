@@ -6,7 +6,7 @@ import json
 import time
 from pathlib import Path
 
-from tests.e2e.harness import E2EResult, TurnRecord
+from tests.e2e.harness import E2EResult
 
 REPORTS_DIR = Path(__file__).parent / "reports"
 
@@ -95,7 +95,6 @@ def _render_markdown(result: E2EResult) -> str:
     # Tool usage breakdown
     lines.append("## Tool Usage")
     lines.append("")
-    tools_called = result.tools_called()
     tool_counts: dict[str, int] = {}
     for t in result.transcript:
         if t.role == "tool_call" and t.tool_name:
@@ -126,7 +125,7 @@ def _render_markdown(result: E2EResult) -> str:
             lines.append(f"> {rec.content}")
             lines.append("")
         elif rec.role == "agent":
-            lines.append(f"### Agent")
+            lines.append("### Agent")
             # Truncate long agent messages
             content = rec.content
             if len(content) > 1000:

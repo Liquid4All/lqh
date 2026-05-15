@@ -90,7 +90,9 @@ async def ssh_run(
 
     stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
     stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
-    returncode = proc.returncode or 0
+    returncode = proc.returncode
+    if returncode is None:
+        returncode = 0
 
     if returncode != 0:
         logger.debug(

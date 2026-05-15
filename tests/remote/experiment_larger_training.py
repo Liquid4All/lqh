@@ -158,11 +158,10 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
     from lqh.config import load_config
     from lqh.engine import run_pipeline
     from lqh.remote.backend import RemoteConfig
-    from lqh.remote.bootstrap import bootstrap_remote
     from lqh.remote.ssh_direct import SSHDirectBackend
     from lqh.remote.ssh_helpers import ssh_run
     from lqh.scoring import run_scoring
-    from lqh.train.progress import read_latest_progress, read_progress
+    from lqh.train.progress import read_latest_progress
 
     remote_root = f"/tmp/lqh-experiment-{uuid4().hex[:8]}"
     tmpdir = Path(tempfile.mkdtemp(prefix="lqh_exp_"))
@@ -391,7 +390,7 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
         print(f"  Epochs:              {NUM_EPOCHS}")
         print(f"  Training steps:      {last_step}")
         print(f"  Training time:       {t_train:.0f}s")
-        print(f"")
+        print("")
         print(f"  Baseline (API):      {baseline_api:.2f}/10")
         print(f"  Baseline (local HF): {baseline_local:.2f}/10")
         print(f"  Post-training:       {post_score:.2f}/10")

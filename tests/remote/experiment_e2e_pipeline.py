@@ -41,7 +41,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -290,9 +290,9 @@ async def stage_filter(
     )
     if result.kept < 0.5 * result.total:
         print(
-            f"  ⚠️  WARN: kept ratio is below 50%. "
-            f"Either the data is bad or the scorer is off-axis with the spec. "
-            f"Continuing, but consider investigating before relying on the result.",
+            "  ⚠️  WARN: kept ratio is below 50%. "
+            "Either the data is bad or the scorer is off-axis with the spec. "
+            "Continuing, but consider investigating before relying on the result.",
             flush=True,
         )
     return FilterReport(
@@ -693,7 +693,7 @@ async def stage_dpo(
     config_path = run_dir / "config.json"
     config_path.write_text(json.dumps(config, indent=2) + "\n")
 
-    print(f"  spawning lqh.train (DPO) subprocess…", flush=True)
+    print("  spawning lqh.train (DPO) subprocess…", flush=True)
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "lqh.train", str(config_path),
         cwd=str(REPO_ROOT),
@@ -709,7 +709,7 @@ async def stage_dpo(
             preds_file = iter_dir / "predictions.parquet"
 
             print(f"\n  --- iteration {i + 1}/{num_iterations} ---", flush=True)
-            print(f"  waiting for predictions…", flush=True)
+            print("  waiting for predictions…", flush=True)
             await _wait_for_iter_artifacts(
                 request_file, preds_file, proc,
                 iteration=i, progress_dir=run_dir,
@@ -755,7 +755,7 @@ async def stage_dpo(
             # ---- Per-iter held-out eval (after DPO step finishes) ----
             eval_preds_file = iter_dir / "eval_predictions.parquet"
             ready_file = iter_dir / "eval_predictions_ready.json"
-            print(f"  waiting for held-out eval predictions…", flush=True)
+            print("  waiting for held-out eval predictions…", flush=True)
             got_eval = await _wait_for_eval_predictions(
                 eval_preds_file, ready_file, proc, iteration=i,
             )

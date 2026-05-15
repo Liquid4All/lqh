@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch, call
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -51,7 +51,6 @@ class TestDetectEnvironment:
 
 def _mock_rsync_noop(*args, **kwargs):
     """No-op async mock for rsync and subprocess calls in bootstrap."""
-    import asyncio
 
     async def _noop():
         pass
@@ -111,7 +110,7 @@ class TestBootstrapRemote:
         with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh), \
              patch("lqh.remote.gpu.ssh_run", side_effect=mock_ssh), \
              patch("lqh.remote.bootstrap._find_lqh_package_root", return_value=None):
-            log = await bootstrap_remote("host", "/remote/root")
+            await bootstrap_remote("host", "/remote/root")
 
         venv_cmds = [c for c in calls if "venv" in c]
         assert any("python3 -m venv" in c for c in venv_cmds)

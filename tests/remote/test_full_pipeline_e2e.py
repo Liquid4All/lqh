@@ -33,7 +33,7 @@ import pytest_asyncio
 from lqh.remote.backend import RemoteConfig
 from lqh.remote.ssh_direct import SSHDirectBackend
 from lqh.remote.ssh_helpers import ssh_run
-from lqh.train.progress import read_latest_progress, read_progress
+from lqh.train.progress import read_latest_progress
 
 logger = logging.getLogger(__name__)
 
@@ -466,7 +466,7 @@ class TestFullPipelineE2E:
         print(f"  Training completed at step {last_step}")
 
         # ---- Step 5: Post-training eval (normal LR) ----
-        print(f"\n[5/7] Post-training eval (normal lr=2e-5)...")
+        print("\n[5/7] Post-training eval (normal lr=2e-5)...")
         post_normal_score = await _run_remote_eval(
             project_dir, backend, remote_root, remote_host,
             trained_model, "post_training_normal",
@@ -484,7 +484,7 @@ class TestFullPipelineE2E:
         print(f"  Training completed at step {last_step_tiny}")
 
         # ---- Step 7: Post-training eval (tiny LR) ----
-        print(f"\n[7/7] Post-training eval (tiny lr=1e-8, should match baseline)...")
+        print("\n[7/7] Post-training eval (tiny lr=1e-8, should match baseline)...")
         post_tiny_score = await _run_remote_eval(
             project_dir, backend, remote_root, remote_host,
             trained_model_tiny, "post_training_tiny_lr",
@@ -493,12 +493,12 @@ class TestFullPipelineE2E:
 
         # ---- Summary ----
         print(f"\n{'='*60}")
-        print(f"Score comparison:")
+        print("Score comparison:")
         print(f"  Baseline (API):              {baseline_api_score:.2f}/10")
         print(f"  Baseline (local HF):         {baseline_local_score:.2f}/10")
         print(f"  Post-training (lr=2e-5):     {post_normal_score:.2f}/10")
         print(f"  Post-training (lr=1e-8):     {post_tiny_score:.2f}/10")
-        print(f"")
+        print("")
         delta_normal = post_normal_score - baseline_local_score
         delta_tiny = post_tiny_score - baseline_local_score
         print(f"  Delta (normal lr):           {delta_normal:+.2f}")
@@ -533,7 +533,7 @@ class TestFullPipelineE2E:
         (project_dir / "pipeline_e2e_summary.json").write_text(
             json.dumps(summary, indent=2) + "\n"
         )
-        print(f"\n  Summary saved to pipeline_e2e_summary.json")
+        print("\n  Summary saved to pipeline_e2e_summary.json")
 
     async def _train_on_remote(
         self,

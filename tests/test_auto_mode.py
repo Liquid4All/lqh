@@ -17,13 +17,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from lqh.agent import Agent, AgentCallbacks
 from lqh.session import Session
 from lqh.tools.definitions import get_all_tools
 from lqh.tools.handlers import (
-    ToolResult,
     execute_tool,
     handle_exit_auto_mode,
     handle_set_auto_stage,
