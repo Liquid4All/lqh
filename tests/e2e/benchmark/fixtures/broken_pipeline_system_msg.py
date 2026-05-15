@@ -1,7 +1,6 @@
 """Broken pipeline: system message in output Conversation (forbidden)."""
 
-from lqh.pipeline import Pipeline, ChatMLMessage, Conversation, GenerationError, step
-import json
+from lqh.pipeline import Pipeline, ChatMLMessage, Conversation
 import liquidrandom
 
 

@@ -416,7 +416,7 @@ class TestExtractFailures(unittest.TestCase):
     def test_below_threshold_returned(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._make_results([2.0, 4.0, 7.0, 9.0, 8.0], tmpdir)
-            failures = extract_failures(path, threshold=6.0, min_failures=0)
+            failures, _ = extract_failures(path, threshold=6.0, min_failures=0)
             scores = [f["score"] for f in failures]
             self.assertEqual(scores, [2.0, 4.0])
 
@@ -424,7 +424,7 @@ class TestExtractFailures(unittest.TestCase):
         """If only 1 sample below threshold but min_failures=3, pad from bottom."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._make_results([3.0, 7.0, 8.0, 6.5, 9.0], tmpdir)
-            failures = extract_failures(path, threshold=6.0, min_failures=3)
+            failures, _ = extract_failures(path, threshold=6.0, min_failures=3)
             self.assertEqual(len(failures), 3)
             # Should include the one below threshold + 2 next lowest
             scores = [f["score"] for f in failures]
@@ -433,27 +433,27 @@ class TestExtractFailures(unittest.TestCase):
     def test_max_cap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._make_results([1.0, 2.0, 3.0, 4.0, 5.0], tmpdir)
-            failures = extract_failures(path, threshold=10.0, min_failures=0, max_failures=3)
+            failures, _ = extract_failures(path, threshold=10.0, min_failures=0, max_failures=3)
             self.assertEqual(len(failures), 3)
 
     def test_sorted_ascending(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._make_results([5.0, 2.0, 4.0, 1.0, 3.0], tmpdir)
-            failures = extract_failures(path, threshold=6.0, min_failures=0)
+            failures, _ = extract_failures(path, threshold=6.0, min_failures=0)
             scores = [f["score"] for f in failures]
             self.assertEqual(scores, sorted(scores))
 
     def test_empty_when_all_high(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._make_results([8.0, 9.0, 10.0], tmpdir)
-            failures = extract_failures(path, threshold=6.0, min_failures=0)
+            failures, _ = extract_failures(path, threshold=6.0, min_failures=0)
             self.assertEqual(failures, [])
 
     def test_messages_parsed(self) -> None:
         """Messages should be parsed from JSON, not raw strings."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._make_results([1.0], tmpdir)
-            failures = extract_failures(path, threshold=6.0, min_failures=0)
+            failures, _ = extract_failures(path, threshold=6.0, min_failures=0)
             self.assertEqual(len(failures), 1)
             self.assertIsInstance(failures[0]["messages"], list)
             self.assertEqual(failures[0]["messages"][0]["role"], "user")
@@ -462,7 +462,7 @@ class TestExtractFailures(unittest.TestCase):
         """min_failures > dataset size should return all samples."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._make_results([8.0, 9.0], tmpdir)
-            failures = extract_failures(path, threshold=6.0, min_failures=10)
+            failures, _ = extract_failures(path, threshold=6.0, min_failures=10)
             self.assertEqual(len(failures), 2)
 
 

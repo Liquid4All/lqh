@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from lqh.remote.ssh_helpers import rsync_push, ssh_run
+from lqh.remote.ssh_helpers import ssh_run
 
 logger = logging.getLogger(__name__)
 

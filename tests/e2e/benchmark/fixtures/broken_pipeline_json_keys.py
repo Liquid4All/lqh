@@ -1,6 +1,6 @@
 """Broken pipeline: wrong JSON key names in validation (GenerationError every time)."""
 
-from lqh.pipeline import Pipeline, ChatMLMessage, Conversation, GenerationError, step
+from lqh.pipeline import Pipeline, ChatMLMessage, Conversation, GenerationError
 import json
 import liquidrandom
 

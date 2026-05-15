@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -233,9 +232,8 @@ class TestRemoteJobLifecycle:
         else:
             pytest.fail("PID file never appeared")
 
-        # Check liveness
-        alive = await ssh_backend.is_job_alive(pid)
-        # May or may not still be alive (script is short)
+        # Check liveness (may or may not still be alive — script is short)
+        await ssh_backend.is_job_alive(pid)
 
         # Wait for completion
         for _ in range(20):

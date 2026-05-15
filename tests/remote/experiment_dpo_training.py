@@ -300,7 +300,7 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
             print(f"\n  --- Iteration {iteration + 1}/{NUM_ITERATIONS} ---")
 
             # Wait for iter_request.json (subprocess generated predictions)
-            print(f"  Waiting for predictions...")
+            print("  Waiting for predictions...")
             last_step_seen = -1
             deadline = time.monotonic() + 600
             while time.monotonic() < deadline:
@@ -373,16 +373,16 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
                 n_prefs = pq.read_metadata(str(prefs_path)).num_rows
                 print(f"  {n_prefs} preference pairs assembled")
             else:
-                print(f"  WARNING: preferences.parquet not created!")
+                print("  WARNING: preferences.parquet not created!")
                 break
 
             # Push preferences back to remote
             remote_prefs = f"{remote_iter_dir}/preferences.parquet"
             await backend.sync_file_to_remote(str(prefs_path), remote_prefs)
-            print(f"  Preferences synced to remote, DPO step running...")
+            print("  Preferences synced to remote, DPO step running...")
 
         # Wait for training to complete
-        print(f"\n  Waiting for DPO to finish...")
+        print("\n  Waiting for DPO to finish...")
         deadline = time.monotonic() + 600
         final_state = "unknown"
         while time.monotonic() < deadline:
@@ -437,7 +437,7 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
         print(f"  Eval samples:        {eval_samples}")
         print(f"  DPO iterations:      {NUM_ITERATIONS}")
         print(f"  Total time:          {t_total:.0f}s")
-        print(f"")
+        print("")
         print(f"  Baseline (local HF): {baseline_score:.2f}/10")
         for i, s in enumerate(iteration_scores):
             print(f"  Iteration {i} score:   {s:.2f}/10")

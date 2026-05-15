@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lqh.tools.handlers import (
-    ToolResult,
     handle_create_file,
     handle_edit_file,
     handle_get_eval_failures,
@@ -37,6 +38,13 @@ class TestRunScoringValidation(unittest.TestCase):
     """Verify parameter validation in handle_run_scoring."""
 
     def setUp(self) -> None:
+        # handle_run_scoring requires a token before it reaches the parameter
+        # validation branches these tests exercise. Inject a dummy via the
+        # debug env var so auth succeeds and validation runs.
+        self._env_patcher = mock.patch.dict(os.environ, {"LQH_DEBUG_API_KEY": "test-token"})
+        self._env_patcher.start()
+        self.addCleanup(self._env_patcher.stop)
+
         self.tmpdir = tempfile.mkdtemp()
         self.project_dir = Path(self.tmpdir)
         # Create a minimal dataset

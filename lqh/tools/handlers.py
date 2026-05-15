@@ -1643,7 +1643,6 @@ async def _execute_start_training_remote(
     """Start training on a remote backend."""
     from lqh.remote.config import get_remote
     from lqh.remote.ssh_direct import SSHDirectBackend
-    from lqh.remote.watcher import RemoteRunWatcher
 
     remote_config = get_remote(project_dir, remote_name)
     if remote_config is None:
@@ -2743,7 +2742,7 @@ async def handle_remote_status(
     )
     stdout, _, rc = await ssh_run(hostname, proc_cmd, timeout=10.0)
     if rc == 0 and stdout.strip():
-        proc_lines = [l.strip() for l in stdout.splitlines() if l.strip()]
+        proc_lines = [line.strip() for line in stdout.splitlines() if line.strip()]
         lines.append(f"⚙️  **Training processes:** {len(proc_lines)} found\n")
         for pl in proc_lines[:10]:  # cap at 10 to avoid flooding
             # Show user, PID, %CPU, %MEM, and command (trimmed)

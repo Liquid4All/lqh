@@ -1,7 +1,6 @@
 """Broken pipeline: Conversation() constructor misuse (TypeError)."""
 
-from lqh.pipeline import Pipeline, ChatMLMessage, Conversation, GenerationError, step
-import json
+from lqh.pipeline import Pipeline, ChatMLMessage, Conversation
 import liquidrandom
 
 

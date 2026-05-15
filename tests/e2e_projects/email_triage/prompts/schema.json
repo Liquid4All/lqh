@@ -8,7 +8,14 @@
       "properties": {
         "category": {
           "type": "string",
-          "enum": ["billing", "shipping", "product_quality", "account", "feature_request", "other"]
+          "enum": [
+            "billing",
+            "shipping",
+            "product_quality",
+            "account",
+            "feature_request",
+            "other"
+          ]
         },
         "priority": {
           "type": "string",
@@ -18,7 +25,14 @@
           "type": "array",
           "items": {
             "type": "string",
-            "enum": ["acknowledge", "escalate", "offer_refund", "loop_in_team", "request_more_info", "close"]
+            "enum": [
+              "acknowledge",
+              "escalate",
+              "offer_refund",
+              "loop_in_team",
+              "request_more_info",
+              "close"
+            ]
           },
           "minItems": 1,
           "maxItems": 3

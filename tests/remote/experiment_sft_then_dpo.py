@@ -362,7 +362,7 @@ async def main(
             print(f"\n  --- Iteration {iteration + 1}/{DPO_ITERATIONS} ---")
 
             # Wait for predictions
-            print(f"  Waiting for predictions...")
+            print("  Waiting for predictions...")
             last_step_seen = -1
             deadline = time.monotonic() + 600
             while time.monotonic() < deadline:
@@ -432,16 +432,16 @@ async def main(
                 n_prefs = pq.read_metadata(str(prefs_path)).num_rows
                 print(f"  {n_prefs} preference pairs assembled")
             else:
-                print(f"  WARNING: preferences.parquet not created!")
+                print("  WARNING: preferences.parquet not created!")
                 break
 
             # Push preferences back to remote
             remote_prefs = f"{remote_iter_dir}/preferences.parquet"
             await backend.sync_file_to_remote(str(prefs_path), remote_prefs)
-            print(f"  Preferences synced to remote, DPO step running...")
+            print("  Preferences synced to remote, DPO step running...")
 
         # Wait for DPO to complete
-        print(f"\n  Waiting for DPO to finish...")
+        print("\n  Waiting for DPO to finish...")
         deadline = time.monotonic() + 600
         final_state = "unknown"
         while time.monotonic() < deadline:
@@ -500,13 +500,13 @@ async def main(
         print(f"  SFT time:            {t_sft:.0f}s")
         print(f"  DPO iterations:      {DPO_ITERATIONS}")
         print(f"  DPO time:            {t_dpo:.0f}s")
-        print(f"")
+        print("")
         print(f"  Baseline (local HF): {baseline_score:.2f}/10")
         print(f"  Post-SFT:            {post_sft_score:.2f}/10  (delta: {sft_delta:+.2f})")
         for i, s in enumerate(iteration_scores):
             print(f"    DPO iter {i} score:  {s:.2f}/10")
         print(f"  Post-DPO:            {post_dpo_score:.2f}/10  (delta vs SFT: {dpo_delta:+.2f})")
-        print(f"")
+        print("")
         print(f"  Total improvement:   {total_delta:+.2f}")
         print(f"  Pipeline:            {'YES' if total_delta > 0 else 'NO'}")
         print("=" * 60)
