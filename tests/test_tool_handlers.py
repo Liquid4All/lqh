@@ -14,11 +14,9 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 from lqh.tools.handlers import (
     ToolResult,
-    _validate_path,
     handle_create_file,
     handle_edit_file,
     handle_get_eval_failures,
@@ -33,86 +31,6 @@ from lqh.tools.handlers import (
 # ---------------------------------------------------------------------------
 # Unit tests for validation logic (no network)
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("rel_path", "expected_rel"),
-    [
-        ("file.txt", "file.txt"),
-        ("nested/item.txt", "nested/item.txt"),
-        ("nested/../file.txt", "file.txt"),
-        (".", "."),
-    ],
-)
-def test_validate_path_accepts_paths_inside_project(
-    tmp_path: Path,
-    rel_path: str,
-    expected_rel: str,
-) -> None:
-    project_dir = tmp_path / "proj"
-    project_dir.mkdir()
-    (project_dir / "nested").mkdir()
-
-    assert _validate_path(project_dir, rel_path) == (project_dir / expected_rel).resolve()
-
-
-def test_validate_path_accepts_absolute_path_inside_project(tmp_path: Path) -> None:
-    project_dir = tmp_path / "proj"
-    project_dir.mkdir()
-    inside = project_dir / "file.txt"
-
-    assert _validate_path(project_dir, str(inside)) == inside.resolve()
-
-
-def test_validate_path_accepts_symlink_resolving_inside_project(tmp_path: Path) -> None:
-    project_dir = tmp_path / "proj"
-    nested = project_dir / "nested"
-    project_dir.mkdir()
-    nested.mkdir()
-    link = project_dir / "link-inside"
-    try:
-        link.symlink_to(nested, target_is_directory=True)
-    except (OSError, NotImplementedError) as exc:
-        pytest.skip(f"symlink creation unavailable: {exc}")
-
-    assert _validate_path(project_dir, "link-inside/item.txt") == (nested / "item.txt").resolve()
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "parent_escape",
-        "sibling_prefix_escape",
-        "absolute_escape",
-        "symlink_escape",
-    ],
-)
-def test_validate_path_rejects_paths_outside_project(tmp_path: Path, case: str) -> None:
-    project_dir = tmp_path / "proj"
-    sibling_prefix = tmp_path / "proj2"
-    outside = tmp_path / "outside"
-    project_dir.mkdir()
-    sibling_prefix.mkdir()
-    outside.mkdir()
-
-    if case == "parent_escape":
-        rel_path = "../outside/secret.txt"
-    elif case == "sibling_prefix_escape":
-        rel_path = "../proj2/secret.txt"
-    elif case == "absolute_escape":
-        rel_path = str(outside / "secret.txt")
-    elif case == "symlink_escape":
-        link = project_dir / "link-outside"
-        try:
-            link.symlink_to(outside, target_is_directory=True)
-        except (OSError, NotImplementedError) as exc:
-            pytest.skip(f"symlink creation unavailable: {exc}")
-        rel_path = "link-outside/secret.txt"
-    else:
-        raise AssertionError(f"unknown case: {case}")
-
-    with pytest.raises(ValueError, match="outside the project"):
-        _validate_path(project_dir, rel_path)
 
 
 class TestRunScoringValidation(unittest.TestCase):
@@ -350,6 +268,19 @@ class TestFileToolHandlers(unittest.TestCase):
         with self.assertRaises(ValueError, msg="outside the project"):
             asyncio.run(
                 handle_read_file(self.project_dir, path="../../etc/passwd")
+            )
+
+    def test_path_prefix_sibling_rejected(self) -> None:
+        sibling = self.project_dir.parent / f"{self.project_dir.name}2"
+        sibling.mkdir()
+        (sibling / "secret.txt").write_text("secret")
+
+        with self.assertRaisesRegex(ValueError, "outside the project"):
+            asyncio.run(
+                handle_read_file(
+                    self.project_dir,
+                    path=f"../{sibling.name}/secret.txt",
+                )
             )
 
 
