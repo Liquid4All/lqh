@@ -14,9 +14,11 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from lqh.tools.handlers import (
     ToolResult,
+    _validate_path,
     handle_create_file,
     handle_edit_file,
     handle_get_eval_failures,
@@ -31,6 +33,33 @@ from lqh.tools.handlers import (
 # ---------------------------------------------------------------------------
 # Unit tests for validation logic (no network)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("rel_path", "expected"),
+    [
+        ("file.txt", "file.txt"),
+        ("nested/../file.txt", "file.txt"),
+        ("../proj2/secret.txt", ValueError),
+        ("../outside/secret.txt", ValueError),
+    ],
+)
+def test_validate_path_containment(
+    tmp_path: Path,
+    rel_path: str,
+    expected: str | type[Exception],
+) -> None:
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    (project_dir / "nested").mkdir()
+    (tmp_path / "proj2").mkdir()
+    (tmp_path / "outside").mkdir()
+
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="outside the project"):
+            _validate_path(project_dir, rel_path)
+    else:
+        assert _validate_path(project_dir, rel_path) == (project_dir / expected).resolve()
 
 
 class TestRunScoringValidation(unittest.TestCase):
@@ -268,19 +297,6 @@ class TestFileToolHandlers(unittest.TestCase):
         with self.assertRaises(ValueError, msg="outside the project"):
             asyncio.run(
                 handle_read_file(self.project_dir, path="../../etc/passwd")
-            )
-
-    def test_path_prefix_sibling_rejected(self) -> None:
-        sibling = self.project_dir.parent / f"{self.project_dir.name}2"
-        sibling.mkdir()
-        (sibling / "secret.txt").write_text("secret")
-
-        with self.assertRaisesRegex(ValueError, "outside the project"):
-            asyncio.run(
-                handle_read_file(
-                    self.project_dir,
-                    path=f"../{sibling.name}/secret.txt",
-                )
             )
 
 
