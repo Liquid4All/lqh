@@ -15,8 +15,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -31,14 +31,13 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - run: uv python install ${{ matrix.python-version }}
-      - run: uv sync --python ${{ matrix.python-version }}
-      - run: uv pip install pytest pytest-asyncio
+      - run: uv sync --frozen --group dev --python ${{ matrix.python-version }}
       - run: >-
           uv run pytest tests
           --ignore=tests/e2e
