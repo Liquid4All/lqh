@@ -50,6 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - run: |
-          find . -name '*.json' -not -path './.git/*' -print0 \
-            | xargs -0 -n1 jq empty
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - run: npx --yes prettier@3.4.2 --check '**/*.json'
