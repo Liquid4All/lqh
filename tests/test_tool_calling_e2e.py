@@ -20,7 +20,6 @@ Usage::
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +28,6 @@ import pytest
 
 from lqh.engine import load_dataset_with_tools, run_pipeline
 from lqh.scoring import run_data_scoring
-
-logger = logging.getLogger(__name__)
 
 NUM_SAMPLES = 10
 
