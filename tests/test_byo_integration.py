@@ -1,66 +1,56 @@
 """Integration tests for bring-your-own-data flows end-to-end through the engine.
 
-These tests write real pipeline files that import lqh.sources, load them via
-the engine's dynamic loader, and execute them with a mocked AsyncOpenAI
-client. No network required, but exercises the full wiring: source()
-discovery, per-item instantiation, samples_per_item multiplier, parquet
-output, and the lqh.sources helpers.
+These tests write real pipeline files that import ``lqh.sources``, load them via
+the engine's dynamic loader, and execute them with a mocked ``AsyncOpenAI``
+client.  No network required, but they exercise the full wiring:
+``source()`` discovery, per-item instantiation, ``samples_per_item``
+multiplier, parquet output, and the ``lqh.sources`` helpers.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from textwrap import dedent
-from unittest.mock import AsyncMock, MagicMock
+from typing import Callable
 
-import pytest
 import pyarrow.parquet as pq
+import pytest
 
 from lqh.engine import run_pipeline
 
 
-def _fake_client(reply: str = "ok") -> MagicMock:
-    """AsyncOpenAI stand-in: chat.completions.create returns *reply* as content."""
-    client = MagicMock()
-    client.chat = MagicMock()
-    client.chat.completions = MagicMock()
-
-    async def _create(**kwargs):
-        resp = MagicMock()
-        choice = MagicMock()
-        choice.message.content = reply
-        resp.choices = [choice]
-        return resp
-
-    client.chat.completions.create = AsyncMock(side_effect=_create)
-    return client
-
-
-def _write_pipeline(path: Path, body: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(dedent(body))
-
-
 @pytest.fixture
-def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.chdir(tmp_path)
-    return tmp_path
+def write_pipeline(chdir_to_tmp: Path) -> Callable[[str, str], Path]:
+    """Write a pipeline module under the current project directory."""
+
+    def _factory(relative_path: str, body: str) -> Path:
+        path = chdir_to_tmp / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(dedent(body))
+        return path
+
+    return _factory
 
 
 # ---------------------------------------------------------------------------
-# Bring-your-prompts: source()=prompts(), generate() completes them.
+# Bring-your-prompts: ``source()=prompts()``, ``generate()`` completes them.
 # ---------------------------------------------------------------------------
 
 
-def test_byo_prompts_end_to_end(project: Path) -> None:
+async def test_byo_prompts_end_to_end(
+    chdir_to_tmp: Path,
+    write_pipeline,
+    mock_openai_client,
+) -> None:
+    project = chdir_to_tmp
     (project / "prompts.jsonl").write_text(
-        json.dumps({"prompt": "hello"}) + "\n" + json.dumps({"prompt": "world"}) + "\n"
+        json.dumps({"prompt": "hello"}) + "\n"
+        + json.dumps({"prompt": "world"}) + "\n"
     )
 
-    _write_pipeline(
-        project / "data_gen" / "p.py",
+    pipeline = write_pipeline(
+        "data_gen/p.py",
         """
         from lqh.pipeline import Pipeline, ChatMLMessage
         import lqh.sources as sources
@@ -83,15 +73,13 @@ def test_byo_prompts_end_to_end(project: Path) -> None:
     )
 
     output_dir = project / "datasets" / "v1"
-    result = asyncio.run(
-        run_pipeline(
-            script_path=project / "data_gen" / "p.py",
-            num_samples=5,  # larger than source length; engine caps at source
-            output_dir=output_dir,
-            client=_fake_client("greetings"),
-            concurrency=1,
-            max_retries=0,
-        )
+    result = await run_pipeline(
+        script_path=pipeline,
+        num_samples=5,  # larger than source length; engine caps at source
+        output_dir=output_dir,
+        client=mock_openai_client(content="greetings"),
+        concurrency=1,
+        max_retries=0,
     )
 
     assert result.succeeded == 2
@@ -109,12 +97,17 @@ def test_byo_prompts_end_to_end(project: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_byo_seed_data_with_iteration(project: Path) -> None:
+async def test_byo_seed_data_with_iteration(
+    chdir_to_tmp: Path,
+    write_pipeline,
+    mock_openai_client,
+) -> None:
+    project = chdir_to_tmp
     (project / "seed_data").mkdir()
     (project / "seed_data" / "flowers.txt").write_text("rose\ntulip\n")
 
-    _write_pipeline(
-        project / "data_gen" / "p.py",
+    pipeline = write_pipeline(
+        "data_gen/p.py",
         """
         from lqh.pipeline import Pipeline, ChatMLMessage
         import lqh.sources as sources
@@ -137,16 +130,14 @@ def test_byo_seed_data_with_iteration(project: Path) -> None:
     )
 
     output_dir = project / "datasets" / "v1"
-    result = asyncio.run(
-        run_pipeline(
-            script_path=project / "data_gen" / "p.py",
-            num_samples=2,
-            output_dir=output_dir,
-            client=_fake_client("lovely flower"),
-            concurrency=1,
-            samples_per_item=3,  # 2 seeds × 3 iterations = 6 samples
-            max_retries=0,
-        )
+    result = await run_pipeline(
+        script_path=pipeline,
+        num_samples=2,
+        output_dir=output_dir,
+        client=mock_openai_client(content="lovely flower"),
+        concurrency=1,
+        samples_per_item=3,  # 2 seeds × 3 iterations = 6 samples
+        max_retries=0,
     )
 
     assert result.total == 6
@@ -154,9 +145,7 @@ def test_byo_seed_data_with_iteration(project: Path) -> None:
 
     table = pq.read_table(output_dir / "data.parquet")
     assert table.num_rows == 6
-    rows = [json.loads(m) for m in table.column("messages").to_pylist()]
-    user_msgs = [r[0]["content"] for r in rows]
-    # Each seed appears 3 times
+    user_msgs = [json.loads(m)[0]["content"] for m in table.column("messages").to_pylist()]
     assert user_msgs.count("About roses?") == 3
     assert user_msgs.count("About tulips?") == 3
 
@@ -166,14 +155,19 @@ def test_byo_seed_data_with_iteration(project: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_byo_image_folder_end_to_end(project: Path) -> None:
-    images = project / "images"
+async def test_byo_image_folder_end_to_end(
+    chdir_to_tmp: Path,
+    write_pipeline,
+    mock_openai_client,
+) -> None:
+    project = chdir_to_tmp
+    images = project / "images" / "dog"
+    images.mkdir(parents=True)
     for name in ("a.jpg", "b.jpg"):
-        (images / "dog").mkdir(parents=True, exist_ok=True)
-        (images / "dog" / name).write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        (images / name).write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
 
-    _write_pipeline(
-        project / "data_gen" / "p.py",
+    pipeline = write_pipeline(
+        "data_gen/p.py",
         """
         from lqh.pipeline import Pipeline, ChatMLMessage
         import lqh.sources as sources
@@ -186,7 +180,6 @@ def test_byo_image_folder_end_to_end(project: Path) -> None:
                 )
 
             async def generate(self, client, input):
-                # Touch the item to ensure it's the expected type.
                 assert input.subfolder == "dog"
                 _ = input.as_data_url()  # forces read_bytes
                 resp = await client.chat.completions.create(
@@ -201,14 +194,12 @@ def test_byo_image_folder_end_to_end(project: Path) -> None:
     )
 
     output_dir = project / "datasets" / "v1"
-    result = asyncio.run(
-        run_pipeline(
-            script_path=project / "data_gen" / "p.py",
-            num_samples=10,
-            output_dir=output_dir,
-            client=_fake_client("dog"),
-            concurrency=1,
-            max_retries=0,
-        )
+    result = await run_pipeline(
+        script_path=pipeline,
+        num_samples=10,
+        output_dir=output_dir,
+        client=mock_openai_client(content="dog"),
+        concurrency=1,
+        max_retries=0,
     )
     assert result.succeeded == 2
