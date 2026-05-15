@@ -270,6 +270,19 @@ class TestFileToolHandlers(unittest.TestCase):
                 handle_read_file(self.project_dir, path="../../etc/passwd")
             )
 
+    def test_path_prefix_sibling_rejected(self) -> None:
+        sibling = self.project_dir.parent / f"{self.project_dir.name}2"
+        sibling.mkdir()
+        (sibling / "secret.txt").write_text("secret")
+
+        with self.assertRaisesRegex(ValueError, "outside the project"):
+            asyncio.run(
+                handle_read_file(
+                    self.project_dir,
+                    path=f"../{sibling.name}/secret.txt",
+                )
+            )
+
 
 class TestExecuteToolDispatch(unittest.TestCase):
     """Test the execute_tool dispatch function."""
