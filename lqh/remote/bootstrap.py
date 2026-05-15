@@ -78,7 +78,7 @@ async def bootstrap_remote(
     if not env["python3"]:
         raise RuntimeError(
             f"python3 not found on {hostname}. "
-            "Please install Python 3.10+ before running setup."
+            "Please install Python 3.11+ before running setup."
         )
 
     # Step 2: Create directory structure

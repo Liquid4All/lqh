@@ -64,7 +64,7 @@ $ lqh --auto ./my-task
 
 ## 🔧 Requirements
 
-- Python 3.10+
+- Python 3.11+
 - A Liquid Harness account ([request access](https://lqh.ai))
 - Optional: `torch` + `transformers` for local fine-tuning
 - Optional: `HF_TOKEN` for HuggingFace dataset sync
