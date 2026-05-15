@@ -1,4 +1,3 @@
-> **Closed beta** — visit [lqh.ai](https://lqh.ai) to request access.
 
 <p align="center">
   <a href="https://youtu.be/suC4VlY8z6Y">
@@ -8,9 +7,11 @@
 
 # lqh — Liquid Harness
 
+> ⚠️ **Closed beta** — visit [lqh.ai](https://lqh.ai) to request access.
+
 From zero to a fine-tuned LFM in under an hour.
 
-Liquid Harness is a terminal agent that turns a plain-English task description into a deployable model. It writes the data pipeline, scores and filters samples, runs baselines, fine-tunes, and iterates. No ML experience required. Built and maintained by Liquid AI as the official way to customize [Liquid Foundation Models](https://www.liquid.ai/), powered by **LQH Cloud**.
+Liquid Harness is a terminal user-interface (TUI) agent for customizing [Liquid Foundation Models](https://www.liquid.ai/). It guide the user to define clear specifications of what problem needs to be solved, writes the data pipeline, scores and filters samples, runs baselines, fine-tunes, and iterates. No ML experience required.
 
 ```bash
 pip install lqh
