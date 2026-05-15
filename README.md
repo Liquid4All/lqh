@@ -82,6 +82,25 @@ The CLI stores your token in `~/.lqh/config.json` and authenticates all requests
 
 Default: **LFM2-1.2B-Instruct** — small, capable, runs anywhere.
 
+## 📁 Project layout
+
+A project is just a directory. `cd` into it, run `lqh`, and the agent reads the directory contents to understand current state. There is no init command and no project marker file — the files themselves are the project.
+
+```
+my-task/
+├── SPEC.md              # main spec: what you want the model to do
+├── other_specs/         # additional specs for edge cases or sub-requirements
+├── data_gen/            # generated pipeline scripts (one .py per pipeline)
+├── evals/               # eval definitions and results, versioned (v1/, v2/, ...)
+├── datasets/            # generated and curated datasets as parquet (v1/, v2/, ...)
+├── runs/                # training runs with checkpoints, logs, and configs
+└── .lqh/                # conversation logs and per-project permissions (gitignored)
+```
+
+- **`SPEC.md`** is the heart of the project. The agent creates it during the spec-capture interview and refers back to it at every downstream stage. Edit it directly any time — the agent will pick up the changes on the next turn.
+- **Everything is plain files.** Specs are markdown, pipelines are Python, datasets are parquet, runs are directories of artifacts. Inspect, diff, and version-control them like any other code.
+- **`.lqh/` holds session state** (conversation logs, tool permissions). Add it to `.gitignore`. Depending on size, you may also want to gitignore `datasets/` and `runs/`.
+
 ## 🗺️ Roadmap / work in progress
 
 Things we're actively building or planning. Open an issue if you want to weigh in.
