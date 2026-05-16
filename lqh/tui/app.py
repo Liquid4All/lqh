@@ -1320,6 +1320,19 @@ class LqhApp:
         else:
             await self._emit(render_system_message("⚠️ Not logged in. Run /login to authenticate."))
 
+        if not self.auto_mode and not get_token():
+            choice = await self._wait_for_user_response(
+                options=["Yes, log in now", "No, continue without login"],
+            )
+            if choice.startswith("Yes"):
+                await self._do_login()
+                self._status_bar.logged_in = bool(get_token())
+                self._invalidate()
+            else:
+                await self._emit(render_system_message(
+                    "Continuing without login. Run /login when you're ready."
+                ))
+
         # Auto mode: skip the interactive welcome / resume flow and run the
         # pipeline non-interactively. The agent's auto skill (sticky system
         # message) drives the pipeline; we only inject SPEC.md as the kickoff
