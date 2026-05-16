@@ -75,6 +75,8 @@ class TestBootstrapRemote:
                 return ("/usr/bin/nvidia-smi", "", 0)
             if "nvidia-smi --query-gpu=index,name,memory.total" in cmd:
                 return ("0, NVIDIA A100-SXM4-80GB, 81920", "", 0)
+            if cmd.startswith("test -x ") and "/bin/python" in cmd:
+                return ("", "", 1)  # venv does not exist yet → exercise creation path
             return ("", "", 0)
 
         mock_proc = AsyncMock()
@@ -105,6 +107,8 @@ class TestBootstrapRemote:
                 return ("", "", 1)
             if "command -v amd-smi" in cmd or "command -v rocm-smi" in cmd:
                 return ("", "", 1)
+            if cmd.startswith("test -x ") and "/bin/python" in cmd:
+                return ("", "", 1)  # venv does not exist yet → exercise creation path
             return ("", "", 0)
 
         with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh), \
