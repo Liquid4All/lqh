@@ -9,8 +9,11 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.text import Text
+
+from lqh.tui.renderer import render_json_view
 
 
 def _make_console(width: int = 100) -> tuple[StringIO, Console]:
@@ -19,6 +22,73 @@ def _make_console(width: int = 100) -> tuple[StringIO, Console]:
         file=buf, force_terminal=True, width=width, color_system="truecolor"
     )
     return buf, console
+
+
+def _try_parse_json(value: str) -> object:
+    """Return parsed JSON if ``value`` is a JSON object/array, else the input."""
+    s = value.strip()
+    if not s or s[0] not in "{[":
+        return value
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return value
+
+
+def _try_parse_ndjson(value: str) -> list | None:
+    """If ``value`` is newline-delimited JSON (≥2 parsable rows), return the rows.
+
+    Otherwise return None. Tolerates blank lines but requires *every* non-blank
+    line to be a JSON object/array — partial parses fall back to plain text.
+    """
+    lines = [ln for ln in value.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    rows: list = []
+    for ln in lines:
+        s = ln.strip()
+        if s[0] not in "{[":
+            return None
+        try:
+            rows.append(json.loads(s))
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return rows
+
+
+def _render_text_or_json(console: Console, text: object, width: int) -> None:
+    """Render ``text`` as a JSON table if it parses as JSON, else as plain text.
+
+    Handles three shapes:
+    - A single JSON object/array → one Key/Value table
+    - Newline-delimited JSON → one table per row
+    - Anything else → plain text
+    """
+    if isinstance(text, str):
+        parsed = _try_parse_json(text)
+        if isinstance(parsed, (dict, list)) and parsed:
+            _print_indented(console, render_json_view(parsed, width=width - 4), width)
+            return
+        ndjson = _try_parse_ndjson(text)
+        if ndjson:
+            for row in ndjson:
+                _print_indented(console, render_json_view(row, width=width - 4), width)
+            return
+    elif isinstance(text, (dict, list)) and text:
+        _print_indented(console, render_json_view(text, width=width - 4), width)
+        return
+    for line in str(text).splitlines():
+        console.print(Text(f"    {line}", style=""))
+
+
+def _print_indented(console: Console, renderable: object, _width: int) -> None:
+    """Print ``renderable`` left-padded by 4 cells to align with message body.
+
+    Uses ``rich.padding.Padding`` so the inner renderable (table) sees the
+    correct content width and lays out cell wrapping consistently with the
+    outer console — no double-render through a sub-console.
+    """
+    console.print(Padding(renderable, (0, 0, 0, 4)))
 
 
 # Role styling
@@ -128,15 +198,24 @@ class DatasetViewer:
                     for line in inner_buf.getvalue().splitlines():
                         console.print(Text(f"    {line}"))
                 elif isinstance(content, list):
-                    # Multi-part content (e.g., vision messages)
+                    # Multi-part content: each part may be text, a typed dict,
+                    # or a JSON-encoded string (common in log datasets).
                     for part in content:
                         if isinstance(part, dict):
                             if part.get("type") == "text":
-                                console.print(Text(f"    {part['text']}", style=""))
+                                _render_text_or_json(console, part["text"], width)
                             else:
-                                console.print(Text(f"    [{part.get('type', '?')}]", style="dim"))
+                                _print_indented(
+                                    console,
+                                    render_json_view(part, width=width - 4),
+                                    width,
+                                )
+                        elif isinstance(part, str):
+                            _render_text_or_json(console, part, width)
                         else:
                             console.print(Text(f"    {part}", style=""))
+                elif isinstance(content, str):
+                    _render_text_or_json(console, content, width)
                 else:
                     for line in str(content).splitlines():
                         console.print(Text(f"    {line}", style=""))
@@ -148,7 +227,12 @@ class DatasetViewer:
                     fn = tc.get("function", {})
                     fn_name = fn.get("name", "?")
                     fn_args = fn.get("arguments", "{}")
-                    console.print(Text(f"    -> {fn_name}({fn_args[:60]}{'...' if len(fn_args) > 60 else ''})", style="dim yellow"))
+                    console.print(Text(f"    → {fn_name}", style="bold yellow"))
+                    parsed_args = _try_parse_json(fn_args) if isinstance(fn_args, str) else fn_args
+                    if isinstance(parsed_args, (dict, list)) and parsed_args:
+                        _print_indented(console, render_json_view(parsed_args, width=width - 4), width)
+                    elif fn_args:
+                        console.print(Text(f"      {fn_args}", style="dim"))
 
             # Audio indicator
             if audio and str(i) in audio:

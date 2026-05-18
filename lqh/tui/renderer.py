@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from io import StringIO
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 
 BLOCK_INDENT = 2
@@ -288,6 +290,108 @@ def render_option_list(options: list[str], width: int = 100) -> str:
     return buf.getvalue()
 
 
+def _json_value_renderable(value: object) -> object:
+    """Render a JSON value for the Value column of a key/value table.
+
+    Scalars become plain text; containers become pretty-printed JSON with
+    light syntax highlighting. We keep this single-level — nested containers
+    are dumped as formatted JSON rather than recursing into more tables.
+    """
+    if value is None:
+        return Text("null", style="dim italic")
+    if isinstance(value, bool):
+        return Text("true" if value else "false", style="cyan")
+    if isinstance(value, (int, float)):
+        return Text(str(value), style="cyan")
+    if isinstance(value, str):
+        return Text(value)
+    # dict / list — pretty-print as JSON
+    try:
+        pretty = json.dumps(value, indent=2, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        pretty = repr(value)
+    return Syntax(pretty, "json", theme="monokai", background_color="default")
+
+
+def render_json_view(
+    value: object,
+    title: str | None = None,
+    width: int = 100,
+) -> object:
+    """Return a Rich renderable for JSON-shaped data (single-level table).
+
+    - dict → bordered Key/Value table
+    - list[dict] with uniform keys → table with a row per item
+    - other (scalar, mixed list) → syntax-highlighted JSON
+
+    Returned as a Rich renderable so callers can embed it; use
+    ``render_json_view_str`` for an ANSI string.
+    """
+    if isinstance(value, dict) and value:
+        table = Table(
+            title=title,
+            title_style="bold",
+            show_header=True,
+            header_style="bold dim",
+            expand=True,
+            pad_edge=False,
+        )
+        table.add_column("Key", style="bold cyan", no_wrap=True)
+        table.add_column("Value", overflow="fold")
+        for k, v in value.items():
+            table.add_row(str(k), _json_value_renderable(v))
+        return table
+
+    if (
+        isinstance(value, list)
+        and value
+        and all(isinstance(item, dict) for item in value)
+    ):
+        keys: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            for k in item.keys():
+                if k not in seen:
+                    seen.add(k)
+                    keys.append(str(k))
+        table = Table(
+            title=title,
+            title_style="bold",
+            show_header=True,
+            header_style="bold dim",
+            expand=True,
+            pad_edge=False,
+        )
+        for k in keys:
+            table.add_column(k, overflow="fold")
+        for item in value:
+            table.add_row(*[_json_value_renderable(item.get(k)) for k in keys])
+        return table
+
+    # Fallback: pretty-printed JSON
+    try:
+        pretty = json.dumps(value, indent=2, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        pretty = str(value)
+    syntax = Syntax(pretty, "json", theme="monokai", background_color="default")
+    if title:
+        return Group(Text(title, style="bold"), syntax)
+    return syntax
+
+
+def render_json_view_str(
+    value: object,
+    title: str | None = None,
+    width: int = 100,
+) -> str:
+    """ANSI-string wrapper around :func:`render_json_view`."""
+
+    def render(console: Console) -> None:
+        console.print(render_json_view(value, title=title, width=width))
+
+    return _render_block(render, width)
+
+
 def render_file_view(path: str, content: str, width: int = 100) -> str:
     """Render a file for display (with syntax highlighting if possible)."""
 
@@ -308,6 +412,15 @@ def render_file_view(path: str, content: str, width: int = 100) -> str:
         }
         ext = "." + path.rsplit(".", 1)[-1] if "." in path else ""
         lang = ext_to_lang.get(ext)
+
+        if ext == ".json":
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                parsed = None
+            if parsed is not None and isinstance(parsed, (dict, list)):
+                console.print(render_json_view(parsed, title=path, width=width))
+                return
 
         if lang:
             console.print(Syntax(content, lang, theme="monokai", line_numbers=True))
