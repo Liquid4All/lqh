@@ -24,6 +24,13 @@ __all__ = [
 # Directory for ControlMaster sockets.
 _CONTROL_DIR = Path.home() / ".lqh" / "ssh"
 
+# Per-user binary dirs where uv / pipx / cargo install tools. The Astral
+# uv installer only touches the user's *login* shell rc files (e.g. it
+# writes ~/.config/fish/conf.d/uv.env.fish for fish users) — so when we
+# force bash below, bash has no idea these dirs exist. Prepend them here
+# so `command -v uv` and friends work regardless of login shell.
+_PATH_PREPEND = '$HOME/.local/bin:$HOME/.cargo/bin'
+
 
 def _shell_quote(s: str) -> str:
     """Quote a string for use as a single bash -c argument."""
@@ -61,8 +68,11 @@ async def ssh_run(
     Returns ``(stdout, stderr, returncode)``.
     """
     # Force bash as the remote shell to avoid fish/zsh compatibility issues
-    # with venv activation and other bash-isms.
-    bash_command = f"bash -lc {_shell_quote(command)}"
+    # with venv activation and other bash-isms. Prepend the per-user bin
+    # dirs so uv / pipx tools installed under a non-bash login shell are
+    # still on PATH.
+    augmented = f'export PATH="{_PATH_PREPEND}:$PATH"; {command}'
+    bash_command = f"bash -lc {_shell_quote(augmented)}"
     ssh_cmd = ["ssh"] + _multiplex_args(hostname) + [hostname, bash_command]
 
     process_env = os.environ.copy()

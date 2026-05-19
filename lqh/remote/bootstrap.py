@@ -29,9 +29,18 @@ async def detect_environment(hostname: str) -> dict[str, bool | str | None]:
     """
     from lqh.remote.gpu import detect_gpu_vendor
 
+    # The uv check probes PATH first, then falls back to the canonical
+    # per-user install locations. ssh_run already adds ~/.local/bin and
+    # ~/.cargo/bin to PATH, but the direct test guards against installs
+    # in non-standard layouts where uv exists but isn't symlinked there.
+    uv_check = (
+        'command -v uv >/dev/null 2>&1'
+        ' || test -x "$HOME/.local/bin/uv"'
+        ' || test -x "$HOME/.cargo/bin/uv"'
+    )
     checks = {
         "python3": "command -v python3",
-        "uv": "command -v uv",
+        "uv": uv_check,
         "pip": "command -v pip3 || command -v pip",
         "module": "type module 2>/dev/null",  # Lmod / Environment Modules
     }
