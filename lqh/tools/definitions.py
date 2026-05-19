@@ -664,9 +664,13 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         _tool(
             name="hf_pull",
             description=(
-                "Download a dataset from Hugging Face Hub to local storage. "
-                "Saves as parquet in datasets/. Passes HF_TOKEN if available "
-                "for private repos."
+                "Download a dataset or model from Hugging Face Hub to local storage. "
+                "The repo type is auto-detected by querying the Hub (model first, "
+                "then dataset); pass repo_type to override. Datasets are saved as "
+                "parquet under datasets/{repo-name}/; models are saved with their "
+                "full file tree under models/{repo-name}/ — the local path can then "
+                "be used as base_model in training configs or as the eval target. "
+                "Passes HF_TOKEN if available for private repos."
             ),
             parameters={
                 "type": "object",
@@ -674,37 +678,49 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     "repo_id": {
                         "type": "string",
                         "description": (
-                            "HF dataset repo ID (e.g. 'username/my-dataset')."
+                            "HF repo ID (e.g. 'meta-llama/Llama-3.2-1B' or "
+                            "'username/my-dataset')."
+                        ),
+                    },
+                    "repo_type": {
+                        "type": "string",
+                        "enum": ["dataset", "model"],
+                        "description": (
+                            "Override the auto-detected repo type. By default the "
+                            "type is inferred by querying the Hub."
                         ),
                     },
                     "local_path": {
                         "type": "string",
                         "description": (
                             "Where to save locally, relative to project dir. "
-                            "Defaults to 'datasets/{repo-name}/'."
+                            "Defaults to 'datasets/{repo-name}/' for datasets and "
+                            "'models/{repo-name}/' for models."
                         ),
                     },
                     "split": {
                         "type": "string",
                         "description": (
                             "Specific split to download (e.g. 'train'). "
-                            "If omitted, downloads all splits."
+                            "If omitted, downloads all splits. Only applies when "
+                            "repo_type=dataset."
                         ),
                     },
                     "subset": {
                         "type": "string",
                         "description": (
                             "Dataset config/subset name. Required if the dataset "
-                            "has multiple configs."
+                            "has multiple configs. Only applies when repo_type=dataset."
                         ),
                     },
                     "files": {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Specific files to download instead of the full dataset "
-                            "(e.g. ['data/train-00000-of-00001.parquet']). "
-                            "Useful for downloading single parquet files."
+                            "Specific files to download instead of the full repo "
+                            "(e.g. ['data/train-00000-of-00001.parquet'] or "
+                            "['config.json', 'tokenizer.json']). Useful for "
+                            "lightweight inspection without pulling weights."
                         ),
                     },
                 },

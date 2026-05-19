@@ -1166,31 +1166,59 @@ async def handle_hf_repo_info(
         return ToolResult(content=f"Error: {e}")
 
 
+def _resolve_hf_pull_repo_type(api, repo_id: str, explicit: str | None) -> tuple[str | None, str | None]:
+    """Determine repo_type for hf_pull. Returns (repo_type, error_message)."""
+    if explicit is not None:
+        if explicit not in ("dataset", "model"):
+            return None, f"invalid repo_type '{explicit}' (must be 'dataset' or 'model')"
+        return explicit, None
+
+    from huggingface_hub.errors import RepositoryNotFoundError
+
+    for candidate in ("model", "dataset"):
+        try:
+            api.repo_info(repo_id=repo_id, repo_type=candidate)
+            return candidate, None
+        except RepositoryNotFoundError:
+            continue
+        except Exception as e:
+            return None, f"failed to query Hub for '{repo_id}': {e}"
+    return None, f"repo '{repo_id}' not found on the Hub as either a model or a dataset"
+
+
 async def handle_hf_pull(
     project_dir: Path,
     *,
     repo_id: str,
+    repo_type: str | None = None,
     local_path: str | None = None,
     split: str | None = None,
     subset: str | None = None,
     files: list[str] | None = None,
     **kwargs: Any,
 ) -> ToolResult:
-    """Download a dataset from HF Hub to local storage."""
+    """Download a dataset or model from HF Hub to local storage."""
     token = os.environ.get("HF_TOKEN")  # optional for public repos
 
-    # Determine local output path
+    try:
+        api = _get_hf_api()
+    except ValueError as e:
+        return ToolResult(content=f"Error: {e}")
+
+    resolved_type, err = _resolve_hf_pull_repo_type(api, repo_id, repo_type)
+    if err is not None:
+        return ToolResult(content=f"Error: {err}")
+    repo_type = resolved_type
+
+    repo_name = repo_id.split("/")[-1] if "/" in repo_id else repo_id
     if local_path is None:
-        # username/my-dataset -> my-dataset
-        repo_name = repo_id.split("/")[-1] if "/" in repo_id else repo_id
-        local_path = f"datasets/{repo_name}"
+        local_path = f"{'datasets' if repo_type == 'dataset' else 'models'}/{repo_name}"
 
     target = _validate_path(project_dir, local_path)
     target.mkdir(parents=True, exist_ok=True)
 
     try:
         if files:
-            # Download specific files
             from huggingface_hub import hf_hub_download
 
             downloaded = []
@@ -1198,62 +1226,87 @@ async def handle_hf_pull(
                 out = hf_hub_download(
                     repo_id=repo_id,
                     filename=f,
-                    repo_type="dataset",
+                    repo_type=repo_type,
                     local_dir=str(target),
                     token=token,
                 )
                 downloaded.append(out)
 
-            _save_hf_mapping(project_dir, local_path, repo_id, "dataset", split)
+            _save_hf_mapping(project_dir, local_path, repo_id, repo_type, split)
             return ToolResult(
                 content=(
-                    f"✅ Downloaded {len(downloaded)} file(s) to {local_path}/\n"
+                    f"✅ Downloaded {len(downloaded)} file(s) from {repo_id} ({repo_type}) to {local_path}/\n"
                     + "\n".join(f"  - {Path(d).name}" for d in downloaded)
                 )
             )
-        else:
-            # Download full dataset via datasets library
-            import datasets as ds_lib
 
-            load_kwargs: dict[str, Any] = {"path": repo_id, "trust_remote_code": False}
-            if token:
-                load_kwargs["token"] = token
-            if split:
-                load_kwargs["split"] = split
-            if subset:
-                load_kwargs["name"] = subset
-
-            dataset = ds_lib.load_dataset(**load_kwargs)
-
-            # dataset can be DatasetDict (multiple splits) or Dataset (single split)
-            if isinstance(dataset, ds_lib.DatasetDict):
-                total_rows = 0
-                split_info = []
-                for split_name, split_ds in dataset.items():
-                    out_path = target / f"{split_name}.parquet"
-                    split_ds.to_parquet(str(out_path))
-                    total_rows += len(split_ds)
-                    split_info.append(f"  - {split_name}: {len(split_ds):,} rows -> {split_name}.parquet")
-
-                _save_hf_mapping(project_dir, local_path, repo_id, "dataset")
+        if repo_type == "model":
+            if split or subset:
                 return ToolResult(
-                    content=(
-                        f"✅ Downloaded {repo_id} to {local_path}/ ({total_rows:,} rows total)\n"
-                        + "\n".join(split_info)
-                    )
+                    content="Error: split/subset are dataset-only options; omit them for model pulls."
                 )
-            else:
-                # Single split
-                out_path = target / "data.parquet"
-                dataset.to_parquet(str(out_path))
 
-                _save_hf_mapping(project_dir, local_path, repo_id, "dataset", split)
-                return ToolResult(
-                    content=(
-                        f"✅ Downloaded {repo_id} to {local_path}/data.parquet "
-                        f"({len(dataset):,} rows)"
-                    )
+            from huggingface_hub import snapshot_download
+
+            snapshot_download(
+                repo_id=repo_id,
+                repo_type="model",
+                local_dir=str(target),
+                token=token,
+            )
+            _save_hf_mapping(project_dir, local_path, repo_id, "model")
+
+            file_count = sum(
+                1 for p in target.rglob("*")
+                if p.is_file() and not any(part.startswith(".") for part in p.relative_to(target).parts)
+            )
+            return ToolResult(
+                content=(
+                    f"✅ Downloaded model {repo_id} to {local_path}/ ({file_count} files)\n"
+                    f"  Use this path as base_model in training configs or as the eval target."
                 )
+            )
+
+        # Dataset path: download full dataset via datasets library
+        import datasets as ds_lib
+
+        load_kwargs: dict[str, Any] = {"path": repo_id, "trust_remote_code": False}
+        if token:
+            load_kwargs["token"] = token
+        if split:
+            load_kwargs["split"] = split
+        if subset:
+            load_kwargs["name"] = subset
+
+        dataset = ds_lib.load_dataset(**load_kwargs)
+
+        if isinstance(dataset, ds_lib.DatasetDict):
+            total_rows = 0
+            split_info = []
+            for split_name, split_ds in dataset.items():
+                out_path = target / f"{split_name}.parquet"
+                split_ds.to_parquet(str(out_path))
+                total_rows += len(split_ds)
+                split_info.append(f"  - {split_name}: {len(split_ds):,} rows -> {split_name}.parquet")
+
+            _save_hf_mapping(project_dir, local_path, repo_id, "dataset")
+            return ToolResult(
+                content=(
+                    f"✅ Downloaded {repo_id} to {local_path}/ ({total_rows:,} rows total)\n"
+                    + "\n".join(split_info)
+                )
+            )
+
+        out_path = target / "data.parquet"
+        dataset.to_parquet(str(out_path))
+
+        _save_hf_mapping(project_dir, local_path, repo_id, "dataset", split)
+        return ToolResult(
+            content=(
+                f"✅ Downloaded {repo_id} to {local_path}/data.parquet "
+                f"({len(dataset):,} rows)"
+            )
+        )
 
     except Exception as e:
         error_msg = str(e)
