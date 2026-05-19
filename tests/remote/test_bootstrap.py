@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -148,6 +148,21 @@ class TestWhichViaLoginShell:
             ) is None
 
     @pytest.mark.asyncio
+    async def test_rejects_motd_line_starting_with_slash(self):
+        """A MOTD line like `/etc/motd updated …` starts with / but is
+        not a path. `command -v` always emits a single token, so a space
+        disqualifies."""
+        motd_only = "Welcome\n/etc/motd updated 2024-01-01\n"
+
+        async def mock_ssh(hostname, cmd, **kw):
+            return (motd_only, "", 0)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _which_via_login_shell(
+                "host", "/usr/bin/fish", "uv",
+            ) is None
+
+    @pytest.mark.asyncio
     async def test_shell_error_returns_none(self):
         async def mock_ssh(hostname, cmd, **kw):
             return ("", "syntax error", 2)
@@ -226,7 +241,9 @@ class TestLocateTool:
 
     @pytest.mark.asyncio
     async def test_no_login_shell_skips_first_probe(self):
-        """When $SHELL is /bin/false we shouldn't try to exec it."""
+        """With login_shell=None (e.g. /bin/false filtered upstream),
+        `_locate_tool` must go straight to bash PATH — never attempt a
+        `<shell> -lc` invocation."""
         calls: list[str] = []
 
         async def mock_ssh(hostname, cmd, **kw):
@@ -242,8 +259,9 @@ class TestLocateTool:
                 login_shell=None,
             ) == "/usr/bin/uv"
 
-        assert not any("/bin/false" in c for c in calls)
-        assert not any("-lc" in c and "fish" in c for c in calls)
+        # First call must be the bash command-v probe, not a nested
+        # `<shell> -lc` invocation.
+        assert calls[0].startswith("command -v uv"), calls
 
 
 def _mock_rsync_noop(*args, **kwargs):
@@ -267,40 +285,49 @@ class TestBootstrapRemote:
             if "command -v python3" in cmd:
                 return ("/usr/bin/python3", "", 0)
             if "command -v uv" in cmd:
-                return ("/usr/bin/uv", "", 0)
+                return ("/opt/uv-build/uv", "", 0)
             if "command -v nvidia-smi" in cmd:
                 return ("/usr/bin/nvidia-smi", "", 0)
             if "nvidia-smi --query-gpu=index,name,memory.total" in cmd:
                 return ("0, NVIDIA A100-SXM4-80GB, 81920", "", 0)
+            # Force venv-doesn't-exist so the creation branch runs.
+            if cmd.startswith("test -x") and "/bin/python" in cmd:
+                return ("", "", 1)
             return ("", "", 0)
-
-        mock_proc = AsyncMock()
-        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
-        mock_proc.returncode = 0
 
         with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh), \
              patch("lqh.remote.gpu.ssh_run", side_effect=mock_ssh), \
              patch("lqh.remote.bootstrap._find_lqh_package_root", return_value=None):
-            log = await bootstrap_remote("host", "/remote/root")
+            await bootstrap_remote("host", "/remote/root")
 
-        assert "uv" in log.lower() or "venv" in log.lower()
-        # Should have used uv venv, not python3 -m venv
+        # The absolute uv path returned by detection must be the one used
+        # for venv creation — not the bare `uv` token.
         venv_cmds = [c for c in calls if "venv" in c]
-        assert any("uv venv" in c for c in venv_cmds)
+        assert any("/opt/uv-build/uv venv" in c for c in venv_cmds), venv_cmds
+        # And for `uv pip install` of lqh[train].
+        install_cmds = [c for c in calls if "lqh[train]" in c]
+        assert any("/opt/uv-build/uv pip install" in c for c in install_cmds), install_cmds
 
     @pytest.mark.asyncio
-    async def test_bootstrap_without_uv(self):
+    async def test_bootstrap_without_uv_uses_resolved_python(self):
+        """Regression for #5 review item: when uv is unavailable, the
+        absolute python3 path from detect_environment must be threaded
+        into venv creation — not the bare `python3` token."""
         calls: list[str] = []
 
         async def mock_ssh(hostname, cmd, **kw):
             calls.append(cmd)
+            # python3 lives in a non-standard location on this host so
+            # the bare token would resolve to something else (or nothing).
             if "command -v python3" in cmd:
-                return ("/usr/bin/python3", "", 0)
+                return ("/opt/py311/bin/python3", "", 0)
             if "command -v uv" in cmd:
-                return ("", "", 1)  # uv not available
+                return ("", "", 1)
             if "command -v nvidia-smi" in cmd:
                 return ("", "", 1)
             if "command -v amd-smi" in cmd or "command -v rocm-smi" in cmd:
+                return ("", "", 1)
+            if cmd.startswith("test -x") and "/bin/python" in cmd:
                 return ("", "", 1)
             return ("", "", 0)
 
@@ -310,7 +337,7 @@ class TestBootstrapRemote:
             await bootstrap_remote("host", "/remote/root")
 
         venv_cmds = [c for c in calls if "venv" in c]
-        assert any("python3 -m venv" in c for c in venv_cmds)
+        assert any("/opt/py311/bin/python3 -m venv" in c for c in venv_cmds), venv_cmds
 
     @pytest.mark.asyncio
     async def test_bootstrap_no_python(self):

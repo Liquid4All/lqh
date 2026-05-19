@@ -82,11 +82,14 @@ async def _which_via_login_shell(
     if rc != 0:
         return None
     # A login shell may print a MOTD/greeting before our command's
-    # output, so take the last absolute-path-looking line. Filters out
-    # aliases / builtins that `command -v` would echo as bare names.
+    # output, so take the last line that looks like a single absolute
+    # path. `command -v` always emits one whitespace-free token, so a
+    # space disqualifies (rules out MOTD text like
+    # "/etc/motd updated 2024-01-01") and a leading "/" rules out
+    # aliases / builtins that `command -v` echoes as bare names.
     for line in reversed(stdout.splitlines()):
         stripped = line.strip()
-        if stripped.startswith("/"):
+        if stripped.startswith("/") and " " not in stripped:
             return stripped
     return None
 
