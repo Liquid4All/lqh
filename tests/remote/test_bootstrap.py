@@ -7,7 +7,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from lqh.remote.bootstrap import (
-    _locate_uv,
+    _detect_login_shell,
+    _locate_tool,
+    _UV_CANDIDATE_PATHS,
+    _which_via_login_shell,
     bootstrap_remote,
     check_hf_token,
     configure_hf_token,
@@ -21,6 +24,10 @@ class TestDetectEnvironment:
     @pytest.mark.asyncio
     async def test_all_tools_available(self):
         async def mock_ssh(hostname, cmd, **kw):
+            if "echo $SHELL" in cmd:
+                return ("/bin/bash", "", 0)
+            if "command -v python3" in cmd:
+                return ("/usr/bin/python3", "", 0)
             if "command -v uv" in cmd:
                 return ("/usr/local/bin/uv", "", 0)
             return ("", "", 0)
@@ -29,7 +36,8 @@ class TestDetectEnvironment:
              patch("lqh.remote.gpu.ssh_run", side_effect=mock_ssh):
             env = await detect_environment("host")
 
-        assert env["python3"] is True
+        assert env["login_shell"] == "/bin/bash"
+        assert env["python3"] == "/usr/bin/python3"
         assert env["uv"] == "/usr/local/bin/uv"
         assert env["pip"] is True
         assert env["gpu_vendor"] == "nvidia"
@@ -38,6 +46,8 @@ class TestDetectEnvironment:
     @pytest.mark.asyncio
     async def test_only_python_available(self):
         async def mock_ssh(hostname, cmd, **kw):
+            if "echo $SHELL" in cmd:
+                return ("/bin/bash", "", 0)
             if "python3" in cmd:
                 return ("/usr/bin/python3", "", 0)
             return ("", "", 1)
@@ -46,70 +56,194 @@ class TestDetectEnvironment:
              patch("lqh.remote.gpu.ssh_run", side_effect=mock_ssh):
             env = await detect_environment("host")
 
-        assert env["python3"] is True
+        assert env["python3"] == "/usr/bin/python3"
         assert env["uv"] is None
         assert env["pip"] is False
         assert env["gpu_vendor"] is None
 
 
-class TestLocateUv:
-    """Test the uv discovery helper."""
+class TestDetectLoginShell:
+    """Test login-shell detection."""
 
     @pytest.mark.asyncio
-    async def test_found_on_path(self):
+    async def test_returns_shell_path(self):
         async def mock_ssh(hostname, cmd, **kw):
-            if "command -v uv" in cmd:
-                return ("/usr/bin/uv", "", 0)
-            pytest.fail(f"unexpected probe after PATH hit: {cmd}")
+            return ("/usr/bin/fish", "", 0)
 
         with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
-            assert await _locate_uv("host") == "/usr/bin/uv"
+            assert await _detect_login_shell("host") == "/usr/bin/fish"
 
     @pytest.mark.asyncio
-    async def test_found_via_snap(self):
+    async def test_skips_nologin_accounts(self):
         async def mock_ssh(hostname, cmd, **kw):
-            if "command -v uv" in cmd:
+            return ("/sbin/nologin", "", 0)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _detect_login_shell("host") is None
+
+    @pytest.mark.asyncio
+    async def test_skips_false(self):
+        async def mock_ssh(hostname, cmd, **kw):
+            return ("/bin/false", "", 0)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _detect_login_shell("host") is None
+
+    @pytest.mark.asyncio
+    async def test_empty_returns_none(self):
+        async def mock_ssh(hostname, cmd, **kw):
+            return ("", "", 0)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _detect_login_shell("host") is None
+
+
+class TestWhichViaLoginShell:
+    """Test resolving tools through the user's actual shell."""
+
+    @pytest.mark.asyncio
+    async def test_invokes_user_shell_with_lc(self):
+        seen: dict[str, str] = {}
+
+        async def mock_ssh(hostname, cmd, **kw):
+            seen["cmd"] = cmd
+            return ("/home/me/.local/bin/uv", "", 0)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            result = await _which_via_login_shell(
+                "host", "/usr/bin/fish", "uv",
+            )
+
+        assert result == "/home/me/.local/bin/uv"
+        # The wrapping bash -lc is supplied by ssh_run; this command
+        # should invoke fish with -lc so fish's own config files are
+        # sourced (which is the whole point — they're where fish users'
+        # PATH additions live).
+        assert "/usr/bin/fish" in seen["cmd"]
+        assert "-lc" in seen["cmd"]
+        assert "command -v uv" in seen["cmd"]
+
+    @pytest.mark.asyncio
+    async def test_strips_motd_greeting(self):
+        """A login shell may print a banner before the command's output."""
+        banner = "Welcome to Acme HPC, last login Tue\n/snap/bin/uv\n"
+
+        async def mock_ssh(hostname, cmd, **kw):
+            return (banner, "", 0)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _which_via_login_shell(
+                "host", "/usr/bin/fish", "uv",
+            ) == "/snap/bin/uv"
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_absolute_output(self):
+        """`command -v` echoes bare names for aliases/builtins — skip."""
+        async def mock_ssh(hostname, cmd, **kw):
+            return ("uv: aliased to /weird\n", "", 0)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _which_via_login_shell(
+                "host", "/usr/bin/fish", "uv",
+            ) is None
+
+    @pytest.mark.asyncio
+    async def test_shell_error_returns_none(self):
+        async def mock_ssh(hostname, cmd, **kw):
+            return ("", "syntax error", 2)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _which_via_login_shell(
+                "host", "/usr/bin/fish", "uv",
+            ) is None
+
+
+class TestLocateTool:
+    """Test the layered tool-resolution helper."""
+
+    @pytest.mark.asyncio
+    async def test_login_shell_finds_it(self):
+        """If fish/zsh resolves uv, we use that and stop."""
+        calls: list[str] = []
+
+        async def mock_ssh(hostname, cmd, **kw):
+            calls.append(cmd)
+            # First call is the fish -lc invocation — return a hit.
+            if "/usr/bin/fish" in cmd:
+                return ("/home/me/.local/bin/uv", "", 0)
+            pytest.fail(f"should have stopped after shell hit: {cmd}")
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            result = await _locate_tool(
+                "host", "uv",
+                candidates=_UV_CANDIDATE_PATHS,
+                login_shell="/usr/bin/fish",
+            )
+
+        assert result == "/home/me/.local/bin/uv"
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_bash_path(self):
+        """Shell can't find it → ask bash directly."""
+        async def mock_ssh(hostname, cmd, **kw):
+            if "/usr/bin/fish" in cmd:
                 return ("", "", 1)
-            # Probe runs the for-loop and finds /snap/bin/uv.
-            assert "/snap/bin/uv" in cmd
-            return ("/snap/bin/uv", "", 0)
+            if cmd.startswith("command -v uv"):
+                return ("/usr/local/bin/uv", "", 0)
+            pytest.fail(f"unexpected probe: {cmd}")
 
         with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
-            assert await _locate_uv("host") == "/snap/bin/uv"
+            assert await _locate_tool(
+                "host", "uv",
+                candidates=_UV_CANDIDATE_PATHS,
+                login_shell="/usr/bin/fish",
+            ) == "/usr/local/bin/uv"
 
     @pytest.mark.asyncio
-    async def test_probe_covers_canonical_locations(self):
-        """The probe script must reference every documented install dir."""
+    async def test_falls_back_to_canonical_probe(self):
+        """Neither shell nor bash knows → walk the candidate list."""
         captured: dict[str, str] = {}
 
         async def mock_ssh(hostname, cmd, **kw):
-            if "command -v uv" in cmd:
+            if "/usr/bin/fish" in cmd:
+                return ("", "", 1)
+            if cmd.startswith("command -v uv"):
                 return ("", "", 1)
             captured["probe"] = cmd
-            return ("", "", 1)  # nothing found
+            return ("/snap/bin/uv", "", 0)
 
         with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
-            assert await _locate_uv("host") is None
+            assert await _locate_tool(
+                "host", "uv",
+                candidates=_UV_CANDIDATE_PATHS,
+                login_shell="/usr/bin/fish",
+            ) == "/snap/bin/uv"
 
-        probe = captured["probe"]
-        for expected in (
-            "$HOME/.local/bin/uv",
-            "$HOME/.cargo/bin/uv",
-            "/snap/bin/uv",
-            "/usr/local/bin/uv",
-            "/opt/homebrew/bin/uv",
-            "/home/linuxbrew/.linuxbrew/bin/uv",
-            "/usr/bin/uv",
-        ):
-            assert expected in probe, f"probe missing {expected}: {probe}"
+        # Probe must enumerate every documented location.
+        for expected in _UV_CANDIDATE_PATHS:
+            assert expected in captured["probe"]
 
     @pytest.mark.asyncio
-    async def test_not_found(self):
+    async def test_no_login_shell_skips_first_probe(self):
+        """When $SHELL is /bin/false we shouldn't try to exec it."""
+        calls: list[str] = []
+
         async def mock_ssh(hostname, cmd, **kw):
+            calls.append(cmd)
+            if cmd.startswith("command -v uv"):
+                return ("/usr/bin/uv", "", 0)
             return ("", "", 1)
 
         with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
-            assert await _locate_uv("host") is None
+            assert await _locate_tool(
+                "host", "uv",
+                candidates=_UV_CANDIDATE_PATHS,
+                login_shell=None,
+            ) == "/usr/bin/uv"
+
+        assert not any("/bin/false" in c for c in calls)
+        assert not any("-lc" in c and "fish" in c for c in calls)
 
 
 def _mock_rsync_noop(*args, **kwargs):

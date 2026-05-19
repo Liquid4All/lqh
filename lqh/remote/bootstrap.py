@@ -7,6 +7,7 @@ and installs a Python environment with ``lqh[train]`` dependencies.
 from __future__ import annotations
 
 import logging
+import shlex
 from pathlib import Path
 
 from lqh.remote.ssh_helpers import ssh_run
@@ -20,14 +21,11 @@ __all__ = [
 ]
 
 
-# Where uv tends to live, in priority order. Astral's installer drops it
-# in ~/.local/bin; `cargo install` in ~/.cargo/bin; `snap install` in
-# /snap/bin; the rest cover manual installs and Homebrew on macOS / Linux.
-# Probing these directly means we don't depend on the remote user's
-# *login* shell having uv on PATH — which it often doesn't when their
-# shell is fish (the installer drops PATH config in ~/.config/fish/conf.d/
-# only) or when the box uses a service account whose dotfiles haven't been
-# refreshed since the install.
+# Fallback install locations searched when neither the user's login
+# shell nor bash knows about the tool on PATH. These cover the layouts
+# real GPU boxes actually use: Astral's installer (~/.local/bin), cargo
+# (~/.cargo/bin), snap (/snap/bin), manual installs, and Homebrew on
+# macOS / Linux.
 _UV_CANDIDATE_PATHS: tuple[str, ...] = (
     "$HOME/.local/bin/uv",
     "$HOME/.cargo/bin/uv",
@@ -38,47 +36,127 @@ _UV_CANDIDATE_PATHS: tuple[str, ...] = (
     "/usr/bin/uv",
 )
 
+_PYTHON3_CANDIDATE_PATHS: tuple[str, ...] = (
+    "/usr/bin/python3",
+    "/usr/local/bin/python3",
+    "/opt/homebrew/bin/python3",
+    "$HOME/.local/bin/python3",
+    "/snap/bin/python3",
+)
 
-async def _locate_uv(hostname: str) -> str | None:
-    """Return the absolute path to ``uv`` on the remote host, or ``None``.
+# Login-shell entries that aren't real shells we can exec for a `-lc`
+# lookup. Service accounts and locked accounts frequently use these.
+_NON_INTERACTIVE_SHELLS: tuple[str, ...] = ("/false", "/nologin", "/true")
 
-    Checks ``PATH`` first (one fast round-trip — covers the case where
-    the user's bash dotfiles do know about uv), then falls back to a
-    single-round-trip probe across the canonical install locations.
+
+async def _detect_login_shell(hostname: str) -> str | None:
+    """Return the remote user's login shell (e.g. ``/usr/bin/fish``).
+
+    Reads ``$SHELL``, which SSH sets from the user's ``/etc/passwd``
+    entry on session start. Returns ``None`` if it's unset or points
+    to a stub shell we can't usefully exec.
     """
+    stdout, _, rc = await ssh_run(hostname, "echo $SHELL", timeout=10.0)
+    shell = stdout.strip()
+    if rc != 0 or not shell:
+        return None
+    if shell.endswith(_NON_INTERACTIVE_SHELLS):
+        return None
+    return shell
+
+
+async def _which_via_login_shell(
+    hostname: str, shell: str, tool: str,
+) -> str | None:
+    """Resolve ``tool`` by asking the user's login shell.
+
+    This picks up PATH set by shell-specific config — e.g.
+    ``~/.config/fish/conf.d/uv.env.fish`` for fish, ``~/.zprofile`` for
+    zsh — that ``bash -lc`` never sources. The ``-lc`` invocation form
+    is accepted by bash, zsh, fish, and dash, which covers everything
+    short of csh / nushell.
+    """
+    inner = f"command -v {shlex.quote(tool)} 2>/dev/null"
+    cmd = f"{shlex.quote(shell)} -lc {shlex.quote(inner)}"
+    stdout, _, rc = await ssh_run(hostname, cmd, timeout=15.0)
+    if rc != 0:
+        return None
+    # A login shell may print a MOTD/greeting before our command's
+    # output, so take the last absolute-path-looking line. Filters out
+    # aliases / builtins that `command -v` would echo as bare names.
+    for line in reversed(stdout.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("/"):
+            return stripped
+    return None
+
+
+async def _locate_tool(
+    hostname: str,
+    tool: str,
+    *,
+    candidates: tuple[str, ...],
+    login_shell: str | None,
+) -> str | None:
+    """Find ``tool`` on the remote host, returning its absolute path.
+
+    Tries in order:
+    1. The user's actual login shell (picks up fish/zsh PATH config).
+    2. ``bash -lc`` PATH (the default ``ssh_run`` shell).
+    3. Direct ``test -x`` over ``candidates`` (catches installs no
+       shell rc has been taught about — e.g. service accounts).
+    """
+    if login_shell:
+        found = await _which_via_login_shell(hostname, login_shell, tool)
+        if found:
+            return found
+
     stdout, _, rc = await ssh_run(
-        hostname, "command -v uv 2>/dev/null", timeout=10.0,
+        hostname, f"command -v {shlex.quote(tool)} 2>/dev/null", timeout=10.0,
     )
     if rc == 0 and stdout.strip():
         return stdout.strip()
 
-    candidates = " ".join(f'"{p}"' for p in _UV_CANDIDATE_PATHS)
+    quoted = " ".join(f'"{p}"' for p in candidates)
     probe = (
-        f'for p in {candidates}; do '
+        f'for p in {quoted}; do '
         f'[ -x "$p" ] && {{ echo "$p"; exit 0; }}; '
         f'done; exit 1'
     )
     stdout, _, rc = await ssh_run(hostname, probe, timeout=10.0)
     if rc == 0 and stdout.strip():
         return stdout.strip()
-
     return None
 
 
 async def detect_environment(hostname: str) -> dict[str, bool | str | None]:
     """Probe the remote host for available tools.
 
-    Returns a dict mapping tool names to availability:
-    ``python3``, ``pip``, ``module`` (bool), ``uv`` (absolute path or
-    ``None``), and ``gpu_vendor`` (``"nvidia"`` | ``"amd"`` | ``None``).
+    Returns a dict with:
+    - ``login_shell`` — the user's login shell path (or ``None``)
+    - ``python3``, ``uv`` — absolute paths, resolved against the user's
+      real shell PATH (not just bash's), or ``None`` if not found
+    - ``pip``, ``module`` — bool
+    - ``gpu_vendor`` — ``"nvidia"`` | ``"amd"`` | ``None``
     """
     from lqh.remote.gpu import detect_gpu_vendor
 
     result: dict[str, bool | str | None] = {}
-    result["uv"] = await _locate_uv(hostname)
+    login_shell = await _detect_login_shell(hostname)
+    result["login_shell"] = login_shell
+
+    result["python3"] = await _locate_tool(
+        hostname, "python3",
+        candidates=_PYTHON3_CANDIDATE_PATHS,
+        login_shell=login_shell,
+    )
+    result["uv"] = await _locate_tool(
+        hostname, "uv",
+        candidates=_UV_CANDIDATE_PATHS,
+        login_shell=login_shell,
+    )
 
     checks = {
-        "python3": "command -v python3",
         "pip": "command -v pip3 || command -v pip",
         "module": "type module 2>/dev/null",  # Lmod / Environment Modules
     }
@@ -118,11 +196,17 @@ async def bootstrap_remote(
     log(f"Detecting environment on {hostname}...")
     env = await detect_environment(hostname)
     gpu_vendor = env["gpu_vendor"]
-    uv_path: str | None = env["uv"] if isinstance(env["uv"], str) else None
-    log(f"  python3: {env['python3']}, uv: {uv_path or 'not found'}, "
-        f"pip: {env['pip']}, gpu: {gpu_vendor or 'none'}")
+    shell = env["login_shell"] if isinstance(env["login_shell"], str) else None
+    python3_path = env["python3"] if isinstance(env["python3"], str) else None
+    uv_path = env["uv"] if isinstance(env["uv"], str) else None
+    log(
+        f"  shell: {shell or 'unknown'}, "
+        f"python3: {python3_path or 'not found'}, "
+        f"uv: {uv_path or 'not found'}, "
+        f"pip: {env['pip']}, gpu: {gpu_vendor or 'none'}"
+    )
 
-    if not env["python3"]:
+    if not python3_path:
         raise RuntimeError(
             f"python3 not found on {hostname}. "
             "Please install Python 3.11+ before running setup."
@@ -150,8 +234,8 @@ async def bootstrap_remote(
             log(f"Creating venv with uv ({uv_path})...")
             cmd = f"{uv_path} venv {venv_path}"
         else:
-            log("Creating venv with python3 -m venv...")
-            cmd = f"python3 -m venv {venv_path}"
+            log(f"Creating venv with {python3_path} -m venv...")
+            cmd = f"{python3_path} -m venv {venv_path}"
 
         stdout, stderr, rc = await ssh_run(hostname, cmd, timeout=60.0)
         if rc != 0:
