@@ -60,9 +60,12 @@ async def ssh_run(
 
     Returns ``(stdout, stderr, returncode)``.
     """
-    # Force bash as the remote shell to avoid fish/zsh compatibility issues
-    # with venv activation and other bash-isms.
-    bash_command = f"bash -lc {_shell_quote(command)}"
+    # Force bash as the remote shell to avoid fish/zsh compatibility
+    # issues with venv activation and other bash-isms. Route through
+    # `/usr/bin/env` so the login shell can't shadow `bash` with a
+    # function or alias of the same name — env is exec'd as an
+    # external binary and resolves bash via PATH directly.
+    bash_command = f"/usr/bin/env bash -lc {_shell_quote(command)}"
     ssh_cmd = ["ssh"] + _multiplex_args(hostname) + [hostname, bash_command]
 
     process_env = os.environ.copy()
