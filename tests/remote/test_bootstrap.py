@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from lqh.remote.bootstrap import (
+    _locate_uv,
     bootstrap_remote,
     check_hf_token,
     configure_hf_token,
@@ -20,6 +21,8 @@ class TestDetectEnvironment:
     @pytest.mark.asyncio
     async def test_all_tools_available(self):
         async def mock_ssh(hostname, cmd, **kw):
+            if "command -v uv" in cmd:
+                return ("/usr/local/bin/uv", "", 0)
             return ("", "", 0)
 
         with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh), \
@@ -27,7 +30,7 @@ class TestDetectEnvironment:
             env = await detect_environment("host")
 
         assert env["python3"] is True
-        assert env["uv"] is True
+        assert env["uv"] == "/usr/local/bin/uv"
         assert env["pip"] is True
         assert env["gpu_vendor"] == "nvidia"
         assert env["module"] is True
@@ -44,9 +47,69 @@ class TestDetectEnvironment:
             env = await detect_environment("host")
 
         assert env["python3"] is True
-        assert env["uv"] is False
+        assert env["uv"] is None
         assert env["pip"] is False
         assert env["gpu_vendor"] is None
+
+
+class TestLocateUv:
+    """Test the uv discovery helper."""
+
+    @pytest.mark.asyncio
+    async def test_found_on_path(self):
+        async def mock_ssh(hostname, cmd, **kw):
+            if "command -v uv" in cmd:
+                return ("/usr/bin/uv", "", 0)
+            pytest.fail(f"unexpected probe after PATH hit: {cmd}")
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _locate_uv("host") == "/usr/bin/uv"
+
+    @pytest.mark.asyncio
+    async def test_found_via_snap(self):
+        async def mock_ssh(hostname, cmd, **kw):
+            if "command -v uv" in cmd:
+                return ("", "", 1)
+            # Probe runs the for-loop and finds /snap/bin/uv.
+            assert "/snap/bin/uv" in cmd
+            return ("/snap/bin/uv", "", 0)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _locate_uv("host") == "/snap/bin/uv"
+
+    @pytest.mark.asyncio
+    async def test_probe_covers_canonical_locations(self):
+        """The probe script must reference every documented install dir."""
+        captured: dict[str, str] = {}
+
+        async def mock_ssh(hostname, cmd, **kw):
+            if "command -v uv" in cmd:
+                return ("", "", 1)
+            captured["probe"] = cmd
+            return ("", "", 1)  # nothing found
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _locate_uv("host") is None
+
+        probe = captured["probe"]
+        for expected in (
+            "$HOME/.local/bin/uv",
+            "$HOME/.cargo/bin/uv",
+            "/snap/bin/uv",
+            "/usr/local/bin/uv",
+            "/opt/homebrew/bin/uv",
+            "/home/linuxbrew/.linuxbrew/bin/uv",
+            "/usr/bin/uv",
+        ):
+            assert expected in probe, f"probe missing {expected}: {probe}"
+
+    @pytest.mark.asyncio
+    async def test_not_found(self):
+        async def mock_ssh(hostname, cmd, **kw):
+            return ("", "", 1)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _locate_uv("host") is None
 
 
 def _mock_rsync_noop(*args, **kwargs):

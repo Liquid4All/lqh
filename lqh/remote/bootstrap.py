@@ -20,31 +20,68 @@ __all__ = [
 ]
 
 
+# Where uv tends to live, in priority order. Astral's installer drops it
+# in ~/.local/bin; `cargo install` in ~/.cargo/bin; `snap install` in
+# /snap/bin; the rest cover manual installs and Homebrew on macOS / Linux.
+# Probing these directly means we don't depend on the remote user's
+# *login* shell having uv on PATH — which it often doesn't when their
+# shell is fish (the installer drops PATH config in ~/.config/fish/conf.d/
+# only) or when the box uses a service account whose dotfiles haven't been
+# refreshed since the install.
+_UV_CANDIDATE_PATHS: tuple[str, ...] = (
+    "$HOME/.local/bin/uv",
+    "$HOME/.cargo/bin/uv",
+    "/snap/bin/uv",
+    "/usr/local/bin/uv",
+    "/opt/homebrew/bin/uv",
+    "/home/linuxbrew/.linuxbrew/bin/uv",
+    "/usr/bin/uv",
+)
+
+
+async def _locate_uv(hostname: str) -> str | None:
+    """Return the absolute path to ``uv`` on the remote host, or ``None``.
+
+    Checks ``PATH`` first (one fast round-trip — covers the case where
+    the user's bash dotfiles do know about uv), then falls back to a
+    single-round-trip probe across the canonical install locations.
+    """
+    stdout, _, rc = await ssh_run(
+        hostname, "command -v uv 2>/dev/null", timeout=10.0,
+    )
+    if rc == 0 and stdout.strip():
+        return stdout.strip()
+
+    candidates = " ".join(f'"{p}"' for p in _UV_CANDIDATE_PATHS)
+    probe = (
+        f'for p in {candidates}; do '
+        f'[ -x "$p" ] && {{ echo "$p"; exit 0; }}; '
+        f'done; exit 1'
+    )
+    stdout, _, rc = await ssh_run(hostname, probe, timeout=10.0)
+    if rc == 0 and stdout.strip():
+        return stdout.strip()
+
+    return None
+
+
 async def detect_environment(hostname: str) -> dict[str, bool | str | None]:
     """Probe the remote host for available tools.
 
     Returns a dict mapping tool names to availability:
-    ``python3``, ``uv``, ``pip``, ``module`` (bool),
-    and ``gpu_vendor`` (``"nvidia"`` | ``"amd"`` | ``None``).
+    ``python3``, ``pip``, ``module`` (bool), ``uv`` (absolute path or
+    ``None``), and ``gpu_vendor`` (``"nvidia"`` | ``"amd"`` | ``None``).
     """
     from lqh.remote.gpu import detect_gpu_vendor
 
-    # The uv check probes PATH first, then falls back to the canonical
-    # per-user install locations. ssh_run already adds ~/.local/bin and
-    # ~/.cargo/bin to PATH, but the direct test guards against installs
-    # in non-standard layouts where uv exists but isn't symlinked there.
-    uv_check = (
-        'command -v uv >/dev/null 2>&1'
-        ' || test -x "$HOME/.local/bin/uv"'
-        ' || test -x "$HOME/.cargo/bin/uv"'
-    )
+    result: dict[str, bool | str | None] = {}
+    result["uv"] = await _locate_uv(hostname)
+
     checks = {
         "python3": "command -v python3",
-        "uv": uv_check,
         "pip": "command -v pip3 || command -v pip",
         "module": "type module 2>/dev/null",  # Lmod / Environment Modules
     }
-    result: dict[str, bool | str | None] = {}
     for tool, cmd in checks.items():
         _, _, rc = await ssh_run(hostname, cmd, timeout=10.0)
         result[tool] = rc == 0
@@ -81,7 +118,8 @@ async def bootstrap_remote(
     log(f"Detecting environment on {hostname}...")
     env = await detect_environment(hostname)
     gpu_vendor = env["gpu_vendor"]
-    log(f"  python3: {env['python3']}, uv: {env['uv']}, "
+    uv_path: str | None = env["uv"] if isinstance(env["uv"], str) else None
+    log(f"  python3: {env['python3']}, uv: {uv_path or 'not found'}, "
         f"pip: {env['pip']}, gpu: {gpu_vendor or 'none'}")
 
     if not env["python3"]:
@@ -108,9 +146,9 @@ async def bootstrap_remote(
     if exists_rc == 0:
         log("  venv already exists, reusing.")
     else:
-        if env["uv"]:
-            log("Creating venv with uv...")
-            cmd = f"uv venv {venv_path}"
+        if uv_path:
+            log(f"Creating venv with uv ({uv_path})...")
+            cmd = f"{uv_path} venv {venv_path}"
         else:
             log("Creating venv with python3 -m venv...")
             cmd = f"python3 -m venv {venv_path}"
@@ -162,17 +200,17 @@ async def bootstrap_remote(
                 f"Failed to sync lqh source: {stderr_bytes.decode('utf-8', errors='replace')}"
             )
 
-        if env["uv"]:
+        if uv_path:
             log("Installing lqh[train] from source with uv pip...")
-            install_cmd = f"{activate} && uv pip install --upgrade '{lqh_remote_src}[train]'"
+            install_cmd = f"{activate} && {uv_path} pip install --upgrade '{lqh_remote_src}[train]'"
         else:
             log("Installing lqh[train] from source with pip...")
             install_cmd = f"{activate} && pip install --upgrade '{lqh_remote_src}[train]'"
     else:
         # Fallback: try installing from PyPI
         log("Local lqh source not found, trying PyPI...")
-        if env["uv"]:
-            install_cmd = f"{activate} && uv pip install --upgrade 'lqh[train]'"
+        if uv_path:
+            install_cmd = f"{activate} && {uv_path} pip install --upgrade 'lqh[train]'"
         else:
             install_cmd = f"{activate} && pip install --upgrade 'lqh[train]'"
 

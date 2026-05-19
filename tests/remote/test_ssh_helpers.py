@@ -64,28 +64,6 @@ class TestSSHRun:
         assert bash_arg, f"Expected 'echo hello' in args: {call_args}"
 
     @pytest.mark.asyncio
-    async def test_path_augmented_for_user_bin_dirs(self):
-        """Per-user install dirs are prepended so uv (and friends) installed
-        under a fish-only shell config are still discoverable from bash."""
-        mock_proc = AsyncMock()
-        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
-        mock_proc.returncode = 0
-
-        with patch(
-            "lqh.remote.ssh_helpers.asyncio.create_subprocess_exec",
-            return_value=mock_proc,
-        ) as mock_exec:
-            await ssh_run("host", "command -v uv")
-
-        call_args = mock_exec.call_args[0]
-        # Find the bash -lc payload
-        payload = next((a for a in call_args if "command -v uv" in a), "")
-        assert "$HOME/.local/bin" in payload
-        assert "$HOME/.cargo/bin" in payload
-        # PATH export must come before the user command so the export wins.
-        assert payload.index("PATH=") < payload.index("command -v uv")
-
-    @pytest.mark.asyncio
     async def test_command_failure(self, caplog):
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(return_value=(b"", b"not found\n"))
