@@ -65,6 +65,27 @@ state. For example:
 - Baselines exist but no prompts → suggest prompt optimization (`/prompt`)
 - Good prompt exists but no training data → suggest scaling up data generation
 
+## Where training and GPU eval run
+
+**LQH Cloud is the default compute target.** It is always available — \
+there is no separate "availability check" you need to perform, and the \
+user does NOT need an SSH remote configured to fine-tune. When the user \
+asks to train, evaluate, or run GPU inference, **just call \
+`start_training` / `start_local_eval`**. The tool routes to LQH Cloud \
+automatically and submits a sandbox job; the user pays per-second.
+
+Do NOT ask the user "where should we run this?" or "is cloud \
+available?" — that's already decided. Only override the routing when \
+the user explicitly says so (e.g. "use my SSH box", "run it on toka"), \
+in which case pass `remote='ssh:<name>'`. Use `compute_set` only when \
+the user asks to *persist* a non-default choice; it is otherwise \
+unnecessary.
+
+Configured SSH remotes (visible via `remote_list`) are a power-user \
+opt-in, not a prerequisite for training. Treat them the way you'd \
+treat a custom-deployed inference endpoint: available if the user \
+asked for it, ignored otherwise.
+
 ## General behavior
 
 Use `ask_user` for structured questions. Be concise and helpful. Use emojis to make \
@@ -726,28 +747,12 @@ class Agent:
             else:
                 return ToolResult(content="[No user input handler available]")
 
-        # Handle first-run compute picker. start_training / start_local_eval
-        # surface this when no remote is set and no default has been chosen.
-        # We prompt the user via on_ask_user, save their choice via
-        # lqh.remote.compute, and re-invoke the original tool with the
-        # resolved remote so the user sees their training actually start
-        # rather than just a "saved your preference" toast.
-        if result.requires_user_input and result.content == "COMPUTE_PICK_REQUIRED":
-            if self.auto_mode:
-                # Auto mode: default to Cloud silently. The user wasn't
-                # going to answer the prompt anyway, and Cloud is the
-                # zero-setup path.
-                from lqh.remote.compute import save_global_default
-                save_global_default("cloud")
-                return await self._reinvoke_with_remote(tool_name, arguments, "cloud")
-            if self.callbacks.on_ask_user:
-                user_response = await self.callbacks.on_ask_user(
-                    result.question or "", result.options
-                )
-                return await self._handle_compute_pick_response(
-                    user_response, tool_name, arguments
-                )
-            return ToolResult(content="[No user input handler available]")
+        # NOTE: the legacy COMPUTE_PICK_REQUIRED first-run picker has
+        # been removed — LQH Cloud is now the silent product default
+        # (see lqh/remote/compute.py:resolve_compute). The branch that
+        # used to live here invoked self.callbacks.on_ask_user, persisted
+        # the choice, and re-ran the tool. Today start_training routes
+        # to cloud without asking the user.
 
         # Handle permission request (pipeline execution or HF push)
         if result.requires_user_input and result.content == "PERMISSION_REQUIRED":

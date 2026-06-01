@@ -661,7 +661,7 @@ async def handle_ask_user(
 async def handle_compute_set(
     project_dir: Path,
     *,
-    value: str,
+    value: str | None = None,
     scope: str = "global",
     **kwargs: Any,
 ) -> ToolResult:
@@ -669,20 +669,45 @@ async def handle_compute_set(
 
     Parameters
     ----------
-    value : str
+    value : str | None
         ``"cloud"`` for LQH Cloud, ``"ssh:<name>"`` for a previously-bound
-        SSH remote, or empty string to clear.
+        SSH remote, or empty string to clear. When omitted, the handler
+        reports the current resolved compute target instead of writing
+        anything — so an agent that calls ``compute_set`` with no args
+        gets a useful answer instead of a TypeError.
     scope : str
         ``"global"`` writes ``~/.lqh/config.json`` (default — affects every
         project). ``"project"`` writes ``<project>/.lqh/compute.json``
         (overrides the global default for this project only).
     """
-    from lqh.remote.compute import save_global_default, save_project_default
+    from lqh.remote.compute import (
+        load_global_default,
+        load_project_default,
+        resolve_compute,
+        save_global_default,
+        save_project_default,
+    )
+
+    # No value supplied → "show current". This is the friendly answer
+    # for the model when it forgets the value arg (previously raised
+    # TypeError, surfaced to the user as an opaque internal error).
+    if value is None:
+        resolved = resolve_compute(project_dir)
+        proj = load_project_default(project_dir)
+        glob = load_global_default()
+        lines = [f"Current compute target: **{resolved}**"]
+        lines.append(f"  • global default: {glob or '(unset → LQH Cloud)'}")
+        lines.append(f"  • project default: {proj or '(unset)'}")
+        lines.append(
+            "Pass `value='cloud'` or `value='ssh:<name>'` to change it; "
+            "`value=''` to clear."
+        )
+        return ToolResult(content="\n".join(lines))
 
     if scope not in ("global", "project"):
         return ToolResult(content=f"Error: scope must be 'global' or 'project', got {scope!r}")
 
-    value = (value or "").strip()
+    value = value.strip()
     if value == "":
         # Clear.
         if scope == "global":
@@ -1751,55 +1776,20 @@ def _next_run_name(project_dir: Path, prefix: str) -> str:
 
 def _pick_compute_or_use(
     project_dir: Path, explicit: str | None
-) -> ToolResult | str | None:
+) -> str:
     """Resolve the compute target with the precedence in lqh.remote.compute.
 
-    Returns one of:
-      * ``ToolResult`` — when the agent needs to ask the user (the
-        COMPUTE_PICK_REQUIRED sentinel). The caller MUST return this
-        result up to the agent loop unchanged.
-      * ``str`` — the resolved target (``"cloud"`` or ``"ssh:<name>"`` or
-        a bare SSH remote name for legacy callers).
-      * ``None`` — no compute requested and resolver says local (we
-        treat that as "stay local", matching the historical default
-        when ``remote=None``).
-
-    Why this returns either a ToolResult or a string: keeps the picker
-    branch out of every caller's body. Each handler that wants to
-    "route to cloud/ssh on first-run pick" just does::
-
-        decision = _pick_compute_or_use(project_dir, remote)
-        if isinstance(decision, ToolResult):
-            return decision
-        remote = decision  # may still be None (= run local)
+    LQH Cloud is the product default: ``resolve_compute`` never
+    returns None, so this helper always returns a usable target
+    string. Callers that historically branched on a ``ToolResult``
+    return (the old first-run picker sentinel) no longer need to —
+    the agent should just call ``start_training`` and we route the
+    job without asking the user. Users who want a different default
+    flip it via ``compute_set``.
     """
     from lqh.remote.compute import resolve_compute
 
-    resolved = resolve_compute(project_dir, explicit=explicit)
-    if resolved is not None:
-        return resolved
-    # Nothing set anywhere and nothing explicitly requested. Without
-    # the picker we'd silently run locally, but since the user is
-    # asking the agent to start a training run, this is the right
-    # moment to ask them whether to use cloud or BYO. The agent loop
-    # special-cases ``content="COMPUTE_PICK_REQUIRED"`` to: prompt the
-    # user → persist the choice → re-invoke this tool with the right
-    # ``remote=``.
-    return ToolResult(
-        content="COMPUTE_PICK_REQUIRED",
-        requires_user_input=True,
-        question=(
-            "Where should training and GPU eval run?\n\n"
-            "  • LQH Cloud — zero setup, pay-per-second, runs on api.lqh.ai.\n"
-            "  • Bring your own compute — connect an SSH-accessible GPU box.\n\n"
-            "Your pick is saved as the default for future runs and can be "
-            "changed any time with compute_set."
-        ),
-        options=[
-            "LQH Cloud (recommended)",
-            "Bring my own compute",
-        ],
-    )
+    return resolve_compute(project_dir, explicit=explicit)
 
 
 async def handle_start_training(
@@ -1848,15 +1838,10 @@ async def handle_start_training(
     """
     from lqh.tools.permissions import check_permission
 
-    # First-run picker: when the agent didn't pass an explicit
-    # ``remote=`` and the user hasn't set a default-compute yet, bubble
-    # the picker question up so the agent can ask the user. After the
-    # user picks, the agent loop saves the choice and re-invokes this
-    # tool with the resolved ``remote=`` filled in.
-    decision = _pick_compute_or_use(project_dir, remote)
-    if isinstance(decision, ToolResult):
-        return decision
-    remote = decision
+    # Resolve compute target. LQH Cloud is the product default; the
+    # agent does not need to ask the user where to train. Users who
+    # want SSH compute persist that choice via ``compute_set``.
+    remote = _pick_compute_or_use(project_dir, remote)
 
     # Check torch + GPU only when running locally; remote execution has its
     # own venv (provisioned by remote_setup) and its own GPUs.
@@ -2680,11 +2665,7 @@ async def handle_start_local_eval(
     """Start a local inference subprocess for model evaluation."""
     on_bg_started = kwargs.get("on_background_task_started")
 
-    # First-run picker — same gate as handle_start_training.
-    decision = _pick_compute_or_use(project_dir, remote)
-    if isinstance(decision, ToolResult):
-        return decision
-    remote = decision
+    remote = _pick_compute_or_use(project_dir, remote)
 
     if remote:
         return await _start_local_eval_remote(

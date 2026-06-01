@@ -40,10 +40,12 @@ def isolated_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------
 
 
-def test_resolve_returns_none_when_nothing_set(tmp_path, isolated_home):
+def test_resolve_defaults_to_cloud_when_nothing_set(tmp_path, isolated_home):
+    """LQH Cloud is the product default. Resolver never returns None —
+    the first-run picker has been removed."""
     project = tmp_path / "proj"
     project.mkdir()
-    assert compute.resolve_compute(project) is None
+    assert compute.resolve_compute(project) == "cloud"
 
 
 def test_global_default_resolves(tmp_path, isolated_home):
@@ -152,16 +154,29 @@ def _make_dataset(project: Path, name: str = "ds") -> str:
     return f"datasets/{name}"
 
 
-def test_picker_fires_when_no_default_no_remote(tmp_path, isolated_home, monkeypatch):
-    """First-run path: no default, no explicit remote → ToolResult with
-    COMPUTE_PICK_REQUIRED so the agent loop will ask the user."""
-    from lqh.tools.handlers import handle_start_training
+def test_first_run_routes_to_cloud_silently(tmp_path, isolated_home, monkeypatch):
+    """First-run path: no default, no explicit remote → start_training
+    routes straight to LQH Cloud without asking the user. The legacy
+    COMPUTE_PICK_REQUIRED first-run picker has been removed."""
+    import lqh.tools.handlers as handlers
 
     project = tmp_path / "proj"
     project.mkdir()
     ds = _make_dataset(project)
 
-    res = asyncio.run(handle_start_training(
+    from lqh.tools.permissions import grant_permission
+    grant_permission(project, project_wide=True)
+
+    recorded: dict = {}
+
+    async def fake_remote(project_dir, run_dir, config, run_name, remote_name, api_key, **kw):
+        from lqh.tools.handlers import ToolResult
+        recorded["remote_name"] = remote_name
+        return ToolResult(content=f"stub: ran on {remote_name}")
+
+    monkeypatch.setattr(handlers, "_execute_start_training_remote", fake_remote)
+
+    res = asyncio.run(handlers.handle_start_training(
         project,
         type="sft",
         base_model="LiquidAI/LFM2-1.2B",
@@ -170,11 +185,11 @@ def test_picker_fires_when_no_default_no_remote(tmp_path, isolated_home, monkeyp
         scorer=None,
         remote=None,
     ))
-    assert res.content == "COMPUTE_PICK_REQUIRED"
-    assert res.requires_user_input is True
-    assert res.options is not None
-    labels = " ".join(res.options).lower()
-    assert "cloud" in labels and "own compute" in labels
+
+    assert recorded.get("remote_name") == "cloud"
+    assert "cloud" in res.content
+    # No user prompt should have been emitted.
+    assert not res.requires_user_input
 
 
 def test_picker_skipped_when_global_default_set(tmp_path, isolated_home, monkeypatch):

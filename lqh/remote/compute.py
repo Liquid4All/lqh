@@ -100,12 +100,13 @@ def resolve_compute(
     project_dir: Path,
     *,
     explicit: ComputeTarget | None = None,
-) -> ComputeTarget | None:
+) -> ComputeTarget:
     """Compute the effective target, applying the precedence rules.
 
-    Returns the resolved value (``"cloud"`` / ``"ssh:<name>"``) or
-    ``None`` if no layer has set one yet — callers should prompt the
-    user in that case via the first-run picker.
+    Returns ``"cloud"`` / ``"ssh:<name>"``. **LQH Cloud is the default
+    when nothing has been configured anywhere** — the agent should
+    never need to ask the user where to train just to get started.
+    Users who want a different default set it via ``compute_set``.
 
     Bare remote names without an ``ssh:`` prefix (eg. ``explicit="lab"``)
     are passed through unchanged so existing agent calls keep working;
@@ -116,7 +117,11 @@ def resolve_compute(
     proj = load_project_default(project_dir)
     if proj:
         return proj
-    return load_global_default()
+    glob = load_global_default()
+    if glob:
+        return glob
+    # No layer set anything → LQH Cloud is the product default.
+    return "cloud"
 
 
 def is_cloud(target: ComputeTarget | None) -> bool:

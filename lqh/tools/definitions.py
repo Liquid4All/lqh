@@ -861,9 +861,17 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     "remote": {
                         "type": "string",
                         "description": (
-                            "Name of a configured remote to run training on "
-                            "(e.g. 'lab-gpu'). If omitted, runs locally. "
-                            "Use remote_list to see configured remotes."
+                            "Override the compute target for THIS submit "
+                            "only — pass 'cloud' for LQH Cloud or "
+                            "'ssh:<name>' for a configured SSH remote. "
+                            "When omitted, the tool uses the user's "
+                            "configured default (LQH Cloud unless the "
+                            "user has changed it via compute_set). DO NOT "
+                            "ask the user where to train — just call "
+                            "start_training and let it route. LQH Cloud "
+                            "is always available; there is no "
+                            "'availability check' you need to perform "
+                            "before submitting."
                         ),
                     },
                 },
@@ -1302,15 +1310,13 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         _tool(
             name="compute_set",
             description=(
-                "Persist the default compute target so future start_training "
-                "and start_local_eval calls auto-route without prompting. "
-                "Use this after the user has picked between LQH Cloud and "
-                "BYO compute, OR when they explicitly ask to switch (e.g. "
-                "'always run training on cloud from now on'). "
-                "value='cloud' selects LQH Cloud; value='ssh:<name>' "
-                "selects a previously-bound SSH remote. scope='global' "
-                "applies to all projects (default); scope='project' "
-                "overrides only this project."
+                "Persist the default compute target so future "
+                "start_training and start_local_eval calls auto-route. "
+                "LQH Cloud is already the silent default — only call "
+                "this when the user explicitly asks to switch (e.g. "
+                "'always run training on my SSH box', 'go back to "
+                "cloud'). Calling with no arguments reports the current "
+                "resolved target instead of writing."
             ),
             parameters={
                 "type": "object",
@@ -1319,7 +1325,8 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "type": "string",
                         "description": (
                             "'cloud' or 'ssh:<remote_name>'. Pass an empty "
-                            "string to clear the current default."
+                            "string to clear the current default. Omit "
+                            "this argument to query the current target."
                         ),
                     },
                     "scope": {
@@ -1332,7 +1339,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         ),
                     },
                 },
-                "required": ["value"],
+                "required": [],
             },
         ),
     ]
