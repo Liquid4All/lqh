@@ -521,6 +521,22 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             extra={"phase": "waiting_for_preferences", "iteration": iteration},
         )
 
+        # Cloud sandbox path: when LQH_API_TOKEN + LQH_BASE_URL are
+        # set, the laptop watcher cannot reach us — score inline so
+        # preferences.parquet exists before the wait_for_file() below
+        # runs. No-op for SSH backends, where the laptop continues to
+        # do the scoring + golden assembly via RemoteRunWatcher.
+        try:
+            from lqh.train.cloud_score import score_dpo_iter_inline
+
+            score_dpo_iter_inline(iter_dir, config, Path.cwd())
+        except Exception as exc:  # noqa: BLE001
+            # Don't crash the trainer on a scoring failure — surface
+            # the error and let the existing wait_for_file timeout
+            # path handle it. The harness can read partial state on
+            # the next reconnect.
+            print(f"WARNING: inline scoring failed: {exc}")
+
         # Step 2: Wait for preferences from main process
         print("Waiting for preferences from main process...")
         try:
@@ -893,6 +909,35 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                     }) + "\n"
                 )
                 print("  Held-out eval predictions written.")
+
+                # Cloud-mode: score the held-out eval inline so the
+                # laptop doesn't have to do a round-trip just to
+                # produce eval_result.json. Result is also persisted
+                # to held_out_eval/summary.json for the harness.
+                try:
+                    from lqh.train.cloud_score import score_held_out_eval_inline
+
+                    summary = score_held_out_eval_inline(
+                        iter_dir, config, Path.cwd(),
+                    )
+                    if summary is not None:
+                        (iter_dir / "eval_result.json").write_text(
+                            json.dumps({
+                                "iteration": iteration,
+                                "samples": len(eval_preds),
+                                "summary": summary,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            }) + "\n"
+                        )
+                        # lqh.scoring.run_scoring nests stats under
+                        # summary["scores"] (see lqh/scoring.py:563);
+                        # the top-level summary has dataset / scorer
+                        # / timestamp metadata only.
+                        scores_block = summary.get("scores") if isinstance(summary, dict) else None
+                        mean_val = scores_block.get("mean") if isinstance(scores_block, dict) else None
+                        print(f"  Held-out eval scored: mean={mean_val}")
+                except Exception as exc:
+                    print(f"  WARNING: inline held-out scoring failed: {exc}")
             except Exception as exc:
                 print(f"  WARNING: held-out eval inference failed: {exc}")
 

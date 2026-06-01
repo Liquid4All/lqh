@@ -1,10 +1,10 @@
-"""Cloud remote backend — runs jobs on api.lqh.ai (Modal under the hood).
+"""Cloud remote backend — runs jobs on api.lqh.ai.
 
-The user only sees ``api.lqh.ai``; the fact that GPU sandboxes run on
-Modal is an internal detail. This backend mirrors the SSH-direct
-``RemoteBackend`` contract so ``RemoteRunWatcher`` doesn't need to
-know which path is in use — it reads ``progress.jsonl`` /
-``status.json`` / ``stdout.log`` either way.
+The GPU provider is a backend-implemented detail; the user only sees
+``api.lqh.ai``. This backend mirrors the SSH-direct ``RemoteBackend``
+contract so ``RemoteRunWatcher`` doesn't need to know which path is
+in use — it reads ``progress.jsonl`` / ``status.json`` / ``stdout.log``
+either way.
 
 Disconnect resilience is a first-class concern: the SSE stream carries
 a monotonically increasing ``seq`` per job. We persist the last seen
@@ -34,6 +34,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from lqh.auth import api_root, get_token, require_token
+from lqh.project_meta import gather_project_meta
 from lqh.remote.backend import JobStatus, RemoteBackend, RemoteConfig
 from lqh.remote.bundle import build_bundle
 
@@ -112,6 +113,14 @@ class _CloudState:
 class CloudBackend(RemoteBackend):
     """RemoteBackend backed by api.lqh.ai's /v1/cloud/jobs endpoints."""
 
+    # The sandbox runs its own LLM-judge scoring + golden-trajectory
+    # assembly using the scoped LQH_API_TOKEN injected by the backend.
+    # RemoteRunWatcher checks this flag to skip _check_iter_requests /
+    # _check_eval_requests / _push_results, because (a) it would race
+    # the sandbox and (b) the push helpers raise NotImplementedError.
+    # SSH backends don't set this; the laptop watcher does the work.
+    inline_scoring = True
+
     def __init__(
         self,
         config: RemoteConfig,
@@ -180,9 +189,13 @@ class CloudBackend(RemoteBackend):
             "module": module,
             "config": config,
         }
+        # Project metadata: display name, spec hash, base/reward model.
+        # The backend upserts the projects row on submit; missing
+        # fields don't overwrite previously-recorded values.
+        meta.update(gather_project_meta(self.project_dir, config).to_meta_dict())
         # HF token donate path: if the project binding asked us to
         # donate the local env var, attach it to meta.hf_token. The
-        # backend forwards it as an ephemeral Modal Secret and never
+        # backend forwards it as an ephemeral cloud secret and never
         # persists it.
         if getattr(self.config, "hf_token_configured", False):
             hf = os.environ.get("HF_TOKEN")
@@ -358,7 +371,7 @@ class CloudBackend(RemoteBackend):
         """Push a single file to the sandbox.
 
         Phase 1 ships with infer-only support and the GPU sandbox
-        consumes the input bundle plus whatever's on the Modal volume
+        consumes the input bundle plus whatever's on the cloud volume
         — there's no mid-run client → remote sync. DPO's eval-result
         feedback loop will need this (Phase 2); for now raise.
         """
@@ -430,7 +443,7 @@ class CloudBackend(RemoteBackend):
             if status:
                 # Two kinds of "status=completed" events can reach us:
                 # (1) the runner's final Wait() event, which always
-                #     carries ``exit_code`` (modal_runner.go streamSandbox);
+                #     carries ``exit_code`` (cloud runner streamSandbox);
                 # (2) the trainer subprocess's own end-of-training
                 #     sentinel via lqh.train.progress.write_status, which
                 #     does not carry exit_code.
@@ -547,6 +560,15 @@ def _raise_for_cloud_error(resp: httpx.Response) -> None:
         msg = body.get("error", {}).get("message", resp.text[:200])
     except Exception:
         msg = resp.text[:200]
+    # 402 is the "billing precondition" status the backend returns
+    # for monthly-cap exhaustion, GPU min-balance floor violation,
+    # and org deactivation (see OpenAPI CostLimitExceeded). The
+    # backend message is human-readable; surface it with a clear
+    # prefix so the TUI rendering of the tool failure makes the
+    # "this is a billing issue, not a transient error" distinction
+    # obvious to the user without parsing.
+    if resp.status_code == 402:
+        raise CloudError(f"insufficient balance: {msg}")
     raise CloudError(f"{resp.status_code}: {msg}")
 
 
@@ -581,11 +603,24 @@ def _infer_kind(config: dict[str, Any], module: str) -> str:
     if isinstance(config.get("kind"), str):
         return config["kind"]
     cfg_type = (config.get("type") or "").lower()
+    base_type = (
+        (config.get("base_config") or {}).get("type", "").lower()
+        if isinstance(config.get("base_config"), dict) else ""
+    )
+    # eval_hf has its own module + entrypoint; check first so it
+    # doesn't get swallowed by the generic .infer test below.
+    if module.endswith(".eval_hf") or cfg_type == "eval_hf":
+        return "eval_hf"
     if module.endswith(".infer") or cfg_type == "infer":
         return "infer"
+    # Sweep dispatch: prefer the DPO sweep module/base_config type
+    # over the SFT default. ``module.endswith(".dpo_sweep")`` matches
+    # the cloud-handler module whitelist (lqh.train.dpo_sweep).
+    if module.endswith(".dpo_sweep") or base_type in ("dpo", "on_policy_dpo"):
+        return "train_dpo_sweep"
     if cfg_type == "sweep" or module.endswith(".sweep"):
         return "train_sft_sweep"
-    if cfg_type == "dpo":
+    if cfg_type in ("dpo", "on_policy_dpo"):
         return "train_dpo"
     return "train_sft"
 

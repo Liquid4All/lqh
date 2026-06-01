@@ -50,12 +50,18 @@ __all__ = ["main", "publish_run", "PublishResult"]
 class _Candidate:
     """One thing to publish: either a single file or a directory to be
     tar'd. ``kind`` is the registered artifact kind; ``relpath`` is the
-    path relative to the run dir for human-readable manifest entries."""
+    path relative to the run dir for human-readable manifest entries.
+
+    ``lineage`` is an optional dict matching the ArtifactLineageInput
+    schema; when set, it's passed to the register call so the backend
+    writes an `artifact_lineage` row alongside the artifact row.
+    """
 
     path: Path
     kind: ArtifactKind
     relpath: str
     is_dir: bool = False
+    lineage: dict | None = None
 
 
 @dataclass
@@ -82,6 +88,56 @@ class PublishResult:
                 {"relpath": rp, "error": err} for rp, err in self.failed
             ],
         }
+
+
+def _load_lineage_sidecar(target: Path) -> dict | None:
+    """Look for ``<target>.lineage.json`` (file) or
+    ``<target>/lineage.json`` (dir). Returns the parsed dict or None.
+
+    The trainer drops these next to each artifact it intends to
+    publish: a SFT checkpoint dir gets ``checkpoints/4500/lineage.json``,
+    a rollouts parquet gets ``iterations/2/predictions.parquet.lineage.json``.
+    The publisher reads them on its sweep so the lineage row is
+    written in the same call as the artifact registration.
+    """
+    if target.is_dir():
+        cand = target / "lineage.json"
+    else:
+        cand = target.with_suffix(target.suffix + ".lineage.json")
+    if cand.exists() and cand.is_file():
+        try:
+            return json.loads(cand.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("failed to read %s: %s", cand, exc)
+    return None
+
+
+def _dir_has_weights(d: Path) -> bool:
+    """True when ``d`` looks like a real saved checkpoint (i.e. carries
+    model weights), False when it's a sidecar dir holding only eval
+    outputs.
+
+    SFT writes two distinct shapes under ``checkpoints/``:
+      * ``checkpoints/step_N/`` — eval-only dir produced by the
+        per-checkpoint eval callback; contains ``predictions.parquet``
+        and ``eval_request.json``, no weights.
+      * ``checkpoints/checkpoint-N/`` (HF Trainer default) — real
+        checkpoint with ``*.safetensors`` or ``adapter_model.*``.
+
+    Tarring an eval-only dir as ``kind=checkpoint`` mislabels it in
+    the artifact list and wastes R2 storage. Gating on the presence
+    of weight files distinguishes them without coupling to a specific
+    naming convention.
+    """
+    if not d.is_dir():
+        return False
+    for entry in d.iterdir():
+        name = entry.name
+        if name.endswith(".safetensors") or name == "pytorch_model.bin":
+            return True
+        if name.startswith("adapter_model.") or name.startswith("model.safetensors"):
+            return True
+    return False
 
 
 def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
@@ -111,7 +167,7 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
             out.append(_Candidate(path=p, kind=kind, relpath=name))
 
     # --- logs/ — the cloud launcher tees stdout/stderr into
-    # run_dir/logs/ (see modal_runner.go buildLauncherScript). The
+    # run_dir/logs/ (see the cloud runner's buildLauncherScript). The
     # SSH-direct backend writes them at run_dir top-level, so we
     # support both layouts.
     logs_dir = run_dir / "logs"
@@ -131,7 +187,7 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
     # a successful fine-tune leaves no model state in R2.
     for sub in ("model", "model-lora"):
         p = run_dir / sub
-        if p.exists() and p.is_dir():
+        if _dir_has_weights(p):
             out.append(
                 _Candidate(
                     path=p,
@@ -154,14 +210,19 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
     if ckpt_root.exists() and ckpt_root.is_dir():
         for sub in sorted(ckpt_root.iterdir()):
             if sub.is_dir():
-                out.append(
-                    _Candidate(
-                        path=sub,
-                        kind="checkpoint",
-                        relpath=f"checkpoints/{sub.name}",
-                        is_dir=True,
+                # Only tar the dir as a checkpoint artifact if it
+                # actually carries weights — see _dir_has_weights.
+                # Eval-only step_N dirs still surface their inner
+                # predictions / eval_result files individually below.
+                if _dir_has_weights(sub):
+                    out.append(
+                        _Candidate(
+                            path=sub,
+                            kind="checkpoint",
+                            relpath=f"checkpoints/{sub.name}",
+                            is_dir=True,
+                        )
                     )
-                )
                 for fname, kind in (
                     ("predictions.parquet", "predictions"),
                     ("eval_request.json", "eval_result"),
@@ -178,6 +239,10 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
                         )
             elif sub.is_file():
                 # eg checkpoints/best.json — small file alongside dirs
+                # Skip lineage sidecars themselves; they're metadata
+                # *about* artifacts, not artifacts in their own right.
+                if sub.name.endswith(".lineage.json"):
+                    continue
                 out.append(
                     _Candidate(
                         path=sub,
@@ -190,9 +255,6 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
     iter_root = run_dir / "iterations"
     if iter_root.exists() and iter_root.is_dir():
         for sub in sorted(iter_root.iterdir()):
-            # Inside each iteration we publish the predictions file and
-            # the iter_request.json directly — the model state is in
-            # the checkpoint dir already covered above.
             for fname, kind in (
                 ("predictions.parquet", "predictions"),
                 ("eval_predictions.parquet", "eval_result"),
@@ -207,6 +269,71 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
                             relpath=f"iterations/{sub.name}/{fname}",
                         )
                     )
+            # Per-iteration checkpoint dir (lqh/train/dpo.py writes
+            # iter_dir / "checkpoint" via save_pretrained). Gating on
+            # _dir_has_weights skips the dir on incomplete iters or if
+            # the saver was disabled.
+            ckpt_sub = sub / "checkpoint"
+            if _dir_has_weights(ckpt_sub):
+                out.append(
+                    _Candidate(
+                        path=ckpt_sub,
+                        kind="checkpoint",
+                        relpath=f"iterations/{sub.name}/checkpoint",
+                        is_dir=True,
+                    )
+                )
+
+    # --- sweep_<id>/ — hyperparameter-sweep per-config sub-dirs ---
+    # Each contains the child trainer's stdout.log, stderr.log,
+    # progress.jsonl, eval_history.json, model{,-lora}/, and
+    # checkpoints/. Without this branch all that's published from a
+    # sweep run is the OUTER sweep's logs — the child's actual
+    # training output is invisible, which is the failure mode that
+    # made the before/after test impossible to debug.
+    for sub in sorted(run_dir.iterdir()):
+        if not (sub.is_dir() and sub.name.startswith("sweep_")):
+            continue
+        # Small files at the sub-dir root.
+        sub_smalls: dict[str, ArtifactKind] = {
+            "config.json":       "other",
+            "stdout.log":        "logs",
+            "stderr.log":        "logs",
+            "progress.jsonl":    "metrics",
+            "eval_history.json": "metrics",
+            "chosen_ce_summary.json": "metrics",
+            "status.json":       "metrics",
+        }
+        for fname, kind in sub_smalls.items():
+            p = sub / fname
+            if p.exists() and p.is_file():
+                out.append(
+                    _Candidate(
+                        path=p,
+                        kind=kind,
+                        relpath=f"{sub.name}/{fname}",
+                    )
+                )
+        # Per-config model/checkpoints — same shape as the top-level
+        # paths, but nested. Saves the trained adapter so a sweep
+        # can be inspected after the fact.
+        for mdir in ("model", "model-lora"):
+            p = sub / mdir
+            if _dir_has_weights(p):
+                out.append(
+                    _Candidate(
+                        path=p,
+                        kind="checkpoint",
+                        relpath=f"{sub.name}/{mdir}",
+                        is_dir=True,
+                    )
+                )
+
+    # Single sweep to attach any lineage sidecar files. Cheap (just a
+    # stat per candidate) and keeps the per-block logic above focused
+    # on "what to publish" rather than "metadata to attach".
+    for c in out:
+        c.lineage = _load_lineage_sidecar(c.path)
 
     return out
 
@@ -260,6 +387,7 @@ async def publish_run(
                         project_id=project_id,
                         kind=cand.kind,
                         job_id=job_id,
+                        lineage=cand.lineage,
                     )
             else:
                 handle = await store.upload_file(
@@ -267,6 +395,7 @@ async def publish_run(
                     project_id=project_id,
                     kind=cand.kind,
                     job_id=job_id,
+                    lineage=cand.lineage,
                 )
             logger.info("published %s -> %s", cand.relpath, handle.id)
             successes.append(handle)

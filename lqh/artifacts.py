@@ -42,6 +42,36 @@ __all__ = [
 # Keep in sync with backend/internal/db/artifacts.go ArtifactKind.
 ArtifactKind = str  # one of: checkpoint predictions metrics logs eval_result dataset bundle other
 
+def _augment_lineage_from_env(lineage: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Stamp environment-derived image provenance into a lineage payload.
+
+    The cloud-job launcher injects ``LQH_IMAGE_ID`` and
+    ``LQH_IMAGE_PURPOSE`` for every sandbox (see
+    handler/cloud_jobs.go). When a caller hands us a lineage dict
+    without those fields set, we fill them in here so the registered
+    ``artifact_lineage`` row records which container image produced
+    the artifact — needed to reproduce an old checkpoint against its
+    exact image build (image registry, migration 0016).
+
+    Caller-supplied values always win: a trainer that knows better
+    than the env (e.g. an image override for a one-off rebuild)
+    won't be overwritten.
+
+    Returns the (possibly augmented) dict, or None if input is None.
+    Idempotent on already-stamped inputs.
+    """
+    if lineage is None:
+        return None
+    out = dict(lineage)  # shallow copy so we don't mutate the caller's dict
+    if not out.get("image_id"):
+        if v := os.environ.get("LQH_IMAGE_ID"):
+            out["image_id"] = v
+    if not out.get("image_purpose"):
+        if v := os.environ.get("LQH_IMAGE_PURPOSE"):
+            out["image_purpose"] = v
+    return out
+
+
 _VALID_KINDS = frozenset(
     {
         "checkpoint",
@@ -203,6 +233,7 @@ class BackendArtifactStore:
         job_id: str | None,
         sha256: str | None,
         hf_repo: str | None,
+        lineage: dict[str, Any] | None = None,
     ) -> ArtifactHandle:
         body: dict[str, Any] = {
             "project_id": project_id,
@@ -216,6 +247,8 @@ class BackendArtifactStore:
             body["sha256"] = sha256
         if hf_repo:
             body["hf_repo"] = hf_repo
+        if lineage:
+            body["lineage"] = lineage
         r = await client.post(
             "/v1/artifacts/register",
             json=body,
@@ -246,11 +279,16 @@ class BackendArtifactStore:
         kind: ArtifactKind,
         job_id: str | None = None,
         sha256: str | None = None,
+        lineage: dict[str, Any] | None = None,
     ) -> ArtifactHandle:
         """Upload ``path`` to R2, then register it as an artifact.
 
         sha256 is computed locally if not supplied — checksum protects
         against silent corruption on PUT.
+
+        ``lineage`` is an optional dict matching ArtifactLineageInput
+        in the OpenAPI spec — set when the caller knows the artifact's
+        provenance (training method, base model, parents, metrics, ...).
         """
         if kind not in _VALID_KINDS:
             raise ValueError(f"invalid artifact kind: {kind!r}")
@@ -259,6 +297,10 @@ class BackendArtifactStore:
         size = path.stat().st_size
         if sha256 is None:
             sha256 = _sha256_file(path)
+
+        # Stamp image / purpose from env when not pinned by caller.
+        # Idempotent + safe outside the sandbox (env vars absent → no-op).
+        lineage = _augment_lineage_from_env(lineage)
 
         async with httpx.AsyncClient(base_url=self._base, timeout=self._timeout) as client:
             r2_key, upload_url = await self._request_upload_url(
@@ -291,6 +333,7 @@ class BackendArtifactStore:
                 job_id=job_id,
                 sha256=sha256,
                 hf_repo=None,
+                lineage=lineage,
             )
 
     async def signed_url(self, handle: ArtifactHandle | str) -> str:

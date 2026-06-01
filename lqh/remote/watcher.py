@@ -77,18 +77,36 @@ class RemoteRunWatcher(RunWatcher):
     # ------------------------------------------------------------------
 
     async def _watch_loop(self) -> None:
+        # Cloud backends inject LQH_API_TOKEN into the sandbox so the
+        # trainer can do its own scoring + golden assembly via
+        # lqh.train.cloud_score. When that path is active, the laptop
+        # must NOT also try to score (it would race the sandbox and
+        # also fail to push results back — CloudBackend.sync_file_to_remote
+        # raises NotImplementedError). The check goes by backend
+        # identity: a backend that reports a non-empty `inline_scoring`
+        # attribute as True is doing its own scoring. SSH backends
+        # don't set it; CloudBackend sets it to True.
+        sandbox_scores_inline = bool(getattr(self._backend, "inline_scoring", False))
+
         while not self._stop.is_set():
             try:
                 # 1. Pull from remote
                 await self._sync_from_remote()
 
-                # 2. Check progress + scoring (inherited)
+                # 2. Check progress + scoring (inherited).
+                #    Skip the scoring half when the sandbox is doing
+                #    it itself — we still want progress updates so the
+                #    TUI continues to display live status.
                 self._update_progress()
-                await self._check_eval_requests()
-                await self._check_iter_requests()
+                if not sandbox_scores_inline:
+                    await self._check_eval_requests()
+                    await self._check_iter_requests()
 
-                # 3. Push results back to remote
-                await self._push_results()
+                # 3. Push results back to remote. Also skipped in the
+                #    sandbox-scores-inline path — there's nothing to
+                #    push, and the backend would reject it anyway.
+                if not sandbox_scores_inline:
+                    await self._push_results()
 
                 # 4. Check completion (remote-aware)
                 await self._check_completion_remote()

@@ -11,7 +11,7 @@ Two layers, in precedence order (highest first):
 
 Values are strings:
 
-  ``"cloud"``                — LQH Cloud (api.lqh.ai → Modal)
+  ``"cloud"``                — LQH Cloud (api.lqh.ai, GPU provider backend-implemented)
   ``"ssh:<remote_name>"``    — a previously-bound SSH remote
   ``None``                   — no decision yet
 

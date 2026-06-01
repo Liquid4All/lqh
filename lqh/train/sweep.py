@@ -276,8 +276,9 @@ def _run_child(sub_run_dir: Path, sub_config: dict[str, Any]) -> int:
     cfg_path = sub_run_dir / "config.json"
     cfg_path.write_text(json.dumps(sub_config, indent=2) + "\n")
 
+    stderr_path = sub_run_dir / "stderr.log"
     with (sub_run_dir / "stdout.log").open("w") as stdout_f, \
-         (sub_run_dir / "stderr.log").open("w") as stderr_f:
+         stderr_path.open("w") as stderr_f:
         proc = subprocess.run(
             [sys.executable, "-m", "lqh.train", str(cfg_path)],
             stdin=subprocess.DEVNULL,
@@ -285,6 +286,25 @@ def _run_child(sub_run_dir: Path, sub_config: dict[str, Any]) -> int:
             stderr=stderr_f,
             check=False,
         )
+    # When a child fails, echo the tail of its stderr to OUR stderr
+    # so the failure is visible in the sweep's published logs. The
+    # child's sub_run_dir/stderr.log isn't picked up by publish.py
+    # (which only walks the run_dir's standard layout), so without
+    # this echo the only thing R2 sees is `rc=1 eval_loss=n/a`,
+    # which is useless for debugging.
+    if proc.returncode != 0:
+        try:
+            stderr_tail = stderr_path.read_text(errors="replace").splitlines()[-60:]
+        except OSError:
+            stderr_tail = ["(could not re-read child stderr)"]
+        print(
+            f"\nsweep: child {sub_run_dir.name} failed with rc="
+            f"{proc.returncode}; last 60 stderr lines:",
+            file=sys.stderr,
+            flush=True,
+        )
+        for line in stderr_tail:
+            print(f"  {line}", file=sys.stderr, flush=True)
     return proc.returncode
 
 
@@ -391,17 +411,48 @@ def _run_eval_of_best(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
             import shutil
             shutil.copy2(src, dst)
 
-    return {"ok": True, "dataset": cfg.get("dataset"), "model": cfg["base_model"]}
+    summary: dict[str, Any] = {
+        "ok": True,
+        "dataset": cfg.get("dataset"),
+        "model": cfg["base_model"],
+    }
+
+    # Cloud-mode: score the eval predictions inline so we emit a
+    # complete real-metric (judge_score) artifact without depending
+    # on the laptop watcher. score_run_eval_inline is a no-op for
+    # SSH backends — the laptop watcher continues to pick up the
+    # symlinked predictions + score them as before.
+    try:
+        from lqh.train.cloud_score import score_run_eval_inline
+
+        score_summary = score_run_eval_inline(run_dir, base)
+        if score_summary is not None:
+            summary["score_summary"] = score_summary
+    except Exception as exc:  # noqa: BLE001
+        print(f"sweep: inline eval-of-best scoring failed: {exc}", flush=True)
+
+    return summary
 
 
 def _materialize_best_model(winner_dir: Path, run_dir: Path) -> None:
     """Expose the winner's model directly as ``run_dir/model``.
 
-    Tries a symlink first (instant, no disk duplication). Falls back to
-    ``shutil.copytree`` on filesystems that don't support symlinks.
+    Looks for ``winner_dir/model`` first (full / merged-LoRA case),
+    falls back to ``winner_dir/model-lora`` (adapter-only LoRA case;
+    sft.py:_save_final_model writes there when ``lora.merge`` is
+    false). ``load_for_inference`` happily resolves an adapter dir
+    (PeftModel + merge_and_unload), so eval-of-best works against
+    either layout — the only requirement is that *something* exists
+    at ``run_dir/model``.
+
+    Tries a symlink first (instant, no disk duplication). Falls back
+    to ``shutil.copytree`` on filesystems that don't support symlinks.
     """
-    src = winner_dir / "model"
-    if not src.exists():
+    for candidate in ("model", "model-lora"):
+        src = winner_dir / candidate
+        if src.exists():
+            break
+    else:
         return
     dst = run_dir / "model"
     # Clear any prior winner artifact (symlink or copy).

@@ -5,14 +5,14 @@ The subprocess writes; the main process reads.
 
 Cloud sandboxes are a special case: the host can't tail a file inside
 the sandbox's volume in real time. So when ``LQH_JOB_ID`` is set in the
-process env (which the Modal runner injects via
-``SandboxCreateParams.Env``), every progress and status write is ALSO
-echoed to stdout as a single line prefixed with ``LQH_EVENT_JSON:``.
-The Modal runner's stdout parser (``cloud.parseSentinel``) pulls these
-out, converts them to SSE events, and persists them to
-``cloud_job_events`` so the live stream reaches the lqh CLI. Local and
-SSH-direct runs don't set ``LQH_JOB_ID``, so the sentinel path is a
-no-op there — file behavior is unchanged.
+process env (which the cloud runner injects via the sandbox env),
+every progress and status write is ALSO echoed to stdout as a single
+line prefixed with ``LQH_EVENT_JSON:``. The cloud runner's stdout
+parser (``cloud.parseSentinel``) pulls these out, converts them to
+SSE events, and persists them to ``cloud_job_events`` so the live
+stream reaches the lqh CLI. Local and SSH-direct runs don't set
+``LQH_JOB_ID``, so the sentinel path is a no-op there — file behavior
+is unchanged.
 """
 
 from __future__ import annotations
@@ -186,11 +186,11 @@ def _append_jsonl(path: Path, entry: dict[str, Any]) -> None:
         f.write(json.dumps(entry, default=_json_default) + "\n")
 
 
-# The env var the Modal runner injects to mark "you are inside a
+# The env var the cloud runner injects to mark "you are inside a
 # cloud sandbox". Other backends (local, SSH-direct) leave it unset.
 _CLOUD_ENV_MARKER = "LQH_JOB_ID"
 
-# stdout sentinel prefix recognized by backend/internal/cloud/modal_runner.go
+# stdout sentinel prefix recognized by the backend's cloud runner
 # (parseSentinel). Any line starting with this prefix is parsed as a
 # structured event; everything else is treated as a log line.
 _SENTINEL_PREFIX = "LQH_EVENT_JSON:"
@@ -198,7 +198,7 @@ _SENTINEL_PREFIX = "LQH_EVENT_JSON:"
 
 def _emit_sentinel(kind: str, payload: dict[str, Any]) -> None:
     """If running in a cloud sandbox, echo one structured event to
-    stdout for the Modal runner to pick up.
+    stdout for the cloud runner to pick up.
 
     Silent in every other context (local training, SSH-direct, tests).
     Designed to be a strict superset of the file-based protocol — the
@@ -219,7 +219,7 @@ def _emit_sentinel(kind: str, payload: dict[str, Any]) -> None:
         )
         # Use print rather than sys.stdout.write so we get auto-flush
         # behavior on line buffering. flush=True forces it even on
-        # block-buffered stdout (which is what Modal's stdout pipe
+        # block-buffered stdout (which is what the sandbox stdout pipe
         # typically is).
         print(line, flush=True)
     except Exception:

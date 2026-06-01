@@ -47,12 +47,22 @@ def _run_inference(run_dir: Path, config: dict) -> None:
 
     base_model = config["base_model"]
     dataset_path = config["dataset"]
+    # Optional explicit base override — used by eval_hf when a LoRA
+    # adapter's `adapter_config.json["base_model_name_or_path"]` is
+    # missing, points at a renamed/moved repo, or the caller wants to
+    # pin a specific base revision regardless of what the adapter
+    # declares. Forwarded to load_for_inference; ignored for non-
+    # adapter `base_model` values.
+    base_override = config.get("base_override")
 
     print(f"Loading model: {base_model}")
     # load_for_inference transparently handles hub ids, merged dirs,
     # and adapter dirs (the latter via base+PeftModel+merge_and_unload).
     model, tokenizer = load_for_inference(
-        base_model, dtype=torch.bfloat16, device_map="auto",
+        base_model,
+        dtype=torch.bfloat16,
+        device_map="auto",
+        base_override=base_override,
     )
 
     print(f"Loading dataset: {dataset_path}")

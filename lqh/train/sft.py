@@ -178,6 +178,27 @@ def _run_checkpoint_eval(
     # Signal the main process to score
     write_eval_request(checkpoint_dir)
 
+    # Cloud path: the laptop-side watcher is bypassed (the sandbox
+    # has no laptop), so the eval_request signal would never be
+    # picked up. Run the judge inline using the scoped
+    # LQH_API_TOKEN — same shape sweep eval-of-best and DPO already
+    # use. No-op in local / SSH-direct training where the watcher
+    # does the work.
+    from lqh.train.cloud_score import is_cloud_mode, score_run_eval_inline
+
+    if is_cloud_mode():
+        try:
+            score_run_eval_inline(checkpoint_dir, config)
+        except Exception as exc:  # noqa: BLE001
+            # Inline scoring is best-effort — a judge failure must
+            # never crash a training run. The predictions file is
+            # still on disk so a re-score is possible offline.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "inline scoring failed for %s: %s", checkpoint_dir, exc
+            )
+
 
 # ---------------------------------------------------------------------------
 # Main SFT loop
@@ -235,12 +256,32 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
             task_type="CAUSAL_LM",
         )
 
-    # Load dataset and split off a held-out eval slice for in-training
-    # validation loss. eval_split_ratio=0 disables; default 0.1.
+    # Load training set. The eval set is resolved with this order
+    # of precedence:
+    #   1. explicit ``config["eval_dataset"]`` — separate parquet,
+    #      used verbatim. Honoured even when small (no min_eval gate)
+    #      because the caller knows it's the eval they want.
+    #   2. internal train/eval split, controlled by
+    #      ``training.eval_split_ratio`` (default 0.1). Falls back
+    #      to "no eval" when the resulting slice is below
+    #      split_train_eval's min_eval threshold.
+    #   3. eval_split_ratio=0 disables entirely.
+    #
+    # Reason precedence 1 exists: the sweep harness ships dataset +
+    # eval_dataset in the bundle (the SAME files the laptop watcher
+    # would have scored locally). Without honouring eval_dataset
+    # here, a small training set + a small eval set silently runs
+    # train-only and the sweep's proxy metric stays NaN, marking the
+    # config "failed". That bit us on the before/after test.
     print(f"Loading dataset: {dataset_path}")
     conversations = load_chatml_dataset(dataset_path)
+    eval_dataset_path = config.get("eval_dataset")
     eval_split_ratio = float(training_cfg.get("eval_split_ratio", 0.1))
-    if eval_split_ratio > 0:
+    if eval_dataset_path:
+        print(f"Loading explicit eval_dataset: {eval_dataset_path}")
+        train_convos = conversations
+        eval_convos = load_chatml_dataset(eval_dataset_path)
+    elif eval_split_ratio > 0:
         train_convos, eval_convos = split_train_eval(
             conversations, eval_split_ratio, seed=0
         )
@@ -248,7 +289,7 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         train_convos, eval_convos = conversations, []
     print(
         f"  train={len(train_convos)} eval={len(eval_convos)} "
-        f"(eval_split_ratio={eval_split_ratio})"
+        f"(eval_dataset={'explicit' if eval_dataset_path else f'split:{eval_split_ratio}'})"
     )
 
     train_dataset = Dataset.from_list(chatml_to_sft_dataset(train_convos))

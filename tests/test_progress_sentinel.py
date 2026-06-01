@@ -1,9 +1,9 @@
 """LQH_EVENT_JSON sentinel emission from lqh.train.progress.
 
 These tests guard the cloud-sandbox progress pipeline. The trainer
-inside a Modal sandbox writes progress events to a file the host
+inside a cloud sandbox writes progress events to a file the host
 can't read directly; the sentinel-on-stdout path is what lets the
-Modal runner translate trainer progress into SSE events the client
+cloud runner translate trainer progress into SSE events the client
 consumes.
 
 Three things must hold:
@@ -12,7 +12,7 @@ Three things must hold:
      Local runs must not get noisy stdout.
   2. With LQH_JOB_ID set (cloud path), every write_progress and
      write_status call produces exactly one parseable sentinel.
-  3. The wire format matches what backend/internal/cloud/modal_runner.go
+  3. The wire format matches what the backend's cloud runner
      parseSentinel expects: ``LQH_EVENT_JSON: {"kind": "...", "payload": {...}}``.
 """
 
@@ -90,7 +90,7 @@ def test_status_sentinel_in_sandbox(tmp_path: Path, monkeypatch):
 
 
 def test_sentinel_wire_format_one_line(tmp_path: Path, monkeypatch):
-    """The Modal runner parses line-by-line; payloads MUST be single-line
+    """The cloud runner parses line-by-line; payloads MUST be single-line
     JSON or the SSE consumer will see truncated events."""
     monkeypatch.setenv("LQH_JOB_ID", "test-job-123")
     buf = io.StringIO()

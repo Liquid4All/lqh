@@ -65,11 +65,34 @@ def resolve_manifest(
     paths.  This function resolves them against *project_dir* and returns
     absolute ``Path`` objects (skipping any that don't exist on disk, such
     as HuggingFace Hub model IDs).
+
+    Sweep configs wrap the real training config inside ``base_config``;
+    the ``manifest`` lives there along with the file-path keys it points
+    at. This function transparently digs into ``base_config`` when the
+    top-level config doesn't carry its own manifest, so sweep submits
+    don't need to mirror the manifest at both levels.
     """
-    manifest_keys: list[str] = config.get("manifest", [])
+    # Collect (manifest_keys, lookup_dict) pairs. The outer config wins
+    # for any key it defines; we fall through to base_config only for
+    # keys that aren't on the outer scope.
+    scopes: list[dict[str, Any]] = [config]
+    inner = config.get("base_config")
+    if isinstance(inner, dict):
+        scopes.append(inner)
+    manifest_keys: list[str] = []
+    for scope in scopes:
+        keys = scope.get("manifest")
+        if isinstance(keys, list) and keys:
+            manifest_keys = keys
+            break
     paths: list[Path] = []
     for key in manifest_keys:
-        value = config.get(key)
+        value = None
+        for scope in scopes:
+            v = scope.get(key)
+            if v is not None:
+                value = v
+                break
         if value is None:
             continue
         candidate = project_dir / value

@@ -4,15 +4,15 @@ trained checkpoint → final artifacts in R2.
 Skipped unless:
   - ``LQH_E2E=1`` is exported (opt-in; the test spends real money)
   - the lqh CLI is logged in (token resolvable via ``lqh.auth.get_token``)
-  - ``LQH_BASE_URL`` points at a backend that has Modal + R2 wired up
-    (verify with ``go run ./cmd/modaldebug`` first)
+  - ``LQH_BASE_URL`` points at a backend that has the GPU provider
+    + R2 wired up (verify with ``go run ./cmd/modaldebug`` first)
 
 What this proves:
   - Bundle assembly handles a real parquet dataset
   - Multipart submit to ``/v1/cloud/jobs`` succeeds
   - Backend pre-flight cost check passes for the bootstrapped user
   - R2 bundle upload + presigned-GET works
-  - Modal sandbox boots from the configured image
+  - Cloud sandbox boots from the configured image
   - Volume sub_path mount (project-scoped) works
   - HF model download (or cache hit on warm boot) works
   - Trainer runs and emits LQH_EVENT_JSON sentinels
@@ -33,7 +33,7 @@ What this does NOT prove:
 Time + cost budget:
   - Wall time: ~3-5 min on a cold project (HF model download); ~30s
     warm (post-6a cache).
-  - Modal cost: ~$0.25-$0.50 per run on an A100-40GB.
+  - GPU cost: ~$0.25-$0.50 per run on an A100-40GB.
 
 Usage:
     LQH_E2E=1 python -m pytest lqh_py/tests/e2e/test_cloud_sft_smoke.py -v -s
@@ -146,7 +146,7 @@ def _build_smoke_config(project_dir: Path, dataset_rel: str) -> dict[str, Any]:
 @unittest.skipUnless(_e2e_enabled()[0], _e2e_enabled()[1])
 class TestCloudSftSmoke(unittest.TestCase):
     """The minimum-viable cloud fine-tune that exercises the full
-    Modal+R2+backend round trip."""
+    GPU+R2+backend round trip."""
 
     def setUp(self) -> None:
         self._project_dir = Path(

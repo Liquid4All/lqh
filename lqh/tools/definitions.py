@@ -1011,6 +1011,107 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
             },
         ),
         # ------------------------------------------------------------------
+        # eval_hf_model
+        # ------------------------------------------------------------------
+        _tool(
+            name="eval_hf_model",
+            description=(
+                "Evaluate any HuggingFace checkpoint on a project's eval set "
+                "via LQH Cloud. Use this to score a public/private HF model "
+                "(LoRA adapter or full checkpoint) without training it "
+                "locally — e.g. evaluating someone else's fine-tune, "
+                "benchmarking an off-the-shelf base, or running an "
+                "alternative checkpoint version against the same scorer. "
+                "Generates rollouts on a GPU sandbox and scores them via "
+                "the LLM judge in one job; result lands as eval_result.json "
+                "under runs/<run_name>/."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": (
+                            "HuggingFace repository id "
+                            "(e.g. 'Qwen/Qwen3.5-3B-Instruct' or "
+                            "'someuser/my-translation-lora')."
+                        ),
+                    },
+                    "revision": {
+                        "type": "string",
+                        "description": (
+                            "Git revision / branch / tag to fetch. "
+                            "Defaults to 'main'."
+                        ),
+                        "default": "main",
+                    },
+                    "training_method": {
+                        "type": "string",
+                        "enum": ["lora", "full"],
+                        "description": (
+                            "'lora' for an adapter repo (requires base_model); "
+                            "'full' for a merged checkpoint."
+                        ),
+                        "default": "lora",
+                    },
+                    "base_model": {
+                        "type": "string",
+                        "description": (
+                            "HF repo id of the base model. Required when "
+                            "training_method='lora' — pinned regardless of "
+                            "what adapter_config.json says. Ignored for "
+                            "'full'."
+                        ),
+                    },
+                    "eval_dataset": {
+                        "type": "string",
+                        "description": (
+                            "Relative path to the eval dataset directory "
+                            "(must contain data.parquet)."
+                        ),
+                    },
+                    "scorer": {
+                        "type": "string",
+                        "description": (
+                            "Relative path to the scorer .md file."
+                        ),
+                    },
+                    "system_prompt_path": {
+                        "type": "string",
+                        "description": (
+                            "Optional relative path to a .md file whose "
+                            "contents are prepended as a system message "
+                            "before each sample. Auto-discovers a sibling "
+                            "<task>.schema.json for constrained decoding."
+                        ),
+                    },
+                    "judge_size": {
+                        "type": "string",
+                        "enum": ["small", "medium", "large"],
+                        "description": (
+                            "Which judge to use for scoring. Default 'small' "
+                            "(cheap, fast); pick 'medium' or 'large' for "
+                            "harder rubrics."
+                        ),
+                        "default": "small",
+                    },
+                    "run_name": {
+                        "type": "string",
+                        "description": (
+                            "Name for the eval run directory under runs/. "
+                            "Auto-generated if omitted."
+                        ),
+                    },
+                    "max_new_tokens": {
+                        "type": "integer",
+                        "description": "Token cap per generation. Default 4096.",
+                        "default": 4096,
+                    },
+                },
+                "required": ["repo", "eval_dataset", "scorer"],
+            },
+        ),
+        # ------------------------------------------------------------------
         # remote_list
         # ------------------------------------------------------------------
         _tool(

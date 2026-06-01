@@ -27,7 +27,7 @@ same gate as the smoke test (this one spends more real money).
 Time + cost budget:
   - Wall time: ~6-10 min cold (HF model download + 1 epoch over ~30
     samples + per-checkpoint eval). ~2-3 min warm.
-  - Modal cost: ~$0.50-$1.00 per run on an A100-40GB.
+  - GPU cost: ~$0.50-$1.00 per run on an A100-40GB.
 
 Usage:
     LQH_E2E=1 python -m pytest lqh_py/tests/e2e/test_cloud_sft_hf_e2e.py -v -s
@@ -263,7 +263,7 @@ def _build_sft_config(train_rel: Path, eval_rel: Path) -> dict[str, Any]:
             "enabled": True,
             # Don't merge the adapter into the base model at save
             # time. Merged 1.2B = ~2.4 GB on disk, and publish.py's
-            # tar of that on Modal hits a sandbox memory cap and gets
+            # tar of that on the cloud sandbox hits a memory cap and gets
             # SIGKILL'd (exit 137). Saving the adapter alone keeps
             # the published checkpoint at ~tens of MB. Downstream
             # consumers reload via PeftModel.from_pretrained.

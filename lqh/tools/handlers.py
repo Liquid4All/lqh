@@ -2242,25 +2242,44 @@ async def _training_status_remote(
     run_name: str,
     remote_name: str,
 ) -> ToolResult:
-    """Check status of a remote training run."""
-    from lqh.remote.config import get_remote
-    from lqh.remote.ssh_direct import SSHDirectBackend
+    """Check status of a remote training run.
 
-    remote_config = get_remote(project_dir, remote_name)
-    if remote_config is None:
-        return ToolResult(content=f"Error: remote '{remote_name}' not found.")
+    Branches on ``remote_name``: ``"cloud"`` (or the legacy
+    ``"ssh:cloud"``) routes through ``CloudBackend``; anything else
+    is treated as an SSH remote.
+    """
+    from lqh.remote.compute import is_cloud
 
-    backend = SSHDirectBackend(remote_config, project_dir)
     run_dir = project_dir / "runs" / run_name
 
-    # Read job_id from local metadata
     meta_file = run_dir / "remote_job.json"
     if not meta_file.exists():
         return ToolResult(content=f"Error: no remote job metadata for run '{run_name}'.")
-
     meta = json.loads(meta_file.read_text())
     job_id = meta["job_id"]
     remote_run_dir = meta["remote_run_dir"]
+
+    if is_cloud(remote_name):
+        from lqh.remote.backend import RemoteConfig
+        from lqh.remote.cloud import CloudBackend
+
+        cfg = RemoteConfig(
+            name="cloud",
+            type="cloud",
+            hostname="api.lqh.ai",
+            remote_root="cloud:lqh",
+        )
+        backend = CloudBackend(cfg, project_dir)
+        display_remote = "LQH Cloud"
+    else:
+        from lqh.remote.config import get_remote
+        from lqh.remote.ssh_direct import SSHDirectBackend
+
+        remote_config = get_remote(project_dir, remote_name)
+        if remote_config is None:
+            return ToolResult(content=f"Error: remote '{remote_name}' not found.")
+        backend = SSHDirectBackend(remote_config, project_dir)
+        display_remote = remote_name
 
     try:
         # Sync progress first
@@ -2274,7 +2293,7 @@ async def _training_status_remote(
         "waiting_for_scoring": "⏳", "unknown": "❓",
     }
     emoji = state_emoji.get(status.state, "❓")
-    lines = [f"{emoji} **{run_name}** — {status.state} (remote: {remote_name})"]
+    lines = [f"{emoji} **{run_name}** — {status.state} (remote: {display_remote})"]
     if status.current_step is not None:
         lines.append(f"  Step: {status.current_step}")
     if status.error:
@@ -2740,6 +2759,156 @@ async def handle_start_local_eval(
             f"  PID:     {pid}\n"
             f"  Dir:     runs/{run_name}/\n\n"
             f"Predictions will be scored automatically when ready."
+        )
+    )
+
+
+async def handle_eval_hf_model(
+    project_dir: Path,
+    *,
+    repo: str,
+    eval_dataset: str,
+    scorer: str,
+    revision: str = "main",
+    training_method: str = "lora",
+    base_model: str | None = None,
+    system_prompt_path: str | None = None,
+    judge_size: str = "small",
+    run_name: str | None = None,
+    max_new_tokens: int = 4096,
+    **kwargs: Any,
+) -> ToolResult:
+    """Submit an eval_hf cloud job — runs ``lqh.infer.eval_hf`` in a
+    GPU sandbox (backend-implemented) to evaluate any HF checkpoint
+    against this project's eval set + scorer.
+
+    Cloud-only: HF download + GPU inference + judge scoring all happen
+    sandbox-side using the scoped LQH_API_TOKEN. SSH backends are not
+    a supported route in v1 — they'd need their own HF-download +
+    scoped-token plumbing that doesn't exist yet, and the use case
+    (evaluate someone else's HF model without locally training)
+    naturally lives on managed compute.
+    """
+    on_bg_started = kwargs.get("on_background_task_started")
+
+    # --- Validate inputs ---
+    if training_method not in ("lora", "full"):
+        return ToolResult(
+            content=f"Error: training_method must be 'lora' or 'full', got {training_method!r}"
+        )
+    if training_method == "lora" and not base_model:
+        return ToolResult(
+            content="Error: base_model is required when training_method='lora'"
+        )
+    if judge_size not in ("small", "medium", "large"):
+        return ToolResult(
+            content=f"Error: judge_size must be small/medium/large, got {judge_size!r}"
+        )
+
+    ds_path = _validate_path(project_dir, eval_dataset)
+    data_parquet = ds_path / "data.parquet"
+    if not data_parquet.exists():
+        return ToolResult(
+            content=f"Error: eval dataset not found at {eval_dataset}/data.parquet"
+        )
+
+    scorer_resolved = _validate_path(project_dir, scorer)
+    if not scorer_resolved.exists():
+        return ToolResult(content=f"Error: scorer not found at {scorer}")
+
+    try:
+        system_prompt, schema_dict = _resolve_eval_extras(
+            project_dir,
+            system_prompt_path=system_prompt_path,
+            response_format_path=None,
+        )
+    except FileNotFoundError as e:
+        return ToolResult(content=f"Error: {e}")
+
+    if not run_name:
+        run_name = _next_run_name(project_dir, "eval_hf")
+    run_dir = project_dir / "runs" / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Build sandbox config ---
+    # The sandbox cd's to the bundle root, so the dataset / scorer
+    # paths in the config must be relative paths inside the bundle.
+    # We pass them as the user gave them (project-relative); the
+    # manifest list below tells build_bundle which on-disk files to
+    # ship under those same paths.
+    config: dict[str, Any] = {
+        "type": "eval_hf",
+        "hf_repo": repo,
+        "revision": revision,
+        "training_method": training_method,
+        "eval_dataset": f"{eval_dataset}/data.parquet",
+        "scorer": scorer,
+        "judge_size": judge_size,
+        "max_new_tokens": max_new_tokens,
+        # manifest tells lqh.remote.bundle.resolve_manifest which keys
+        # in this config name files to include in the bundle. The hf
+        # repo itself is downloaded sandbox-side via snapshot_download
+        # — it's NOT in the manifest.
+        "manifest": ["eval_dataset", "scorer"],
+    }
+    if training_method == "lora":
+        config["base_model"] = base_model
+    if system_prompt is not None:
+        config["system_prompt"] = system_prompt
+    if schema_dict is not None:
+        config["response_format"] = schema_dict
+    if system_prompt_path:
+        # Also include the source file in the bundle so the
+        # artifact_lineage row can pin it (the publisher records the
+        # config alongside the eval artifacts).
+        config["system_prompt_path"] = system_prompt_path
+        config["manifest"].append("system_prompt_path")
+
+    # --- Submit to LQH Cloud ---
+    from lqh.remote.backend import RemoteConfig
+    from lqh.remote.cloud import CloudBackend
+
+    cfg = RemoteConfig(
+        name="cloud",
+        type="cloud",
+        hostname="api.lqh.ai",
+        remote_root="cloud:lqh",
+    )
+    backend = CloudBackend(cfg, project_dir)
+    try:
+        job_id = await backend.submit_run(
+            str(run_dir), config, module="lqh.infer.eval_hf",
+        )
+    except Exception as e:  # noqa: BLE001
+        return ToolResult(content=f"Error submitting eval_hf job: {e}")
+
+    if on_bg_started is not None:
+        on_bg_started(run_name, "eval", run_name, "cloud")
+
+    from lqh.project_log import append_event
+
+    append_event(
+        project_dir,
+        "eval_hf_started",
+        f"Submitted eval_hf for {repo}@{revision} (run {run_name}, job {job_id})",
+        run_name=run_name,
+        run_type="eval_hf",
+        base_model=repo,
+        remote="cloud",
+    )
+
+    return ToolResult(
+        content=(
+            f"🧪 HF eval submitted\n"
+            f"  Run:     {run_name}\n"
+            f"  Repo:    {repo}@{revision}\n"
+            f"  Method:  {training_method}"
+            + (f" (base {base_model})" if training_method == 'lora' else "")
+            + f"\n"
+            f"  Judge:   judge:{judge_size}\n"
+            f"  Job ID:  {job_id}\n\n"
+            f"Use training_status to monitor; eval_result.json lands "
+            f"under runs/{run_name}/ when done."
         )
     )
 
@@ -3433,6 +3602,7 @@ TOOL_HANDLERS: dict[str, Callable[..., Awaitable[ToolResult]]] = {
     "training_status": handle_training_status,
     "stop_training": handle_stop_training,
     "start_local_eval": handle_start_local_eval,
+    "eval_hf_model": handle_eval_hf_model,
     "remote_list": handle_remote_list,
     "remote_add": handle_remote_add,
     "remote_bind": handle_remote_bind,
