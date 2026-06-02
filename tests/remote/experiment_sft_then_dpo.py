@@ -327,8 +327,7 @@ async def main(
             "type": "on_policy_dpo",
             "base_model": sft_model_remote,  # start from SFT model
             "dataset": str(train_path),
-            # DPO generates on the training dataset (preference_dataset defaults
-            # to dataset when not set).  No eval_dataset needed here.
+            # DPO generates on-policy rollouts from `dataset` (training data).
             "system_prompt": SYSTEM_PROMPT,
             "num_iterations": DPO_ITERATIONS,
             "dpo_beta": DPO_BETA,

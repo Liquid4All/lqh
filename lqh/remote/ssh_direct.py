@@ -487,7 +487,7 @@ def _rewrite_config_paths(
     """
     project_str = str(project_dir)
     path_keys = (
-        "dataset", "eval_dataset", "preference_dataset", "base_model", "scorer",
+        "dataset", "eval_dataset", "base_model", "scorer",
     )
 
     def _rewrite_level(d: dict[str, Any]) -> dict[str, Any]:
@@ -516,7 +516,7 @@ def _resolve_local_manifest(
     in a ``manifest`` key. Recurses one level into ``base_config`` so
     hyperparameter-sweep payloads sync their datasets correctly.
     """
-    path_keys = ("dataset", "eval_dataset", "preference_dataset", "scorer")
+    path_keys = ("dataset", "eval_dataset", "scorer")
 
     def _collect(d: dict[str, Any], into: list[Path]) -> None:
         for key in path_keys:

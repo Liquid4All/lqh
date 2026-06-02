@@ -3,10 +3,11 @@
 This module is only imported inside the training subprocess — never by
 the main lqh process.  All torch/transformers/trl imports happen here.
 
-The DPO loop generates predictions on the preference dataset (defaults to
-the training dataset), waits for the main process to score and assemble
-preferences, then runs a DPO optimization step.  This ping-pong repeats
-for ``num_iterations``.
+The DPO loop generates on-policy rollouts on the training prompts
+(``config['dataset']`` — the single prompt source; ``eval_dataset`` is
+held-out and never feeds training), waits for the main process to score
+and assemble preferences, then runs a DPO optimization step.  This
+ping-pong repeats for ``num_iterations``.
 """
 
 from __future__ import annotations
@@ -352,20 +353,19 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
     5. Repeat
     """
     base_model = config["base_model"]
-    # The preference dataset provides prompts for on-policy generation.
-    # Defaults to the training dataset when not explicitly provided.
-    # Chained .get so we never index a missing key — the proxy
-    # harness passes only `preference_dataset`.
-    preference_dataset_path = (
-        config.get("preference_dataset")
-        or config.get("eval_dataset")
-        or config.get("dataset")
-    )
-    # Optional held-out eval dataset — when set, the subprocess runs
-    # inference on it after each DPO iter's checkpoint and writes
-    # eval_predictions.parquet alongside the iter dir. The harness
-    # scores those predictions and can write run_dir/early_abort.json
-    # to ask the subprocess to stop on regression.
+    # On-policy generation prompts come from the training dataset.
+    # ``dataset`` is the single source of prompts — there is no
+    # eval_dataset/preference_dataset fallback. ``eval_dataset`` is the
+    # held-out eval set ONLY (scored by the sweep's eval-of-best on
+    # unseen prompts) and must never feed training. When generation is
+    # skipped (pre-seeded preferences), this path is unused.
+    prompt_dataset_path = config.get("dataset")
+    # Optional per-iteration held-out eval (early-abort feature) — when
+    # set, the subprocess runs inference on it after each DPO iter's
+    # checkpoint and writes eval_predictions.parquet alongside the iter
+    # dir; the harness scores those and can write run_dir/early_abort.json
+    # to stop on regression. This is distinct from (and additional to) the
+    # standard end-of-run eval-of-best, which scores ``eval_dataset``.
     held_out_eval_path = config.get("held_out_eval_dataset")
     # When set, iters whose preferences.parquet already exists on disk
     # skip the (expensive) on-policy generation step entirely. Used by
@@ -379,6 +379,17 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
     dpo_beta = config.get("dpo_beta", 0.1)
     training_cfg = config.get("training", {})
     lora_cfg = config.get("lora", {})
+
+    # Fail fast BEFORE the (expensive) model load: on-policy generation
+    # needs prompts from `dataset`. A legacy config that only set
+    # `preference_dataset`/`eval_dataset` would otherwise load the model
+    # and then crash late and unclearly when the prompt load runs.
+    if not prompt_dataset_path and not skip_generation_if_preferences_exist:
+        raise ValueError(
+            "dpo_loop: config['dataset'] is required — it is the on-policy "
+            "generation prompt source. The legacy 'preference_dataset' / "
+            "'eval_dataset' fallbacks were removed; set 'dataset'."
+        )
 
     print(f"Loading model: {base_model}")
 
@@ -444,8 +455,8 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
     max_new_tokens = training_cfg.get("max_seq_length", 2048)
     preference_convos: list[list[dict[str, str]]] = []
     if not skip_generation_if_preferences_exist:
-        print(f"Loading preference dataset: {preference_dataset_path}")
-        preference_convos = load_chatml_dataset(preference_dataset_path)
+        print(f"Loading prompt dataset for on-policy generation: {prompt_dataset_path}")
+        preference_convos = load_chatml_dataset(prompt_dataset_path)
 
     # Load held-out eval prompts once (cheap; just a parquet read).
     held_out_convos: list[list[dict[str, str]]] | None = None

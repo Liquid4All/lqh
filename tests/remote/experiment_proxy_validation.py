@@ -170,13 +170,12 @@ def train_one_dpo(
     config = {
         "type": "on_policy_dpo",
         "base_model": base_model,
-        # preference_dataset is irrelevant here — generation is
-        # skipped because preferences.parquet is pre-seeded. We still
-        # need to point it at SOME valid parquet for the initial
-        # load_chatml_dataset call at module top; use the
-        # preferences file itself (the load is forgiving — it only
-        # reads the "messages" column shape, which we won't use).
-        "preference_dataset": str(preferences_path.resolve()),
+        # dataset is irrelevant here — on-policy generation is skipped
+        # because preferences.parquet is pre-seeded per iter. We still
+        # point it at SOME valid parquet to satisfy the prompt-load path;
+        # use the preferences file itself (the load is never reached when
+        # skip_generation_if_preferences_exist is True).
+        "dataset": str(preferences_path.resolve()),
         "skip_generation_if_preferences_exist": True,
         "num_iterations": 1,
         "dpo_beta": cfg.beta,

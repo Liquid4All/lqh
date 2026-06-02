@@ -775,7 +775,14 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "The compute target (LQH Cloud vs a bring-your-own-compute remote) is "
                 "fixed per project and chosen once via a system picker — do NOT ask the "
                 "user where to train and do NOT pass any compute/remote argument; just "
-                "call start_training and it routes automatically."
+                "call start_training and it routes automatically. "
+                "`eval_dataset` is REQUIRED (a small hyperparameter sweep runs "
+                "automatically and uses it as the held-out signal to pick the winner). "
+                "You must also pass `scorer` — set to the project's default/best scorer — "
+                "so the best checkpoint gets a real judge score; the call is rejected "
+                "unless you pass `scorer` or set `disable_scoring=true` (only when the "
+                "user explicitly asks not to score). The judge score is not returned by "
+                "this call — after the run completes, fetch it with `training_status`."
             ),
             parameters={
                 "type": "object",
@@ -799,22 +806,54 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "type": "string",
                         "description": (
                             "Relative path to the training dataset directory "
-                            "(e.g. 'datasets/summarization_v1'). Must contain data.parquet."
+                            "(e.g. 'datasets/summarization_v1'). Must contain data.parquet. "
+                            "This is the single source of training prompts: SFT trains on "
+                            "these conversations; DPO generates its on-policy rollouts from "
+                            "these prompts. Never used for evaluation — that is "
+                            "`eval_dataset`."
                         ),
                     },
                     "eval_dataset": {
                         "type": "string",
                         "description": (
-                            "Relative path to the eval dataset directory. If provided, "
-                            "checkpoint evaluations are run automatically via the API judge."
+                            "Relative path to the held-out eval dataset directory "
+                            "(must contain data.parquet). REQUIRED — pass the project's "
+                            "eval set (e.g. 'datasets/<name>_eval'), DISTINCT from "
+                            "`dataset`. It is held-out: never used to generate training "
+                            "data, only for evaluation. It is the signal the sweep selects "
+                            "its winner on (for SFT this is the in-training val_loss; for "
+                            "DPO the proxy is a preference split) AND — together with "
+                            "`scorer` — the set the best checkpoint is judge-scored on."
                         ),
                     },
                     "scorer": {
                         "type": "string",
                         "description": (
-                            "Relative path to the scorer .md file for checkpoint evaluations "
-                            "(e.g. 'evals/scorers/summarization_v1.md')."
+                            "Relative path to the scorer .md file. Set this to the "
+                            "project's default or currently-best scorer — typically the "
+                            "one under evals/scorers/ used for the baseline eval "
+                            "(e.g. 'evals/scorers/summarization_v1.md'). REQUIRED unless "
+                            "you set `disable_scoring=true`: the call is rejected if "
+                            "neither is provided. Without a scorer the run yields only the "
+                            "val_loss proxy and NO judge score on the best checkpoint. The "
+                            "judge score is NOT returned by this call — after the run "
+                            "finishes, fetch it via `training_status` and the run's "
+                            "eval_result.json / sweep_summary.json."
                         ),
+                    },
+                    "disable_scoring": {
+                        "type": "boolean",
+                        "description": (
+                            "SFT only. Set true ONLY when the user explicitly asks not to "
+                            "score the run ('just train, no eval', 'skip scoring'). When "
+                            "false (default) you MUST pass `scorer` — the call is rejected "
+                            "if neither `scorer` nor `disable_scoring=true` is given, so "
+                            "that skipping the judge score is always a deliberate choice, "
+                            "never a silent omission. DPO ignores this and rejects it: "
+                            "on-policy DPO must score rollouts every iteration to build "
+                            "preferences, so a scorer is always required for DPO."
+                        ),
+                        "default": False,
                     },
                     "run_name": {
                         "type": "string",
@@ -863,7 +902,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "default": "dataset",
                     },
                 },
-                "required": ["type", "base_model", "dataset"],
+                "required": ["type", "base_model", "dataset", "eval_dataset"],
             },
         ),
         # ------------------------------------------------------------------

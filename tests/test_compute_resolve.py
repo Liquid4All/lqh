@@ -188,8 +188,8 @@ def test_first_run_routes_to_cloud_silently(tmp_path, isolated_home, monkeypatch
         type="sft",
         base_model="LiquidAI/LFM2-1.2B",
         dataset=ds,
-        eval_dataset=ds,
-        scorer=None,
+        eval_dataset=_make_dataset(project, "ds_eval"),
+        disable_scoring=True,
     ))
 
     assert recorded.get("remote_name") == "cloud"
@@ -230,14 +230,14 @@ def test_cloud_training_config_uses_project_relative_dataset_paths(
         type="sft",
         base_model="LiquidAI/LFM2-1.2B",
         dataset=ds,
-        eval_dataset=ds,
-        scorer=None,
+        eval_dataset=_make_dataset(project, "ds_eval"),
+        disable_scoring=True,
     ))
 
     assert recorded["remote_name"] == "cloud"
     base_config = recorded["config"]["base_config"]
     assert base_config["dataset"] == "datasets/ds/data.parquet"
-    assert base_config["eval_dataset"] == "datasets/ds/data.parquet"
+    assert base_config["eval_dataset"] == "datasets/ds_eval/data.parquet"
     assert not Path(base_config["dataset"]).is_absolute()
 
 
@@ -299,8 +299,8 @@ def test_picker_skipped_when_global_default_set(tmp_path, isolated_home, monkeyp
         type="sft",
         base_model="LiquidAI/LFM2-1.2B",
         dataset=ds,
-        eval_dataset=ds,
-        scorer=None,
+        eval_dataset=_make_dataset(project, "ds_eval"),
+        disable_scoring=True,
     ))
 
     assert recorded.get("remote_name") == "cloud"
@@ -331,8 +331,8 @@ def test_picker_fires_with_byoc_remote(tmp_path, isolated_home, monkeypatch):
         type="sft",
         base_model="LiquidAI/LFM2-1.2B",
         dataset=ds,
-        eval_dataset=ds,
-        scorer=None,
+        eval_dataset=_make_dataset(project, "ds_eval"),
+        disable_scoring=True,
     ))
 
     assert res.requires_user_input

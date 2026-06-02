@@ -1856,6 +1856,7 @@ async def handle_start_training(
     dataset: str,
     eval_dataset: str | None = None,
     scorer: str | None = None,
+    disable_scoring: bool = False,
     run_name: str | None = None,
     lora: bool = True,
     num_epochs: int = 3,
@@ -1890,6 +1891,32 @@ async def handle_start_training(
     config with lr=2e-5"). Specific ``learning_rate``/``num_epochs``/
     ``dpo_beta`` values supplied by the agent are honoured under
     ``enable_sweep=false``; under sweep they are overridden by the grid.
+
+    Eval / scoring contract
+    -----------------------
+    ``dataset`` and ``eval_dataset`` are strictly separated for both SFT
+    and DPO: ``dataset`` is the only source of training prompts (SFT trains
+    on it; DPO generates on-policy rollouts from it), and ``eval_dataset``
+    is held-out — used only for evaluation, never to generate training
+    data.
+
+    ``eval_dataset`` is mandatory and must resolve to a DIFFERENT path than
+    ``dataset`` (the call is rejected otherwise). For SFT it is the sweep's
+    selection signal (held-out val_loss) and the judge eval-of-best set.
+    For DPO the sweep selects on a held-out split of the *preferences*
+    (``eval_ce_chosen_mean``), not on ``eval_dataset`` — there
+    ``eval_dataset`` is purely the judge eval-of-best set (scored on unseen
+    prompts). The call is rejected without it.
+
+    ``scorer`` must be an explicit decision: pass the project's
+    default/current scorer, or set ``disable_scoring=True`` (only when the
+    user explicitly asks not to score). The call is rejected when neither
+    is provided, so a missing judge score is never a silent omission.
+
+    ``disable_scoring`` is SFT-only — it skips the final judge eval while
+    training still proceeds on the val_loss proxy. **DPO rejects it**:
+    on-policy DPO builds its preference pairs from scored rollouts every
+    iteration, so a scorer is mandatory for DPO to run at all.
     """
     from lqh.tools.permissions import check_permission
 
@@ -1939,6 +1966,18 @@ async def handle_start_training(
         return ToolResult(content=f"Error: dataset not found at {dataset}/data.parquet")
     dataset_config_path = data_parquet.relative_to(project_dir.resolve()).as_posix()
 
+    # eval_dataset is mandatory: the sweep needs a held-out signal to pick its
+    # winner, and the judge eval-of-best needs rollouts to score. (The tool
+    # schema marks it required; this guards non-schema callers.)
+    if not eval_dataset:
+        return ToolResult(
+            content=(
+                "Error: eval_dataset is required. Pass the project's held-out eval "
+                "set (e.g. 'datasets/<name>_eval'). It is the signal used to select "
+                "the sweep winner and the set the best checkpoint is judge-scored on."
+            )
+        )
+
     eval_parquet_path: str | None = None
     if eval_dataset:
         eval_ds_path = _validate_path(project_dir, eval_dataset)
@@ -1948,6 +1987,45 @@ async def handle_start_training(
                 content=f"Error: eval dataset not found at {eval_dataset}/data.parquet"
             )
         eval_parquet_path = eval_parquet.relative_to(project_dir.resolve()).as_posix()
+        # dataset and eval_dataset must be DISTINCT. Evaluating on the
+        # training prompts is exactly the leak the train/eval split exists
+        # to prevent — reject identical resolved paths rather than silently
+        # scoring the model on data it trained on.
+        if data_parquet.resolve() == eval_parquet.resolve():
+            return ToolResult(
+                content=(
+                    "Error: eval_dataset must be different from dataset — they both "
+                    f"resolve to {dataset_config_path}. Evaluating on the training "
+                    "prompts leaks train into eval. Pass a separate held-out eval set "
+                    "(e.g. 'datasets/<name>_eval')."
+                )
+            )
+
+    # On-policy DPO builds its preference pairs by judge-scoring generated
+    # rollouts every iteration, so a scorer is mandatory — scoring cannot be
+    # disabled the way it can for SFT (where it only gates the final eval).
+    if type in ("on_policy_dpo", "dpo") and disable_scoring:
+        return ToolResult(
+            content=(
+                "Error: scoring cannot be disabled for DPO. On-policy DPO assembles "
+                "its preference pairs from scored rollouts each iteration, so a scorer "
+                "is required — pass `scorer=<path>` (the project's default/best scorer)."
+            )
+        )
+
+    # Scoring must be an explicit decision: pass a scorer, or opt out via
+    # disable_scoring. Silently omitting the scorer would degrade eval-of-best
+    # to proxy-only with no judge score — a common, quiet failure mode.
+    if not scorer and not disable_scoring:
+        return ToolResult(
+            content=(
+                "Error: no scorer provided. The best checkpoint needs a scorer to get "
+                "a real judge score. Pass `scorer=<path>` set to the project's "
+                "default/current scorer (the one under evals/scorers/ used for the "
+                "baseline eval), or — only if the user explicitly asked not to score — "
+                "set disable_scoring=true."
+            )
+        )
 
     scorer_path: str | None = None
     if scorer:

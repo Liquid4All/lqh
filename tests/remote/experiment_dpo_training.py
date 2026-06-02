@@ -256,7 +256,7 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
             "type": "on_policy_dpo",
             "base_model": MODEL_ID,
             "dataset": str(train_path),
-            # preference_dataset defaults to dataset (training data)
+            # DPO generates on-policy rollouts from `dataset` (training data)
             "system_prompt": SYSTEM_PROMPT,
             "num_iterations": NUM_ITERATIONS,
             "dpo_beta": DPO_BETA,

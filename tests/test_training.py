@@ -413,9 +413,13 @@ def training_workspace(
     write_chatml_parquet,
     sample_conversations: Callable[[int], list],
 ) -> Path:
-    """Project dir with dataset, scorer, and auto-allow permissions."""
+    """Project dir with train + eval datasets, scorer, and auto-allow perms."""
     ds_dir = tmp_path / "datasets" / "test_ds"
     write_chatml_parquet(ds_dir / "data.parquet", sample_conversations(5))
+
+    # Separate held-out eval set — dataset and eval_dataset must be distinct.
+    eval_dir = tmp_path / "datasets" / "test_eval"
+    write_chatml_parquet(eval_dir / "data.parquet", sample_conversations(3))
 
     scorer_dir = tmp_path / "evals" / "scorers"
     scorer_dir.mkdir(parents=True)
@@ -482,9 +486,76 @@ class TestTrainingToolValidation:
             type="sft",
             base_model="test-model",
             dataset="datasets/test_ds",
+            eval_dataset="datasets/test_eval",
             scorer="evals/scorers/nonexistent.md",
         )
         assert "not found" in result.content
+
+    async def test_start_training_requires_eval_dataset(
+        self, training_workspace: Path, stub_torch_available,
+    ) -> None:
+        """eval_dataset is mandatory — the run is rejected without it."""
+        from lqh.tools.handlers import handle_start_training
+
+        result = await handle_start_training(
+            training_workspace,
+            type="sft",
+            base_model="test-model",
+            dataset="datasets/test_ds",
+            scorer="evals/scorers/test_scorer.md",
+        )
+        assert "eval_dataset is required" in result.content
+
+    async def test_start_training_rejects_silent_no_scorer(
+        self, training_workspace: Path, stub_torch_available,
+    ) -> None:
+        """Omitting the scorer without disable_scoring is rejected, so a
+        missing judge score is never a silent omission."""
+        from lqh.tools.handlers import handle_start_training
+
+        result = await handle_start_training(
+            training_workspace,
+            type="sft",
+            base_model="test-model",
+            dataset="datasets/test_ds",
+            eval_dataset="datasets/test_eval",
+        )
+        assert "no scorer provided" in result.content
+        assert "disable_scoring" in result.content
+
+    async def test_dpo_cannot_disable_scoring(
+        self, training_workspace: Path, stub_torch_available,
+    ) -> None:
+        """DPO scores rollouts every iteration to build preferences, so
+        disable_scoring is rejected — a scorer is mandatory for DPO."""
+        from lqh.tools.handlers import handle_start_training
+
+        result = await handle_start_training(
+            training_workspace,
+            type="on_policy_dpo",
+            base_model="test-model",
+            dataset="datasets/test_ds",
+            eval_dataset="datasets/test_eval",
+            disable_scoring=True,
+        )
+        assert "cannot be disabled for DPO" in result.content
+
+    async def test_start_training_rejects_identical_train_eval(
+        self, training_workspace: Path, stub_torch_available,
+    ) -> None:
+        """dataset and eval_dataset must resolve to different paths —
+        identical paths leak training prompts into the eval and are rejected."""
+        from lqh.tools.handlers import handle_start_training
+
+        result = await handle_start_training(
+            training_workspace,
+            type="sft",
+            base_model="test-model",
+            dataset="datasets/test_ds",
+            eval_dataset="datasets/test_ds",
+            scorer="evals/scorers/test.md",
+        )
+        assert "must be different from dataset" in result.content
 
     async def test_training_status_no_runs(self, training_workspace: Path) -> None:
         from lqh.tools.handlers import handle_training_status

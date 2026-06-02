@@ -117,11 +117,18 @@ start_training(
 ```
 
 DPO iteratively:
-1. Generates model responses on the eval set
+1. Generates model responses on the **training** prompts (`dataset`)
 2. Scores them with the API judge
 3. Gets "golden" (better) responses for low-scoring samples
 4. Runs a DPO optimization step using (golden, low-scoring) pairs
 5. Repeats for `num_iterations` rounds
+
+`dataset` vs `eval_dataset` are strictly separated, same as SFT: DPO builds its
+preference pairs from rollouts on `dataset` (training prompts), and the best
+checkpoint is judge-scored on the held-out `eval_dataset` (unseen prompts).
+`eval_dataset` never feeds the DPO loop. (Note: the DPO sweep selects its winner
+on a held-out split of the *preferences* — `eval_ce_chosen_mean` — not on
+`eval_dataset` directly; `eval_dataset` is the final judge eval-of-best set.)
 
 **`golden_source`** controls where the preferred responses come from:
 - `"dataset"` — uses the original assistant turn from training data (free, no API call)
@@ -189,6 +196,28 @@ These are read when `enable_sweep=false`:
 - **`num_iterations`** (default: 5) — DPO only.
 - **`dpo_beta`** (default: 0.1) — DPO KL anchor strength.
 
+### `eval_dataset` is required; scoring is on by default
+
+**`eval_dataset` is mandatory.** `start_training` rejects the call without it. It is the held-out set the sweep selects the winner on (for SFT this is the in-training `eval_loss`; for DPO the proxy is a preference split) **and** the set the best checkpoint is judge-scored on. The proxy only *selects* the winner — it is not the result you report to the user.
+
+**Pass `scorer` by default — set it to the project's default or currently-best scorer** (typically the one under `evals/scorers/` you used for the baseline eval). This is what makes a run produce a **real judge score** on the best checkpoint.
+
+- **Scoring must be an explicit decision.** `start_training` rejects the call unless you either pass `scorer` or set `disable_scoring=true`. There is no silent "no scorer" path anymore — a missing judge score is always deliberate.
+- **Only set `disable_scoring=true` if the user explicitly says not to score** — "don't score it", "skip the eval", "just train, no scoring". This is the exception, and it is **SFT-only**.
+- **DPO always requires a scorer — `disable_scoring` is rejected for DPO.** On-policy DPO builds its preference pairs by judge-scoring generated rollouts every iteration, so without a scorer the method cannot run at all (it's not just the final eval, as with SFT). For DPO you must always pass `scorer`.
+- **Without a scorer (SFT), eval-of-best degrades to proxy-only** — you get no judge number, only the val_loss proxy. That's why scoring is opt-out, not opt-in.
+- On LQH Cloud the judge scoring runs **inside the sandbox** with a scoped token, so it completes even if the user closes their laptop. The score is uploaded as an artifact and is available on reconnect — the sandbox does not need to still be alive to read it.
+
+### Fetch the judge score after the run
+
+A finished run does **not** push the judge score into your context automatically — you must fetch it. Once the run reaches a terminal state (including when reconnecting after the laptop was closed during a long sweep + eval):
+
+1. Call `training_status(run_name=...)` — the sweep table surfaces the per-config proxy and the winner.
+2. Read the eval-of-best **judge score** from the run artifacts (`eval_result.json`, or `sweep_summary.json`'s `eval_of_best`). These are pulled from the artifact store, so this works on reconnect.
+3. Report the **judge score vs. baseline** — not the val_loss proxy — when telling the user whether training worked.
+
+If you passed `scorer` + `eval_dataset`, the eval-of-best already ran as part of the run, so you generally do **not** need a separate `start_local_eval` to get the winner's score. Only run one to evaluate a *different* model or held-out set.
+
 ## Directory Structure
 
 ```
@@ -220,26 +249,30 @@ When helping the user with training:
 
 1. **Always run a baseline eval first** — before training, run `run_scoring` with `mode=model_eval` on the base model to establish a score baseline.
 
-2. **Do NOT ask the user whether to hyperparameter-tune.** Sweeping is the default and the user expects it. Just kick off the run. If sweeping will surprise the user (e.g. they expected a fast single-config run), inform them in one sentence after starting: *"I'm running a 6-config sweep — this will pick the best hyperparameters automatically. Use `enable_sweep=false` next time if you'd prefer a single config."* Do **not** gate the run on confirmation.
+2. **Always pass `eval_dataset` and a `scorer`** — `eval_dataset` is required (the run is rejected without it). Set `scorer` to the project's default/best scorer (the one under `evals/scorers/` used for the baseline eval) so the run produces a real judge score, not just the internal proxy. The run is rejected unless you pass `scorer` or set `disable_scoring=true` — **set `disable_scoring=true` only when the user explicitly asks not to score** ("don't score it", "skip the eval"). See *`eval_dataset` is required; scoring is on by default*.
 
-3. **Only pass `enable_sweep=false` when the user explicitly opts out.** Phrases that count as opt-out: "don't tune", "skip the sweep", "just one run", "use these hyperparameters", or any concrete `learning_rate=…` value attached to "just this once". When `enable_sweep=false`, you may pass specific `learning_rate` / `num_epochs` / `dpo_beta` values.
+3. **Fetch the judge score after the run** — a finished run does not push the score into your context. Once the run is terminal (including on reconnect after a closed laptop), call `training_status(run_name=...)` and read the eval-of-best judge score from the run artifacts (`eval_result.json` / `sweep_summary.json` `eval_of_best`), then report **judge score vs. baseline**. See *Fetch the judge score after the run*.
 
-4. **Follow the validate → scale → polish strategy** — unless the user explicitly requests otherwise:
+4. **Do NOT ask the user whether to hyperparameter-tune.** Sweeping is the default and the user expects it. Just kick off the run. If sweeping will surprise the user (e.g. they expected a fast single-config run), inform them in one sentence after starting: *"I'm running a 6-config sweep — this will pick the best hyperparameters automatically. Use `enable_sweep=false` next time if you'd prefer a single config."* Do **not** gate the run on confirmation.
+
+5. **Only pass `enable_sweep=false` when the user explicitly opts out.** Phrases that count as opt-out: "don't tune", "skip the sweep", "just one run", "use these hyperparameters", or any concrete `learning_rate=…` value attached to "just this once". When `enable_sweep=false`, you may pass specific `learning_rate` / `num_epochs` / `dpo_beta` values.
+
+6. **Follow the validate → scale → polish strategy** — unless the user explicitly requests otherwise:
    - Start with a pilot SFT run (200-500 samples) to confirm improvement.
    - Scale up the dataset and run SFT again if the pilot succeeds.
    - Only suggest DPO after SFT has plateaued, and frame it as polishing specific failure cases.
 
-5. **Check dataset quality** — before training, verify the training data quality with `run_scoring` in `data_quality` mode. Low-quality training data = low-quality fine-tuned model.
+7. **Check dataset quality** — before training, verify the training data quality with `run_scoring` in `data_quality` mode. Low-quality training data = low-quality fine-tuned model.
 
-6. **Use `training_status` proactively** — after starting a run, periodically check status. The sweep table in `training_status` shows per-config results with the validated proxy (`eval_loss` for SFT, `eval_ce_chosen_mean` for DPO). It is intentional that DPO `eval_loss` and `eval_rewards/margins` are NOT shown — those metrics would mislead you (they can look great when the model has actually collapsed). Trust the sweep's chosen winner.
+8. **Use `training_status` proactively** — after starting a run, periodically check status. The sweep table in `training_status` shows per-config results with the validated proxy (`eval_loss` for SFT, `eval_ce_chosen_mean` for DPO). It is intentional that DPO `eval_loss` and `eval_rewards/margins` are NOT shown — those metrics would mislead you (they can look great when the model has actually collapsed). Trust the sweep's chosen winner.
 
-7. **Suggest next steps** — after a sweep completes:
+9. **Suggest next steps** — after a sweep completes:
    - Run local eval to compare the winner with baseline.
    - If scores improved and more data is available, suggest scaling up (more samples → retrain).
    - If scores plateaued with sufficient data, suggest DPO to polish specific failure cases.
    - If every DPO config in the sweep collapsed (`sweep_summary.json` winner is null), the preference set may have no useful signal for the current model — suggest either better preference filtering, smaller preference quantile, or skipping DPO.
    - If the model is ready, suggest pushing to HF Hub.
 
-8. **Handle errors gracefully** — if training fails (CUDA OOM, etc.), read `stderr.log` (or `sweep_<config>/stderr.log` for a specific config) and suggest fixes (lower batch size, enable gradient checkpointing, etc.).
+10. **Handle errors gracefully** — if training fails (CUDA OOM, etc.), read `stderr.log` (or `sweep_<config>/stderr.log` for a specific config) and suggest fixes (lower batch size, enable gradient checkpointing, etc.).
 
-9. **Respect user preferences** — if the user wants to start with DPO, skip the pilot, or use a different strategy, follow their instructions. The validate → scale → polish strategy is a default recommendation, not a requirement.
+11. **Respect user preferences** — if the user wants to start with DPO, skip the pilot, or use a different strategy, follow their instructions. The validate → scale → polish strategy is a default recommendation, not a requirement.

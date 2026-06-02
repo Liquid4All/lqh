@@ -123,7 +123,6 @@ def _build_dpo_smoke_config(dataset_rel: str, scorer_rel: str) -> dict[str, Any]
     return {
         "type": "on_policy_dpo",
         "base_model": "LiquidAI/LFM2.5-1.2B-Instruct",
-        "preference_dataset": dataset_rel,
         "dataset":            dataset_rel,
         "eval_dataset":       dataset_rel,
         "scorer":             scorer_rel,
@@ -143,7 +142,7 @@ def _build_dpo_smoke_config(dataset_rel: str, scorer_rel: str) -> dict[str, Any]
             "min_gap":             0.0,
             "min_pairs_per_iter":  1,
         },
-        "manifest": ["preference_dataset", "dataset", "eval_dataset", "scorer"],
+        "manifest": ["dataset", "eval_dataset", "scorer"],
     }
 
 
