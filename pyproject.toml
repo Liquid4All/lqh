@@ -68,3 +68,10 @@ lqh = "lqh.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["lqh"]
+
+# Scope the sdist to the package so untracked working-tree dirs (local
+# projects, scratch data) are never swept into the tarball — some contain
+# absolute symlinks that break the build. pyproject.toml and the README are
+# always included by hatchling for metadata.
+[tool.hatch.build.targets.sdist]
+only-include = ["lqh", "README.md"]
