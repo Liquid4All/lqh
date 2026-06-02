@@ -1782,9 +1782,13 @@ _MAX_PICKER_REMOTES = 5
 
 # Sentinel ToolResult.content that tells the agent loop to run the
 # one-time project compute picker (see lqh/agent.py). Returned by the
-# launch handlers when a project has >=1 BYOC remote but hasn't yet
-# chosen a compute target.
+# launch handlers when a project has a real compute choice to make but
+# hasn't yet pinned a target.
 COMPUTE_PICK_REQUIRED = "COMPUTE_PICK_REQUIRED"
+
+# The picker decides the project's compute target for all GPU work
+# (training and eval), so the question is phrased generically.
+COMPUTE_PICK_QUESTION = "Where should this project run GPU work (training & eval)?"
 
 
 def _local_gpu_available() -> bool:
@@ -1829,34 +1833,19 @@ def _compute_pick_options(project_dir: Path) -> list[str] | None:
     return options
 
 
-def _pick_compute_or_use(
-    project_dir: Path, explicit: str | None
-) -> str | None:
-    """Resolve the compute target with the precedence in lqh.remote.compute.
+def _resolve_compute_target(project_dir: Path) -> str | None:
+    """Resolve the project's pinned compute target for a launch.
 
-    LQH Cloud is the product default — ``resolve_compute`` returns
-    ``"cloud"`` when nothing has been configured, so a bare
-    ``start_training`` call without ``remote=`` routes to cloud.
-    Two escape hatches:
-
-      * ``explicit="local"`` (or empty string) — force the in-process
-        local-GPU path. Returns ``None`` so callers can take their
-        local branch.
-      * ``explicit="ssh:<name>"`` — pinned override for one call.
-
-    A persisted ``"local"`` default (project or global, e.g. picked via
-    the compute picker on a GPU box) resolves the same way — returns
-    ``None`` so the caller runs in-process.
+    The target is fixed per project (see lqh.remote.compute); there is no
+    per-call override. Returns ``"cloud"`` or ``"ssh:<name>"`` for remote
+    execution, or ``None`` for the in-process local-GPU path — a persisted
+    ``"local"`` pin (e.g. chosen via the picker on a GPU box) maps to
+    ``None`` so the caller takes its local branch.
     """
     from lqh.remote.compute import resolve_compute
 
-    if explicit in ("", "local"):
-        # Force local execution. Caller takes its own local branch.
-        return None
-    target = resolve_compute(project_dir, explicit=explicit)
-    if target == "local":
-        return None
-    return target
+    target = resolve_compute(project_dir)
+    return None if target == "local" else target
 
 
 async def handle_start_training(
@@ -1874,7 +1863,6 @@ async def handle_start_training(
     num_iterations: int = 5,
     dpo_beta: float = 0.1,
     golden_source: str = "dataset",
-    remote: str | None = None,
     enable_sweep: bool = True,
     grid_size: str = "small",
     **kwargs: Any,
@@ -1905,26 +1893,22 @@ async def handle_start_training(
     """
     from lqh.tools.permissions import check_permission
 
-    # Compute target is fixed per project. When the project has BYOC
-    # remotes configured but hasn't chosen a target yet, defer to the
-    # one-time picker driven by the agent loop (see lqh/agent.py). This
-    # never fires for cloud-only projects (silent default) or once a
-    # choice has been persisted. An explicit ``remote`` (internal/legacy
-    # callers only — the agent-facing schema no longer exposes it) wins
-    # always and bypasses the picker.
-    pick_options = None if remote is not None else _compute_pick_options(project_dir)
+    # Compute target is fixed per project — there is no per-call override.
+    # When the project has a real choice to make (a BYOC remote and/or a
+    # local GPU) but hasn't pinned a target yet, defer to the one-time
+    # picker driven by the agent loop (see lqh/agent.py). This never fires
+    # for cloud-only projects (silent default) or once a choice has been
+    # persisted.
+    pick_options = _compute_pick_options(project_dir)
     if pick_options is not None:
         return ToolResult(
             content=COMPUTE_PICK_REQUIRED,
             requires_user_input=True,
-            question="Where should this project run fine-tuning?",
+            question=COMPUTE_PICK_QUESTION,
             options=pick_options,
         )
 
-    # Resolve compute target. LQH Cloud is the product default; the
-    # agent does not need to ask the user where to train. Users who
-    # want SSH compute persist that choice via the picker / compute_set.
-    remote = _pick_compute_or_use(project_dir, remote)
+    remote = _resolve_compute_target(project_dir)
 
     # Check torch + GPU only when running locally; remote execution has its
     # own venv (provisioned by remote_setup) and its own GPUs.
@@ -2183,7 +2167,7 @@ async def _execute_start_training_remote(
             f"  Job ID:   {job_id}\n"
             f"  Host:     {remote_config.hostname}\n"
             f"  Dir:      {remote_run_dir}\n\n"
-            f"Use training_status(remote='{ssh_name}') to monitor progress."
+            f"Use training_status(run_name='{run_name}') to monitor progress."
         )
     )
 
@@ -2242,7 +2226,6 @@ async def handle_training_status(
     project_dir: Path,
     *,
     run_name: str | None = None,
-    remote: str | None = None,
     **kwargs: Any,
 ) -> ToolResult:
     """Check training run status.
@@ -2621,7 +2604,6 @@ async def handle_stop_training(
     project_dir: Path,
     *,
     run_name: str,
-    remote: str | None = None,
     **kwargs: Any,
 ) -> ToolResult:
     """Stop a training subprocess.
@@ -2767,7 +2749,6 @@ async def handle_start_local_eval(
     dataset: str,
     scorer: str,
     run_name: str | None = None,
-    remote: str | None = None,
     system_prompt_path: str | None = None,
     response_format_path: str | None = None,
     max_new_tokens: int = 4096,
@@ -2778,15 +2759,26 @@ async def handle_start_local_eval(
 
     on_bg_started = kwargs.get("on_background_task_started")
 
-    # Compute target is fixed per project. Eval runs on the project's
-    # configured bring-your-own-compute SSH remote when there is one;
+    # Compute target is fixed per project — same one-time picker as
+    # training. If the project has a real choice (a BYOC remote and/or a
+    # local GPU) but hasn't pinned a target, defer to the picker.
+    pick_options = _compute_pick_options(project_dir)
+    if pick_options is not None:
+        return ToolResult(
+            content=COMPUTE_PICK_REQUIRED,
+            requires_user_input=True,
+            question=COMPUTE_PICK_QUESTION,
+            options=pick_options,
+        )
+
+    # Eval runs on the project's pinned SSH remote when there is one;
     # otherwise it runs locally in-process. Cloud eval of LQH-trained
     # checkpoints isn't wired yet (the artifact-aware cloud eval path is
-    # a gap — eval_hf_model only accepts HF repos), so a cloud-default
+    # a gap — eval_hf_model only accepts HF repos), so a cloud-pinned
     # project falls back to the local path rather than erroring; to
     # evaluate a cloud-trained checkpoint, push it via hf_push and use
     # eval_hf_model instead.
-    target = _pick_compute_or_use(project_dir, remote)
+    target = _resolve_compute_target(project_dir)
     ssh_name = ssh_remote_name(target) if target else None
     if ssh_name:
         return await _start_local_eval_remote(

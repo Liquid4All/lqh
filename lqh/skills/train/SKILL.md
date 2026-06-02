@@ -127,34 +127,24 @@ DPO iteratively:
 - `"dataset"` — uses the original assistant turn from training data (free, no API call)
 - `"api"` — calls the API with a strong model to generate better responses
 
-## Remote Training
+## Where training runs (compute target)
 
-If the local machine has no GPU (or the user wants to train on a separate box), training can run on a remote machine over SSH. The local lqh process orchestrates; the remote runs the actual subprocess.
+**The compute target is fixed per project — you never pass it.** Just call `start_training` / `start_local_eval` with no compute or remote argument; the harness routes automatically:
 
-### One-time machine setup
+- Cloud-only project (no bring-your-own-compute remote, no local GPU) → runs on LQH Cloud silently.
+- A project that has a real choice (a configured BYOC remote and/or a local GPU) and hasn't pinned a target yet → the first `start_training`/`start_local_eval` triggers a one-time system picker (LQH Cloud / Local (this machine) / each remote). The user's pick is persisted to the project and reused automatically. Do not ask the user where to run; the picker handles it.
+
+Never pass a `remote=` (or similar) argument — those tools no longer accept one, and a wrong value is exactly the kind of mistake the per-project pin exists to prevent.
+
+### Setting up a bring-your-own-compute (SSH) machine
+
+To make a user's own GPU box available as a target, walk them through the one-time setup, then let the picker route to it:
 
 1. `remote_add(name=..., type="ssh_direct", hostname=...)` — register the machine globally. The hostname must be SSH-reachable (typically configured in `~/.ssh/config`).
 2. `remote_bind(name=..., remote_root="~/lqh/<project basename>")` — bind the machine to the current project. Use the `~/lqh/<basename>` default without asking the user; only request a different path if they've indicated a non-default location. The handler resolves `~` to an absolute path on the remote.
 3. `remote_setup(name=...)` — provisions a venv with `lqh[train]`, syncs the lqh source, and detects GPUs. Must complete before training.
 
-### Launching a remote run
-
-Pass `remote=<name>` to `start_training`. Everything else stays the same:
-
-```
-start_training(
-    type="sft",
-    base_model="LiquidAI/LFM2.5-1.2B-Instruct",
-    dataset="datasets/summarization_v1",
-    eval_dataset="datasets/summarization_v1_eval",
-    scorer="evals/scorers/summarization_v1.md",
-    remote="toka",
-)
-```
-
-The launcher syncs the dataset, scorer, and config to the remote, starts the subprocess there, and returns a job ID. Use `training_status(remote=...)` to monitor — progress and checkpoint scores are pulled back to the local mirror.
-
-The local machine does **not** need `lqh[train]` installed when training remotely.
+After setup, the next `start_training` offers the new remote in the picker. The launcher then syncs the dataset, scorer, and config to it, starts the subprocess there, and returns a job ID. Use `training_status(run_name=...)` to monitor — progress and checkpoint scores are pulled back to the local mirror. The local machine does **not** need `lqh[train]` installed when training on a remote. To change a project's pinned target later, use `compute_set`.
 
 ## Training Configuration
 

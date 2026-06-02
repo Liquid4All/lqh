@@ -438,6 +438,13 @@ def stub_torch_available():
 class TestTrainingToolValidation:
     """Training tool handlers validate inputs correctly."""
 
+    @pytest.fixture(autouse=True)
+    def _no_local_gpu(self, monkeypatch: pytest.MonkeyPatch):
+        # Pin local GPU off so the per-project compute picker never fires
+        # — these tests exercise input validation, not compute selection,
+        # and the temp workspace has no pinned target.
+        monkeypatch.setattr("lqh.tools.handlers._local_gpu_available", lambda: False)
+
     async def test_start_training_missing_dataset(
         self, training_workspace: Path, stub_torch_available,
     ) -> None:
@@ -530,15 +537,14 @@ class TestTrainingToolValidation:
     ) -> None:
         from lqh.tools.handlers import handle_start_local_eval
 
-        # remote='local' forces the in-process branch so we hit the
-        # model-path validation. Without it, the default cloud target
-        # returns the "use eval_hf_model" guidance message.
+        # No remote bound and local GPU pinned off → resolves to the
+        # in-process local branch (cloud target falls back to local for
+        # eval), so we reach model-path validation.
         result = await handle_start_local_eval(
             training_workspace,
             model_path="runs/nonexistent/model",
             dataset="datasets/test_ds",
             scorer="evals/scorers/test.md",
-            remote="local",
         )
         assert "not found" in result.content
 

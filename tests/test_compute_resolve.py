@@ -190,7 +190,6 @@ def test_first_run_routes_to_cloud_silently(tmp_path, isolated_home, monkeypatch
         dataset=ds,
         eval_dataset=ds,
         scorer=None,
-        remote=None,
     ))
 
     assert recorded.get("remote_name") == "cloud"
@@ -212,6 +211,9 @@ def test_cloud_training_config_uses_project_relative_dataset_paths(
     from lqh.tools.permissions import grant_permission
     grant_permission(project, project_wide=True)
 
+    # No remote, no local GPU → silent cloud default (no picker).
+    monkeypatch.setattr(handlers, "_local_gpu_available", lambda: False)
+
     recorded: dict = {}
 
     async def fake_remote(project_dir, run_dir, config, run_name, remote_name, api_key, **kw):
@@ -230,7 +232,6 @@ def test_cloud_training_config_uses_project_relative_dataset_paths(
         dataset=ds,
         eval_dataset=ds,
         scorer=None,
-        remote="cloud",
     ))
 
     assert recorded["remote_name"] == "cloud"
@@ -300,7 +301,6 @@ def test_picker_skipped_when_global_default_set(tmp_path, isolated_home, monkeyp
         dataset=ds,
         eval_dataset=ds,
         scorer=None,
-        remote=None,
     ))
 
     assert recorded.get("remote_name") == "cloud"
@@ -333,7 +333,6 @@ def test_picker_fires_with_byoc_remote(tmp_path, isolated_home, monkeypatch):
         dataset=ds,
         eval_dataset=ds,
         scorer=None,
-        remote=None,
     ))
 
     assert res.requires_user_input
@@ -341,35 +340,3 @@ def test_picker_fires_with_byoc_remote(tmp_path, isolated_home, monkeypatch):
     assert res.options[0] == "LQH Cloud (recommended)"
     assert any("lab-gpu" in o for o in res.options)
     assert res.options[-1].startswith("Something else")
-
-
-def test_picker_skipped_when_explicit_remote(tmp_path, isolated_home, monkeypatch):
-    """Even if no default exists, an explicit remote=... silences the picker."""
-    import lqh.tools.handlers as handlers
-
-    project = tmp_path / "proj"
-    project.mkdir()
-    ds = _make_dataset(project)
-
-    from lqh.tools.permissions import grant_permission
-    grant_permission(project, project_wide=True)
-
-    recorded: dict = {}
-
-    async def fake_remote(project_dir, run_dir, config, run_name, remote_name, api_key, **kw):
-        from lqh.tools.handlers import ToolResult
-        recorded["remote_name"] = remote_name
-        return ToolResult(content="stub")
-
-    monkeypatch.setattr(handlers, "_execute_start_training_remote", fake_remote)
-
-    asyncio.run(handlers.handle_start_training(
-        project,
-        type="sft",
-        base_model="LiquidAI/LFM2-1.2B",
-        dataset=ds,
-        eval_dataset=ds,
-        scorer=None,
-        remote="lab-gpu",
-    ))
-    assert recorded.get("remote_name") == "lab-gpu"

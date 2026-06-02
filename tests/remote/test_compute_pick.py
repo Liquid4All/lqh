@@ -102,17 +102,17 @@ def test_global_default_set_returns_none(project_dir: Path):
 
 def test_local_default_resolves_to_local_branch(project_dir: Path):
     """A persisted 'local' default maps to None so callers run in-process."""
-    from lqh.tools.handlers import _pick_compute_or_use
+    from lqh.tools.handlers import _resolve_compute_target
 
     save_project_default(project_dir, "local")
-    assert _pick_compute_or_use(project_dir, None) is None
+    assert _resolve_compute_target(project_dir) is None
 
 
 def test_cloud_default_passes_through(project_dir: Path):
-    from lqh.tools.handlers import _pick_compute_or_use
+    from lqh.tools.handlers import _resolve_compute_target
 
     save_project_default(project_dir, "cloud")
-    assert _pick_compute_or_use(project_dir, None) == "cloud"
+    assert _resolve_compute_target(project_dir) == "cloud"
 
 
 def test_remotes_capped_at_max(project_dir: Path):
