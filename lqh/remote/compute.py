@@ -1,24 +1,28 @@
-"""Default compute target — what backend ``/train`` etc. use when the
-agent doesn't pass an explicit ``remote=...``.
+"""Default compute target — what training/eval routes to.
 
-Two layers, in precedence order (highest first):
+The compute target is a **fixed, per-project decision**, not a per-call
+argument: the agent no longer passes ``remote=...``. Layers, in
+precedence order (highest first):
 
-  1. **Explicit** flag the agent passed (e.g. ``remote="lab-gpu"`` or
-     ``"cloud"``). Wins always.
-  2. **Per-project** override in ``<project>/.lqh/compute.json``.
+  1. **Explicit** value (internal/legacy callers only — the agent-facing
+     tool schemas no longer expose it). Wins always.
+  2. **Per-project** default in ``<project>/.lqh/compute.json``.
   3. **Global** default in ``~/.lqh/config.json`` (``default_compute``).
-  4. ``None`` — first-run picker fires.
+  4. LQH Cloud — the silent product default.
 
 Values are strings:
 
   ``"cloud"``                — LQH Cloud (api.lqh.ai, GPU provider backend-implemented)
   ``"ssh:<remote_name>"``    — a previously-bound SSH remote
-  ``None``                   — no decision yet
+  ``"local"``                — in-process training on this machine (needs a local CUDA GPU)
 
-Kept in a dedicated module to keep the picker policy in one place.
-``remote_name`` strings without an ``ssh:`` prefix are accepted as a
-shorthand for backwards-compat with existing agent calls that pass
-``remote="lab-gpu"``.
+The one-time project picker does NOT live here — it is driven from the
+handler layer (``handlers._compute_pick_options`` + the agent loop) and
+only fires when a project has ≥1 bring-your-own-compute remote bound but
+neither a project nor a global default set. When nothing is configured
+and no BYOC remote exists, ``resolve_compute`` silently returns
+``"cloud"`` with no prompt. ``remote_name`` strings without an ``ssh:``
+prefix are accepted as a shorthand for backwards-compat.
 """
 
 from __future__ import annotations
@@ -103,14 +107,16 @@ def resolve_compute(
 ) -> ComputeTarget:
     """Compute the effective target, applying the precedence rules.
 
-    Returns ``"cloud"`` / ``"ssh:<name>"``. **LQH Cloud is the default
-    when nothing has been configured anywhere** — the agent should
-    never need to ask the user where to train just to get started.
-    Users who want a different default set it via ``compute_set``.
+    Returns ``"cloud"`` / ``"ssh:<name>"`` — never ``None``. **LQH Cloud
+    is the default when nothing has been configured anywhere.** This
+    function does not prompt; the one-time project picker is gated and
+    fired by the handler layer (``handlers._compute_pick_options``)
+    before a launch tool ever calls ``resolve_compute``. Users change a
+    persisted default via the picker or ``compute_set``.
 
     Bare remote names without an ``ssh:`` prefix (eg. ``explicit="lab"``)
-    are passed through unchanged so existing agent calls keep working;
-    ``is_cloud`` and ``ssh_remote_name`` normalize the lookup.
+    are passed through unchanged; ``is_cloud`` and ``ssh_remote_name``
+    normalize the lookup.
     """
     if explicit:
         return explicit
@@ -133,10 +139,10 @@ def ssh_remote_name(target: ComputeTarget | None) -> str | None:
     """Extract the SSH remote name from a target, or None.
 
     Accepts both the canonical ``"ssh:<name>"`` form and the legacy
-    bare ``"<name>"`` form (anything that isn't ``"cloud"``). Returns
-    ``None`` if the input is None / "cloud" / empty.
+    bare ``"<name>"`` form (anything that isn't ``"cloud"``/``"local"``).
+    Returns ``None`` if the input is None / "cloud" / "local" / empty.
     """
-    if not target or target == "cloud":
+    if not target or target in ("cloud", "local"):
         return None
     if target.startswith("ssh:"):
         return target[len("ssh:"):]

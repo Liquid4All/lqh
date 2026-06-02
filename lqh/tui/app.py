@@ -1442,9 +1442,9 @@ class LqhApp:
         self, run_name: str, state: str, error: str | None, remote: str | None,
     ) -> str:
         location = f" on remote '{remote}'" if remote else ""
+        # status derives the remote from the run's remote_job.json, so the
+        # call never needs a remote argument.
         status_call = f"training_status(run_name='{run_name}')"
-        if remote:
-            status_call = f"training_status(run_name='{run_name}', remote='{remote}')"
         if state == "completed":
             return (
                 f"[System: training run {run_name} completed successfully{location}. "

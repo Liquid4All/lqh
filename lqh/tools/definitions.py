@@ -771,7 +771,11 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "optimization). Training runs in a separate process with GPU/torch, "
                 "while the agent stays responsive. Progress is tracked via the "
                 "filesystem. Requires the 'train' optional dependencies "
-                "(pip install lqh[train]). User permission is requested before starting."
+                "(pip install lqh[train]). User permission is requested before starting. "
+                "The compute target (LQH Cloud vs a bring-your-own-compute remote) is "
+                "fixed per project and chosen once via a system picker — do NOT ask the "
+                "user where to train and do NOT pass any compute/remote argument; just "
+                "call start_training and it routes automatically."
             ),
             parameters={
                 "type": "object",
@@ -858,22 +862,6 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         ),
                         "default": "dataset",
                     },
-                    "remote": {
-                        "type": "string",
-                        "description": (
-                            "Override the compute target for THIS submit "
-                            "only — pass 'cloud' for LQH Cloud or "
-                            "'ssh:<name>' for a configured SSH remote. "
-                            "When omitted, the tool uses the user's "
-                            "configured default (LQH Cloud unless the "
-                            "user has changed it via compute_set). DO NOT "
-                            "ask the user where to train — just call "
-                            "start_training and let it route. LQH Cloud "
-                            "is always available; there is no "
-                            "'availability check' you need to perform "
-                            "before submitting."
-                        ),
-                    },
                 },
                 "required": ["type", "base_model", "dataset"],
             },
@@ -897,13 +885,6 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                             "Name of a specific run to check. If omitted, shows all runs."
                         ),
                     },
-                    "remote": {
-                        "type": "string",
-                        "description": (
-                            "Name of the remote where the run is executing. "
-                            "If omitted, checks local runs."
-                        ),
-                    },
                 },
                 "required": [],
             },
@@ -924,13 +905,6 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "type": "string",
                         "description": "Name of the training run to stop.",
                     },
-                    "remote": {
-                        "type": "string",
-                        "description": (
-                            "Name of the remote where the run is executing. "
-                            "If omitted, stops a local run."
-                        ),
-                    },
                 },
                 "required": ["run_name"],
             },
@@ -943,15 +917,17 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
             description=(
                 "Run model inference as a subprocess and score the results "
                 "via the API judge. Best for evaluating a checkpoint that "
-                "lives on a local filesystem you control — either the "
-                "current machine (when invoked with remote='local') or a "
-                "configured SSH remote (remote='ssh:<name>'). For models "
-                "trained on LQH Cloud the checkpoint lives in R2 and is "
-                "not yet directly evaluable here — push the model to "
-                "HuggingFace via hf_push and use eval_hf_model instead. "
-                "Output lives at runs/<run_name>/ — predictions.parquet "
-                "plus eval_result.json once scoring finishes (NOT under "
-                "evals/runs/, which is for run_scoring's API-mode evals)."
+                "lives on a local filesystem you control — the current "
+                "machine or the project's configured bring-your-own-compute "
+                "SSH remote. The compute target is fixed per project (chosen "
+                "once via the system picker); do NOT pass any compute/remote "
+                "argument. For models trained on LQH Cloud the checkpoint "
+                "lives in R2 and is not yet directly evaluable here — push "
+                "the model to HuggingFace via hf_push and use eval_hf_model "
+                "instead. Output lives at runs/<run_name>/ — "
+                "predictions.parquet plus eval_result.json once scoring "
+                "finishes (NOT under evals/runs/, which is for run_scoring's "
+                "API-mode evals)."
             ),
             parameters={
                 "type": "object",
@@ -982,22 +958,6 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "description": (
                             "Name for the eval run directory under evals/runs/. "
                             "Auto-generated if omitted."
-                        ),
-                    },
-                    "remote": {
-                        "type": "string",
-                        "description": (
-                            "Where to run inference. Pass "
-                            "'ssh:<remote_name>' to use a configured SSH "
-                            "remote (see remote_list), or 'local' to "
-                            "force the in-process local-GPU path. When "
-                            "omitted, the tool falls back to the user's "
-                            "configured default — but **cloud is NOT "
-                            "supported here yet** (use eval_hf_model "
-                            "for cloud evaluation), so an omitted "
-                            "remote on a project with the default "
-                            "cloud target will return an error "
-                            "explaining the workaround."
                         ),
                     },
                     "system_prompt_path": {

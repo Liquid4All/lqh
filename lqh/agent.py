@@ -67,24 +67,27 @@ state. For example:
 
 ## Where training and GPU eval run
 
-**LQH Cloud is the default compute target.** It is always available — \
-there is no separate "availability check" you need to perform, and the \
-user does NOT need an SSH remote configured to fine-tune. When the user \
-asks to train, evaluate, or run GPU inference, **just call \
-`start_training` / `start_local_eval`**. The tool routes to LQH Cloud \
-automatically and submits a sandbox job; the user pays per-second.
+**The compute target is fixed per project, not chosen per call.** When \
+the user asks to train, evaluate, or run GPU inference, **just call \
+`start_training` / `start_local_eval` with no compute/remote argument** \
+— you do NOT have one, and you must NOT ask the user "where should we \
+run this?". LQH Cloud is the default and is always available.
 
-Do NOT ask the user "where should we run this?" or "is cloud \
-available?" — that's already decided. Only override the routing when \
-the user explicitly says so (e.g. "use my SSH box", "run it on toka"), \
-in which case pass `remote='ssh:<name>'`. Use `compute_set` only when \
-the user asks to *persist* a non-default choice; it is otherwise \
-unnecessary.
+How routing is decided (you don't manage any of this):
+  - Cloud-only project (no bring-your-own-compute remote configured and \
+no local GPU): runs on LQH Cloud silently.
+  - Project that has a real choice — one or more BYOC remotes bound, \
+and/or a local CUDA GPU — and hasn't picked a target yet: the FIRST \
+`start_training` call triggers a one-time system picker (LQH Cloud vs \
+"Local (this machine)" if a GPU is present vs each remote). The user's \
+choice is persisted to the project; subsequent calls route there \
+automatically.
 
-Configured SSH remotes (visible via `remote_list`) are a power-user \
-opt-in, not a prerequisite for training. Treat them the way you'd \
-treat a custom-deployed inference endpoint: available if the user \
-asked for it, ignored otherwise.
+So never try to select compute yourself. To *change* a project's target \
+later, the user can run `compute_set`. To add a bring-your-own-compute \
+machine, walk the user through `remote_add` → `remote_bind` → \
+`remote_setup` (these are explicit power-user setup actions, listed via \
+`remote_list`).
 
 ### Evaluating cloud-trained checkpoints
 
@@ -97,14 +100,10 @@ local filesystem. To evaluate one, prefer the cloud path:
      end-to-end cloud eval path.
 
 `start_local_eval` does NOT yet route to cloud (artifact-aware cloud \
-eval is a pending gap). If the user wants a cloud eval and the model \
-isn't on HuggingFace, push it first, then call `eval_hf_model`. \
-Don't try to coerce `start_local_eval` into running on cloud by \
-passing `remote='cloud'` — it will return an explanatory error.
-
-If the user has an SSH remote with the downloaded checkpoint, \
-`start_local_eval` with `remote='ssh:<name>'` works. Use `remote='local'` \
-to force in-process execution on the user's machine.
+eval is a pending gap). It runs on the project's configured SSH remote \
+if there is one, otherwise locally in-process — you still pass no \
+compute argument. If the user wants a cloud eval and the model isn't on \
+HuggingFace, push it first, then call `eval_hf_model`.
 
 ## General behavior
 
@@ -776,12 +775,27 @@ class Agent:
             else:
                 return ToolResult(content="[No user input handler available]")
 
-        # NOTE: the legacy COMPUTE_PICK_REQUIRED first-run picker has
-        # been removed — LQH Cloud is now the silent product default
-        # (see lqh/remote/compute.py:resolve_compute). The branch that
-        # used to live here invoked self.callbacks.on_ask_user, persisted
-        # the choice, and re-ran the tool. Today start_training routes
-        # to cloud without asking the user.
+        # Project compute picker. start_training defers here the first
+        # time a project that has bring-your-own-compute remotes runs
+        # without a persisted compute target (see
+        # handlers._compute_pick_options). The choice is saved to the
+        # project (or globally) so it never re-fires.
+        if result.requires_user_input and result.content == "COMPUTE_PICK_REQUIRED":
+            # Auto mode: never block. Persist LQH Cloud for the project so
+            # routing is stable, then re-run the tool.
+            if self.auto_mode:
+                from lqh.remote.compute import save_project_default
+                save_project_default(self.project_dir, "cloud")
+                return await self._reinvoke_tool(tool_name, arguments)
+            if self.callbacks.on_ask_user:
+                user_response = await self.callbacks.on_ask_user(
+                    result.question or "", result.options, False
+                )
+                return await self._handle_compute_pick_response(
+                    user_response, tool_name, arguments
+                )
+            else:
+                return ToolResult(content="[No user input handler available]")
 
         # Handle permission request (pipeline execution or HF push)
         if result.requires_user_input and result.content == "PERMISSION_REQUIRED":
@@ -809,60 +823,83 @@ class Agent:
 
         return result
 
-    async def _reinvoke_with_remote(
-        self, tool_name: str, tool_args: dict, remote: str
-    ) -> ToolResult:
-        """Re-call the original tool now that we have a compute target.
+    async def _reinvoke_tool(self, tool_name: str, tool_args: dict) -> ToolResult:
+        """Re-run the original tool after the compute target is persisted.
 
-        Bypasses ``_call_tool`` so we don't loop forever if for some
-        reason the picker check still fires (it won't, since the value
-        is now persisted, but defense in depth).
+        Goes back through ``_handle_tool_call`` so permission prompts and
+        background-task registration behave exactly as on a fresh call.
+        The compute picker cannot re-fire here because the choice is now
+        saved (``_compute_pick_options`` returns None).
         """
-        from lqh.tools.handlers import execute_tool
-        new_args = dict(tool_args)
-        new_args["remote"] = remote
-        extra: dict[str, Any] = {"api_key": self.api_key}
-        if tool_name in ("start_training", "start_local_eval"):
-            extra["on_background_task_started"] = self.callbacks.on_background_task_started
-        return await execute_tool(tool_name, new_args, self.project_dir, **extra)
+        return await self._handle_tool_call(tool_name, dict(tool_args))
 
     async def _handle_compute_pick_response(
         self, response: str, tool_name: str, tool_args: dict
     ) -> ToolResult:
-        """User picked cloud or BYO in the first-run dialog.
+        """Persist the user's project compute choice, then re-run the tool.
 
-        Cloud → save the global default and re-run the tool with
-        ``remote="cloud"``.
+        "Something else" → return guidance walking the user through
+        adding a *different* SSH remote; nothing is persisted, so the
+        picker fires again on the next launch (now offering the new
+        remote).
 
-        BYO → return guidance asking the LLM to drive the user through
-        the existing remote_add / remote_bind / remote_setup flow.
-        Saving the SSH default is deferred until a remote actually
-        exists (no point persisting ``ssh:foo`` before ``foo`` is
-        configured).
+        LQH Cloud / a listed remote → ask whether to save the choice for
+        this project only or for all projects, persist accordingly, then
+        re-invoke the original tool (which now routes to the saved
+        target).
         """
-        from lqh.remote.compute import save_global_default
+        from lqh.remote.compute import save_global_default, save_project_default
+        from lqh.remote.config import load_remotes
 
-        # Normalize: accept partial matches so the LLM/UI text rendering
-        # of the choice doesn't have to match exactly.
         lower = response.lower()
-        if "cloud" in lower:
-            save_global_default("cloud")
-            return await self._reinvoke_with_remote(tool_name, arguments=tool_args, remote="cloud")
 
-        # BYO path. Don't save yet; the agent has to walk the user
-        # through remote_add + remote_bind + remote_setup first.
-        return ToolResult(content=(
-            "The user prefers bring-your-own compute. Walk them through "
-            "setting up an SSH remote:\n"
-            "  1. Ask for the hostname (SSH alias or user@host) and the "
-            "remote_root path on that machine.\n"
-            "  2. Call remote_add with the chosen name + hostname.\n"
-            "  3. Call remote_bind with the name + remote_root for this project.\n"
-            "  4. Call remote_setup to provision the venv.\n"
-            "  5. Call compute_set(scope='project', value=f'ssh:<name>') so "
-            "future runs auto-route there.\n"
-            "  6. Re-issue the original training command with remote='<name>'."
-        ))
+        # "Something else" — help the user set up a different BYOC remote.
+        if "something else" in lower:
+            return ToolResult(content=(
+                "The user wants to use a different bring-your-own-compute "
+                "machine. Walk them through setting up an SSH remote:\n"
+                "  1. Ask for the hostname (SSH alias or user@host) and the "
+                "remote_root path on that machine.\n"
+                "  2. Call remote_add with the chosen name + hostname.\n"
+                "  3. Call remote_bind with the name + remote_root for this "
+                "project.\n"
+                "  4. Call remote_setup to provision the venv.\n"
+                "Then re-issue the original command — the project compute "
+                "picker will offer the new remote."
+            ))
+
+        # Map the chosen label back to a concrete compute target.
+        # Picker labels are "LQH Cloud (recommended)", "Local (this
+        # machine)", and "<name> — <hostname>".
+        target: str | None = None
+        if "cloud" in lower:
+            target = "cloud"
+        elif lower.startswith("local") or "this machine" in lower:
+            target = "local"
+        else:
+            for name in load_remotes(self.project_dir):
+                if response.startswith(name) or name.lower() in lower:
+                    target = f"ssh:{name}"
+                    break
+
+        if target is None:
+            # Unrecognized choice — re-run, which re-shows the picker.
+            return await self._reinvoke_tool(tool_name, tool_args)
+
+        # Scope follow-up: this project only vs all projects.
+        scope = "This project only (recommended)"
+        if self.callbacks.on_ask_user:
+            scope = await self.callbacks.on_ask_user(
+                "Use this compute target for…",
+                ["This project only (recommended)", "All my projects"],
+                False,
+            )
+        if "all" in scope.lower():
+            save_global_default(target)
+        else:
+            save_project_default(self.project_dir, target)
+
+        return await self._reinvoke_tool(tool_name, tool_args)
 
     async def _handle_permission_response(
         self, response: str, tool_name: str, tool_args: dict

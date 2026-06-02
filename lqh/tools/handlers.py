@@ -671,7 +671,8 @@ async def handle_compute_set(
     ----------
     value : str | None
         ``"cloud"`` for LQH Cloud, ``"ssh:<name>"`` for a previously-bound
-        SSH remote, or empty string to clear. When omitted, the handler
+        SSH remote, ``"local"`` for in-process training on this machine
+        (requires a local CUDA GPU), or empty string to clear. When omitted, the handler
         reports the current resolved compute target instead of writing
         anything — so an agent that calls ``compute_set`` with no args
         gets a useful answer instead of a TypeError.
@@ -717,9 +718,10 @@ async def handle_compute_set(
         return ToolResult(content=f"Cleared default compute ({scope}).")
 
     # Validate the shape — clearer to fail here than at /train time.
-    if value != "cloud" and not value.startswith("ssh:"):
+    if value not in ("cloud", "local") and not value.startswith("ssh:"):
         return ToolResult(content=(
-            f"Error: value must be 'cloud' or 'ssh:<remote_name>', got {value!r}."
+            f"Error: value must be 'cloud', 'local', or 'ssh:<remote_name>', "
+            f"got {value!r}."
         ))
 
     if scope == "global":
@@ -1774,6 +1776,59 @@ def _next_run_name(project_dir: Path, prefix: str) -> str:
     return f"{prefix}_{next_num:03d}"
 
 
+# Max bring-your-own-compute remotes to show in the project compute
+# picker. Extras stay reachable via the "Something else" option.
+_MAX_PICKER_REMOTES = 5
+
+# Sentinel ToolResult.content that tells the agent loop to run the
+# one-time project compute picker (see lqh/agent.py). Returned by the
+# launch handlers when a project has >=1 BYOC remote but hasn't yet
+# chosen a compute target.
+COMPUTE_PICK_REQUIRED = "COMPUTE_PICK_REQUIRED"
+
+
+def _local_gpu_available() -> bool:
+    """True iff torch is importable and a CUDA GPU is visible locally.
+
+    Gates the "Local (this machine)" compute-picker option — there is no
+    point offering in-process training on a laptop without a usable GPU.
+    """
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _compute_pick_options(project_dir: Path) -> list[str] | None:
+    """Return compute-picker option labels, or None when no pick is needed.
+
+    The compute target is a fixed, per-project decision — not a per-call
+    parameter. We only prompt when the project hasn't chosen, no global
+    default is set, AND the project actually has a choice to make: at
+    least one bring-your-own-compute (SSH) remote is bound, or a local
+    CUDA GPU is available for in-process training. Otherwise LQH Cloud is
+    the silent default and no dialog is shown.
+    """
+    from lqh.remote.compute import load_global_default, load_project_default
+    from lqh.remote.config import load_remotes
+
+    if load_project_default(project_dir) or load_global_default():
+        return None
+    remotes = load_remotes(project_dir)
+    local_ok = _local_gpu_available()
+    if not remotes and not local_ok:
+        return None
+    options = ["LQH Cloud (recommended)"]
+    if local_ok:
+        options.append("Local (this machine)")
+    for cfg in list(remotes.values())[:_MAX_PICKER_REMOTES]:
+        options.append(f"{cfg.name} — {cfg.hostname}")
+    options.append("Something else (set up a different remote)")
+    return options
+
+
 def _pick_compute_or_use(
     project_dir: Path, explicit: str | None
 ) -> str | None:
@@ -1788,13 +1843,20 @@ def _pick_compute_or_use(
         local-GPU path. Returns ``None`` so callers can take their
         local branch.
       * ``explicit="ssh:<name>"`` — pinned override for one call.
+
+    A persisted ``"local"`` default (project or global, e.g. picked via
+    the compute picker on a GPU box) resolves the same way — returns
+    ``None`` so the caller runs in-process.
     """
     from lqh.remote.compute import resolve_compute
 
     if explicit in ("", "local"):
         # Force local execution. Caller takes its own local branch.
         return None
-    return resolve_compute(project_dir, explicit=explicit)
+    target = resolve_compute(project_dir, explicit=explicit)
+    if target == "local":
+        return None
+    return target
 
 
 async def handle_start_training(
@@ -1843,9 +1905,25 @@ async def handle_start_training(
     """
     from lqh.tools.permissions import check_permission
 
+    # Compute target is fixed per project. When the project has BYOC
+    # remotes configured but hasn't chosen a target yet, defer to the
+    # one-time picker driven by the agent loop (see lqh/agent.py). This
+    # never fires for cloud-only projects (silent default) or once a
+    # choice has been persisted. An explicit ``remote`` (internal/legacy
+    # callers only — the agent-facing schema no longer exposes it) wins
+    # always and bypasses the picker.
+    pick_options = None if remote is not None else _compute_pick_options(project_dir)
+    if pick_options is not None:
+        return ToolResult(
+            content=COMPUTE_PICK_REQUIRED,
+            requires_user_input=True,
+            question="Where should this project run fine-tuning?",
+            options=pick_options,
+        )
+
     # Resolve compute target. LQH Cloud is the product default; the
     # agent does not need to ask the user where to train. Users who
-    # want SSH compute persist that choice via ``compute_set``.
+    # want SSH compute persist that choice via the picker / compute_set.
     remote = _pick_compute_or_use(project_dir, remote)
 
     # Check torch + GPU only when running locally; remote execution has its
@@ -2169,15 +2247,13 @@ async def handle_training_status(
 ) -> ToolResult:
     """Check training run status.
 
-    Per-run with explicit remote: dispatch to the remote handler. Single
-    run without a remote: read local mirror + (if remote_job.json exists)
-    poll the corresponding remote — local PIDs aren't comparable across
-    machines. List mode (no run_name): same per-run rule applied to every
-    runs/<name>/ entry.
+    The compute target is derived per-run from the run's persisted
+    ``remote_job.json`` (written at launch) — never from a caller
+    argument. A run with that metadata polls the corresponding remote
+    (local PIDs aren't comparable across machines); a run without it is
+    a local subprocess. List mode (no run_name) applies the same rule to
+    every runs/<name>/ entry.
     """
-    if remote and run_name:
-        return await _training_status_remote(project_dir, run_name, remote)
-
     from lqh.subprocess_manager import SubprocessManager
 
     manager = SubprocessManager()
@@ -2548,15 +2624,20 @@ async def handle_stop_training(
     remote: str | None = None,
     **kwargs: Any,
 ) -> ToolResult:
-    """Stop a training subprocess."""
-    if remote:
-        return await _stop_training_remote(project_dir, run_name, remote)
+    """Stop a training subprocess.
 
+    Whether the run is remote is derived from its persisted
+    ``remote_job.json`` (written at launch), not from a caller argument.
+    """
     from lqh.subprocess_manager import SubprocessManager
 
     run_dir = _validate_path(project_dir, f"runs/{run_name}")
     if not run_dir.exists():
         return ToolResult(content=f"Error: run '{run_name}' not found")
+
+    meta = _read_remote_meta(run_dir)
+    if meta is not None:
+        return await _stop_training_remote(project_dir, run_name, meta["remote_name"])
 
     manager = SubprocessManager()
     if not manager.is_alive(run_dir):
@@ -2582,16 +2663,12 @@ async def _stop_training_remote(
     run_name: str,
     remote_name: str,
 ) -> ToolResult:
-    """Stop a remote training run."""
-    from lqh.remote.compute import ssh_remote_name
-    from lqh.remote.config import get_remote
-    from lqh.remote.ssh_direct import SSHDirectBackend
+    """Stop a remote training run.
 
-    ssh_name = ssh_remote_name(remote_name) or remote_name
-    remote_config = get_remote(project_dir, ssh_name)
-    if remote_config is None:
-        return ToolResult(content=f"Error: remote '{ssh_name}' not found.")
-    remote_name = ssh_name
+    Branches on ``remote_name``: ``"cloud"`` routes through
+    ``CloudBackend``; anything else is treated as an SSH remote.
+    """
+    from lqh.remote.compute import is_cloud
 
     run_dir = project_dir / "runs" / run_name
     meta_file = run_dir / "remote_job.json"
@@ -2601,7 +2678,30 @@ async def _stop_training_remote(
     meta = json.loads(meta_file.read_text())
     job_id = meta["job_id"]
 
-    backend = SSHDirectBackend(remote_config, project_dir)
+    if is_cloud(remote_name):
+        from lqh.remote.backend import RemoteConfig
+        from lqh.remote.cloud import CloudBackend
+
+        cfg = RemoteConfig(
+            name="cloud",
+            type="cloud",
+            hostname="api.lqh.ai",
+            remote_root="cloud:lqh",
+        )
+        backend = CloudBackend(cfg, project_dir)
+        remote_name = "LQH Cloud"
+    else:
+        from lqh.remote.compute import ssh_remote_name
+        from lqh.remote.config import get_remote
+        from lqh.remote.ssh_direct import SSHDirectBackend
+
+        ssh_name = ssh_remote_name(remote_name) or remote_name
+        remote_config = get_remote(project_dir, ssh_name)
+        if remote_config is None:
+            return ToolResult(content=f"Error: remote '{ssh_name}' not found.")
+        remote_name = ssh_name
+        backend = SSHDirectBackend(remote_config, project_dir)
+
     try:
         await backend.teardown(job_id)
     except Exception as e:
@@ -2674,39 +2774,23 @@ async def handle_start_local_eval(
     **kwargs: Any,
 ) -> ToolResult:
     """Start a local inference subprocess for model evaluation."""
-    from lqh.remote.compute import is_cloud
+    from lqh.remote.compute import ssh_remote_name
 
     on_bg_started = kwargs.get("on_background_task_started")
 
-    remote = _pick_compute_or_use(project_dir, remote)
-
-    # Cloud branch. start_local_eval doesn't yet have artifact-aware
-    # cloud routing (gap #4 — eval_hf only accepts HF repos, not LQH
-    # artifact IDs). Until that lands, give the agent a precise next
-    # step rather than failing with "remote 'cloud' not found".
-    if is_cloud(remote):
-        return ToolResult(content=(
-            "❌ start_local_eval doesn't yet support cloud evaluation "
-            "of LQH-trained checkpoints (the artifact-aware cloud "
-            "eval path is not wired). To evaluate this model, choose "
-            "one:\n\n"
-            "  • **eval_hf_model** — if the checkpoint is on "
-            "HuggingFace (or push it via hf_push first), call "
-            f"`eval_hf_model(repo='<org>/<name>', "
-            f"eval_dataset='{dataset}', scorer='{scorer}')`. This "
-            "runs entirely on cloud GPUs.\n\n"
-            "  • **SSH remote** — call start_local_eval again with "
-            "an explicit `remote='<ssh-remote-name>'` (see "
-            "`remote_list`). The SSH backend can load LoRA adapters "
-            "from local paths directly.\n\n"
-            "  • **Local eval** — call start_local_eval again with "
-            "`remote=''` to force the local path (requires a local "
-            "GPU + the `train` extras installed)."
-        ))
-
-    if remote:
+    # Compute target is fixed per project. Eval runs on the project's
+    # configured bring-your-own-compute SSH remote when there is one;
+    # otherwise it runs locally in-process. Cloud eval of LQH-trained
+    # checkpoints isn't wired yet (the artifact-aware cloud eval path is
+    # a gap — eval_hf_model only accepts HF repos), so a cloud-default
+    # project falls back to the local path rather than erroring; to
+    # evaluate a cloud-trained checkpoint, push it via hf_push and use
+    # eval_hf_model instead.
+    target = _pick_compute_or_use(project_dir, remote)
+    ssh_name = ssh_remote_name(target) if target else None
+    if ssh_name:
         return await _start_local_eval_remote(
-            project_dir, model_path, dataset, scorer, run_name, remote,
+            project_dir, model_path, dataset, scorer, run_name, target,
             system_prompt_path=system_prompt_path,
             response_format_path=response_format_path,
             max_new_tokens=max_new_tokens,

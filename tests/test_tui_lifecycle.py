@@ -123,5 +123,10 @@ def test_completion_message_tells_agent_to_check_status(tmp_path: Path) -> None:
 
     message = app._format_completion_message("run_1", "completed", None, "cloud")
 
-    assert "training_status(run_name='run_1', remote='cloud')" in message
+    # The suggested call carries no remote arg — status derives it from
+    # the run's remote_job.json. The remote still appears as readable
+    # context ("on remote 'cloud'").
+    assert "training_status(run_name='run_1')" in message
+    assert "remote=" not in message
+    assert "on remote 'cloud'" in message
     assert "continue with the natural next step" in message

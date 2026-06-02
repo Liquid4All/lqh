@@ -157,9 +157,11 @@ def _make_dataset(project: Path, name: str = "ds") -> str:
 
 
 def test_first_run_routes_to_cloud_silently(tmp_path, isolated_home, monkeypatch):
-    """First-run path: no default, no explicit remote → start_training
-    routes straight to LQH Cloud without asking the user. The legacy
-    COMPUTE_PICK_REQUIRED first-run picker has been removed."""
+    """Cloud-only project (no bring-your-own-compute remote bound, no
+    local GPU), no default, no explicit remote → start_training routes
+    straight to LQH Cloud without asking. The picker only fires when
+    there's a real choice — a BYOC remote or a local GPU (see
+    test_picker_fires_with_byoc_remote)."""
     import lqh.tools.handlers as handlers
 
     project = tmp_path / "proj"
@@ -168,6 +170,9 @@ def test_first_run_routes_to_cloud_silently(tmp_path, isolated_home, monkeypatch
 
     from lqh.tools.permissions import grant_permission
     grant_permission(project, project_wide=True)
+
+    # No BYOC remote and no local GPU → no choice to make → silent cloud.
+    monkeypatch.setattr(handlers, "_local_gpu_available", lambda: False)
 
     recorded: dict = {}
 
@@ -300,6 +305,42 @@ def test_picker_skipped_when_global_default_set(tmp_path, isolated_home, monkeyp
 
     assert recorded.get("remote_name") == "cloud"
     assert "cloud" in res.content
+
+
+def test_picker_fires_with_byoc_remote(tmp_path, isolated_home, monkeypatch):
+    """A project with a bound BYOC remote and no chosen target gets the
+    one-time picker sentinel instead of routing immediately."""
+    import lqh.tools.handlers as handlers
+    from lqh.remote.backend import ProjectBinding, RemoteMachine
+    from lqh.remote.config import add_binding, add_machine
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    ds = _make_dataset(project)
+    add_machine(RemoteMachine(name="lab-gpu", type="ssh_direct", hostname="lab-gpu-01"))
+    add_binding(project, ProjectBinding(name="lab-gpu", remote_root="/home/u/lab"))
+
+    # Pin local GPU off so the option list is just Cloud + remote + else.
+    monkeypatch.setattr(handlers, "_local_gpu_available", lambda: False)
+
+    from lqh.tools.permissions import grant_permission
+    grant_permission(project, project_wide=True)
+
+    res = asyncio.run(handlers.handle_start_training(
+        project,
+        type="sft",
+        base_model="LiquidAI/LFM2-1.2B",
+        dataset=ds,
+        eval_dataset=ds,
+        scorer=None,
+        remote=None,
+    ))
+
+    assert res.requires_user_input
+    assert res.content == "COMPUTE_PICK_REQUIRED"
+    assert res.options[0] == "LQH Cloud (recommended)"
+    assert any("lab-gpu" in o for o in res.options)
+    assert res.options[-1].startswith("Something else")
 
 
 def test_picker_skipped_when_explicit_remote(tmp_path, isolated_home, monkeypatch):
