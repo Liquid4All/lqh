@@ -761,6 +761,128 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
             },
         ),
         # ------------------------------------------------------------------
+        # pull
+        # ------------------------------------------------------------------
+        _tool(
+            name="pull",
+            description=(
+                "Download a model, dataset, or artifact into local storage using a "
+                "location URI. The scheme is explicit and never guessed:\n"
+                "  - 'hf:owner/repo[@rev]' — Hugging Face Hub (models under models/, "
+                "datasets under datasets/).\n"
+                "  - 'lqh:<artifact_id>' — an LQH cloud artifact in R2 (checkpoints "
+                "arrive as a .tar.gz).\n"
+                "For private HF repos, set HF_TOKEN. Use 'artifacts' (action=list) to "
+                "find artifact IDs."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": (
+                            "Location URI to pull from: 'hf:owner/repo[@rev]' or "
+                            "'lqh:<artifact_id>'."
+                        ),
+                    },
+                    "dest": {
+                        "type": "string",
+                        "description": (
+                            "Local path (relative to the project) to save into. "
+                            "Defaults to models/ or datasets/ for hf:, and "
+                            "artifacts/<id> for lqh:."
+                        ),
+                    },
+                },
+                "required": ["source"],
+            },
+        ),
+        # ------------------------------------------------------------------
+        # push
+        # ------------------------------------------------------------------
+        _tool(
+            name="push",
+            description=(
+                "Upload to Hugging Face Hub from a location URI. The destination must "
+                "be an 'hf:owner/repo'. The source is either:\n"
+                "  - a local path — uploaded directly (dataset or model, auto-detected); "
+                "or\n"
+                "  - 'lqh:<artifact_id>' — an R2 artifact, transferred to HF by a short "
+                "CPU-only cloud sandbox (bytes never round-trip through this machine; "
+                "requires a stored HF token via /hf_login).\n"
+                "Creates the repo if missing (private by default)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": (
+                            "What to push: a local path (e.g. 'runs/sft-1/model') or "
+                            "'lqh:<artifact_id>'."
+                        ),
+                    },
+                    "dest": {
+                        "type": "string",
+                        "description": "Destination repo as 'hf:owner/repo'.",
+                    },
+                    "private": {
+                        "type": "boolean",
+                        "description": "Whether the HF repo should be private. Defaults to true.",
+                        "default": True,
+                    },
+                },
+                "required": ["source", "dest"],
+            },
+        ),
+        # ------------------------------------------------------------------
+        # artifacts
+        # ------------------------------------------------------------------
+        _tool(
+            name="artifacts",
+            description=(
+                "Manage the cloud artifacts (checkpoints, predictions, metrics, logs) "
+                "registered for this project. Actions:\n"
+                "  - list (default): show artifacts with size, expiry, pin status.\n"
+                "  - pin: keep an artifact indefinitely (exempt from auto-expiry).\n"
+                "  - unpin: re-arm the per-kind expiry clock.\n"
+                "  - delete: remove an artifact (R2 bytes purged on the next retention "
+                "tick).\n"
+                "Unpinned artifacts auto-expire per a retention policy; the best/final "
+                "checkpoints and referenced artifacts are protected automatically — pin "
+                "anything else you want to keep."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "pin", "unpin", "delete"],
+                        "description": "What to do. Defaults to 'list'.",
+                        "default": "list",
+                    },
+                    "artifact_id": {
+                        "type": "string",
+                        "description": "Artifact ID — required for pin/unpin/delete.",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "checkpoint", "predictions", "metrics", "logs",
+                            "eval_result", "dataset", "bundle", "other",
+                        ],
+                        "description": "Filter the list by kind (list action only).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max artifacts to list. Defaults to 50.",
+                        "default": 50,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        # ------------------------------------------------------------------
         # start_training
         # ------------------------------------------------------------------
         _tool(

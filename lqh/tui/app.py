@@ -615,6 +615,10 @@ class LqhApp:
             await self._do_login()
             return True
 
+        if command == "/hf_login":
+            await self._do_hf_login(_args)
+            return True
+
         if command == "/clear":
             self._save_session()
             self._session = Session.create(self.project_dir)
@@ -837,6 +841,57 @@ class LqhApp:
             await self._emit(render_error("Device code expired. Run /login again."))
         except Exception as e:
             await self._emit(render_error(f"Login failed: {type(e).__name__}: {e}"))
+
+    async def _do_hf_login(self, args: str) -> None:
+        """Handle /hf_login: store a Hugging Face token on the backend so
+        cloud jobs can use it for private repos and pushes."""
+        import getpass
+
+        from lqh.auth import set_hf_token
+
+        token = (args or "").strip()
+        if not token:
+            try:
+                token = (await run_in_terminal(
+                    lambda: getpass.getpass("Paste your Hugging Face token (hidden): ")
+                )).strip()
+            except Exception:
+                token = ""
+        if not token:
+            await self._emit(render_system_message("HF login cancelled (no token entered)."))
+            return
+        try:
+            await set_hf_token(token)
+        except Exception as e:
+            await self._emit(render_error(f"Failed to store HF token: {type(e).__name__}: {e}"))
+            return
+        await self._refresh_hf_status()
+        await self._emit(render_system_message(
+            "✅ Hugging Face token stored (encrypted on the backend). Cloud jobs will "
+            "use it for private models/datasets and pushes — the laptop env is not needed."
+        ))
+        self._invalidate()
+
+    async def _refresh_hf_status(self) -> None:
+        """Resolve the project's compute target and, for cloud projects,
+        query the backend for the stored-HF-token status so the 🤗
+        indicator reflects what the sandbox will actually have.
+        Best-effort — never raises into the caller."""
+        try:
+            from lqh.remote.compute import resolve_compute
+            target = resolve_compute(self.project_dir)
+        except Exception:
+            target = "cloud"
+        is_cloud = target == "cloud"
+        self._status_bar.compute_is_cloud = is_cloud
+        if is_cloud and get_token():
+            try:
+                from lqh.auth import hf_token_status
+                status = await hf_token_status()
+                self._status_bar.hf_cloud_configured = bool(status.get("configured"))
+            except Exception:
+                self._status_bar.hf_cloud_configured = None
+        self._invalidate()
 
     async def _do_resume(self) -> None:
         """Handle the /resume command."""
@@ -1496,6 +1551,10 @@ class LqhApp:
         token = get_token()
         self._status_bar.logged_in = bool(token)
         self._invalidate()
+        if token:
+            # Best-effort: reflect the stored HF-token status for cloud
+            # projects in the 🤗 indicator.
+            await self._refresh_hf_status()
         if token:
             await self._emit(render_system_message("✅ Logged in to lqh.ai"))
         else:

@@ -32,6 +32,13 @@ class StatusBar:
         self._spinner_frame: int = 0
         self._spin_start: float = 0.0
         self._hf_token: bool = bool(os.environ.get("HF_TOKEN"))
+        # Compute-aware HF indicator. For a cloud project the token that
+        # matters is the one STORED on the backend (injected into the
+        # sandbox), not the laptop's env. compute_is_cloud +
+        # hf_cloud_configured are set by the app after resolving the
+        # project's compute target and querying the backend.
+        self.compute_is_cloud: bool = True
+        self.hf_cloud_configured: bool | None = None  # None = unknown
         self._gpu_info: str = self._detect_gpu()
         self._cwd: str = self._format_cwd(project_dir)
 
@@ -156,8 +163,17 @@ class StatusBar:
 
         parts.append(("class:status.separator", " │ "))
 
-        # HF token
-        if self._hf_token:
+        # HF token — compute-aware. On a cloud project, the relevant
+        # token is the one stored on the backend (used inside the
+        # sandbox); on ssh/local, it's the laptop's HF_TOKEN env.
+        if self.compute_is_cloud:
+            if self.hf_cloud_configured is True:
+                parts.append(("class:status", "🤗 HF ✓"))
+            elif self.hf_cloud_configured is False:
+                parts.append(("class:status.dim", "🤗 HF ✗"))
+            else:
+                parts.append(("class:status.dim", "🤗 HF ?"))
+        elif self._hf_token:
             parts.append(("class:status", "🤗 HF ✓"))
         else:
             parts.append(("class:status.dim", "🤗 HF ✗"))

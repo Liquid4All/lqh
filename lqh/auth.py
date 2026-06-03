@@ -57,6 +57,33 @@ def require_token() -> str:
     return token
 
 
+async def set_hf_token(token: str) -> None:
+    """Store the user's HF token on the backend (encrypted at rest). The
+    backend never returns the plaintext; cloud jobs decrypt it server-
+    side and inject it into the sandbox. Raises on a non-2xx response."""
+    async with httpx.AsyncClient(base_url=api_root(), timeout=30.0) as http:
+        r = await http.post(
+            "/v1/account/hf_token",
+            json={"token": token},
+            headers={"Authorization": f"Bearer {require_token()}"},
+        )
+        if r.status_code not in (200, 204):
+            raise LoginError(f"failed to store HF token ({r.status_code}): {r.text[:200]}")
+
+
+async def hf_token_status() -> dict[str, Any]:
+    """Return {"configured": bool, "last_used_at": str|None} for the
+    stored HF token (the one cloud jobs use). Empty dict on error."""
+    async with httpx.AsyncClient(base_url=api_root(), timeout=15.0) as http:
+        r = await http.get(
+            "/v1/account/hf_token",
+            headers={"Authorization": f"Bearer {require_token()}"},
+        )
+        if r.status_code != 200:
+            return {}
+        return r.json()
+
+
 UserCodeCallback = Callable[[str, str], Awaitable[None]]
 
 

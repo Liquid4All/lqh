@@ -1239,6 +1239,183 @@ async def handle_hf_repo_info(
         return ToolResult(content=f"Error: {e}")
 
 
+# ----------------------------------------------------------------------
+# Unified pull / push over the location URI grammar (hf: / lqh: / local).
+# Thin wrappers over the HF handlers and the artifact store; the scheme
+# is always explicit (see lqh.tools.uri).
+# ----------------------------------------------------------------------
+
+
+async def handle_pull(
+    project_dir: Path, *, source: str, dest: str | None = None, **kwargs: Any,
+) -> ToolResult:
+    """Download from hf: or lqh: into local storage."""
+    from lqh.tools.uri import parse_location, LocationError
+
+    try:
+        loc = parse_location(source)
+    except LocationError as e:
+        return ToolResult(content=f"Error: {e}")
+
+    if loc.scheme == "hf":
+        return await handle_hf_pull(
+            project_dir, repo_id=loc.value, local_path=dest, revision=loc.revision,
+        )
+    if loc.scheme == "lqh":
+        return await _pull_lqh_artifact(project_dir, loc.value, dest)
+    return ToolResult(
+        content=(
+            f"Error: pull source must be 'hf:owner/repo' or 'lqh:<artifact_id>'; "
+            f"got a local path {source!r}. Local files are already on disk — use "
+            "read_file / list_files instead."
+        )
+    )
+
+
+async def _pull_lqh_artifact(project_dir: Path, artifact_id: str, dest: str | None) -> ToolResult:
+    from lqh.artifacts import ArtifactError, BackendArtifactStore
+
+    rel = dest or f"artifacts/{artifact_id}"
+    try:
+        target = _validate_path(project_dir, rel)
+    except ValueError as e:
+        return ToolResult(content=f"Error: {e}")
+
+    store = BackendArtifactStore()
+    try:
+        await store.download(artifact_id, target)
+    except ArtifactError as e:
+        return ToolResult(content=f"Error downloading lqh:{artifact_id}: {e}")
+    except Exception as e:  # noqa: BLE001 - surface any client error to the agent
+        return ToolResult(content=f"Error downloading lqh:{artifact_id}: {e}")
+
+    size = target.stat().st_size if target.exists() else 0
+    return ToolResult(
+        content=(
+            f"✅ Downloaded lqh:{artifact_id} -> {rel} ({size:,} bytes). "
+            "Checkpoints arrive as a .tar.gz; extract before use."
+        )
+    )
+
+
+async def handle_push(
+    project_dir: Path, *, source: str, dest: str, private: bool = True, **kwargs: Any,
+) -> ToolResult:
+    """Push a local path or an lqh: artifact to a Hugging Face repo.
+
+    A local source uploads directly. An lqh: source (an R2 artifact) is
+    transferred to HF by a short CPU-only cloud sandbox — bytes never
+    round-trip through this laptop.
+    """
+    from lqh.tools.uri import parse_location, LocationError
+
+    try:
+        src = parse_location(source)
+        dst = parse_location(dest)
+    except LocationError as e:
+        return ToolResult(content=f"Error: {e}")
+
+    if dst.scheme != "hf":
+        return ToolResult(
+            content=f"Error: push destination must be 'hf:owner/repo'; got {dest!r}"
+        )
+
+    if src.scheme == "local":
+        return await handle_hf_push(
+            project_dir, local_path=src.value, repo_id=dst.value, private=private,
+        )
+    if src.scheme == "lqh":
+        return await _push_lqh_to_hf(project_dir, src.value, dst.value, private)
+    return ToolResult(
+        content=(
+            f"Error: push source must be a local path or 'lqh:<artifact_id>'; "
+            f"got {source!r}"
+        )
+    )
+
+
+async def _push_lqh_to_hf(
+    project_dir: Path, artifact_id: str, target_repo: str, private: bool,
+) -> ToolResult:
+    """Submit a CPU-only transfer job that copies an R2 artifact to HF."""
+    from lqh.remote.transfer import submit_transfer
+
+    try:
+        job_id = await submit_transfer(
+            project_id=project_dir.name,
+            source_artifact_id=artifact_id,
+            target_hf_repo=target_repo,
+            private=private,
+        )
+    except Exception as e:  # noqa: BLE001 - surface clearly to the agent
+        return ToolResult(content=f"Error starting transfer of lqh:{artifact_id}: {e}")
+    return ToolResult(
+        content=(
+            f"🚚 Transferring lqh:{artifact_id} → hf:{target_repo} via a CPU sandbox "
+            f"(job {job_id}). The checkpoint is uploaded from R2 directly; check "
+            "training_status or the artifact's hf_repo once it completes. Requires a "
+            "stored HF token (run /hf_login) since the upload happens in the cloud."
+        )
+    )
+
+
+async def handle_artifacts(
+    project_dir: Path,
+    *,
+    action: str = "list",
+    artifact_id: str | None = None,
+    kind: str | None = None,
+    limit: int = 50,
+    **kwargs: Any,
+) -> ToolResult:
+    """List / pin / unpin / delete artifacts registered for this project."""
+    from lqh.artifacts import ArtifactError, BackendArtifactStore
+
+    store = BackendArtifactStore()
+    act = (action or "list").lower().strip()
+
+    try:
+        if act == "list":
+            handles = await store.list_for_project(
+                project_dir.name, kind=kind, limit=limit,
+            )
+            if not handles:
+                return ToolResult(content="No artifacts registered for this project.")
+            lines = [f"Artifacts for project '{project_dir.name}':"]
+            for h in handles:
+                flags = []
+                if h.pinned:
+                    flags.append("📌 pinned")
+                if h.checkpoint_role:
+                    flags.append(h.checkpoint_role)
+                if h.expires_at:
+                    flags.append(f"expires {h.expires_at}")
+                elif not h.pinned:
+                    flags.append("never expires")
+                suffix = f"  ({', '.join(flags)})" if flags else ""
+                size_mb = h.size_bytes / 1_000_000
+                lines.append(f"  - {h.id}  {h.kind}  {size_mb:.1f} MB{suffix}")
+            return ToolResult(content="\n".join(lines))
+
+        if not artifact_id:
+            return ToolResult(content=f"Error: action '{act}' requires artifact_id")
+
+        if act == "pin":
+            await store.pin(artifact_id)
+            return ToolResult(content=f"📌 Pinned {artifact_id} — exempt from auto-expiry.")
+        if act == "unpin":
+            await store.unpin(artifact_id)
+            return ToolResult(content=f"Unpinned {artifact_id} — per-kind expiry re-armed.")
+        if act == "delete":
+            await store.delete(artifact_id)
+            return ToolResult(content=f"Deleted {artifact_id} (R2 bytes purged on the next retention tick).")
+        return ToolResult(content=f"Error: unknown action '{act}' (use list/pin/unpin/delete)")
+    except ArtifactError as e:
+        return ToolResult(content=f"Error: {e}")
+    except Exception as e:  # noqa: BLE001
+        return ToolResult(content=f"Error: {e}")
+
+
 def _resolve_hf_pull_repo_type(api, repo_id: str, explicit: str | None) -> tuple[str | None, str | None]:
     """Determine repo_type for hf_pull. Returns (repo_type, error_message)."""
     if explicit is not None:
@@ -1268,6 +1445,7 @@ async def handle_hf_pull(
     split: str | None = None,
     subset: str | None = None,
     files: list[str] | None = None,
+    revision: str | None = None,
     **kwargs: Any,
 ) -> ToolResult:
     """Download a dataset or model from HF Hub to local storage."""
@@ -1302,6 +1480,7 @@ async def handle_hf_pull(
                     repo_type=repo_type,
                     local_dir=str(target),
                     token=token,
+                    revision=revision,
                 )
                 downloaded.append(out)
 
@@ -1326,6 +1505,7 @@ async def handle_hf_pull(
                 repo_type="model",
                 local_dir=str(target),
                 token=token,
+                revision=revision,
             )
             _save_hf_mapping(project_dir, local_path, repo_id, "model")
 
@@ -1350,6 +1530,8 @@ async def handle_hf_pull(
             load_kwargs["split"] = split
         if subset:
             load_kwargs["name"] = subset
+        if revision:
+            load_kwargs["revision"] = revision
 
         dataset = ds_lib.load_dataset(**load_kwargs)
 
@@ -3775,6 +3957,9 @@ TOOL_HANDLERS: dict[str, Callable[..., Awaitable[ToolResult]]] = {
     "hf_push": handle_hf_push,
     "hf_pull": handle_hf_pull,
     "hf_repo_info": handle_hf_repo_info,
+    "pull": handle_pull,
+    "push": handle_push,
+    "artifacts": handle_artifacts,
     "start_training": handle_start_training,
     "training_status": handle_training_status,
     "stop_training": handle_stop_training,

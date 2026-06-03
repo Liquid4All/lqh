@@ -113,6 +113,12 @@ class ArtifactHandle:
     sha256: str | None = None
     hf_repo: str | None = None
     created_at: str | None = None
+    pinned: bool = False
+    # When the retention engine may auto-expire this artifact. None =
+    # never (pinned, or a never-expire kind like metrics/eval_result).
+    expires_at: str | None = None
+    # "final" / "intermediate" for checkpoints; None otherwise.
+    checkpoint_role: str | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "ArtifactHandle":
@@ -126,6 +132,9 @@ class ArtifactHandle:
             sha256=data.get("sha256"),
             hf_repo=data.get("hf_repo"),
             created_at=data.get("created_at"),
+            pinned=bool(data.get("pinned", False)),
+            expires_at=data.get("expires_at"),
+            checkpoint_role=data.get("checkpoint_role"),
         )
 
 
@@ -234,6 +243,7 @@ class BackendArtifactStore:
         sha256: str | None,
         hf_repo: str | None,
         lineage: dict[str, Any] | None = None,
+        checkpoint_role: str | None = None,
     ) -> ArtifactHandle:
         body: dict[str, Any] = {
             "project_id": project_id,
@@ -249,6 +259,8 @@ class BackendArtifactStore:
             body["hf_repo"] = hf_repo
         if lineage:
             body["lineage"] = lineage
+        if checkpoint_role:
+            body["checkpoint_role"] = checkpoint_role
         r = await client.post(
             "/v1/artifacts/register",
             json=body,
@@ -280,6 +292,7 @@ class BackendArtifactStore:
         job_id: str | None = None,
         sha256: str | None = None,
         lineage: dict[str, Any] | None = None,
+        checkpoint_role: str | None = None,
     ) -> ArtifactHandle:
         """Upload ``path`` to R2, then register it as an artifact.
 
@@ -334,6 +347,7 @@ class BackendArtifactStore:
                 sha256=sha256,
                 hf_repo=None,
                 lineage=lineage,
+                checkpoint_role=checkpoint_role,
             )
 
     async def signed_url(self, handle: ArtifactHandle | str) -> str:
@@ -393,6 +407,27 @@ class BackendArtifactStore:
         async with httpx.AsyncClient(base_url=self._base, timeout=self._timeout) as client:
             r = await client.delete(
                 f"/v1/artifacts/{artifact_id}",
+                headers=self._auth_headers(),
+            )
+            _raise_for_artifact_error(r)
+
+    async def pin(self, handle: ArtifactHandle | str) -> None:
+        """Pin an artifact so the backend retention engine never
+        auto-expires it (clears its expires_at)."""
+        artifact_id = handle.id if isinstance(handle, ArtifactHandle) else handle
+        async with httpx.AsyncClient(base_url=self._base, timeout=self._timeout) as client:
+            r = await client.post(
+                f"/v1/artifacts/{artifact_id}/pin",
+                headers=self._auth_headers(),
+            )
+            _raise_for_artifact_error(r)
+
+    async def unpin(self, handle: ArtifactHandle | str) -> None:
+        """Unpin an artifact, re-arming the per-kind expiry clock."""
+        artifact_id = handle.id if isinstance(handle, ArtifactHandle) else handle
+        async with httpx.AsyncClient(base_url=self._base, timeout=self._timeout) as client:
+            r = await client.post(
+                f"/v1/artifacts/{artifact_id}/unpin",
                 headers=self._auth_headers(),
             )
             _raise_for_artifact_error(r)

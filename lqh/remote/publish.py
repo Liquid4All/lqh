@@ -62,6 +62,13 @@ class _Candidate:
     relpath: str
     is_dir: bool = False
     lineage: dict | None = None
+    # "final" for a run's published model (model/ or model-lora/),
+    # "intermediate" for per-step / per-iteration / per-sweep-config
+    # checkpoints. Drives the backend retention engine's protection:
+    # final checkpoints are kept indefinitely, intermediate ones expire
+    # unless they're the project's best or have descendants. None for
+    # non-checkpoint artifacts.
+    checkpoint_role: str | None = None
 
 
 @dataclass
@@ -194,6 +201,7 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
                     kind="checkpoint",
                     relpath=sub,
                     is_dir=True,
+                    checkpoint_role="final",
                 )
             )
 
@@ -221,6 +229,7 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
                             kind="checkpoint",
                             relpath=f"checkpoints/{sub.name}",
                             is_dir=True,
+                            checkpoint_role="intermediate",
                         )
                     )
                 for fname, kind in (
@@ -281,6 +290,7 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
                         kind="checkpoint",
                         relpath=f"iterations/{sub.name}/checkpoint",
                         is_dir=True,
+                        checkpoint_role="intermediate",
                     )
                 )
 
@@ -320,12 +330,16 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
         for mdir in ("model", "model-lora"):
             p = sub / mdir
             if _dir_has_weights(p):
+                # Per-sweep-config model: "intermediate" so only the
+                # winning config (best checkpoint) is protected from
+                # auto-expiry; the losing configs age out.
                 out.append(
                     _Candidate(
                         path=p,
                         kind="checkpoint",
                         relpath=f"{sub.name}/{mdir}",
                         is_dir=True,
+                        checkpoint_role="intermediate",
                     )
                 )
 
@@ -388,6 +402,7 @@ async def publish_run(
                         kind=cand.kind,
                         job_id=job_id,
                         lineage=cand.lineage,
+                        checkpoint_role=cand.checkpoint_role,
                     )
             else:
                 handle = await store.upload_file(
@@ -396,6 +411,7 @@ async def publish_run(
                     kind=cand.kind,
                     job_id=job_id,
                     lineage=cand.lineage,
+                    checkpoint_role=cand.checkpoint_role,
                 )
             logger.info("published %s -> %s", cand.relpath, handle.id)
             successes.append(handle)

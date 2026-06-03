@@ -20,6 +20,7 @@ class SlashCommand:
 # All available slash commands
 COMMANDS: list[SlashCommand] = [
     SlashCommand("/login", "Log in to lqh.ai"),
+    SlashCommand("/hf_login", "Store a Hugging Face token for cloud jobs"),
     SlashCommand("/clear", "Start a fresh conversation"),
     SlashCommand("/resume", "Resume a previous conversation"),
     SlashCommand("/spec", "Start specification capture mode"),
