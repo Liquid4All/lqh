@@ -24,6 +24,14 @@ guidance, but this skill remains the source of truth for the overall plan.
 4. **Permission prompts auto-grant.** Tools that would normally ask the
    user for execution permission (pipelines, HF push) auto-grant
    project-wide in auto mode. You do not need to handle them specially.
+5. **Wait for runs with a single `training_status` call.** After starting an
+   SFT/DPO/eval run, call `training_status(run_name=...)` **once** when you
+   need the result. While a run is still active that call blocks until the
+   run reaches a terminal state and then returns the final status — it does
+   not return "running". Do **not** poll in a loop or invent your own
+   wait/sleep: one call per run is enough, and it spends zero LLM cycles
+   while waiting. If it ever returns a "still running after …" heartbeat,
+   the run is taking unusually long — just call it again to keep waiting.
 
 ## Goal
 

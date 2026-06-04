@@ -24,6 +24,10 @@ class ToolResult:
     question: str | None = None
     options: list[str] | None = None
     multi_select: bool = False
+    # For PERMISSION_REQUIRED results, the exact permission key to grant on
+    # approval (e.g. "training:<run_name>"). Lets the agent grant only the
+    # specific action the user approved instead of a project-wide flag.
+    permission_key: str | None = None
     show_file_path: str | None = None
     skill_content: str | None = None
     # Auto-mode signals. The agent loop checks these after each tool call.
@@ -2100,7 +2104,7 @@ async def handle_start_training(
     on-policy DPO builds its preference pairs from scored rollouts every
     iteration, so a scorer is mandatory for DPO to run at all.
     """
-    from lqh.tools.permissions import check_permission
+    from lqh.tools.permissions import check_training_permission
 
     # Compute target is fixed per project — there is no per-call override.
     # When the project has a real choice to make (a BYOC remote and/or a
@@ -2266,12 +2270,15 @@ async def handle_start_training(
         config["dpo_beta"] = dpo_beta
         config["golden_source"] = golden_source
 
-    # Permission check
+    # Permission check. Training has its own permission domain (see
+    # permissions.check_training_permission) so approving a run never grants
+    # arbitrary pipeline/script execution.
     perm_key = f"training:{run_name}"
-    if not check_permission(project_dir, perm_key):
+    if not check_training_permission(project_dir, run_name):
         return ToolResult(
             content="PERMISSION_REQUIRED",
             requires_user_input=True,
+            permission_key=perm_key,
             question=(
                 f"The agent wants to start a {type.upper()} training run:\n"
                 f"  Run:       {run_name}\n"
@@ -2619,6 +2626,39 @@ async def _training_status_remote(
             lines.append(f"  Loss: {latest['loss']:.4f}")
         if latest.get("lr") is not None:
             lines.append(f"  LR:   {latest['lr']:.2e}")
+
+    chosen_summary = run_dir / "chosen_pool_summary.json"
+    if chosen_summary.exists():
+        try:
+            payload = json.loads(chosen_summary.read_text())
+            mean = payload.get("mean")
+            if mean is not None:
+                lines.append(
+                    f"  Chosen-pool ceiling: {mean:.2f} — model can't "
+                    f"exceed this on the same judge."
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    iterations_dir = run_dir / "iterations"
+    if iterations_dir.exists():
+        iter_lines = _format_dpo_iter_stats(iterations_dir)
+        if iter_lines:
+            lines.append("  DPO iterations:")
+            lines.extend(iter_lines)
+
+    abort = run_dir / "early_abort.json"
+    if abort.exists():
+        try:
+            payload = json.loads(abort.read_text())
+            reason = payload.get("reason", "regression past threshold")
+            lines.append(f"  ⚠️  Early-abort signaled: {reason}")
+        except (json.JSONDecodeError, OSError):
+            lines.append("  ⚠️  Early-abort signaled (unparseable)")
+
+    sweep_lines = _format_sweep_summary(run_dir)
+    if sweep_lines:
+        lines.extend(sweep_lines)
 
     return ToolResult(content="\n".join(lines))
 

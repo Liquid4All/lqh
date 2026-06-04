@@ -168,8 +168,8 @@ def test_first_run_routes_to_cloud_silently(tmp_path, isolated_home, monkeypatch
     project.mkdir()
     ds = _make_dataset(project)
 
-    from lqh.tools.permissions import grant_permission
-    grant_permission(project, project_wide=True)
+    from lqh.tools.permissions import grant_training_permission
+    grant_training_permission(project, project_wide=True)
 
     # No BYOC remote and no local GPU → no choice to make → silent cloud.
     monkeypatch.setattr(handlers, "_local_gpu_available", lambda: False)
@@ -208,8 +208,8 @@ def test_cloud_training_config_uses_project_relative_dataset_paths(
     project.mkdir()
     ds = _make_dataset(project)
 
-    from lqh.tools.permissions import grant_permission
-    grant_permission(project, project_wide=True)
+    from lqh.tools.permissions import grant_training_permission
+    grant_training_permission(project, project_wide=True)
 
     # No remote, no local GPU → silent cloud default (no picker).
     monkeypatch.setattr(handlers, "_local_gpu_available", lambda: False)
@@ -282,8 +282,8 @@ def test_picker_skipped_when_global_default_set(tmp_path, isolated_home, monkeyp
     # control should flow straight through to this stub.
     # Grant project-wide training permission so the handler doesn't
     # stop at the permission check.
-    from lqh.tools.permissions import grant_permission
-    grant_permission(project, project_wide=True)
+    from lqh.tools.permissions import grant_training_permission
+    grant_training_permission(project, project_wide=True)
 
     recorded: dict = {}
 
@@ -323,8 +323,8 @@ def test_picker_fires_with_byoc_remote(tmp_path, isolated_home, monkeypatch):
     # Pin local GPU off so the option list is just Cloud + remote + else.
     monkeypatch.setattr(handlers, "_local_gpu_available", lambda: False)
 
-    from lqh.tools.permissions import grant_permission
-    grant_permission(project, project_wide=True)
+    from lqh.tools.permissions import grant_training_permission
+    grant_training_permission(project, project_wide=True)
 
     res = asyncio.run(handlers.handle_start_training(
         project,

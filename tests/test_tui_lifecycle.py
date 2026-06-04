@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 from pathlib import Path
@@ -130,3 +131,120 @@ def test_completion_message_tells_agent_to_check_status(tmp_path: Path) -> None:
     assert "remote=" not in message
     assert "on remote 'cloud'" in message
     assert "continue with the natural next step" in message
+
+
+# ---------------------------------------------------------------------------
+# Auto-mode transparent waiting (_await_background)
+# ---------------------------------------------------------------------------
+
+
+def _register_running(app: LqhApp, name: str) -> None:
+    from lqh.tui.background_tasks import BackgroundTask
+
+    app._tasks.register(
+        BackgroundTask(task_id=name, kind="train", label=name, state="running")
+    )
+
+
+async def test_await_background_returns_none_when_nothing_running(tmp_path: Path) -> None:
+    app = LqhApp(tmp_path)
+    # No tasks registered -> nothing to wait for.
+    result = await app._await_background(["run_1"], timeout=5.0)
+    assert result is None
+
+
+async def test_await_background_returns_none_when_target_not_running(tmp_path: Path) -> None:
+    app = LqhApp(tmp_path)
+    _register_running(app, "other_run")
+    # Asking about run_1, but only other_run is active -> don't park.
+    result = await app._await_background(["run_1"], timeout=5.0)
+    assert result is None
+
+
+async def test_await_background_wakes_on_completion_message(tmp_path: Path) -> None:
+    app = LqhApp(tmp_path)
+    _register_running(app, "run_1")
+
+    # Simulate _watch_jobs pushing a completion notice while the agent parks.
+    notice = "[System: training run run_1 completed successfully.]"
+
+    async def _producer() -> None:
+        await asyncio.sleep(0.01)
+        app._input_queue.put_nowait(notice)
+
+    producer = asyncio.create_task(_producer())
+    result = await app._await_background(["run_1"], timeout=5.0)
+    await producer
+
+    assert result == notice
+
+
+async def test_await_background_heartbeat_on_timeout(tmp_path: Path) -> None:
+    app = LqhApp(tmp_path)
+    _register_running(app, "run_1")
+
+    # Nothing is ever pushed -> we hit the (tiny) timeout and get a heartbeat
+    # that still names the run and is safe for the agent to re-check.
+    result = await app._await_background(["run_1"], timeout=0.05)
+    assert result is not None
+    assert "still running" in result
+    assert "run_1" in result
+
+
+# ---------------------------------------------------------------------------
+# Wake-once-results-arrive for eval/infer runs (_wait_for_results)
+# ---------------------------------------------------------------------------
+
+
+def _make_run(tmp_path: Path, name: str, run_type: str, **files: str) -> Path:
+    run_dir = tmp_path / "runs" / name
+    run_dir.mkdir(parents=True)
+    (run_dir / "config.json").write_text(json.dumps({"type": run_type}) + "\n")
+    for fname, body in files.items():
+        (run_dir / fname.replace("__", ".")).write_text(body)
+    return run_dir
+
+
+async def test_wait_for_results_returns_immediately_for_training(tmp_path: Path) -> None:
+    app = LqhApp(tmp_path)
+    _make_run(tmp_path, "sft_v1", "sft")
+    # Training runs never block here even without eval_result.json.
+    await asyncio.wait_for(app._wait_for_results(["sft_v1"]), timeout=1.0)
+
+
+async def test_wait_for_results_skips_infer_with_no_pending_scoring(tmp_path: Path) -> None:
+    app = LqhApp(tmp_path)
+    # Infer run, no predictions / eval_request / watcher -> nothing to wait for.
+    _make_run(tmp_path, "eval_1", "infer")
+    await asyncio.wait_for(app._wait_for_results(["eval_1"]), timeout=1.0)
+
+
+async def test_wait_for_results_waits_until_eval_result_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = LqhApp(tmp_path)
+    run_dir = _make_run(
+        tmp_path, "eval_1", "infer", predictions__parquet="x",
+    )
+
+    async def _writer() -> None:
+        await asyncio.sleep(0.05)
+        (run_dir / "eval_result.json").write_text(json.dumps({"mean": 7.0}))
+
+    writer = asyncio.create_task(_writer())
+    # Grace window comfortably longer than the writer delay.
+    monkeypatch.setattr("lqh.tui.app.SCORING_GRACE_SEC", 5.0)
+    await asyncio.wait_for(app._wait_for_results(["eval_1"]), timeout=3.0)
+    await writer
+    assert (run_dir / "eval_result.json").exists()
+
+
+async def test_wait_for_results_respects_grace_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = LqhApp(tmp_path)
+    # Pending scoring that never completes -> bounded by the grace window.
+    _make_run(tmp_path, "eval_1", "infer", predictions__parquet="x")
+    monkeypatch.setattr("lqh.tui.app.SCORING_GRACE_SEC", 0.1)
+    # Must return despite eval_result.json never appearing.
+    await asyncio.wait_for(app._wait_for_results(["eval_1"]), timeout=1.0)

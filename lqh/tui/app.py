@@ -62,6 +62,11 @@ OTHER_OPTION = "Other (please specify)"
 JOB_POLL_INTERVAL_SEC = 60.0
 RECONNECT_BACKOFF_SEC = (3.0, 20.0, 60.0)
 SLEEP_GAP_FACTOR = 2.0
+# After an eval/infer run goes terminal, the scoring watcher still needs to
+# judge predictions and write eval_result.json. Auto-mode parking gives that
+# a bounded grace period so the agent wakes once *results* are ready, not just
+# when the inference job finished. Bounded so a stuck/failed scorer can't hang.
+SCORING_GRACE_SEC = 180.0
 
 
 class LqhApp:
@@ -951,6 +956,7 @@ class LqhApp:
             on_pipeline_progress=self._on_pipeline_progress,
             on_pipeline_done=self._on_pipeline_done,
             on_background_task_started=self._on_background_task_started,
+            on_await_background=self._await_background,
             on_auto_stage=self._on_auto_stage,
         )
         return Agent(
@@ -1281,6 +1287,122 @@ class LqhApp:
             "See the conversation log above for the full results table; "
             "checkpoints are under runs/, datasets under datasets/."
         ))
+
+    async def _await_background(
+        self, run_names: list[str] | None, timeout: float,
+    ) -> str | None:
+        """Auto-mode: park the agent until a watched run reaches a terminal state.
+
+        Returns the ``[System: ...]`` completion notification once a run
+        finishes (or a heartbeat string if ``timeout`` elapses first), or
+        ``None`` when nothing relevant is running so the caller should just
+        use the status it already has.
+
+        The wake signal is the very same completion message that
+        ``_watch_jobs`` pushes into ``_input_queue`` on a ``running ->
+        terminal`` transition — so this reuses the existing watcher instead
+        of adding a second poller. In auto mode the interactive ``run()``
+        loop is not consuming ``_input_queue``, so there is no double-consumer
+        race. While parked here, the agent's inner loop is suspended at the
+        ``await`` for the tool call: no LLM calls and no status polls happen.
+        """
+        def _running_targets() -> list[str]:
+            # The registry is the authoritative "is it running" view: it is
+            # populated eagerly at launch (on_background_task_started) and
+            # cleared by _watch_jobs on a terminal transition.
+            running = [
+                t.label for t in self._tasks.snapshot() if t.state == "running"
+            ]
+            if run_names:
+                wanted = set(run_names)
+                running = [r for r in running if r in wanted]
+            return running
+
+        targets = _running_targets()
+        if not targets:
+            return None
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return (
+                    f"[System: still running after {int(timeout)}s — "
+                    f"{', '.join(targets)}. No LLM cycles were spent waiting. "
+                    "Call training_status again to keep waiting, or take a "
+                    "different step if there is independent work to do.]"
+                )
+            try:
+                # Any completion wakes us; we hand the message back and let the
+                # agent re-read fresh status. In the sequential auto pipeline
+                # the completing run is virtually always the one being waited
+                # on; if not, the agent simply re-checks and re-parks.
+                msg = await asyncio.wait_for(
+                    self._input_queue.get(), timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                # Safety: the target may have finished without a queued message
+                # (e.g. it completed before we parked and the message was
+                # already drained). If nothing is running, stop waiting.
+                if not _running_targets():
+                    return None
+                # else fall through; next iteration emits the heartbeat.
+                continue
+            # The job is terminal, but eval/infer runs still need their
+            # predictions scored before results are readable. Give the scoring
+            # watcher a bounded grace period so the agent wakes once results —
+            # not merely the job — are ready. Training runs return at once.
+            await self._wait_for_results(targets)
+            return msg
+
+    async def _wait_for_results(self, run_names: list[str]) -> None:
+        """Bounded wait for watcher-scored eval/infer runs to write results.
+
+        A ``type: infer`` run reaches a terminal state when inference finishes,
+        but ``eval_result.json`` is written afterwards by the scoring watcher
+        (see ``lqh/watcher.py``). Without this, the agent could wake and read a
+        completed-but-unscored run. Training runs (and runs with no pending
+        scoring) return immediately; the wait is capped by ``SCORING_GRACE_SEC``
+        so a failed/stuck scorer can never hang the agent.
+        """
+        import json
+
+        def _pending() -> list[str]:
+            out: list[str] = []
+            for name in run_names:
+                run_dir = self.project_dir / "runs" / name
+                config_path = run_dir / "config.json"
+                if not config_path.exists():
+                    continue
+                try:
+                    run_type = json.loads(config_path.read_text()).get("type", "")
+                except Exception:
+                    continue
+                # Training eval lands per-checkpoint during the run; only
+                # inference runs score after going terminal.
+                if run_type != "infer":
+                    continue
+                if (run_dir / "eval_result.json").exists():
+                    continue
+                # Only wait when scoring is actually in flight or pending —
+                # otherwise (e.g. a failed run with no predictions) return now.
+                scoring_possible = (
+                    name in self._run_watchers
+                    or (run_dir / "predictions.parquet").exists()
+                    or (run_dir / "eval_request.json").exists()
+                )
+                if scoring_possible:
+                    out.append(name)
+            return out
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + SCORING_GRACE_SEC
+        while _pending():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(2.0, remaining))
 
     async def _watch_jobs(self) -> None:
         """Periodically scan background runs and inject completion notifications.

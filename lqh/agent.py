@@ -15,7 +15,11 @@ from lqh.auth import get_token
 from lqh.context_stats import ContextStats, TurnStats
 from lqh.tools.definitions import get_all_tools
 from lqh.tools.handlers import execute_tool, ToolResult
-from lqh.tools.permissions import grant_permission, grant_hf_permission
+from lqh.tools.permissions import (
+    grant_permission,
+    grant_hf_permission,
+    grant_training_permission,
+)
 from lqh.session import Session
 from lqh.skills import load_skill_content
 
@@ -191,6 +195,13 @@ To evaluate a model: use run_scoring with mode='model_eval', a run_name, and sys
 
 MAX_CONTEXT_TOKENS = 200_000
 
+# Auto mode: how long a single `training_status` call may park the agent
+# waiting for a run to finish before it returns a heartbeat so the agent can
+# re-evaluate (or do independent work). The normal wake path is the
+# background job watcher firing well before this; the heartbeat is only a
+# safety net against a missed running -> terminal transition.
+AUTO_PARK_HEARTBEAT_SEC = 600.0
+
 # When True, strip reasoning/thinking content from previous assistant turns
 # before sending them in follow-up API calls.  Reduces context usage at the
 # cost of losing the model's chain-of-thought in subsequent turns.
@@ -215,6 +226,14 @@ class AgentCallbacks:
     # later notify the agent (e.g. start_local_eval, start_training).
     # Signature: (task_id, kind, label, remote_name | None).
     on_background_task_started: Callable[[str, str, str, str | None], None] | None = None
+    # Auto-mode: park the agent until a background run reaches a terminal
+    # state instead of busy-polling its status. Given the run name(s) of
+    # interest (or None for "any active run") and a max wait, returns the
+    # completion notification once a run finishes (or a heartbeat string on
+    # timeout), or None when nothing is running so the caller should just use
+    # the status it already has. While this awaits, the agent loop is
+    # suspended — no LLM calls, no stdout spam.
+    on_await_background: Callable[[list[str] | None, float], Awaitable[str | None]] | None = None
     # Auto-mode: fires when the agent calls set_auto_stage (stage, note?).
     on_auto_stage: Callable[[str, str | None], None] | None = None
     # Auto-mode: fires when the agent calls exit_auto_mode (status, reason).
@@ -743,14 +762,39 @@ class Agent:
                     "again in this run."
                 ),
             )
+        # Auto mode: instead of busy-polling a long run's status (which costs
+        # one full orchestration LLM call per poll and spams stdout), park the
+        # agent loop until the run reaches a terminal state. The TUI's
+        # background job watcher delivers the wake signal. The agent keeps
+        # calling training_status exactly as before — the wait is transparent.
+        if (
+            tool_name == "training_status"
+            and self.auto_mode
+            and self.callbacks.on_await_background is not None
+        ):
+            run_name = arguments.get("run_name")
+            run_names = [run_name] if run_name else None
+            completion = await self.callbacks.on_await_background(
+                run_names, AUTO_PARK_HEARTBEAT_SEC,
+            )
+            result = await execute_tool(tool_name, arguments, self.project_dir)
+            if completion is None:
+                # Nothing was running — return the status the agent asked for.
+                return result
+            # A run finished (or we hit the heartbeat). Prepend the completion
+            # notice so the agent acts on the freshly-read terminal state.
+            return ToolResult(content=f"{completion}\n\n{result.content}")
+
         extra: dict[str, Any] = {}
         if tool_name in ("run_data_gen_pipeline", "run_scoring", "run_data_filter"):
             extra = self._pipeline_kwargs()
-        if tool_name in ("start_training", "start_local_eval"):
+        if tool_name in ("start_training", "start_local_eval", "eval_hf_model"):
             # Lets handlers eagerly register a background task with the TUI
             # the moment a job is submitted, so the status bar updates
             # immediately instead of waiting for the next 60-second
-            # _watch_jobs poll.
+            # _watch_jobs poll. eval_hf_model submits a cloud eval that also
+            # registers here — without it, auto-mode parking would see no
+            # running task and fall through to busy-polling that run.
             extra["on_background_task_started"] = self.callbacks.on_background_task_started
         result = await execute_tool(tool_name, arguments, self.project_dir, **extra)
 
@@ -803,14 +847,16 @@ class Agent:
             if self.auto_mode:
                 synthetic_choice = "Execute and don't ask again for this project"
                 return await self._handle_permission_response(
-                    synthetic_choice, tool_name, arguments
+                    synthetic_choice, tool_name, arguments,
+                    permission_key=result.permission_key,
                 )
             if self.callbacks.on_ask_user:
                 user_response = await self.callbacks.on_ask_user(
                     result.question or "", result.options
                 )
                 return await self._handle_permission_response(
-                    user_response, tool_name, arguments
+                    user_response, tool_name, arguments,
+                    permission_key=result.permission_key,
                 )
             else:
                 return ToolResult(content="[No user input handler available]")
@@ -902,11 +948,27 @@ class Agent:
         return await self._reinvoke_tool(tool_name, tool_args)
 
     async def _handle_permission_response(
-        self, response: str, tool_name: str, tool_args: dict
+        self, response: str, tool_name: str, tool_args: dict,
+        permission_key: str | None = None,
     ) -> ToolResult:
         """Process the user's permission choice for pipeline execution or HF push."""
         if tool_name == "hf_push":
             return await self._handle_hf_push_permission(response, tool_args)
+
+        if tool_name in ("start_training", "start_local_eval"):
+            if "do not" in response.lower():
+                return ToolResult(content="Training/evaluation launch declined by user.")
+
+            # Grant in the training-only domain — never the shared
+            # project_allow_all flag that governs pipeline/script execution.
+            # Auto mode grants project-wide so the unattended run never
+            # re-prompts; interactive mode grants only the specific run the
+            # user just approved (permission_key = "training:<run_name>").
+            if self.auto_mode or not permission_key:
+                grant_training_permission(self.project_dir, project_wide=True)
+            else:
+                grant_training_permission(self.project_dir, key=permission_key)
+            return await self._reinvoke_tool(tool_name, tool_args)
 
         # Pipeline execution permission (run_data_gen_pipeline)
         script_path = tool_args.get("script_path", "")

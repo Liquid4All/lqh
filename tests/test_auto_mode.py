@@ -365,6 +365,175 @@ class TestAutoModeAgentBehavior:
         assert ("rubric", "writing scorer") in stages
 
 
+class TestAutoModeParking:
+    """Auto mode parks on training_status instead of busy-polling runs."""
+
+    async def test_training_status_parks_in_auto_mode(
+        self, make_agent: Callable[..., Agent],
+    ) -> None:
+        from lqh.tools.handlers import ToolResult
+
+        seen: list[tuple[list[str] | None, float]] = []
+
+        async def on_await_background(run_names, timeout):
+            seen.append((run_names, timeout))
+            return "[System: training run sft_v1 completed successfully.]"
+
+        agent = make_agent(
+            auto_mode=True,
+            callbacks=AgentCallbacks(on_await_background=on_await_background),
+        )
+
+        with patch(
+            "lqh.agent.execute_tool",
+            return_value=ToolResult(content="✅ **sft_v1** — completed"),
+        ):
+            result = await agent._handle_tool_call(
+                "training_status", {"run_name": "sft_v1"}
+            )
+
+        # The callback was consulted with the queried run name, and its
+        # completion notice is prepended to the freshly-read status.
+        assert seen == [(["sft_v1"], pytest.approx(600.0))]
+        assert "completed successfully" in result.content
+        assert "sft_v1" in result.content
+
+    async def test_training_status_no_park_when_nothing_running(
+        self, make_agent: Callable[..., Agent],
+    ) -> None:
+        from lqh.tools.handlers import ToolResult
+
+        async def on_await_background(run_names, timeout):
+            return None  # nothing running
+
+        agent = make_agent(
+            auto_mode=True,
+            callbacks=AgentCallbacks(on_await_background=on_await_background),
+        )
+        with patch(
+            "lqh.agent.execute_tool",
+            return_value=ToolResult(content="✅ **sft_v1** — completed"),
+        ):
+            result = await agent._handle_tool_call(
+                "training_status", {"run_name": "sft_v1"}
+            )
+
+        # No completion notice prepended — just the plain status.
+        assert result.content == "✅ **sft_v1** — completed"
+
+    async def test_interactive_mode_does_not_park(
+        self, make_agent: Callable[..., Agent],
+    ) -> None:
+        from lqh.tools.handlers import ToolResult
+
+        called = False
+
+        async def on_await_background(run_names, timeout):
+            nonlocal called
+            called = True
+            return None
+
+        agent = make_agent(
+            auto_mode=False,
+            callbacks=AgentCallbacks(on_await_background=on_await_background),
+        )
+        with patch(
+            "lqh.agent.execute_tool",
+            return_value=ToolResult(content="🏃 **sft_v1** — running"),
+        ):
+            await agent._handle_tool_call("training_status", {"run_name": "sft_v1"})
+
+        assert called is False  # interactive mode keeps the old behavior
+
+    @pytest.mark.parametrize(
+        "tool_name", ["start_training", "start_local_eval", "eval_hf_model"],
+    )
+    async def test_background_callback_wired_for_run_starters(
+        self, make_agent: Callable[..., Agent], tool_name: str,
+    ) -> None:
+        """Every run-starting tool gets on_background_task_started so the run
+        is eagerly registered (otherwise auto-mode parking can't see it)."""
+        from lqh.tools.handlers import ToolResult
+
+        sentinel = MagicMock(name="on_background_task_started")
+        captured: dict[str, Any] = {}
+
+        async def fake_execute_tool(name, args, project_dir, **extra):
+            captured.update(extra)
+            return ToolResult(content="started")
+
+        agent = make_agent(
+            auto_mode=True,
+            callbacks=AgentCallbacks(on_background_task_started=sentinel),
+        )
+        with patch("lqh.agent.execute_tool", side_effect=fake_execute_tool):
+            await agent._handle_tool_call(tool_name, {})
+
+        assert captured.get("on_background_task_started") is sentinel
+
+
+class TestTrainingPermissionScope:
+    """Approving a training run grants the training domain only — never the
+    shared pipeline-execution flag — and auto mode stays autonomous."""
+
+    async def test_interactive_approval_grants_only_this_run(
+        self, make_agent: Callable[..., Agent],
+    ) -> None:
+        from lqh.tools.permissions import (
+            check_permission,
+            check_training_permission,
+        )
+
+        agent = make_agent(auto_mode=False)
+        with patch.object(agent, "_reinvoke_tool", return_value=None) as reinvoke:
+            await agent._handle_permission_response(
+                "Start training", "start_training", {},
+                permission_key="training:sft_1",
+            )
+
+        reinvoke.assert_awaited_once()
+        # Exactly the approved run is granted...
+        assert check_training_permission(agent.project_dir, "sft_1") is True
+        assert check_training_permission(agent.project_dir, "sft_2") is False
+        # ...and pipeline/script execution is untouched.
+        assert check_permission(agent.project_dir, "data_gen/x.py") is False
+
+    async def test_interactive_decline_does_not_grant(
+        self, make_agent: Callable[..., Agent],
+    ) -> None:
+        from lqh.tools.permissions import check_training_permission
+
+        agent = make_agent(auto_mode=False)
+        result = await agent._handle_permission_response(
+            "Do not start training", "start_training", {},
+            permission_key="training:sft_1",
+        )
+        assert "declined" in result.content
+        assert check_training_permission(agent.project_dir, "sft_1") is False
+
+    async def test_auto_mode_grants_training_project_wide_not_pipeline(
+        self, make_agent: Callable[..., Agent],
+    ) -> None:
+        from lqh.tools.permissions import (
+            check_permission,
+            check_training_permission,
+        )
+
+        agent = make_agent(auto_mode=True)
+        with patch.object(agent, "_reinvoke_tool", return_value=None):
+            await agent._handle_permission_response(
+                "Execute and don't ask again for this project",
+                "start_training", {},
+                permission_key="training:sft_1",
+            )
+
+        # Autonomous: all future training is allowed without re-prompting...
+        assert check_training_permission(agent.project_dir, "sft_1") is True
+        assert check_training_permission(agent.project_dir, "anything") is True
+        # ...but the pipeline-execution flag is still NOT set by training.
+        assert check_permission(agent.project_dir, "data_gen/x.py") is False
+
+
 # ---------------------------------------------------------------------------
 # CLI parser
 # ---------------------------------------------------------------------------

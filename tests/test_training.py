@@ -427,7 +427,10 @@ def training_workspace(
 
     lqh_dir = tmp_path / ".lqh"
     lqh_dir.mkdir(parents=True)
-    (lqh_dir / "permissions.json").write_text(json.dumps({"project_allow_all": True}))
+    (lqh_dir / "permissions.json").write_text(json.dumps({
+        "project_allow_all": True,
+        "training_allow_all": True,
+    }))
 
     return tmp_path
 

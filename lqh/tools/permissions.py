@@ -9,10 +9,17 @@ PERMISSIONS_FILE = ".lqh/permissions.json"
 
 @dataclass
 class PermissionStore:
+    # Pipeline / script execution (run_data_gen_pipeline).
     project_allow_all: bool = False
     allowed_files: list[str] = field(default_factory=list)
+    # HF push.
     hf_push_allow_all: bool = False
     hf_allowed_repos: list[str] = field(default_factory=list)
+    # Training launches (start_training). Kept SEPARATE from
+    # project_allow_all so that approving a training run never silently
+    # grants arbitrary pipeline/script execution, and vice versa.
+    training_allow_all: bool = False
+    allowed_training: list[str] = field(default_factory=list)
 
 
 def load_permissions(project_dir: Path) -> PermissionStore:
@@ -26,6 +33,8 @@ def load_permissions(project_dir: Path) -> PermissionStore:
             allowed_files=data.get("allowed_files", []),
             hf_push_allow_all=data.get("hf_push_allow_all", False),
             hf_allowed_repos=data.get("hf_allowed_repos", []),
+            training_allow_all=data.get("training_allow_all", False),
+            allowed_training=data.get("allowed_training", []),
         )
     except (json.JSONDecodeError, OSError):
         return PermissionStore()
@@ -52,6 +61,36 @@ def grant_permission(
         perms.project_allow_all = True
     elif script_path is not None and script_path not in perms.allowed_files:
         perms.allowed_files.append(script_path)
+    save_permissions(project_dir, perms)
+
+
+def check_training_permission(project_dir: Path, run_name: str) -> bool:
+    """Whether a training run may launch.
+
+    Deliberately does NOT consult ``project_allow_all`` (pipeline/script
+    execution): the two domains are independent so granting one never
+    implies the other.
+    """
+    perms = load_permissions(project_dir)
+    return perms.training_allow_all or f"training:{run_name}" in perms.allowed_training
+
+
+def grant_training_permission(
+    project_dir: Path,
+    key: str | None = None,
+    project_wide: bool = False,
+) -> None:
+    """Grant a training launch.
+
+    ``project_wide=True`` approves all future training in the project (used
+    by autonomous auto mode so it never re-prompts). Otherwise ``key`` — a
+    ``"training:<run_name>"`` string — grants exactly that one run.
+    """
+    perms = load_permissions(project_dir)
+    if project_wide:
+        perms.training_allow_all = True
+    elif key is not None and key not in perms.allowed_training:
+        perms.allowed_training.append(key)
     save_permissions(project_dir, perms)
 
 
