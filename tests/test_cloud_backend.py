@@ -286,6 +286,46 @@ def test_disconnect_then_resume_replays_missed_events(tmp_path, fake_cloud):
     assert "pre-1" in log and "post-1" in log
 
 
+def test_sync_progress_preserves_sweep_progress_payload(tmp_path, fake_cloud):
+    project = tmp_path / "proj"
+    project.mkdir()
+    run_dir = project / ".lqh" / "runs" / "run_001"
+
+    backend = _make_backend(project)
+    job_id = asyncio.run(backend.submit_run(
+        str(run_dir),
+        {"manifest": [], "type": "sweep"},
+        module="lqh.train.sweep",
+    ))
+    fake_cloud.add_events(job_id, [
+        {
+            "kind": "progress",
+            "payload": {
+                "phase": "sweep_config_progress",
+                "config_id": "cfg",
+                "config_index": 1,
+                "n_configs": 6,
+                "step": 42,
+                "child_step": 42,
+                "child_loss": 0.9,
+                "child_max_steps": 300,
+            },
+        },
+    ])
+
+    asyncio.run(backend.sync_progress(f"cloud:{job_id}", str(run_dir)))
+
+    rows = [
+        json.loads(line)
+        for line in (run_dir / "progress.jsonl").read_text().splitlines()
+    ]
+    assert rows[-1]["phase"] == "sweep_config_progress"
+    assert rows[-1]["config_index"] == 1
+    assert rows[-1]["n_configs"] == 6
+    assert rows[-1]["child_step"] == 42
+    assert rows[-1]["child_max_steps"] == 300
+
+
 def test_resume_does_not_replay_already_seen_events(tmp_path, fake_cloud):
     """If sync_progress is invoked twice in a row with no new server-side
     activity, the second call must be a no-op (no duplicate rows)."""

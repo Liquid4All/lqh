@@ -2621,7 +2621,10 @@ async def _training_status_remote(
     # Also show local mirror progress if available
     from lqh.train.progress import read_latest_progress
     latest = read_latest_progress(run_dir)
-    if latest:
+    latest_sweep_lines = _format_latest_sweep_progress(latest)
+    if latest_sweep_lines:
+        lines.extend(latest_sweep_lines)
+    elif latest:
         if latest.get("loss") is not None:
             lines.append(f"  Loss: {latest['loss']:.4f}")
         if latest.get("lr") is not None:
@@ -2674,14 +2677,20 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
     emoji = state_emoji.get(status.state, "❓")
     lines = [f"{emoji} **{run_name}** — {status.state}"]
 
-    if status.step is not None:
-        lines.append(f"  Step: {status.step}")
-    if status.loss is not None:
-        lines.append(f"  Loss: {status.loss:.4f}")
-    if status.lr is not None:
-        lines.append(f"  LR:   {status.lr:.2e}")
-    if status.epoch is not None:
-        lines.append(f"  Epoch: {status.epoch:.2f}")
+    from lqh.train.progress import read_latest_progress
+    latest = read_latest_progress(run_dir)
+    latest_sweep_lines = _format_latest_sweep_progress(latest)
+    if latest_sweep_lines:
+        lines.extend(latest_sweep_lines)
+    else:
+        if status.step is not None:
+            lines.append(f"  Step: {status.step}")
+        if status.loss is not None:
+            lines.append(f"  Loss: {status.loss:.4f}")
+        if status.lr is not None:
+            lines.append(f"  LR:   {status.lr:.2e}")
+        if status.epoch is not None:
+            lines.append(f"  Epoch: {status.epoch:.2f}")
     if status.error:
         lines.append(f"  Error: {status.error}")
 
@@ -2757,6 +2766,69 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
         lines.extend(sweep_lines)
 
     return "\n".join(lines)
+
+
+def _format_latest_sweep_progress(latest: dict[str, Any] | None) -> list[str]:
+    """Render the live sweep row from progress.jsonl, if the latest row is one."""
+    if not latest:
+        return []
+    phase = latest.get("phase")
+    if not isinstance(phase, str) or not phase.startswith("sweep_"):
+        return []
+
+    config_id = latest.get("config_id")
+    config_label = f" · {config_id}" if isinstance(config_id, str) and config_id else ""
+    idx = latest.get("config_index")
+    total = latest.get("n_configs")
+    position = ""
+    if isinstance(idx, int) and isinstance(total, int) and total > 0:
+        position = f" {idx + 1}/{total}"
+    elif isinstance(total, int) and total > 0:
+        position = f" {total} configs"
+
+    if phase == "sweep_start":
+        proxy = latest.get("proxy_key")
+        proxy_label = f" · proxy={proxy}" if isinstance(proxy, str) and proxy else ""
+        return [f"  Sweep: starting{position}{proxy_label}"]
+
+    if phase == "sweep_config_start":
+        return [f"  Sweep: running config{position}{config_label}"]
+
+    if phase == "sweep_config_progress":
+        step = latest.get("child_step", latest.get("step"))
+        max_steps = latest.get("child_max_steps")
+        step_label = ""
+        if isinstance(step, int):
+            if isinstance(max_steps, int) and max_steps > 0:
+                step_label = f" · step {step}/{max_steps}"
+            else:
+                step_label = f" · step {step}"
+        metric_bits: list[str] = []
+        loss = latest.get("child_loss", latest.get("loss"))
+        if isinstance(loss, (int, float)):
+            metric_bits.append(f"loss={loss:.4f}")
+        eval_loss = latest.get("child_eval_loss")
+        if isinstance(eval_loss, (int, float)):
+            metric_bits.append(f"eval_loss={eval_loss:.4f}")
+        lr = latest.get("child_lr", latest.get("lr"))
+        if isinstance(lr, (int, float)):
+            metric_bits.append(f"lr={lr:.2e}")
+        epoch = latest.get("child_epoch", latest.get("epoch"))
+        if isinstance(epoch, (int, float)):
+            metric_bits.append(f"epoch={epoch:.2f}")
+        metrics = f" · {' '.join(metric_bits)}" if metric_bits else ""
+        return [f"  Sweep: config{position}{config_label}{step_label}{metrics}"]
+
+    if phase == "sweep_config_done":
+        primary = latest.get("primary")
+        primary_label = (
+            f" · proxy={primary:.4f}"
+            if isinstance(primary, (int, float))
+            else ""
+        )
+        return [f"  Sweep: completed config{position}{config_label}{primary_label}"]
+
+    return []
 
 
 def _format_sweep_summary(run_dir: Path) -> list[str]:

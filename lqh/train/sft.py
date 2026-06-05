@@ -68,6 +68,9 @@ class ProgressCallback(TrainerCallback):
             extra["eval_loss"] = logs["eval_loss"]
         if "eval_runtime" in logs:
             extra["eval_runtime"] = logs["eval_runtime"]
+        max_steps = getattr(state, "max_steps", None)
+        if isinstance(max_steps, int) and max_steps > 0:
+            extra["max_steps"] = max_steps
         write_progress(
             self.run_dir,
             step=state.global_step,

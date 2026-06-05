@@ -73,6 +73,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -93,6 +95,25 @@ class SweepPoint:
 
     id: str
     overrides: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _ChildProgressContext:
+    """Scoped parent-run metadata for forwarding child progress rows."""
+
+    parent_run_dir: Path
+    config_id: str
+    config_index: int
+    n_configs: int
+    offset: int = 0
+    last_step: int | None = None
+    emitted_eval_keys: set[tuple[int, str]] = field(default_factory=set)
+
+
+_CHILD_PROGRESS_CONTEXT: ContextVar[_ChildProgressContext | None] = ContextVar(
+    "_CHILD_PROGRESS_CONTEXT",
+    default=None,
+)
 
 
 def sft_grid_small() -> list[SweepPoint]:
@@ -280,33 +301,138 @@ def _run_child(sub_run_dir: Path, sub_config: dict[str, Any]) -> int:
     stderr_path = sub_run_dir / "stderr.log"
     with (sub_run_dir / "stdout.log").open("w") as stdout_f, \
          stderr_path.open("w") as stderr_f:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [sys.executable, "-m", "lqh.train", str(cfg_path)],
             stdin=subprocess.DEVNULL,
             stdout=stdout_f,
             stderr=stderr_f,
-            check=False,
         )
+        while True:
+            _forward_child_progress(sub_run_dir)
+            rc = proc.poll()
+            if rc is not None:
+                break
+            time.sleep(2.0)
+        _forward_child_progress(sub_run_dir)
     # When a child fails, echo the tail of its stderr to OUR stderr
     # so the failure is visible in the sweep's published logs. The
     # child's sub_run_dir/stderr.log isn't picked up by publish.py
     # (which only walks the run_dir's standard layout), so without
     # this echo the only thing R2 sees is `rc=1 eval_loss=n/a`,
     # which is useless for debugging.
-    if proc.returncode != 0:
+    if rc != 0:
         try:
             stderr_tail = stderr_path.read_text(errors="replace").splitlines()[-60:]
         except OSError:
             stderr_tail = ["(could not re-read child stderr)"]
         print(
             f"\nsweep: child {sub_run_dir.name} failed with rc="
-            f"{proc.returncode}; last 60 stderr lines:",
+            f"{rc}; last 60 stderr lines:",
             file=sys.stderr,
             flush=True,
         )
         for line in stderr_tail:
             print(f"  {line}", file=sys.stderr, flush=True)
-    return proc.returncode
+    return rc
+
+
+def _forward_child_progress(sub_run_dir: Path) -> None:
+    """Forward new child progress rows into the sweep parent's progress log.
+
+    The cloud runner only sees the sweep parent's stdout. Child SFT/DPO
+    progress rows are written under ``sweep_<config>/progress.jsonl`` and
+    would otherwise be invisible until the config completes.
+    """
+    ctx = _CHILD_PROGRESS_CONTEXT.get()
+    if ctx is None:
+        return
+    progress_path = sub_run_dir / "progress.jsonl"
+    if not progress_path.exists():
+        return
+    try:
+        with progress_path.open("rb") as fh:
+            fh.seek(ctx.offset)
+            chunk = fh.read()
+    except OSError:
+        return
+    if not chunk:
+        return
+
+    parts = chunk.split(b"\n")
+    if chunk.endswith(b"\n"):
+        raw_lines = parts[:-1]
+        ctx.offset += len(chunk)
+    else:
+        # The child writes JSONL with open/write/close per row, but avoid
+        # consuming a partially visible final line if a poll races the write.
+        raw_lines = parts[:-1]
+        ctx.offset += len(chunk) - len(parts[-1])
+
+    for raw_bytes in raw_lines:
+        raw = raw_bytes.decode("utf-8", errors="replace").strip()
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        _forward_child_progress_row(ctx, row)
+
+
+def _forward_child_progress_row(
+    ctx: _ChildProgressContext,
+    row: dict[str, Any],
+) -> None:
+    step = row.get("step")
+    if not isinstance(step, int):
+        return
+
+    eval_loss = row.get("eval_loss")
+    eval_key: tuple[int, str] | None = None
+    if eval_loss is not None:
+        eval_key = (step, str(eval_loss))
+
+    should_emit = step != ctx.last_step
+    if eval_key is not None and eval_key not in ctx.emitted_eval_keys:
+        should_emit = True
+    if not should_emit:
+        return
+
+    ctx.last_step = step
+    if eval_key is not None:
+        ctx.emitted_eval_keys.add(eval_key)
+
+    extra: dict[str, Any] = {
+        "phase": "sweep_config_progress",
+        "config_id": ctx.config_id,
+        "config_index": ctx.config_index,
+        "n_configs": ctx.n_configs,
+        "child_step": step,
+    }
+    if row.get("loss") is not None:
+        extra["child_loss"] = row["loss"]
+    if row.get("lr") is not None:
+        extra["child_lr"] = row["lr"]
+    if row.get("epoch") is not None:
+        extra["child_epoch"] = row["epoch"]
+    if eval_loss is not None:
+        extra["child_eval_loss"] = eval_loss
+    max_steps = row.get("max_steps")
+    if isinstance(max_steps, int) and max_steps > 0:
+        extra["child_max_steps"] = max_steps
+
+    # Parent sweep rows normally use top-level `step` as the config index.
+    # Forwarded child rows intentionally use the child's trainer step so
+    # existing progress readers still show motion; phase/child_* identify
+    # the row as within-config progress.
+    write_progress(
+        ctx.parent_run_dir,
+        step=step,
+        loss=row.get("loss"),
+        lr=row.get("lr"),
+        epoch=row.get("epoch"),
+        extra=extra,
+    )
 
 
 def _build_eval_of_best_config(base: dict[str, Any], run_dir: Path) -> dict[str, Any] | None:
@@ -619,7 +745,17 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
         print(f"\n[{i+1}/{len(grid)}] {point.id}", flush=True)
 
         t0 = datetime.now(timezone.utc).timestamp()
-        rc = _run_child(sub_run_dir, sub_config)
+        progress_ctx = _ChildProgressContext(
+            parent_run_dir=run_dir,
+            config_id=point.id,
+            config_index=i,
+            n_configs=len(grid),
+        )
+        token = _CHILD_PROGRESS_CONTEXT.set(progress_ctx)
+        try:
+            rc = _run_child(sub_run_dir, sub_config)
+        finally:
+            _CHILD_PROGRESS_CONTEXT.reset(token)
         elapsed = datetime.now(timezone.utc).timestamp() - t0
 
         if run_type == "sft":

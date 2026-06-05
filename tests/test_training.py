@@ -21,6 +21,7 @@ when no CUDA device is visible (see ``tests/conftest.py``).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -465,6 +466,89 @@ class TestSweepOrchestration:
         ]
         assert resumed and resumed[-1].get("resumed") is True
 
+    def test_forwards_child_progress_with_sweep_context(
+        self, tmp_path: Path,
+    ) -> None:
+        from lqh.train import sweep
+
+        run_dir = tmp_path / "runs" / "sweep"
+        sub_run_dir = run_dir / "sweep_cfg"
+        sub_run_dir.mkdir(parents=True)
+
+        ctx = sweep._ChildProgressContext(
+            parent_run_dir=run_dir,
+            config_id="cfg",
+            config_index=1,
+            n_configs=6,
+        )
+
+        sweep._forward_child_progress_row(ctx, {
+            "step": 10,
+            "loss": 0.75,
+            "lr": 2e-5,
+            "epoch": 0.5,
+            "max_steps": 300,
+        })
+        sweep._forward_child_progress_row(ctx, {
+            "step": 10,
+            "loss": 0.74,
+        })
+        sweep._forward_child_progress_row(ctx, {
+            "step": 10,
+            "eval_loss": 0.66,
+            "max_steps": 300,
+        })
+
+        rows = [
+            json.loads(line)
+            for line in (run_dir / "progress.jsonl").read_text().splitlines()
+        ]
+        assert len(rows) == 2
+        assert rows[0]["phase"] == "sweep_config_progress"
+        assert rows[0]["config_id"] == "cfg"
+        assert rows[0]["config_index"] == 1
+        assert rows[0]["n_configs"] == 6
+        assert rows[0]["child_step"] == 10
+        assert rows[0]["child_loss"] == pytest.approx(0.75)
+        assert rows[0]["child_max_steps"] == 300
+        assert rows[1]["child_eval_loss"] == pytest.approx(0.66)
+
+    def test_forward_child_progress_retries_partial_jsonl_line(
+        self, tmp_path: Path,
+    ) -> None:
+        from lqh.train import sweep
+
+        run_dir = tmp_path / "runs" / "sweep"
+        sub_run_dir = run_dir / "sweep_cfg"
+        sub_run_dir.mkdir(parents=True)
+        progress_path = sub_run_dir / "progress.jsonl"
+
+        ctx = sweep._ChildProgressContext(
+            parent_run_dir=run_dir,
+            config_id="cfg",
+            config_index=0,
+            n_configs=1,
+        )
+        token = sweep._CHILD_PROGRESS_CONTEXT.set(ctx)
+        try:
+            progress_path.write_text('{"step": 1, "loss": 0.9}')
+            sweep._forward_child_progress(sub_run_dir)
+            assert not (run_dir / "progress.jsonl").exists()
+            assert ctx.offset == 0
+
+            progress_path.write_text('{"step": 1, "loss": 0.9}\n')
+            sweep._forward_child_progress(sub_run_dir)
+        finally:
+            sweep._CHILD_PROGRESS_CONTEXT.reset(token)
+
+        rows = [
+            json.loads(line)
+            for line in (run_dir / "progress.jsonl").read_text().splitlines()
+        ]
+        assert len(rows) == 1
+        assert rows[0]["child_step"] == 1
+        assert rows[0]["child_loss"] == pytest.approx(0.9)
+
 
 # ---------------------------------------------------------------------------
 # Cloud continuation resume helpers
@@ -754,6 +838,42 @@ class TestTrainingToolValidation:
         result = await handle_training_status(training_workspace, run_name="sft_001")
         assert "completed" in result.content
         assert "sft_001" in result.content
+
+    async def test_training_status_shows_live_sweep_progress(
+        self, training_workspace: Path,
+    ) -> None:
+        from lqh.tools.handlers import handle_training_status
+        from lqh.train.progress import write_progress
+
+        run = training_workspace / "runs" / "sft_sweep"
+        run.mkdir(parents=True)
+        (run / "config.json").write_text('{"type": "sweep"}')
+        (run / "pid").write_text(str(os.getpid()))
+        write_progress(
+            run,
+            step=42,
+            loss=0.91,
+            lr=2e-5,
+            epoch=0.75,
+            extra={
+                "phase": "sweep_config_progress",
+                "config_id": "sft_lr2e-05_e2",
+                "config_index": 1,
+                "n_configs": 6,
+                "child_step": 42,
+                "child_loss": 0.91,
+                "child_lr": 2e-5,
+                "child_epoch": 0.75,
+                "child_max_steps": 300,
+            },
+        )
+
+        result = await handle_training_status(training_workspace, run_name="sft_sweep")
+        assert "running" in result.content
+        assert "Sweep: config 2/6" in result.content
+        assert "sft_lr2e-05_e2" in result.content
+        assert "step 42/300" in result.content
+        assert "loss=0.9100" in result.content
 
     async def test_start_local_eval_missing_model(
         self, training_workspace: Path, stub_torch_available,
