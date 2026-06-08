@@ -301,6 +301,22 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     if eval_convos:
         eval_dataset = Dataset.from_list(chatml_to_sft_dataset(eval_convos))
 
+    # Safe batch-size auto-tuning (GPU_TYPE.md §6). Mutates training_cfg
+    # in place (per_device_batch_size + gradient_accumulation_steps) so
+    # the sft_kwargs below pick up the calibrated values. No-op when
+    # auto_batch is off, no GPU, or the backend is unreachable.
+    from lqh.train.calibrate import maybe_autotune_batch_size
+
+    _lora_enabled = lora_cfg.get("enabled", True)
+    maybe_autotune_batch_size(
+        training_cfg,
+        model=model,
+        tokenizer=tokenizer,
+        base_model=base_model,
+        method="lora" if _lora_enabled else "full",
+        lora_rank=int(lora_cfg.get("r", 32)) if _lora_enabled else 0,
+    )
+
     # Checkpoints dir
     checkpoint_output = str(run_dir / "checkpoints")
 

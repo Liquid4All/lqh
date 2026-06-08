@@ -89,6 +89,22 @@ def test_status_sentinel_in_sandbox(tmp_path: Path, monkeypatch):
     assert events[1]["payload"]["error"] == "OOM at step 1000"
 
 
+def test_status_oom_flag(tmp_path: Path, monkeypatch):
+    """oom=True stamps an `oom` flag the backend uses to classify the
+    lease as `oom` instead of `preempted` (both are exit 137)."""
+    monkeypatch.setenv("LQH_JOB_ID", "test-job-123")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        progress.write_status(tmp_path, "failed", error="CUDA out of memory", oom=True)
+        progress.write_status(tmp_path, "failed", error="some other error")
+
+    events = _parse_sentinels(buf.getvalue())
+    assert len(events) == 2
+    assert events[0]["payload"]["oom"] is True
+    # Default: no oom key when not flagged (Go reads it as false).
+    assert "oom" not in events[1]["payload"]
+
+
 def test_sentinel_wire_format_one_line(tmp_path: Path, monkeypatch):
     """The cloud runner parses line-by-line; payloads MUST be single-line
     JSON or the SSE consumer will see truncated events."""

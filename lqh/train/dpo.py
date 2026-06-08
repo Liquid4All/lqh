@@ -621,6 +621,21 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         eval_steps = int(training_cfg.get("dpo_eval_steps", training_cfg.get("eval_steps", 10)))
         has_eval = eval_dataset is not None
 
+        # Safe batch-size auto-tuning (GPU_TYPE.md §6). Mutates training_cfg
+        # in place before dpo_kwargs reads it. First iter probes + caches;
+        # later iters hit the cached profile. No-op without GPU/backend.
+        from lqh.train.calibrate import maybe_autotune_batch_size
+
+        _dpo_lora_enabled = lora_cfg.get("enabled", True)
+        maybe_autotune_batch_size(
+            training_cfg,
+            model=model,
+            tokenizer=tokenizer,
+            base_model=base_model,
+            method="lora" if _dpo_lora_enabled else "full",
+            lora_rank=int(lora_cfg.get("r", 32)) if _dpo_lora_enabled else 0,
+        )
+
         # DPO training config
         dpo_kwargs: dict[str, Any] = dict(
             output_dir=str(iter_dir / "dpo_output"),

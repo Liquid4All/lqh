@@ -67,15 +67,27 @@ def write_status(
     status: str,
     *,
     error: str | None = None,
+    oom: bool = False,
     extra: dict[str, Any] | None = None,
 ) -> None:
-    """Write a terminal status line (``completed`` or ``failed``)."""
+    """Write a terminal status line (``completed`` or ``failed``).
+
+    ``oom=True`` stamps an ``oom`` flag on the event. This is the
+    cooperative out-of-memory signal the backend relies on: exit 137 is
+    SIGKILL for both preemption and OOM, so the backend cannot tell them
+    apart from the exit code alone. Emitting this flag *before* the
+    process dies lets the per-lease telemetry classify the lease as
+    ``oom`` (vs ``preempted``) and lets batch auto-tuning self-heal
+    (GPU_TYPE.md Design §3.5, §6).
+    """
     entry: dict[str, Any] = {
         "status": status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     if error is not None:
         entry["error"] = error
+    if oom:
+        entry["oom"] = True
     if extra:
         entry.update(extra)
 

@@ -49,11 +49,34 @@ def main() -> None:
 
         write_status(run_dir, "interrupted", error="Timeout waiting for preferences")
     except Exception as exc:
-        # Write failure to progress so the watcher can detect it.
+        # Write failure to progress so the watcher can detect it. A CUDA
+        # OOM is flagged explicitly (oom=True) so the backend classifies
+        # the lease as `oom` rather than `preempted` and batch auto-tuning
+        # can self-heal — see lqh.train.progress.write_status.
         from lqh.train.progress import write_status
 
-        write_status(run_dir, "failed", error=str(exc))
+        is_oom = _looks_like_oom(exc)
+        if is_oom:
+            # Self-heal: write back a smaller batch profile so the next
+            # run uses it (GPU_TYPE.md §6). Best-effort, never raises.
+            from lqh.train.calibrate import report_oom_downgrade
+
+            report_oom_downgrade(config)
+        write_status(run_dir, "failed", error=str(exc), oom=is_oom)
         raise
+
+
+def _looks_like_oom(exc: BaseException) -> bool:
+    """Best-effort CUDA out-of-memory detection without importing torch.
+
+    torch.cuda.OutOfMemoryError subclasses RuntimeError; we match on the
+    type name and message so this stays a zero-dependency check at the
+    dispatch layer (torch is imported only inside the training loops).
+    """
+    if type(exc).__name__ == "OutOfMemoryError":
+        return True
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda oom" in msg or "outofmemory" in msg
 
 
 if __name__ == "__main__":
