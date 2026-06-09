@@ -305,6 +305,14 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # in place (per_device_batch_size + gradient_accumulation_steps) so
     # the sft_kwargs below pick up the calibrated values. No-op when
     # auto_batch is off, no GPU, or the backend is unreachable.
+    #
+    # The probe must see the model in its TRAINING configuration: for
+    # LoRA we wrap with the adapter first (frozen base + tiny trainable
+    # adapter) and unload right after — SFTTrainer re-wraps via
+    # peft_config exactly as before, so the training path is unchanged.
+    # The pre-fix probe ran on the raw model, measured roughly
+    # full-FT-without-checkpointing memory, and discovered micro-batches
+    # ~10x too small (GPU_TYPE_2.md).
     from lqh.train.calibrate import ensure_batch_defaults, maybe_autotune_batch_size
 
     _lora_enabled = lora_cfg.get("enabled", True)
@@ -313,14 +321,21 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         default_micro_batch=256 if _lora_enabled else 1,
         default_effective_batch=256 if _lora_enabled else 16,
     )
+    probe_model = model
+    if peft_config is not None:
+        from peft import get_peft_model
+
+        probe_model = get_peft_model(model, peft_config)
     maybe_autotune_batch_size(
         training_cfg,
-        model=model,
+        model=probe_model,
         tokenizer=tokenizer,
         base_model=base_model,
         method="lora" if _lora_enabled else "full",
         lora_rank=int(lora_cfg.get("r", 32)) if _lora_enabled else 0,
     )
+    if probe_model is not model:
+        model = probe_model.unload()
 
     # Checkpoints dir
     checkpoint_output = str(run_dir / "checkpoints")

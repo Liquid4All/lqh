@@ -105,3 +105,120 @@ def test_report_oom_downgrade_noop_outside_cloud(monkeypatch):
     monkeypatch.delenv("LQH_API_TOKEN", raising=False)
     # Should simply return without raising or calling the network.
     calibrate.report_oom_downgrade({"base_model": "x", "training": {}})
+
+
+class _FakeCuda:
+    @staticmethod
+    def is_available():
+        return True
+
+    @staticmethod
+    def get_device_name(_idx):
+        return "FakeGPU"
+
+
+class _FakeTorch:
+    cuda = _FakeCuda()
+
+
+def _patch_torch(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "torch", _FakeTorch())
+
+
+def test_autotune_applies_cached_value_below_configured(monkeypatch):
+    """A cached measured value smaller than the configured micro-batch
+    must still apply (the old `micro >= cur_micro` guard ignored it and
+    re-probed on every run)."""
+    _patch_torch(monkeypatch)
+    monkeypatch.setattr(
+        calibrate, "_get_cached_profile", lambda key: {"measured_micro_batch": 64}
+    )
+    monkeypatch.setattr(
+        calibrate,
+        "_probe_micro_batch",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not probe on cache hit")),
+    )
+    cfg = {
+        "per_device_batch_size": 256,
+        "gradient_accumulation_steps": 1,
+        "effective_batch_size": 256,
+    }
+    calibrate.maybe_autotune_batch_size(
+        cfg, model=object(), tokenizer=object(), base_model="m", method="lora", lora_rank=32
+    )
+    assert cfg["per_device_batch_size"] == 64
+    assert cfg["gradient_accumulation_steps"] == 4  # effective 256 preserved
+
+
+def test_autotune_cached_value_respects_admin_cap(monkeypatch):
+    _patch_torch(monkeypatch)
+    monkeypatch.setattr(
+        calibrate,
+        "_get_cached_profile",
+        lambda key: {"measured_micro_batch": 128, "admin_max_micro_batch": 32},
+    )
+    cfg = {"per_device_batch_size": 4, "gradient_accumulation_steps": 4}
+    calibrate.maybe_autotune_batch_size(
+        cfg, model=object(), tokenizer=object(), base_model="m", method="lora", lora_rank=32
+    )
+    assert cfg["per_device_batch_size"] == 32
+
+
+def test_autotune_probes_full_range_despite_small_config(monkeypatch):
+    """Old run configs carry per_device_batch_size=4; the probe must
+    still search the full candidate range, not cap at the configured
+    value (the bug that froze discovery at 4, GPU_TYPE_2.md)."""
+    _patch_torch(monkeypatch)
+    monkeypatch.setattr(calibrate, "_get_cached_profile", lambda key: None)
+    seen = {}
+
+    def fake_probe(model, tokenizer, *, seq_len, max_micro_batch, target_headroom, gradient_checkpointing):
+        seen["max_micro_batch"] = max_micro_batch
+        return 96, 25_000
+
+    monkeypatch.setattr(calibrate, "_probe_micro_batch", fake_probe)
+    posted = {}
+
+    def fake_post(key, **kwargs):
+        posted.update(kwargs)
+        return True
+
+    monkeypatch.setattr(calibrate, "_post_profile", fake_post)
+    cfg = {
+        "per_device_batch_size": 4,
+        "gradient_accumulation_steps": 4,
+        "effective_batch_size": 64,
+    }
+    calibrate.maybe_autotune_batch_size(
+        cfg, model=object(), tokenizer=object(), base_model="m", method="lora", lora_rank=32
+    )
+    assert seen["max_micro_batch"] == max(calibrate._PROBE_BATCHES)
+    assert cfg["per_device_batch_size"] == 96
+    assert cfg["gradient_accumulation_steps"] == 1  # ceil(64/96)
+    assert posted["micro_batch"] == 96
+    assert posted["source"] == "probe"
+
+
+def test_autotune_probe_cap_uses_admin_ceiling(monkeypatch):
+    _patch_torch(monkeypatch)
+    monkeypatch.setattr(
+        calibrate,
+        "_get_cached_profile",
+        lambda key: {"measured_micro_batch": None, "admin_max_micro_batch": 48},
+    )
+    seen = {}
+
+    def fake_probe(model, tokenizer, *, seq_len, max_micro_batch, target_headroom, gradient_checkpointing):
+        seen["max_micro_batch"] = max_micro_batch
+        return 48, 10_000
+
+    monkeypatch.setattr(calibrate, "_probe_micro_batch", fake_probe)
+    monkeypatch.setattr(calibrate, "_post_profile", lambda key, **kw: True)
+    cfg = {"per_device_batch_size": 256, "effective_batch_size": 256}
+    calibrate.maybe_autotune_batch_size(
+        cfg, model=object(), tokenizer=object(), base_model="m", method="lora", lora_rank=32
+    )
+    assert seen["max_micro_batch"] == 48
+    assert cfg["per_device_batch_size"] == 48

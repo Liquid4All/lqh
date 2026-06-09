@@ -1,3 +1,3 @@
 """Liquid Harness (lqh) – A fine-tuning tool for foundation models."""
 
-__version__ = "0.2.10"
+__version__ = "0.2.11"

@@ -109,11 +109,14 @@ def _post_profile(
     headroom: float,
     source: str,
     stable: bool,
-) -> None:
+) -> bool:
+    """POST the measured profile back. Returns True on a 2xx response —
+    the standalone calibration job (main) exits non-zero on False so the
+    backend resets the row's 'probing' marker."""
     base = _api_base()
     token = os.environ.get("LQH_API_TOKEN")
     if not base or not token:
-        return
+        return False
     try:
         import httpx
 
@@ -126,14 +129,15 @@ def _post_profile(
             source=source,
             stable=stable,
         )
-        httpx.post(
+        r = httpx.post(
             base + "/cloud/batch_profile",
             json=body,
             headers={"Authorization": f"Bearer {token}"},
             timeout=30.0,
         )
+        return 200 <= r.status_code < 300
     except Exception:
-        return
+        return False
 
 
 def _apply(training_cfg: dict[str, Any], micro: int, target_effective: int) -> int:
@@ -180,9 +184,19 @@ def _probe_micro_batch(
     seq_len: int,
     max_micro_batch: int,
     target_headroom: float,
+    gradient_checkpointing: bool = True,
 ):
-    """Probe increasing micro-batches with a real fwd+backward and a short
-    generate(), returning (safe_micro_batch, peak_mem_mb) or (None, None).
+    """Probe increasing micro-batches with a real fwd+backward, one
+    optimizer step and a short generate(), returning
+    (safe_micro_batch, peak_mem_mb) or (None, None).
+
+    Fidelity matters more than speed here (GPU_TYPE_2.md): the caller
+    must pass the model in its *training* configuration — PEFT-wrapped
+    for LoRA — and we enable gradient checkpointing to match the HF
+    Trainer (which turns it on itself, after this probe runs). The
+    pre-fix probe measured a full-model backward without checkpointing,
+    which inflated memory ~10x for LoRA and made every discovered batch
+    far too small.
 
     Conservative: stops at the first batch that exceeds the memory budget
     or OOMs, and uses the last batch that fit."""
@@ -205,6 +219,23 @@ def _probe_micro_batch(
         candidates.append(max_micro_batch)
     candidates = sorted(set(candidates))
     was_training = model.training
+
+    # Match the trainer's activation-memory configuration. use_cache must
+    # be off under checkpointing (HF disables it the same way); generate()
+    # below re-enables it temporarily because decoding without a KV cache
+    # is pathological.
+    prev_use_cache = getattr(getattr(model, "config", None), "use_cache", None)
+    if gradient_checkpointing:
+        try:
+            model.gradient_checkpointing_enable()
+            model.config.use_cache = False
+            # LoRA + checkpointing: the frozen base produces no input
+            # grads, so checkpointed blocks need this or backward dies.
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+        except Exception:
+            pass
+
     for b in candidates:
         try:
             torch.cuda.empty_cache()
@@ -214,25 +245,56 @@ def _probe_micro_batch(
             attn = torch.ones_like(input_ids)
             out = model(input_ids=input_ids, attention_mask=attn, labels=input_ids)
             out.loss.backward()
+            # One zero-LR optimizer step over the trainable params so the
+            # Adam state allocation (2 fp32 tensors per trainable param —
+            # the dominant term for full fine-tuning, negligible for
+            # LoRA) is part of the measurement. lr=0 → weights unchanged.
+            opt = torch.optim.AdamW(
+                (p for p in model.parameters() if p.requires_grad), lr=0.0
+            )
+            opt.step()
+            opt.zero_grad(set_to_none=True)
             model.zero_grad(set_to_none=True)
             # Eval-time generate peak — the documented OOM source. Include
             # it so the chosen batch survives checkpoint-eval, not just the
             # train step.
             model.eval()
             with torch.no_grad():
+                if gradient_checkpointing:
+                    model.config.use_cache = True
                 prompt = input_ids[:, : min(seq_len, 32)]
                 model.generate(prompt, max_new_tokens=8, do_sample=False)
+                if gradient_checkpointing:
+                    model.config.use_cache = False
             used = int(torch.cuda.max_memory_reserved(device))
+            del opt, input_ids, attn, out
             if used <= budget:
                 safe, peak = b, used // (1024 * 1024)
+                print(
+                    f"calibrate: probe micro_batch={b} peak={used // (1024 * 1024)}MB "
+                    f"(budget {budget // (1024 * 1024)}MB)",
+                    flush=True,
+                )
             else:
+                print(
+                    f"calibrate: probe micro_batch={b} peak={used // (1024 * 1024)}MB "
+                    f"exceeds budget {budget // (1024 * 1024)}MB; stopping",
+                    flush=True,
+                )
                 break
-        except Exception:
+        except Exception as exc:
             # OOM (torch.cuda.OutOfMemoryError) or any probe error — the
             # previous safe batch stands.
+            print(f"calibrate: probe micro_batch={b} failed ({type(exc).__name__}); stopping", flush=True)
             break
         finally:
+            model.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
+    if prev_use_cache is not None:
+        try:
+            model.config.use_cache = prev_use_cache
+        except Exception:
+            pass
     if was_training:
         model.train()
     else:
@@ -286,27 +348,42 @@ def maybe_autotune_batch_size(
         )
 
         cached = _get_cached_profile(key)
+        admin_cap: int | None = None
+        if cached:
+            try:
+                admin_cap = int(cached.get("admin_max_micro_batch") or 0) or None
+            except (TypeError, ValueError):
+                admin_cap = None
         if cached and cached.get("measured_micro_batch"):
+            # Apply the measured value unconditionally (modulo the admin
+            # ceiling): it is the ground truth for this exact key. The old
+            # `micro >= cur_micro` guard meant a cached value below the
+            # config default was ignored and re-probed on every run.
             micro = int(cached["measured_micro_batch"])
-            cap = cached.get("admin_max_micro_batch")
-            if cap:
-                micro = min(micro, int(cap))
-            if micro >= cur_micro:
-                accum = _apply(training_cfg, micro, target_effective)
-                print(
-                    f"calibrate: cached micro_batch={micro} grad_accum={accum} "
-                    f"(effective {target_effective}, gpu={gpu_type})",
-                    flush=True,
-                )
-                return
+            if admin_cap:
+                micro = min(micro, admin_cap)
+            accum = _apply(training_cfg, micro, target_effective)
+            print(
+                f"calibrate: cached micro_batch={micro} grad_accum={accum} "
+                f"(effective {target_effective}, gpu={gpu_type})",
+                flush=True,
+            )
+            return
 
+        # Probe the full candidate range, not just up to the configured
+        # micro-batch: old run configs carry per_device_batch_size=4 and
+        # capping at cur_micro froze discovery there (GPU_TYPE_2.md). When
+        # auto_batch is on, the probe owns the decision; the only ceiling
+        # is the admin override.
+        probe_cap = admin_cap or max(_PROBE_BATCHES)
         headroom = float(training_cfg.get("batch_headroom", _DEFAULT_HEADROOM))
         safe, peak = _probe_micro_batch(
             model,
             tokenizer,
             seq_len=seq_len,
-            max_micro_batch=cur_micro,
+            max_micro_batch=probe_cap,
             target_headroom=headroom,
+            gradient_checkpointing=bool(training_cfg.get("gradient_checkpointing", True)),
         )
         if not safe:
             print("calibrate: probe found no safe batch; keeping configured default", flush=True)
@@ -379,3 +456,120 @@ def report_oom_downgrade(config: dict[str, Any]) -> None:
         print(f"calibrate: OOM self-heal — wrote downgraded micro_batch={downgraded}", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"calibrate: OOM downgrade skipped ({exc})", flush=True)
+
+
+# Default LoRA target modules for the standalone probe — keep in sync
+# with the sft.py / dpo.py LoraConfig defaults.
+_LORA_TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "in_proj", "out_proj", "w1", "w2", "w3",
+]
+
+
+def main() -> int:
+    """Standalone calibration job: ``python -m lqh.train.calibrate``.
+
+    Launched by the backend when an admin clicks "re-discover" on the
+    Model Catalog (KindCalibrate, GPU_TYPE.md §7). The probe key arrives
+    via LQH_CALIBRATE_* env; the measurement is POSTed back through the
+    scoped job token. Exits non-zero when no safe batch was found or the
+    write-back failed, so the backend resets the row's 'probing' marker
+    and the job shows as failed instead of silently stale.
+    """
+    import torch
+
+    base_model = os.environ.get("LQH_CALIBRATE_BASE_MODEL", "").strip()
+    if not base_model:
+        print("calibrate: LQH_CALIBRATE_BASE_MODEL is required", flush=True)
+        return 2
+    method = (os.environ.get("LQH_CALIBRATE_METHOD") or "lora").strip().lower()
+    if method not in ("lora", "full"):
+        print(f"calibrate: unknown method {method!r}", flush=True)
+        return 2
+    lora_rank = int(os.environ.get("LQH_CALIBRATE_LORA_RANK") or 0)
+    if method == "lora" and lora_rank <= 0:
+        lora_rank = 32
+    seq_len = int(os.environ.get("LQH_CALIBRATE_SEQ_LEN") or 2048)
+    dtype = (os.environ.get("LQH_CALIBRATE_DTYPE") or "bf16").strip() or "bf16"
+    modality = (os.environ.get("LQH_CALIBRATE_MODALITY") or "text").strip() or "text"
+    max_micro_env = os.environ.get("LQH_CALIBRATE_MAX_MICRO", "").strip()
+    max_micro = int(max_micro_env) if max_micro_env else max(_PROBE_BATCHES)
+
+    if not torch.cuda.is_available():
+        print("calibrate: no CUDA device available", flush=True)
+        return 1
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float32
+    print(
+        f"calibrate: loading {base_model} (dtype={dtype}, method={method}, "
+        f"lora_rank={lora_rank}, seq_len={seq_len})",
+        flush=True,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model, dtype=torch_dtype, device_map="auto"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if method == "lora":
+        from peft import LoraConfig, get_peft_model
+
+        peft_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=2 * lora_rank,
+            lora_dropout=0.02,
+            target_modules=_LORA_TARGET_MODULES,
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, peft_config)
+
+    gpu_type = os.environ.get("LQH_GPU_TYPE") or torch.cuda.get_device_name(0)
+    key = profile_key(
+        base_model=base_model,
+        method=method,
+        gpu_type=gpu_type,
+        modality=modality,
+        seq_len=seq_len,
+        lora_rank=lora_rank if method == "lora" else 0,
+        dtype=dtype,
+        image_id=os.environ.get("LQH_IMAGE_ID", ""),
+    )
+    safe, peak = _probe_micro_batch(
+        model,
+        tokenizer,
+        seq_len=seq_len,
+        max_micro_batch=max_micro,
+        target_headroom=_DEFAULT_HEADROOM,
+        gradient_checkpointing=True,
+    )
+    if not safe:
+        print("calibrate: probe found no safe micro-batch", flush=True)
+        return 1
+    target_effective = 256 if method == "lora" else 16
+    accum = max(1, math.ceil(target_effective / safe))
+    if not _post_profile(
+        key,
+        micro_batch=safe,
+        grad_accum=accum,
+        peak_mem_mb=peak,
+        headroom=_DEFAULT_HEADROOM,
+        source="probe",
+        stable=True,
+    ):
+        print("calibrate: failed to write the profile back to the backend", flush=True)
+        return 1
+    print(
+        f"calibrate: done — micro_batch={safe} grad_accum={accum} peak={peak}MB "
+        f"(effective {target_effective}, gpu={gpu_type}, model={base_model}, method={method})",
+        flush=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())

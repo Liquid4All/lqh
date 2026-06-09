@@ -624,6 +624,14 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         # Safe batch-size auto-tuning (GPU_TYPE.md §6). Mutates training_cfg
         # in place before dpo_kwargs reads it. First iter probes + caches;
         # later iters hit the cached profile. No-op without GPU/backend.
+        #
+        # Probe on the model in its TRAINING configuration: wrap with the
+        # LoRA adapter first (frozen base + tiny trainable adapter) and
+        # unload right after, so DPOTrainer's peft_config wiring below is
+        # untouched. Note the probe still under-counts the resident
+        # frozen ref model (~2 bytes/param, ref stays loaded during
+        # training); the 15% headroom covers that at the ≤1.2B scale we
+        # run DPO at.
         from lqh.train.calibrate import ensure_batch_defaults, maybe_autotune_batch_size
 
         _dpo_lora_enabled = lora_cfg.get("enabled", True)
@@ -632,14 +640,21 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             default_micro_batch=256 if _dpo_lora_enabled else 1,
             default_effective_batch=256 if _dpo_lora_enabled else 2,
         )
+        _probe_model = model
+        if peft_config is not None and not model_has_peft:
+            from peft import get_peft_model
+
+            _probe_model = get_peft_model(model, peft_config)
         maybe_autotune_batch_size(
             training_cfg,
-            model=model,
+            model=_probe_model,
             tokenizer=tokenizer,
             base_model=base_model,
             method="lora" if _dpo_lora_enabled else "full",
             lora_rank=int(lora_cfg.get("r", 32)) if _dpo_lora_enabled else 0,
         )
+        if _probe_model is not model:
+            model = _probe_model.unload()
 
         # DPO training config
         dpo_kwargs: dict[str, Any] = dict(
