@@ -261,6 +261,50 @@ def test_autotune_dpo_method_keys_separately_and_probes_pairs(monkeypatch):
     assert cfg["per_device_batch_size"] == 16
 
 
+def test_oom_downgrade_skipped_when_checkpointing_disabled(monkeypatch):
+    """The OOM self-heal must obey the same cache contract as the probe:
+    an uncheckpointed run's OOM must not downgrade the shared
+    (checkpointing-ON) profile."""
+    monkeypatch.setenv("LQH_JOB_ID", "job-1")
+    monkeypatch.setenv("LQH_API_TOKEN", "tok")
+    _patch_torch(monkeypatch)
+
+    def fail_post(key, **kwargs):
+        raise AssertionError("must not post a downgrade when checkpointing is off")
+
+    monkeypatch.setattr(calibrate, "_post_profile", fail_post)
+    calibrate.report_oom_downgrade(
+        {
+            "base_model": "m",
+            "training": {"gradient_checkpointing": False, "per_device_batch_size": 64},
+        }
+    )
+
+
+def test_oom_downgrade_posts_when_checkpointing_on(monkeypatch):
+    monkeypatch.setenv("LQH_JOB_ID", "job-1")
+    monkeypatch.setenv("LQH_API_TOKEN", "tok")
+    _patch_torch(monkeypatch)
+    posted = {}
+
+    def fake_post(key, **kwargs):
+        posted.update(key)
+        posted.update(kwargs)
+        return True
+
+    monkeypatch.setattr(calibrate, "_post_profile", fake_post)
+    calibrate.report_oom_downgrade(
+        {
+            "base_model": "m",
+            "type": "dpo",
+            "training": {"per_device_batch_size": 64},
+        }
+    )
+    assert posted["micro_batch"] == 32
+    assert posted["source"] == "downgraded"
+    assert posted["training_method"] == "dpo_lora"
+
+
 def test_autotune_no_cache_io_when_checkpointing_disabled(monkeypatch):
     """The shared cache is measured with gradient checkpointing ON; a run
     with it disabled must not consume cached values nor write back its

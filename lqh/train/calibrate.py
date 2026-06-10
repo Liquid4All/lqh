@@ -257,15 +257,18 @@ def _probe_micro_batch(
             input_ids = torch.randint(0, vocab, (rows, seq_len), device=device)
             attn = torch.ones_like(input_ids)
             out = model(input_ids=input_ids, attention_mask=attn, labels=input_ids)
-            out.loss.backward()
             if pair_batch:
                 # Approximate the frozen reference-model forward DPO runs
                 # alongside the policy: one no-grad pass at the same pair
-                # width. Same architecture → comparable activation peak.
-                model.eval()
+                # width (same architecture → comparable activation peak).
+                # It must run BEFORE backward — in DPOTrainer the ref
+                # logprobs are computed while the policy graph and logits
+                # are still live, so the real peak is policy graph + ref
+                # forward overlapping. Probing it after backward (which
+                # frees the graph) under-counted that peak.
                 with torch.no_grad():
                     model(input_ids=input_ids, attention_mask=attn)
-                model.train()
+            out.loss.backward()
             # One zero-LR optimizer step over the trainable params so the
             # Adam state allocation (2 fp32 tensors per trainable param —
             # the dominant term for full fine-tuning, negligible for
@@ -454,6 +457,13 @@ def report_oom_downgrade(config: dict[str, Any]) -> None:
 
         training_cfg = config.get("training", {}) or {}
         if not bool(training_cfg.get("auto_batch", True)):
+            return
+        # Same cache contract as maybe_autotune_batch_size: the shared
+        # profile stores checkpointing-ON measurements only. An OOM in an
+        # uncheckpointed run says nothing about the checkpointed batch,
+        # so it must not downgrade the shared value.
+        if not bool(training_cfg.get("gradient_checkpointing", True)):
+            print("calibrate: OOM downgrade skipped (gradient_checkpointing off — not cached)", flush=True)
             return
         lora_cfg = config.get("lora", {}) or {}
         lora_enabled = bool(lora_cfg.get("enabled", True))
