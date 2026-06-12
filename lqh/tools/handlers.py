@@ -2619,7 +2619,7 @@ async def _training_status_remote(
         await backend.sync_progress(remote_run_dir, str(run_dir))
         status = await backend.poll_status(job_id)
     except Exception as e:
-        return ToolResult(content=f"Error checking remote status: {e}")
+        return ToolResult(content=_format_training_status_error(e))
 
     state_emoji = {
         "running": "🏃", "completed": "✅", "failed": "❌",
@@ -2678,6 +2678,30 @@ async def _training_status_remote(
         lines.extend(sweep_lines)
 
     return ToolResult(content="\n".join(lines))
+
+
+_TRAINING_STATUS_RATE_LIMIT_HINT = (
+    "LQH is already watching this training run in the background. Do not poll "
+    "training_status again; if you need to wait for completion, end the "
+    "conversation without emitting another tool call. The session will wake "
+    "automatically when the watcher observes completion."
+)
+
+
+def _is_http_429_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return (
+        "429" in msg
+        or "rate limit" in msg.lower()
+        or "too many requests" in msg.lower()
+    )
+
+
+def _format_training_status_error(exc: Exception) -> str:
+    content = f"Error checking remote status: {exc}"
+    if _is_http_429_error(exc):
+        content = f"{content}\n\n{_TRAINING_STATUS_RATE_LIMIT_HINT}"
+    return content
 
 
 def _format_status(run_name: str, status: Any, run_dir: Path) -> str:

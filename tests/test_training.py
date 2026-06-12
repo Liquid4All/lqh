@@ -925,6 +925,42 @@ class TestTrainingToolValidation:
         assert "step 42/300" in result.content
         assert "loss=0.9100" in result.content
 
+    async def test_training_status_429_tells_agent_not_to_poll(
+        self, training_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from lqh.tools.handlers import handle_training_status
+
+        run = training_workspace / "runs" / "cloud_sft"
+        run.mkdir(parents=True)
+        (run / "config.json").write_text('{"type": "sft"}')
+        (run / "remote_job.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "job_123",
+                    "remote_name": "cloud",
+                    "remote_run_dir": "cloud:job_123",
+                }
+            )
+        )
+
+        class FakeCloudBackend:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def sync_progress(self, *args: Any, **kwargs: Any) -> None:
+                raise RuntimeError("429: Too Many Requests")
+
+            async def poll_status(self, *args: Any, **kwargs: Any) -> None:
+                raise AssertionError("poll_status should not run after sync failure")
+
+        monkeypatch.setattr("lqh.remote.cloud.CloudBackend", FakeCloudBackend)
+
+        result = await handle_training_status(training_workspace, run_name="cloud_sft")
+
+        assert "Error checking remote status: 429: Too Many Requests" in result.content
+        assert "Do not poll training_status again" in result.content
+        assert "wake automatically" in result.content
+
     async def test_start_local_eval_missing_model(
         self, training_workspace: Path, stub_torch_available,
     ) -> None:

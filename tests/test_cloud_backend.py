@@ -27,7 +27,7 @@ import httpx
 import pytest
 
 from lqh.remote.backend import RemoteConfig
-from lqh.remote.cloud import CloudBackend, _CloudState
+from lqh.remote.cloud import CloudBackend, CloudError, _CloudState
 
 
 # ---------------------------------------------------------------------
@@ -375,6 +375,20 @@ def test_poll_status_maps_states(tmp_path, fake_cloud):
     fake_cloud.jobs[job_id]["status"] = "completed"
     status = asyncio.run(backend.poll_status(job_id))
     assert status.state == "completed"
+
+
+def test_poll_status_propagates_429(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    backend = _make_backend(project)
+
+    async def rate_limited(job_id: str):
+        raise CloudError("429: Too Many Requests")
+
+    monkeypatch.setattr(backend, "_get_snapshot", rate_limited)
+
+    with pytest.raises(CloudError, match="429"):
+        asyncio.run(backend.poll_status("job-0001"))
 
 
 def test_teardown_hits_delete(tmp_path, fake_cloud):

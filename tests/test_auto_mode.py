@@ -134,6 +134,16 @@ class TestAutoModeToolGating:
         names = {t["function"]["name"] for t in get_all_tools(auto_mode=True)}
         assert {"exit_auto_mode", "set_auto_stage"} <= names
 
+    def test_training_status_description_discourages_polling(self) -> None:
+        training_status = next(
+            t for t in get_all_tools() if t["function"]["name"] == "training_status"
+        )
+
+        description = training_status["function"]["description"]
+        assert "watched in the background" in description
+        assert "do not repeatedly poll" in description
+        assert "wake automatically" in description
+
 
 # ---------------------------------------------------------------------------
 # exit_auto_mode + set_auto_stage handlers

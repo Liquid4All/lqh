@@ -1035,7 +1035,11 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
             description=(
                 "Check the status of training runs. Shows current step, loss, "
                 "learning rate, eval scores, and whether the subprocess is alive. "
-                "If run_name is omitted, shows status of all runs."
+                "If run_name is omitted, shows status of all runs. Running training "
+                "jobs are watched in the background, so do not repeatedly poll this "
+                "tool. If you need to wait for training to finish, end the "
+                "conversation without another tool call; the session will wake "
+                "automatically when the watcher observes completion."
             ),
             parameters={
                 "type": "object",

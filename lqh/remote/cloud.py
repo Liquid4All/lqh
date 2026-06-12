@@ -259,6 +259,11 @@ class CloudBackend(RemoteBackend):
         """
         try:
             snap = await self._get_snapshot(job_id)
+        except CloudError as exc:
+            if _is_cloud_rate_limit_error(exc):
+                raise
+            logger.warning("poll_status snapshot failed: %s", exc)
+            return JobStatus(state="unknown")
         except Exception as exc:  # network blip → unknown is the safe fallback
             logger.warning("poll_status snapshot failed: %s", exc)
             return JobStatus(state="unknown")
@@ -550,6 +555,11 @@ async def _parse_sse(resp: httpx.Response) -> AsyncIterator[_SSEEvent]:
 
 class CloudError(RuntimeError):
     """Raised on a non-2xx response from /v1/cloud/*."""
+
+
+def _is_cloud_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "429" in msg or "rate limit" in msg or "too many requests" in msg
 
 
 def _raise_for_cloud_error(resp: httpx.Response) -> None:
