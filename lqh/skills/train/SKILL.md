@@ -280,24 +280,49 @@ These are read when `enable_sweep=false`:
 
 ### Combining multiple data sources
 
-Both `dataset` and `eval_dataset` accept **either a single path or a list** of dataset dirs. Use a list to:
+Both `dataset` and `eval_dataset` accept **either a single path or a list** of dataset dirs, so you can train on several files at once instead of picking just one. **Every source you list must still be a filtered/scored dataset** — the same rule as a single-source run: pipeline-generated data goes through `run_data_filter` first, and you only train on the `*_filtered` outputs you have inspected. Never list a raw, unfiltered generated file (human-curated data is the only exception).
 
-- **Combine sub-tasks** produced by separate data-gen pipelines (e.g. type-A + type-B requests).
-- **Mix your data with HuggingFace datasets** — `pull`/`hf_pull` the hub dataset first (it lands at `datasets/<repo>/`), then list it alongside your own dirs.
-- **Accumulate scale-up batches** — combine the 2k + 10k + 20k parquet collections instead of discarding the earlier ones.
+There are two distinct reasons to use a list — and they call for different `repeat` settings:
+
+**1. Use ALL the good data you have — `repeat: 1` for every source.** When you accumulate more data over time (scale-up: a first 2k-sample file, then a 10k-sample file, then 20k), do **not** throw the smaller earlier files away and train only on the newest one. Train on **everything** — more good data is better. These are the *same kind* of data, just collected in batches, so each source gets the default `repeat: 1` (plain concatenation, no over-sampling):
 
 ```python
 start_training(
     type="sft",
     base_model="LiquidAI/LFM2.5-1.2B-Instruct",
-    dataset=["datasets/type_a", {"path": "datasets/type_b", "repeat": 3}],   # train: concatenated; type_b over-sampled 3x
-    eval_dataset=["datasets/type_a_eval", "datasets/type_b_eval"],            # eval: kept separate, scored per-source
+    # Scale-up: same task, collected in batches → train on all of it, no repeats.
+    dataset=[
+        "datasets/summarization_v1_train_filtered",       # earlier 2k batch
+        "datasets/summarization_v2_train_filtered",        # later 10k batch
+    ],
+    eval_dataset="datasets/summarization_eval_filtered",
+    scorer="evals/scorers/summarization.md",
+)
+```
+
+(A bare string and a list of strings both default to `repeat: 1` — `dataset=["a", "b"]` is plain concatenation.)
+
+**2. Balance imbalanced data *types* — use `repeat` to over-sample the smaller type.** When the list mixes **different kinds** of data (e.g. type-A requests and type-B requests from separate pipelines) and they're imbalanced — say 2k type-A vs 10k type-B — left as-is the model sees ~5× more type-B per batch and under-learns type-A. Set `repeat` on the smaller type to bring the mix closer to balanced (here `repeat: 5` makes type-A ≈ type-B in the blend):
+
+```python
+start_training(
+    type="sft",
+    base_model="LiquidAI/LFM2.5-1.2B-Instruct",
+    # Different types, imbalanced → repeat the smaller type to balance the mix.
+    dataset=[
+        {"path": "datasets/type_a_train_filtered", "repeat": 5},   # ~2k samples
+        "datasets/type_b_train_filtered",                           # ~10k samples (repeat 1)
+    ],
+    eval_dataset=["datasets/type_a_eval_filtered", "datasets/type_b_eval_filtered"],
     scorer="evals/scorers/default.md",
 )
 ```
 
-- **Train (`dataset`)** sources are **concatenated**. An optional integer `repeat` on a source over-samples it in the blend (changes the per-batch source ratio; orthogonal to `num_epochs`). DPO concatenates its prompt sources the same way.
-- **Eval (`eval_dataset`)** sources are kept **separate**: the best checkpoint is judge-scored on each source independently. `training_status` and `eval_result.json` show a **per-source breakdown** plus a **macro-average** headline (each source weighted equally, regardless of size). The sweep still selects its winner on the in-training `eval_loss` computed over the concatenation of all eval sources. (`repeat` is not accepted for eval.)
+Other notes:
+
+- **Mixing in HuggingFace datasets** — `pull`/`hf_pull` the hub dataset first (it lands at `datasets/<repo>/`), filter/inspect it like any other source, then list it alongside your own dirs.
+- **`repeat` is integer over-sampling** of the *same* rows (it changes the per-batch source ratio; it is orthogonal to `num_epochs`, which controls passes over the whole blend). Only reach for it to correct a type imbalance — for "use all my data," leave it at 1. DPO concatenates its prompt sources the same way.
+- **Eval (`eval_dataset`) sources are kept SEPARATE** (never repeated): the best checkpoint is judge-scored on each source independently, and `training_status` / `eval_result.json` show a **per-source breakdown** plus a **macro-average** headline (each source weighted equally, regardless of size). The sweep still selects its winner on the in-training `eval_loss` over the concatenation of all eval sources. List eval sources when you want to see how the model does on each sub-task; `repeat` is rejected for eval.
 - Every eval source must be **distinct** from every training source (the call is rejected on overlap).
 
 ### `eval_dataset` is required; scoring is on by default
