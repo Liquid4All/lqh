@@ -184,6 +184,55 @@ def read_latest_progress(run_dir: Path) -> dict[str, Any] | None:
     return entries[0] if entries else None
 
 
+def format_progress_oneline(latest: dict[str, Any] | None) -> tuple[str, int | None]:
+    """Compact one-line progress for the status bar, plus a percent (or None).
+
+    Distinct from the verbose tool-output renderer
+    (``handlers._format_latest_sweep_progress``): this targets the single-line
+    status bar, so it stays terse. Defensive about missing fields — a partial
+    progress row never raises.
+
+    Returns ``("", None)`` when there's nothing meaningful to show.
+    """
+    if not latest:
+        return ("", None)
+
+    def _pct(step: object, total: object) -> int | None:
+        if isinstance(step, int) and isinstance(total, int) and total > 0:
+            return max(0, min(100, round(step / total * 100)))
+        return None
+
+    phase = latest.get("phase")
+    # Sweep child step takes precedence: it's the live inner-loop progress.
+    if isinstance(phase, str) and phase == "sweep_config_progress":
+        step = latest.get("child_step", latest.get("step"))
+        total = latest.get("child_max_steps")
+        idx = latest.get("config_index")
+        n = latest.get("n_configs")
+        config_pos = ""
+        if isinstance(idx, int) and isinstance(n, int) and n > 0:
+            config_pos = f"{idx + 1}/{n} · "
+        pct = _pct(step, total)
+        if isinstance(step, int) and isinstance(total, int) and total > 0:
+            return (f"{config_pos}step {step}/{total} ({pct}%)", pct)
+        if isinstance(step, int):
+            return (f"{config_pos}step {step}", None)
+        return (config_pos.rstrip(" ·"), None)
+
+    # Plain (non-sweep) run.
+    step = latest.get("step")
+    total = latest.get("max_steps")
+    pct = _pct(step, total)
+    if isinstance(step, int) and isinstance(total, int) and total > 0:
+        return (f"step {step}/{total} ({pct}%)", pct)
+    if isinstance(step, int):
+        epoch = latest.get("epoch")
+        if isinstance(epoch, (int, float)):
+            return (f"step {step} · epoch {epoch:.2f}", None)
+        return (f"step {step}", None)
+    return ("", None)
+
+
 # ---------------------------------------------------------------------------
 # Internal
 # ---------------------------------------------------------------------------

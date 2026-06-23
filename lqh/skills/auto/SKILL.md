@@ -30,8 +30,8 @@ guidance, but this skill remains the source of truth for the overall plan.
    run reaches a terminal state and then returns the final status — it does
    not return "running". Do **not** poll in a loop or invent your own
    wait/sleep: one call per run is enough, and it spends zero LLM cycles
-   while waiting. If it ever returns a "still running after …" heartbeat,
-   the run is taking unusually long — just call it again to keep waiting.
+   while waiting (the user watches live step/percent progress in the status
+   bar meanwhile). The call only returns once the run is genuinely done.
 
 ## Goal
 

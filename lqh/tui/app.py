@@ -109,6 +109,15 @@ class LqhApp:
         # transitions enqueue a notification.
         self._job_watcher_task: asyncio.Task | None = None
         self._job_last_state: dict[str, str] = {}
+        # Completion notices keyed by run_name, recorded by _watch_jobs on a
+        # running -> terminal transition. Auto-mode _await_background pops the
+        # entry for the run it is waiting on, so a stale notice for an unrelated
+        # run can never be mis-delivered as another run's completion.
+        self._pending_completions: dict[str, str] = {}
+        # Live progress tracking for the status bar: the last step seen per run
+        # and the wall time it last advanced (drives the "↑8s ago" freshness).
+        self._job_last_step: dict[str, int] = {}
+        self._job_progress_at: dict[str, float] = {}
         # Per-run scoring/sync watchers (RunWatcher / RemoteRunWatcher),
         # keyed by run_name. Spawned lazily by _watch_jobs when a run is
         # observed in the running state and culled when they finish.
@@ -1005,6 +1014,34 @@ class LqhApp:
             remote=remote,
         ))
 
+    def _update_task_progress(self, run_name: str) -> None:
+        """Push the run's latest step/percent into the status-bar registry.
+
+        Reads ``progress.jsonl`` (already rsynced locally for remote runs by
+        ``_poll_remote``) and updates the task's ``progress`` string. The
+        ``updated_at`` timestamp only advances when the step itself advances,
+        so a stalled run shows a growing "↑Xm ago" age in the status bar.
+        """
+        from lqh.train.progress import format_progress_oneline, read_latest_progress
+
+        run_dir = self.project_dir / "runs" / run_name
+        try:
+            latest = read_latest_progress(run_dir)
+        except Exception:
+            return
+        line, _pct = format_progress_oneline(latest)
+        if not line:
+            return
+        step = latest.get("child_step", latest.get("step")) if latest else None
+        if isinstance(step, int) and self._job_last_step.get(run_name) != step:
+            self._job_last_step[run_name] = step
+            self._job_progress_at[run_name] = time.time()
+        self._tasks.update(
+            run_name,
+            progress=line,
+            updated_at=self._job_progress_at.get(run_name),
+        )
+
     def _on_background_task_started(
         self, task_id: str, kind: str, label: str, remote: str | None,
     ) -> None:
@@ -1016,6 +1053,13 @@ class LqhApp:
             state="running",
             remote=remote,
         ))
+        # Seed the watcher's last-known state so a short run that finishes
+        # before the first ~60s scan is still seen as a running -> terminal
+        # transition (otherwise no completion is recorded and auto-mode parks
+        # for the full safety interval). Also drop any stale completion left
+        # over from an earlier run that reused this name.
+        self._job_last_state[task_id] = "running"
+        self._pending_completions.pop(task_id, None)
 
     async def _on_agent_message(self, text: str) -> None:
         await self._emit(render_agent_message(text))
@@ -1315,9 +1359,8 @@ class LqhApp:
         """Auto-mode: park the agent until a watched run reaches a terminal state.
 
         Returns the ``[System: ...]`` completion notification once a run
-        finishes (or a heartbeat string if ``timeout`` elapses first), or
-        ``None`` when nothing relevant is running so the caller should just
-        use the status it already has.
+        finishes, or ``None`` when nothing relevant is running so the caller
+        should just use the status it already has.
 
         The wake signal is the very same completion message that
         ``_watch_jobs`` pushes into ``_input_queue`` on a ``running ->
@@ -1325,8 +1368,22 @@ class LqhApp:
         of adding a second poller. In auto mode the interactive ``run()``
         loop is not consuming ``_input_queue``, so there is no double-consumer
         race. While parked here, the agent's inner loop is suspended at the
-        ``await`` for the tool call: no LLM calls and no status polls happen.
+        ``await`` for the tool call: **no LLM calls happen until the run is
+        terminal** — truly zero cycles spent waiting. The user sees live
+        progress in the status bar instead (step/percent + freshness), so
+        there's no need to wake the agent periodically just to show progress.
+
+        ``timeout`` is now only an internal safety re-check cadence (never
+        returned to the model). It re-verifies "is anything still running?"
+        in case a completion message was missed before we parked.
         """
+        # NOTE (future): we deliberately do NOT surface a periodic heartbeat to
+        # the agent anymore — parking is silent until completion. If we ever
+        # want the agent to act on a *genuinely stuck* run (e.g. cancel after a
+        # few hours with no progress), re-introduce a long heartbeat here that
+        # returns a "[System: still running after Nh — no progress since …]"
+        # string so the agent can decide to intervene. Progress freshness is
+        # already tracked (see _update_task_progress / status_bar "↑Xm ago").
         def _running_targets() -> list[str]:
             # The registry is the authoritative "is it running" view: it is
             # populated eagerly at launch (on_background_task_started) and
@@ -1339,43 +1396,60 @@ class LqhApp:
                 running = [r for r in running if r in wanted]
             return running
 
-        targets = _running_targets()
-        if not targets:
+        # The runs this call is responsible for: the explicit request, else
+        # everything currently running. Captured once so a completion is matched
+        # to the run even after it leaves the running set.
+        wanted = list(run_names) if run_names else _running_targets()
+
+        # A wanted run may have already finished — before we parked, or before
+        # the very first watcher scan for a fast run. Deliver its completion now
+        # rather than parking for the full safety interval.
+        done = self._take_pending_completion(wanted)
+        if done is not None:
+            await self._wait_for_results(wanted)
+            return done
+
+        if not _running_targets():
             return None
 
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout
         while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return (
-                    f"[System: still running after {int(timeout)}s — "
-                    f"{', '.join(targets)}. No LLM cycles were spent waiting. "
-                    "Call training_status again to keep waiting, or take a "
-                    "different step if there is independent work to do.]"
-                )
             try:
-                # Any completion wakes us; we hand the message back and let the
-                # agent re-read fresh status. In the sequential auto pipeline
-                # the completing run is virtually always the one being waited
-                # on; if not, the agent simply re-checks and re-parks.
-                msg = await asyncio.wait_for(
-                    self._input_queue.get(), timeout=remaining,
-                )
+                # The queue item is only a wake signal — its content is ignored.
+                # The authoritative "did a run I care about finish?" answer comes
+                # from _take_pending_completion, so a stale notice for an
+                # unrelated run can never be mis-delivered as ours. The timeout
+                # is just the still-running safety recheck (never sent to the
+                # model).
+                await asyncio.wait_for(self._input_queue.get(), timeout=timeout)
             except asyncio.TimeoutError:
-                # Safety: the target may have finished without a queued message
-                # (e.g. it completed before we parked and the message was
-                # already drained). If nothing is running, stop waiting.
-                if not _running_targets():
-                    return None
-                # else fall through; next iteration emits the heartbeat.
-                continue
-            # The job is terminal, but eval/infer runs still need their
-            # predictions scored before results are readable. Give the scoring
-            # watcher a bounded grace period so the agent wakes once results —
-            # not merely the job — are ready. Training runs return at once.
-            await self._wait_for_results(targets)
-            return msg
+                pass
+            done = self._take_pending_completion(wanted)
+            if done is not None:
+                # The job is terminal, but eval/infer runs still need their
+                # predictions scored before results are readable. Give the
+                # scoring watcher a bounded grace period so the agent wakes once
+                # results — not merely the job — are ready. Training runs return
+                # at once.
+                await self._wait_for_results(wanted)
+                return done
+            # No wanted run is done. Stop only if none of them is still running
+            # (its completion was missed before we parked); otherwise keep
+            # parking silently — no heartbeat to the LLM.
+            if not _running_targets():
+                return None
+
+    def _take_pending_completion(self, run_names: list[str]) -> str | None:
+        """Pop the recorded completion notice for the first finished wanted run.
+
+        Returns ``None`` if none of ``run_names`` has a pending completion.
+        Matching by run name keeps a stale notice for some other run from being
+        handed back as this run's completion.
+        """
+        for name in run_names:
+            text = self._pending_completions.pop(name, None)
+            if text is not None:
+                return text
+        return None
 
     async def _wait_for_results(self, run_names: list[str]) -> None:
         """Bounded wait for watcher-scored eval/infer runs to write results.
@@ -1472,6 +1546,11 @@ class LqhApp:
                     text = self._format_completion_message(
                         run_name, state, error, remote,
                     )
+                    # Record the notice keyed by run so auto-mode parking
+                    # delivers it only to the run actually being waited on; the
+                    # queue put is the wake signal (and the interactive loop's
+                    # notification source).
+                    self._pending_completions[run_name] = text
                     self._input_queue.put_nowait(text)
                     self._record_completion_event(run_name, state, error, remote)
                     self._tasks.unregister(run_name)
@@ -1480,8 +1559,11 @@ class LqhApp:
                 # fallback for jobs discovered after a TUI restart.
                 if state == "running":
                     self._ensure_task_registered(run_name, remote)
+                    self._update_task_progress(run_name)
                 elif state in terminal_states:
                     self._tasks.unregister(run_name)
+                    self._job_last_step.pop(run_name, None)
+                    self._job_progress_at.pop(run_name, None)
                 self._job_last_state[run_name] = state
 
                 # Ensure a scoring/sync watcher is attached to runs that may

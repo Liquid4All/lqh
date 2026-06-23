@@ -23,6 +23,8 @@ class BackgroundTask:
     label: str           # short human label (e.g. run_name)
     state: str           # "running" | "pending" | ...
     remote: str | None = None
+    progress: str | None = None      # compact one-line, e.g. "6/6 · step 1640/2000 (82%)"
+    updated_at: float | None = None  # time.time() when the step last advanced
 
 
 class BackgroundTaskRegistry:

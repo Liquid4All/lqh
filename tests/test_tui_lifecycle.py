@@ -161,16 +161,24 @@ async def test_await_background_returns_none_when_target_not_running(tmp_path: P
     assert result is None
 
 
+def _simulate_watch_completion(app: LqhApp, name: str, notice: str) -> None:
+    """Mirror what _watch_jobs does on a running -> terminal transition:
+    record the per-run notice, wake the park via the queue, unregister."""
+    app._pending_completions[name] = notice
+    app._input_queue.put_nowait(notice)
+    app._tasks.unregister(name)
+
+
 async def test_await_background_wakes_on_completion_message(tmp_path: Path) -> None:
     app = LqhApp(tmp_path)
     _register_running(app, "run_1")
 
-    # Simulate _watch_jobs pushing a completion notice while the agent parks.
+    # Simulate _watch_jobs signalling completion while the agent parks.
     notice = "[System: training run run_1 completed successfully.]"
 
     async def _producer() -> None:
         await asyncio.sleep(0.01)
-        app._input_queue.put_nowait(notice)
+        _simulate_watch_completion(app, "run_1", notice)
 
     producer = asyncio.create_task(_producer())
     result = await app._await_background(["run_1"], timeout=5.0)
@@ -179,16 +187,76 @@ async def test_await_background_wakes_on_completion_message(tmp_path: Path) -> N
     assert result == notice
 
 
-async def test_await_background_heartbeat_on_timeout(tmp_path: Path) -> None:
+async def test_await_background_delivers_completion_that_finished_before_park(
+    tmp_path: Path,
+) -> None:
+    # Fast run: it finished (watcher recorded the notice and unregistered it)
+    # before the agent called training_status. The park must deliver it at
+    # once instead of waiting out the safety interval.
+    app = LqhApp(tmp_path)
+    notice = "[System: training run fast_run completed successfully.]"
+    app._pending_completions["fast_run"] = notice  # watcher already saw it
+
+    result = await app._await_background(["fast_run"], timeout=5.0)
+    assert result == notice
+    # The pending entry is consumed, not left to leak to a later run.
+    assert "fast_run" not in app._pending_completions
+
+
+async def test_await_background_ignores_stale_completion_for_other_run(
+    tmp_path: Path,
+) -> None:
+    # A completion for run_a is left over in the queue/registry. While waiting
+    # for run_b, the park must NOT hand back run_a's notice as run_b's.
+    app = LqhApp(tmp_path)
+    _register_running(app, "run_b")
+    stale = "[System: training run run_a completed successfully.]"
+    app._pending_completions["run_a"] = stale
+    app._input_queue.put_nowait(stale)  # stale wake nudge
+
+    park = asyncio.create_task(app._await_background(["run_b"], timeout=0.02))
+    await asyncio.sleep(0.1)  # consumes the stale nudge, keeps parking
+    assert not park.done()
+    assert app._pending_completions.get("run_a") == stale  # untouched
+
+    # run_b finishes for real -> that is what gets delivered.
+    notice_b = "[System: training run run_b completed successfully.]"
+    _simulate_watch_completion(app, "run_b", notice_b)
+    result = await asyncio.wait_for(park, timeout=1.0)
+    assert result == notice_b
+
+
+async def test_await_background_parks_silently_until_terminal(tmp_path: Path) -> None:
     app = LqhApp(tmp_path)
     _register_running(app, "run_1")
 
-    # Nothing is ever pushed -> we hit the (tiny) timeout and get a heartbeat
-    # that still names the run and is safe for the agent to re-check.
-    result = await app._await_background(["run_1"], timeout=0.05)
-    assert result is not None
-    assert "still running" in result
-    assert "run_1" in result
+    # With a tiny re-check interval and nothing pushed, the park must NOT
+    # return a heartbeat — it keeps waiting silently while the run is alive
+    # (zero LLM cycles; progress is shown in the status bar instead).
+    park = asyncio.create_task(app._await_background(["run_1"], timeout=0.02))
+    await asyncio.sleep(0.1)  # several internal re-check cycles
+    assert not park.done()
+
+    # Simulate the run going terminal without a queued message (drained):
+    # _watch_jobs would unregister it; the next re-check then returns None.
+    app._tasks.unregister("run_1")
+    result = await asyncio.wait_for(park, timeout=1.0)
+    assert result is None
+
+
+def test_on_background_task_started_seeds_running_state(tmp_path: Path) -> None:
+    # Eager registration must seed _job_last_state so a run that finishes
+    # before the first watcher scan still counts as a running -> terminal
+    # transition (otherwise its completion is never recorded).
+    app = LqhApp(tmp_path)
+    # A stale completion from an earlier run that reused this name must be
+    # cleared, so it can't be delivered as the new run's completion.
+    app._pending_completions["run_x"] = "[System: old run_x finished.]"
+
+    app._on_background_task_started("run_x", "train", "run_x", None)
+
+    assert app._job_last_state["run_x"] == "running"
+    assert "run_x" not in app._pending_completions
 
 
 # ---------------------------------------------------------------------------

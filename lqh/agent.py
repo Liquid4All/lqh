@@ -52,6 +52,15 @@ targeted training data for failures, re-train. Repeat until scores plateau.
 8. **Deployment** — Serve the best checkpoint as an OpenAI-compatible endpoint with \
 `push_to_production`, then `create_inference_key` so the user can call it.
 
+**Filter-before gate (MANDATORY).** Any pipeline-generated dataset that has been \
+scored but not yet filtered must be passed through `run_data_filter` (with the \
+scorer) BEFORE it is used for anything downstream. **No model evaluation, no prompt \
+optimization, and no training on raw/unfiltered generated data — filter it with a \
+scorer first.** Concretely: if a generated set has a `scores.parquet` but no \
+`*_filtered` sibling, the next step is data filtering — NOT `/eval`, NOT `/prompt`, \
+NOT `/train`. The only exception is a human-curated dataset (skip filtering only \
+when the data was hand-written, not pipeline-generated).
+
 **You do NOT need to run every step.** If performance is good enough after any step, \
 stop and suggest deployment. The user may also jump to a specific step or skip steps. \
 Adapt to what the project needs.
@@ -67,9 +76,13 @@ done and what the logical next step is. Suggest it to the user — don't just wa
 When suggesting next steps, consider the pipeline order above and the current project \
 state. For example:
 - Spec exists but no datasets → suggest data generation with draft iteration (`/datagen`)
-- Validation set exists but no model eval runs → suggest model evaluation (`/eval`)
+- A generated set is scored (`scores.parquet`) but not yet filtered (no `*_filtered` \
+sibling) → filter it first (`/filter` / `run_data_filter` with the scorer). Do this \
+**before** any eval, prompt optimization, or training.
+- A *filtered* validation set exists but no model eval runs → suggest model evaluation (`/eval`)
 - Baselines exist but no prompts → suggest prompt optimization (`/prompt`)
-- Good prompt exists but no training data → suggest scaling up data generation
+- Good prompt exists but no training data → suggest scaling up data generation (then \
+filter the new set before training)
 
 ## Where training and GPU eval run
 
@@ -200,11 +213,13 @@ and scores near zero, giving a misleading baseline.\
 
 MAX_CONTEXT_TOKENS = 200_000
 
-# Auto mode: how long a single `training_status` call may park the agent
-# waiting for a run to finish before it returns a heartbeat so the agent can
-# re-evaluate (or do independent work). The normal wake path is the
-# background job watcher firing well before this; the heartbeat is only a
-# safety net against a missed running -> terminal transition.
+# Auto mode: internal safety re-check cadence for a parked `training_status`
+# call. The park is silent and open-ended — the agent stays suspended (zero
+# LLM cycles) until the run goes terminal. The normal wake path is the
+# background job watcher firing a completion message; this interval only bounds
+# how often the park re-verifies "is anything still running?" to recover from a
+# completion message that was drained before the agent parked. It is never
+# returned to the model (no heartbeat).
 AUTO_PARK_HEARTBEAT_SEC = 600.0
 
 # When True, strip reasoning/thinking content from previous assistant turns
@@ -773,8 +788,11 @@ class Agent:
         # Auto mode: instead of busy-polling a long run's status (which costs
         # one full orchestration LLM call per poll and spams stdout), park the
         # agent loop until the run reaches a terminal state. The TUI's
-        # background job watcher delivers the wake signal. The agent keeps
-        # calling training_status exactly as before — the wait is transparent.
+        # background job watcher delivers the wake signal and surfaces live
+        # progress in the status bar meanwhile, so the park is now silent —
+        # the agent spends zero LLM cycles until the run is actually terminal
+        # (no periodic heartbeat). The agent keeps calling training_status
+        # exactly as before — the wait is transparent.
         if (
             tool_name == "training_status"
             and self.auto_mode
@@ -789,8 +807,8 @@ class Agent:
             if completion is None:
                 # Nothing was running — return the status the agent asked for.
                 return result
-            # A run finished (or we hit the heartbeat). Prepend the completion
-            # notice so the agent acts on the freshly-read terminal state.
+            # A run finished. Prepend the completion notice so the agent acts
+            # on the freshly-read terminal state.
             return ToolResult(content=f"{completion}\n\n{result.content}")
 
         extra: dict[str, Any] = {}

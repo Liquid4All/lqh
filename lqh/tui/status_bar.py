@@ -15,6 +15,11 @@ from lqh.tui.background_tasks import BackgroundTask
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
+# The session ID (📋 1a2b3c4d) is the hash-like element we hide to make room
+# for live background-task progress in the status bar. Flip to True to bring
+# it back. The rendering code below is left intact behind this flag.
+SHOW_SESSION_ID = False
+
 
 class StatusBar:
     """Status bar showing session info, tokens, GPU, and spinner."""
@@ -84,6 +89,16 @@ class StatusBar:
         seconds = int(elapsed) % 60
         return f"{minutes}m{seconds:02d}s"
 
+    @staticmethod
+    def _format_age(seconds: float) -> str:
+        """Compact relative age: 8s / 3m / 1h12m."""
+        s = int(seconds)
+        if s < 60:
+            return f"{s}s"
+        if s < 3600:
+            return f"{s // 60}m"
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
     def _format_bg_summary(self) -> str:
         """One-line summary of pending background tasks."""
         n = len(self.bg_tasks)
@@ -91,7 +106,15 @@ class StatusBar:
             t = self.bg_tasks[0]
             label = t.label if len(t.label) <= 32 else t.label[:31] + "…"
             remote = f"@{t.remote}" if t.remote else ""
-            return f"watching {t.kind}:{label}{remote}"
+            base = f"watching {t.kind}:{label}{remote}"
+            if not t.progress:
+                return base
+            # Freshness = how long since the step last advanced. A growing age
+            # while the run is alive is the "it's stalled" signal.
+            fresh = ""
+            if t.updated_at is not None:
+                fresh = f" · ↑{self._format_age(time.time() - t.updated_at)}"
+            return f"{base} · {t.progress}{fresh}"
         kinds = sorted({t.kind for t in self.bg_tasks})
         breakdown = ", ".join(
             f"{sum(1 for t in self.bg_tasks if t.kind == k)} {k}" for k in kinds
@@ -135,11 +158,12 @@ class StatusBar:
         # Working directory
         parts.append(("class:status.dim", f"📂 {self._cwd}"))
 
-        parts.append(("class:status.separator", " │ "))
-
-        # Session
-        short_id = self.session_id[:8] if self.session_id else "none"
-        parts.append(("class:status", f"📋 {short_id}"))
+        # Session (hidden by default — see SHOW_SESSION_ID; freed the slot for
+        # live background progress). Code kept intact for easy re-enabling.
+        if SHOW_SESSION_ID:
+            parts.append(("class:status.separator", " │ "))
+            short_id = self.session_id[:8] if self.session_id else "none"
+            parts.append(("class:status", f"📋 {short_id}"))
 
         parts.append(("class:status.separator", " │ "))
 
