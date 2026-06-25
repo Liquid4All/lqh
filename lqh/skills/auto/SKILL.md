@@ -123,8 +123,11 @@ bar depends on baseline:
 - baseline ≈ 4–6/10 → aim for ≥7/10.
 - baseline already ≥7/10 → aim for at least +1.0 absolute improvement.
 - improvement < ~0.5 over baseline with no clear trajectory → this is a
-  failure signal. Call `exit_auto_mode("failure", ...)` rather than
-  burning compute on Stages 7–8.
+  failure signal. Before giving up, if you haven't already and the data +
+  scorer check out, step **up one model size** (e.g. 1.2B → 2.6B or 8B-A1B)
+  and retry the initial SFT once — a model that is simply too small won't be
+  rescued by more data. If a larger size still can't clear the bar, call
+  `exit_auto_mode("failure", ...)` rather than burning compute on Stages 7–8.
 
 ### Stage 7 — `sft_scaled`
 On a successful initial SFT, scale training data further (**~10,000–
@@ -152,8 +155,18 @@ summary>")`.
 The spec may not specify everything — base model, target model size,
 prompting style, data format, etc. When ambiguous:
 
-- **Base model:** If the spec doesn't name one, fall back to the first
-  available model (typically the smallest 1.2B-parameter default).
+- **Model size:** If the spec/user named a size, use it. Otherwise **start in
+  the middle — the 1.2B model** — never an extreme. Then adapt from evidence: if
+  the task proves very simple (strong zero-shot baseline, clean data) step down
+  toward 350M; if it proves too hard for the size (very poor zero-shot baseline,
+  or SFT plateaus well below target despite good data and a sane scorer) step up
+  to 2.6B or the 8B-A1B MoE. The zero-shot baseline score is your first signal
+  for where to land.
+- **Base vs. instruct checkpoint:** either works as the SFT base; at the large
+  dataset sizes auto mode generates the gap is small, with a slight edge to the
+  `-Base` checkpoint. Default to the instruct/no-suffix model unless you have a
+  specific reason to prefer base. Avoid `-Thinking` checkpoints as an SFT base
+  for non-thinking data.
 - **Prompting style:** Infer from the task. Chat tasks → ChatML; tool-use
   tasks → tool-calling format.
 - **Dataset sizes:** Use the defaults above (validation 100–500, initial

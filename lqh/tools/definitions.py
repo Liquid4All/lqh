@@ -450,10 +450,13 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     "inference_model": {
                         "type": "string",
                         "description": (
-                            "Model to use for inference in mode='model_eval'. "
-                            "Use list_models to discover available LFM models. "
-                            "Examples: 'lfm2.5-1.2b-instruct', 'small', 'medium', "
-                            "'random:small:seed123'. Required for mode='model_eval'."
+                            "Baseline model to run inference with in mode='model_eval'. "
+                            "Use a pool/baseline name: 'small', 'medium', 'large', "
+                            "'orchestration', or 'random:small:seed123'. "
+                            "NOTE: Liquid checkpoints (e.g. LiquidAI/LFM2.5-1.2B-Instruct) "
+                            "CANNOT be evaluated here — the router.liquid.ai API is retired; "
+                            "use eval_hf_model or start_local_eval for those. "
+                            "Required for mode='model_eval'."
                         ),
                     },
                     "inference_system_prompt": {
@@ -497,10 +500,12 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         _tool(
             name="list_models",
             description=(
-                "List available Liquid Foundation Models (LFMs) from the API. "
-                "Returns model IDs, display names, HuggingFace checkpoint IDs, "
-                "and context lengths. Use this to discover which models are "
-                "available for inference in model evaluation runs."
+                "List the Liquid AI model catalog (HuggingFace IDs + kind: "
+                "base/instruct/thinking) plus the baseline/judge pool models. "
+                "Liquid checkpoints are evaluated via the HuggingFace inference "
+                "path (eval_hf_model / start_local_eval), not via the API. The "
+                "pool models (small/medium/large/orchestration) are the only "
+                "names usable as inference_model in run_scoring mode='model_eval'."
             ),
         ),
         # ------------------------------------------------------------------
@@ -1546,7 +1551,10 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "enum": ["lora", "full"],
                         "description": (
                             "'lora' for an adapter repo (requires base_model); "
-                            "'full' for a merged checkpoint."
+                            "'full' for a merged/standalone checkpoint. Use 'full' "
+                            "for an off-the-shelf Liquid catalog model (e.g. "
+                            "LiquidAI/LFM2.5-1.2B-Instruct or a -Base checkpoint) — "
+                            "those are full checkpoints, not adapters."
                         ),
                         "default": "lora",
                     },

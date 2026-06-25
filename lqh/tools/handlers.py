@@ -942,41 +942,32 @@ async def handle_get_eval_failures(
 
 
 async def handle_list_models(**kwargs: Any) -> ToolResult:
-    """List available LFM models from the API."""
-    from lqh.auth import require_token
-    from lqh.client import create_client
-    from lqh.config import load_config
+    """List the Liquid model catalog plus the baseline/judge pool models.
 
-    try:
-        config = load_config()
-        token = require_token()
-        client = create_client(token, config.api_base_url)
-    except Exception as e:
-        return ToolResult(content=f"Error: {e}")
+    The Liquid catalog is a local constant (lqh.models) — the old
+    router.liquid.ai listing API has been retired (see MODELS.md). Liquid
+    checkpoints are evaluated via the HuggingFace inference path
+    (eval_hf_model / start_local_eval), not via run_scoring mode='model_eval'.
+    """
+    from lqh.models import format_catalog
 
-    try:
-        models_response = await client.models.list()
-        lines = ["Available Liquid Foundation Models:\n"]
-        lines.append(f"{'Model ID':<30} {'Display Name':<35} {'Context':<10} {'HuggingFace ID'}")
-        lines.append("-" * 110)
-        for m in models_response.data:
-            model_id = m.id
-            display_name = getattr(m, "display_name", m.id)
-            context_length = getattr(m, "context_length", "?")
-            hf_id = getattr(m, "huggingface_id", "")
-            lines.append(f"{model_id:<30} {display_name:<35} {str(context_length):<10} {hf_id}")
+    lines = [format_catalog()]
+    lines.append("")
+    lines.append("To evaluate a Liquid checkpoint, use the HuggingFace inference path:")
+    lines.append("  eval_hf_model     — cloud eval of a HuggingFace repo id / revision")
+    lines.append("                      (for a catalog model above, pass training_method='full';")
+    lines.append("                      'lora' is only for adapter repos and needs base_model)")
+    lines.append("  start_local_eval  — local or SSH-remote GPU eval of a checkpoint dir")
+    lines.append("")
+    lines.append("These pool/utility models are baselines/judges served by the API and")
+    lines.append("can be used as inference_model in run_scoring mode='model_eval':")
+    lines.append("  small, medium, large          — default model from each size pool")
+    lines.append("  random:<size>                  — random model from pool (different each request)")
+    lines.append("  random:<size>:<seed>           — deterministic model from pool")
+    lines.append("  judge:small, judge:medium, judge:large — dedicated scoring models")
+    lines.append("  orchestration                  — frontier agent model with tool calling")
 
-        lines.append("")
-        lines.append("Additionally, these pool/utility models are always available:")
-        lines.append("  small, medium, large          — default model from each size pool")
-        lines.append("  random:<size>                  — random model from pool (different each request)")
-        lines.append("  random:<size>:<seed>           — deterministic model from pool")
-        lines.append("  judge:small, judge:medium, judge:large — dedicated scoring models")
-        lines.append("  orchestration                  — frontier agent model with tool calling")
-
-        return ToolResult(content="\n".join(lines))
-    except Exception as e:
-        return ToolResult(content=f"Error listing models: {e}")
+    return ToolResult(content="\n".join(lines))
 
 
 async def handle_list_skills(**kwargs: Any) -> ToolResult:
@@ -1114,6 +1105,26 @@ async def handle_run_scoring(
                 return ToolResult(
                     content="Error: inference_model is required for mode='model_eval'. "
                     "Use list_models to discover available models."
+                )
+
+            # Liquid checkpoints can no longer be evaluated through the API:
+            # the router.liquid.ai inference API has been retired (see MODELS.md).
+            # Redirect to the HuggingFace inference path. Pool/baseline names
+            # (small/medium/large/orchestration) still run via the API here.
+            from lqh.models import is_liquid_model_name
+
+            if is_liquid_model_name(inference_model):
+                return ToolResult(
+                    content=(
+                        f"Error: Liquid model '{inference_model}' cannot be evaluated via "
+                        "run_scoring mode='model_eval' — the router.liquid.ai API has been "
+                        "retired (see MODELS.md). To evaluate a Liquid checkpoint, use the "
+                        "HuggingFace inference path instead:\n"
+                        "  - eval_hf_model  — cloud eval of a HuggingFace repo id / revision\n"
+                        "  - start_local_eval — local or SSH-remote GPU eval of a checkpoint dir\n"
+                        "run_scoring mode='model_eval' remains available for non-Liquid "
+                        "baselines (small / medium / large / orchestration)."
+                    )
                 )
 
             from lqh.scoring import JUDGE_MODELS, run_scoring

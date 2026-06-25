@@ -84,6 +84,35 @@ sibling) → filter it first (`/filter` / `run_data_filter` with the scorer). Do
 - Good prompt exists but no training data → suggest scaling up data generation (then \
 filter the new set before training)
 
+## Choosing a model size
+
+Liquid ships several sizes (run `list_models` for the catalog): 230M, 350M, 1.2B, \
+2.6B (LFM2-2.6B-Exp), and the MoE models 8B-A1B and 24B-A2B. Picking the size is one \
+of the first decisions before evaluation or fine-tuning.
+
+- **Ask the user which size to start with** before the first eval or training run, \
+and give a concrete, non-extreme recommendation:
+  - **1.2B** — the sensible default for most tasks.
+  - **2.6B, or the 8B-A1B MoE** — for more complex tasks.
+  - **350M** — for very simple tasks.
+  Don't open with the extremes (230M or 24B-A2B) unless the task clearly calls for it.
+
+- **Use the zero-shot baseline as a complexity gauge.** A model's zero-shot (prompted) \
+score on the eval set is a rough read on how hard the task is for that size. \
+Fine-tuning typically lifts the score by a few points (e.g. a 5–6 up to ~8). But if \
+the instruct/thinking model scores *very* poorly zero-shot, fine-tuning alone probably \
+won't close the gap — step up to a bigger size.
+
+- **If fine-tuning keeps struggling** — you've verified the data is good and the scorer \
+is sane, yet the model still underperforms — try a bigger size rather than grinding \
+more data at the same one. A model that is simply too small won't be rescued by data.
+
+- **Base vs. instruct as the fine-tuning starting point** (models with a `-Base` suffix \
+vs. instruct/no-suffix): at large SFT dataset sizes the difference is small \
+(benchmarks ongoing), with a slight edge to the `-Base` checkpoint as the dataset \
+grows. For smaller datasets or zero-shot use, the instruct/no-suffix model is the \
+safer pick. Note: `-Thinking` models are a poor base for fine-tuning on non-thinking data.
+
 ## Where training and GPU eval run
 
 **The compute target is fixed per project, not chosen per call.** When \
@@ -205,7 +234,9 @@ Scoring and evaluation artifacts:
 Data quality scores are co-located with datasets: datasets/{name}/scores.parquet.
 
 To score data quality: create a scorer .md file, then use run_scoring with mode='data_quality'. \
-To evaluate a model: use run_scoring with mode='model_eval', a run_name, and system_prompt_path. \
+To evaluate a Liquid checkpoint: use eval_hf_model (cloud, by HuggingFace id) or start_local_eval \
+(local/SSH checkpoint dir) — the router.liquid.ai API is retired, so run_scoring mode='model_eval' \
+is reserved for non-Liquid frontier/pool baselines (small/medium/large/orchestration). \
 IMPORTANT: when evaluating a base/zero-shot model, ALWAYS pass a well-structured system \
 prompt (task instructions + expected output format); without one the base model is confused \
 and scores near zero, giving a misleading baseline.\
@@ -316,6 +347,7 @@ class Agent:
         # Safety cap on tool calls per turn. None disables the cap entirely
         # (default). The E2E harness sets a strict integer cap explicitly.
         self.max_tool_calls_per_turn: int | None = None
+        self.max_empty_tool_call_retries: int = 2
         self._client = None
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
@@ -452,6 +484,7 @@ class Agent:
         """Inner loop: call agent, execute tools, repeat until no tools."""
         has_tools_or_first = is_first_turn
         tool_calls_this_turn = 0
+        empty_tool_call_retries = 0
 
         while has_tools_or_first:
             # Auto-mode: terminate cleanly once exit_auto_mode was called
@@ -592,6 +625,9 @@ class Agent:
                     and _completion_tok >= int(ORCHESTRATION_MAX_TOKENS * 0.9)
                 )
             )
+            empty_tool_call_response = (
+                finish_reason == "tool_calls" and not message.tool_calls
+            )
 
             # Build the assistant message dict
             assistant_msg: dict[str, Any] = {"role": "assistant"}
@@ -611,6 +647,33 @@ class Agent:
                 ]
 
             self.session.add_message(assistant_msg)
+
+            if empty_tool_call_response:
+                empty_tool_call_retries += 1
+                if empty_tool_call_retries > self.max_empty_tool_call_retries:
+                    if self.callbacks.on_agent_message:
+                        await self.callbacks.on_agent_message(
+                            "❌ Tool-call backend error: the orchestration model repeatedly "
+                            "returned finish_reason='tool_calls' but the response contained "
+                            "no tool_calls payload, so no tool could be executed. Please "
+                            "retry the request or switch orchestration models if this repeats."
+                        )
+                    return
+
+                self.session.add_message({
+                    "role": "user",
+                    "content": (
+                        "[Tool-call recovery] The API reported finish_reason='tool_calls' "
+                        "but returned no tool_calls payload. Your previous assistant text "
+                        "said you would use a tool, but no tool was emitted. Continue by "
+                        "emitting the actual tool call now. If no tool is needed, answer "
+                        "directly without claiming you will use one."
+                    ),
+                })
+                has_tools_or_first = True
+                continue
+
+            empty_tool_call_retries = 0
 
             # Display agent text
             if message.content and self.callbacks.on_agent_message:

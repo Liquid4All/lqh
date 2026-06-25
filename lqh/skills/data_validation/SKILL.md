@@ -216,7 +216,7 @@ After validation, use `ask_user` to offer:
 4. **"Adjust the spec"** — If validation revealed spec gaps, go back to `/spec` and update.
 5. **"I'm done for now"** — The user can download and use the data externally.
 
-After fine-tuning, the next step is to re-run model eval (`/eval` with mode=model_eval) to compare the fine-tuned model against baselines and the prompt-optimized model. If scores aren't good enough, generate on-policy failure data and fine-tune again.
+After fine-tuning, the next step is to re-run model eval (`/eval`) to compare the fine-tuned checkpoint against baselines and the prompt-optimized model — score the checkpoint via `eval_hf_model` / `start_local_eval` (Liquid checkpoints no longer go through `run_scoring` mode=model_eval). If scores aren't good enough, generate on-policy failure data and fine-tune again.
 
 ## Tips
 

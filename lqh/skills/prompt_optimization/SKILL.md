@@ -78,10 +78,15 @@ run_scoring(
     scorer="evals/scorers/{task}_v1.md",
     mode="model_eval",
     run_name="{task}_prompt_v1_iter1",
-    inference_model="small",  # or user-specified model
+    inference_model="small",  # pool/frontier baseline only — NOT a Liquid id
     system_prompt_path="prompts/{task}_v1.md"
 )
 ```
+
+To iterate a prompt against a **Liquid** checkpoint, run the eval with
+`eval_hf_model` (cloud, by HuggingFace id) or `start_local_eval` (local/SSH
+checkpoint dir) instead — `run_scoring` mode=`model_eval` no longer accepts a
+Liquid model (the router.liquid.ai API is retired).
 
 After the eval completes, read the summary:
 ```

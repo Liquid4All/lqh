@@ -7,10 +7,12 @@ You are now in **model evaluation** mode. Your goal is to benchmark different Li
 ## Overview
 
 You will:
-1. Discover available LFMs with `list_models`
-2. Run baselines on 2-4 models with `run_scoring` (mode=model_eval), **always passing a baseline system prompt** (see "System prompts" below)
+1. Discover the Liquid model catalog with `list_models`
+2. Benchmark Liquid checkpoints with `eval_hf_model` (their HuggingFace ids) and, optionally, run non-Liquid frontier/pool baselines with `run_scoring` (mode=model_eval), **always passing a baseline system prompt** (see "System prompts" below)
 3. Compare results and present a recommendation
 4. Suggest next steps: prompt optimization or fine-tuning
+
+**Important:** Liquid models are evaluated via the **HuggingFace inference path** (`eval_hf_model` for cloud, `start_local_eval` for a local/SSH checkpoint dir). The old `router.liquid.ai` API has been retired, so `run_scoring` mode=`model_eval` no longer accepts a Liquid model as `inference_model` — it is reserved for the pool/frontier baselines (`small`/`medium`/`large`/`orchestration`).
 
 ## System prompts for baseline eval
 
@@ -29,7 +31,7 @@ Strips the final assistant turn(s) from labelled eval samples, runs model infere
 
 1. **Check prerequisites first.** Use `summary` to verify an eval dataset (with `_eval` suffix) and a scorer exist. If not, suggest `/datagen`.
    - **Evaluate on the FILTERED eval set.** A pipeline-generated eval set must be passed through `run_data_filter` (with the scorer) before you benchmark on it — otherwise baselines are measured against noise the pipeline let through. Prefer the `*_eval_filtered` dataset. If only a raw generated `*_eval` set exists, filter it first (`run_data_filter(input_path="datasets/{task}_eval/data.parquet", scorer_path="evals/scorers/{task}_v1.md", output_dataset="{task}_eval_filtered", threshold=7.0, model_size=...)`), then evaluate on the result. Skip filtering only when the eval set is human-curated.
-2. **Test multiple models.** Use `list_models` to see available LFMs, then run at least 2-3 different models for comparison.
+2. **Test multiple models.** Use `list_models` to see the Liquid catalog, then benchmark at least 2-3 different checkpoints (via `eval_hf_model`) for comparison, optionally alongside a pool baseline.
 3. **Use descriptive run names.** E.g., `baseline_lfm2.5_1.2b`, `baseline_small`, `baseline_medium`.
 4. **After scoring, show results.** Use `read_file` on each `evals/runs/*/summary.json` and present a comparison table.
 
@@ -45,24 +47,39 @@ If either is missing, tell the user and suggest running `/datagen` first.
 
 ### Step 2: Discover Available Models
 
-Use `list_models` to see available LFMs. Present the options to the user.
+Use `list_models` to see the Liquid model catalog (HuggingFace ids + kind) and the pool baselines. Present the options to the user.
 
 ### Step 3: Run Baselines
 
-Run model evaluation on 2-4 models. Start with a small model and work up:
+Benchmark 2-4 Liquid checkpoints. Start with a small model and work up. Liquid checkpoints go through `eval_hf_model` (their HuggingFace id):
+
+```
+eval_hf_model(
+    repo="LiquidAI/LFM2.5-1.2B-Instruct",      # a Liquid HF id from list_models
+    training_method="full",
+    eval_dataset="datasets/{task}_eval_filtered",  # filtered eval set, not the raw generated one
+    scorer="evals/scorers/{task}_v1.md",
+    run_name="baseline_lfm2.5_1.2b",
+    system_prompt_path="prompts/{task}_v0.md",
+)
+```
+
+For a checkpoint that lives on a local/SSH filesystem (e.g. a fresh fine-tune), use `start_local_eval(model_path=..., dataset=..., scorer=...)` instead.
+
+Optionally include a **non-Liquid frontier/pool baseline** via `run_scoring` (mode=`model_eval`) for context:
 
 ```
 run_scoring(
-    dataset="datasets/{task}_eval_filtered",   # filtered eval set, not the raw generated one
+    dataset="datasets/{task}_eval_filtered",
     scorer="evals/scorers/{task}_v1.md",
     mode="model_eval",
-    run_name="baseline_{model_id}",
-    inference_model="{model_id}",
+    run_name="baseline_small",
+    inference_model="small",                   # pool/frontier only — NOT a Liquid id
     system_prompt_path="prompts/{task}_v0.md",  # or inference_system_prompt="..."
 )
 ```
 
-Run at least: one small pool model, one medium pool model, and any specific LFM the user is interested in.
+Run at least: 2-3 Liquid checkpoints of interest, optionally one pool baseline for context.
 
 ### Step 4: Compare and Recommend
 

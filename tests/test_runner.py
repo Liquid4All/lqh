@@ -213,25 +213,8 @@ class TestAPIModelRunnerIntegration:
         )
         assert json.loads(result.content)["color"] == "blue"
 
-    async def test_lfm_model_direct(
-        self, runner: APIModelRunner, api_client: Any,
-    ) -> None:
-        """Call a specific LFM model by ID."""
-        models = await api_client.models.list()
-        if not models.data:
-            pytest.skip("No LFM models available on the API")
-
-        result = await runner.complete(
-            [{"role": "user", "content": "Say hello."}],
-            model=models.data[0].id,
-            temperature=0.0,
-            max_tokens=20,
-        )
-        assert len(result.content) > 0
-        assert result.usage is not None
-
-    async def test_list_models_api(self, api_client: Any) -> None:
-        """Verify the ``/v1/models`` endpoint returns model data."""
-        models = await api_client.models.list()
-        assert len(models.data) > 0
-        assert hasattr(models.data[0], "id")
+    # NOTE: tests for calling an LFM model by id and for GET /v1/models were
+    # removed — router.liquid.ai is retired and /v1/models is no longer served
+    # (see MODELS.md). APIModelRunner is now used only for orchestration and
+    # non-Liquid baseline/judge inference; Liquid checkpoints are evaluated via
+    # the HuggingFace path (eval_hf_model / start_local_eval).

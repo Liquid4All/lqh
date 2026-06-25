@@ -311,15 +311,23 @@ class TestExecuteToolDispatch:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.integration
-async def test_list_models_returns_models() -> None:
-    """Integration: list_models hits the live API."""
+async def test_list_models_returns_catalog() -> None:
+    """list_models returns the local Liquid catalog (no API call).
+
+    router.liquid.ai is retired, so list_models no longer hits /v1/models — it
+    renders the curated catalog from lqh.models plus the baseline/judge pool
+    models. See MODELS.md.
+    """
     from lqh.tools.handlers import handle_list_models
 
     result = await handle_list_models()
-    assert "Liquid Foundation Models" in result.content
+    # Catalog header + a known Liquid HF id from lqh.models.
+    assert "Liquid AI model catalog" in result.content
+    assert "LiquidAI/LFM2.5-1.2B-Instruct" in result.content
+    # Pool/baseline models still listed for run_scoring mode='model_eval'.
     assert "orchestration" in result.content
-    assert "lfm" in result.content.lower()
+    # Steers Liquid checkpoint evals to the HuggingFace path.
+    assert "eval_hf_model" in result.content
 
 
 @pytest.fixture

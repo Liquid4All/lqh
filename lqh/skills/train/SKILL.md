@@ -114,7 +114,7 @@ Before training, you should have:
   generated set.** Filtering is skipped only when the data is human-curated.
 - A **filtered eval dataset** in `datasets/<name>_eval_filtered/data.parquet`
   (same rule; skip filtering only for a human-curated eval set)
-- A **baseline eval** run to compare against (via `run_scoring` with `mode=model_eval`)
+- A **baseline eval** run to compare against (Liquid base model via `eval_hf_model` / `start_local_eval`; optionally a pool baseline via `run_scoring` `mode=model_eval`)
 
 If only raw generated datasets exist, filter them first (see the
 `data_generation` skill, Phase 3.5):
@@ -377,8 +377,11 @@ Single-config runs (`enable_sweep=false`) skip the sweep wrapper and use the sam
 When helping the user with training:
 
 1. **Always run a baseline eval first — with a well-structured system prompt.**
-   Before training, run `run_scoring` with `mode=model_eval` on the base model to
-   establish a score baseline. **VERY IMPORTANT: always pass a system prompt for
+   Before training, evaluate the Liquid base model to establish a score baseline:
+   use `eval_hf_model` (cloud, by its HuggingFace id) or `start_local_eval`
+   (local/SSH checkpoint dir). The router.liquid.ai API is retired, so
+   `run_scoring` mode=`model_eval` is reserved for non-Liquid frontier/pool
+   baselines, not the Liquid base model itself. **VERY IMPORTANT: always pass a system prompt for
    this baseline.** A small base model with no system prompt does not know what the
    task is, produces confused output, and scores near zero — a meaningless baseline
    that then makes any trained model look falsely amazing. Forgetting the system

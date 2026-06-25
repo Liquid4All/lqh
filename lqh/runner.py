@@ -6,7 +6,12 @@ prompt optimization) goes through.  The protocol is intentionally minimal
 
 Implementations:
   - ``APIModelRunner`` — wraps ``AsyncOpenAI`` pointed at api.lqh.ai (or any
-    OpenAI-compatible endpoint).
+    OpenAI-compatible endpoint). Used for the agent's orchestration brain and
+    for LLM-as-judge scoring + non-Liquid baseline inference. It is NOT used to
+    evaluate Liquid checkpoints — the router.liquid.ai API has been retired
+    (see MODELS.md), so Liquid models go through the HuggingFace inference path
+    (``lqh/infer/``, surfaced as the ``eval_hf_model`` / ``start_local_eval``
+    tools).
   - Future: ``HFModelRunner`` (local transformers), ``QuantModelRunner``
     (llama.cpp server).
 """
