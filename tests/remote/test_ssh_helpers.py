@@ -59,9 +59,27 @@ class TestSSHRun:
         call_args = mock_exec.call_args[0]
         assert call_args[0] == "ssh"
         assert "host" in call_args
-        # Command is wrapped: bash -lc 'echo hello'
+        # Command is wrapped: /usr/bin/env bash -lc 'echo hello'
         bash_arg = [a for a in call_args if "echo hello" in a]
         assert bash_arg, f"Expected 'echo hello' in args: {call_args}"
+
+    @pytest.mark.asyncio
+    async def test_invokes_bash_via_env(self):
+        """Use `/usr/bin/env bash` so a function/alias named `bash` in
+        the user's login shell can't shadow the real binary."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+        mock_proc.returncode = 0
+
+        with patch(
+            "lqh.remote.ssh_helpers.asyncio.create_subprocess_exec",
+            return_value=mock_proc,
+        ) as mock_exec:
+            await ssh_run("host", "true")
+
+        call_args = mock_exec.call_args[0]
+        payload = next((a for a in call_args if "true" in a), "")
+        assert payload.startswith("/usr/bin/env bash -lc "), payload
 
     @pytest.mark.asyncio
     async def test_command_failure(self, caplog):
