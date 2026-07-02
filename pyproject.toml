@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lqh"
-version = "0.4.6"
+version = "0.4.7"
 description = "Liquid Harness – customize Liquid AI foundation models into task-specific models."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,6 +26,8 @@ dependencies = [
     "datasets",
     "huggingface_hub>=0.20",
     "pyarrow",
+    # Image preprocessing for VLM data-gen (resize/re-encode before base64).
+    "pillow>=10.0",
 ]
 
 [project.optional-dependencies]

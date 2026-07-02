@@ -502,43 +502,13 @@ Only write custom loading if no helper fits. Mixing helpers with manual
 Before writing the pipeline, call `list_user_data` — it tells you what
 the user has placed in the project and which helper to use.
 
-#### 5a. Image folder → label/caption
+#### 5a. Image folder → VLM dataset
 
-```python
-import lqh.sources as sources
-
-class LabelSatellite(Pipeline):
-    @classmethod
-    def source(cls, project_dir):
-        # Subfolders carry coarse labels; set include_subfolder_label=True.
-        return sources.image_folder(
-            project_dir / "images", include_subfolder_label=True,
-        )
-
-    async def generate(self, client, input: sources.ImageItem) -> Conversation:
-        label_hint = f" (hint: subfolder is '{input.subfolder}')" if input.subfolder else ""
-        return [
-            ChatMLMessage("user", [
-                {"type": "text", "text": f"What type of land is in this image?{label_hint}"},
-                {"type": "image_url", "image_url": {"url": input.as_data_url()}},
-            ]),
-            ChatMLMessage("assistant", await self._caption(client, input)),
-        ]
-
-    @step(retries=2)
-    async def _caption(self, client, item):
-        resp = await client.chat.completions.create(
-            model="random:medium",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Describe the land use in this image."},
-                    {"type": "image_url", "image_url": {"url": item.as_data_url()}},
-                ],
-            }],
-        )
-        return resp.choices[0].message.content.strip()
-```
+For image data (captioning, image-QA, classification — anything destined for
+a vision model), **load the `vision_data_generation` skill** and follow it.
+It covers `sources.image_folder`, image preprocessing/size limits, the
+multi-round VLM synthesis pattern, and image-aware scoring. Do not hand-roll
+a vision pipeline from this file alone.
 
 #### 5b. Bring-your-prompts → complete them
 

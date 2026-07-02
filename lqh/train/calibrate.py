@@ -505,7 +505,11 @@ def report_oom_downgrade(config: dict[str, Any]) -> None:
 
 
 # Default LoRA target modules for the standalone probe — keep in sync
-# with the sft.py / dpo.py LoraConfig defaults.
+# with the sft.py / dpo.py TEXT LoraConfig defaults. The probe builds
+# synthetic text-only batches, so it is never run for vision (LFM-VL)
+# models — sft.py skips maybe_autotune_batch_size for modality="vision"
+# and relies on conservative defaults + the OOM downgrade path (which is
+# modality-keyed and works for vision unchanged).
 _LORA_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "in_proj", "out_proj", "w1", "w2", "w3",

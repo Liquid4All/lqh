@@ -24,6 +24,11 @@ def list_available_skills() -> list[dict[str, str]]:
             "command": "/datagen",
         },
         {
+            "name": "vision_data_generation",
+            "description": "Turn an image folder into an image-QA dataset for VLM fine-tuning (extends data_generation)",
+            "command": "/vision-datagen",
+        },
+        {
             "name": "data_validation",
             "description": "Create validation criteria for generated datasets",
             "command": "/validate",
@@ -63,6 +68,11 @@ _SKILL_ALIASES: dict[str, str] = {
     "datagen": "data_generation",
     "/datagen": "data_generation",
     "data_gen": "data_generation",
+    "vision-datagen": "vision_data_generation",
+    "/vision-datagen": "vision_data_generation",
+    "vision_datagen": "vision_data_generation",
+    "vlm_data_generation": "vision_data_generation",
+    "vision": "vision_data_generation",
     "validate": "data_validation",
     "/validate": "data_validation",
     "filter": "data_filtering",

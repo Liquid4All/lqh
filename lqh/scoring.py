@@ -157,14 +157,58 @@ def _format_tool_calls(tool_calls: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def _render_content(content: Any, images: list[str] | None = None) -> str:
+    """Render a ChatML content value as judge-readable text.
+
+    String content passes through unchanged. Multi-part (list) content — the
+    OpenAI vision format — renders its text parts in order and replaces each
+    image part with an ``[image N]`` placeholder. When *images* is given, the
+    image URLs are appended to it (deduplicated, in order of first
+    appearance) so the caller can re-attach them to the judge request as real
+    image parts; N is the 1-based index into that list.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+
+    rendered: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            rendered.append(str(part))
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            rendered.append(part.get("text", ""))
+        elif ptype == "image_url":
+            url = (part.get("image_url") or {}).get("url", "")
+            if images is None or not url:
+                rendered.append("[image]")
+            else:
+                if url in images:
+                    idx = images.index(url) + 1
+                else:
+                    images.append(url)
+                    idx = len(images)
+                rendered.append(f"[image {idx}]")
+        else:
+            rendered.append(f"[{ptype or 'unknown'} part]")
+    return "\n".join(r for r in rendered if r != "")
+
+
 def _format_conversation(
     messages: list[dict],
     tools: list[dict] | None = None,
+    images: list[str] | None = None,
 ) -> str:
     """Format a ChatML conversation as readable text for the judge.
 
     Presents each turn clearly labelled, so the judge doesn't confuse
-    the role/content wrapper with the actual model output.
+    the role/content wrapper with the actual model output. Image parts in
+    multi-part content are shown as ``[image N]`` placeholders; see
+    ``_render_content`` for how *images* collects the URLs.
     """
     parts: list[str] = []
 
@@ -174,7 +218,7 @@ def _format_conversation(
 
     for msg in messages:
         role = msg.get("role", "unknown")
-        content = msg.get("content", "")
+        content = _render_content(msg.get("content", ""), images)
         if role == "system":
             parts.append(f"[System Prompt]\n{content}")
         elif role == "user":
@@ -238,7 +282,11 @@ def _build_scoring_prompt(
         Optional tool definitions for tool-calling conversations.
     """
     is_tool_calling = _has_tool_calls(messages) or tools is not None
-    formatted = _format_conversation(messages, tools=tools)
+    # Collect image URLs across the sample and the reference (deduplicated)
+    # so vision conversations are judged against the actual images rather
+    # than a stringified content list.
+    images: list[str] = []
+    formatted = _format_conversation(messages, tools=tools, images=images)
 
     user_content = (
         "Score the following conversation according to the criteria below.\n\n"
@@ -249,7 +297,7 @@ def _build_scoring_prompt(
     )
 
     if reference_messages:
-        ref_formatted = _format_conversation(reference_messages, tools=tools)
+        ref_formatted = _format_conversation(reference_messages, tools=tools, images=images)
         user_content += (
             "## Reference (ground truth)\n\n"
             f"{ref_formatted}\n\n"
@@ -276,9 +324,24 @@ def _build_scoring_prompt(
 
     system_content = _TOOL_CALL_JUDGE_SYSTEM if is_tool_calling else _DEFAULT_JUDGE_SYSTEM
 
+    # Vision conversations: attach the actual images after the text so the
+    # judge sees them. The [image N] placeholders in the transcript refer to
+    # the attached images in order. The backend routes judge:* requests with
+    # images to a vision-capable judge model.
+    if images:
+        user_content += (
+            f"\n(The conversation contains {len(images)} attached image(s); "
+            "[image N] marks where each appears.)"
+        )
+        user_message_content: Any = [{"type": "text", "text": user_content}] + [
+            {"type": "image_url", "image_url": {"url": url}} for url in images
+        ]
+    else:
+        user_message_content = user_content
+
     return [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content},
+        {"role": "user", "content": user_message_content},
     ]
 
 

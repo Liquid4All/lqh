@@ -168,6 +168,7 @@ def _run_checkpoint_eval(
     # them into a macro-average (see score_predictions_by_source).
     eval_srcs = load_eval_sources(eval_dataset_path)
     max_seq = config.get("training", {}).get("max_seq_length", 2048)
+    is_vision = config.get("modality") == "vision"
 
     predictions: list[dict[str, Any]] = []
     model.eval()
@@ -181,24 +182,38 @@ def _run_checkpoint_eval(
                 prompt_msgs = conv[:-1]
 
             try:
-                inputs = tokenizer.apply_chat_template(
-                    prompt_msgs,
-                    return_tensors="pt",
-                    add_generation_prompt=True,
-                    return_dict=True,
-                )
-                input_ids = inputs["input_ids"].to(model.device)
+                if is_vision:
+                    # Vision path: `tokenizer` is the AutoProcessor here;
+                    # vlm_generate decodes the data-URL image parts and
+                    # moves the full inputs dict (pixel_values included)
+                    # to the model device.
+                    from lqh.train.vlm_data import vlm_generate
 
-                with torch.no_grad():
-                    output_ids = model.generate(
-                        input_ids,
+                    response = vlm_generate(
+                        model,
+                        tokenizer,
+                        prompt_msgs,
                         max_new_tokens=min(max_seq, 1024),
-                        do_sample=False,
                     )
-                response = tokenizer.decode(
-                    output_ids[0][input_ids.shape[-1]:],
-                    skip_special_tokens=True,
-                )
+                else:
+                    inputs = tokenizer.apply_chat_template(
+                        prompt_msgs,
+                        return_tensors="pt",
+                        add_generation_prompt=True,
+                        return_dict=True,
+                    )
+                    input_ids = inputs["input_ids"].to(model.device)
+
+                    with torch.no_grad():
+                        output_ids = model.generate(
+                            input_ids,
+                            max_new_tokens=min(max_seq, 1024),
+                            do_sample=False,
+                        )
+                    response = tokenizer.decode(
+                        output_ids[0][input_ids.shape[-1]:],
+                        skip_special_tokens=True,
+                    )
             except Exception as exc:
                 response = f"[generation error: {exc}]"
 
@@ -266,7 +281,17 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     training_cfg = config.get("training", {})
     lora_cfg = config.get("lora", {})
 
-    print(f"Loading model: {base_model}")
+    # Modality: normally set by handle_start_training; the AutoConfig
+    # fallback covers configs written by hand or by older callers.
+    modality = config.get("modality")
+    if modality not in ("text", "vision"):
+        from lqh.train.load_model import detect_modality
+
+        modality = detect_modality(base_model)
+        config["modality"] = modality
+    is_vision = modality == "vision"
+
+    print(f"Loading model: {base_model} (modality={modality})")
 
     # GPU info
     num_gpus = torch.cuda.device_count()
@@ -283,26 +308,67 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # Symptom: training "runs" but at ~100× CPU speed.
     device_map = "auto" if torch.cuda.is_available() else None
 
-    # Load model
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        dtype=dtype,
-        device_map=device_map,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    # Load model. Vision models (LFM2.5-VL) use the image-text-to-text
+    # class and an AutoProcessor (tokenizer + image processor + chat
+    # template); text models keep the exact pre-existing path.
+    processor = None
+    if is_vision:
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        model = AutoModelForImageTextToText.from_pretrained(
+            base_model,
+            dtype=dtype,
+            device_map=device_map,
+        )
+        processor = AutoProcessor.from_pretrained(
+            base_model,
+            max_image_tokens=int(training_cfg.get("max_image_tokens", 256)),
+        )
+        tokenizer = processor.tokenizer
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            dtype=dtype,
+            device_map=device_map,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # LoRA config
+    # LoRA config. Defaults are per-modality: the vision recipe
+    # (docs.liquid.ai/lfm/fine-tuning/trl) uses a lower rank and targets
+    # the attention + feed-forward + projector linears; hitting the
+    # vision-tower MLPs (fc1/fc2) and the multimodal projector (linear)
+    # is intentional. handle_start_training writes these explicitly, so
+    # the fallbacks here only matter for hand-written configs.
+    if is_vision:
+        _lora_defaults = {
+            "r": 8,
+            "alpha": 16,
+            "dropout": 0.05,
+            "target_modules": [
+                "q_proj", "v_proj", "fc1", "fc2", "linear",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+        }
+    else:
+        _lora_defaults = {
+            "r": 32,
+            "alpha": 64,
+            "dropout": 0.02,
+            "target_modules": [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "in_proj", "out_proj", "w1", "w2", "w3",
+            ],
+        }
     peft_config = None
     if lora_cfg.get("enabled", True):
         peft_config = LoraConfig(
-            r=lora_cfg.get("r", 32),
-            lora_alpha=lora_cfg.get("alpha", 64),
-            lora_dropout=lora_cfg.get("dropout", 0.02),
+            r=lora_cfg.get("r", _lora_defaults["r"]),
+            lora_alpha=lora_cfg.get("alpha", _lora_defaults["alpha"]),
+            lora_dropout=lora_cfg.get("dropout", _lora_defaults["dropout"]),
             target_modules=lora_cfg.get(
-                "target_modules",
-                ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj", "out_proj", "w1", "w2", "w3"],
+                "target_modules", _lora_defaults["target_modules"],
             ),
             task_type="CAUSAL_LM",
         )
@@ -351,10 +417,20 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         f"(eval_dataset={'explicit' if eval_dataset_path else f'split:{eval_split_ratio}'})"
     )
 
-    train_dataset = Dataset.from_list(chatml_to_sft_dataset(train_convos))
-    eval_dataset: Dataset | None = None
-    if eval_convos:
-        eval_dataset = Dataset.from_list(chatml_to_sft_dataset(eval_convos))
+    if is_vision:
+        # Vision rows carry compressed image bytes in a parallel column;
+        # the VLMCollator decodes them to PIL lazily per batch.
+        from lqh.train.vlm_data import chatml_to_vlm_dataset
+
+        train_dataset = Dataset.from_list(chatml_to_vlm_dataset(train_convos))
+        eval_dataset: Dataset | None = None
+        if eval_convos:
+            eval_dataset = Dataset.from_list(chatml_to_vlm_dataset(eval_convos))
+    else:
+        train_dataset = Dataset.from_list(chatml_to_sft_dataset(train_convos))
+        eval_dataset = None
+        if eval_convos:
+            eval_dataset = Dataset.from_list(chatml_to_sft_dataset(eval_convos))
 
     # Safe batch-size auto-tuning (GPU_TYPE.md §6). Mutates training_cfg
     # in place (per_device_batch_size + gradient_accumulation_steps) so
@@ -371,26 +447,38 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     from lqh.train.calibrate import ensure_batch_defaults, maybe_autotune_batch_size
 
     _lora_enabled = lora_cfg.get("enabled", True)
-    ensure_batch_defaults(
-        training_cfg,
-        default_micro_batch=256 if _lora_enabled else 1,
-        default_effective_batch=256 if _lora_enabled else 16,
-    )
-    probe_model = model
-    if peft_config is not None:
-        from peft import get_peft_model
+    if is_vision:
+        # The calibration probe builds synthetic TEXT batches, which would
+        # under-measure the vision encoder's activation peak — skip it and
+        # start from conservative defaults. auto_batch stays on in the
+        # config, so an OOM still triggers report_oom_downgrade, which
+        # writes a halved, modality="vision"-keyed batch profile.
+        ensure_batch_defaults(
+            training_cfg,
+            default_micro_batch=2,
+            default_effective_batch=16,
+        )
+    else:
+        ensure_batch_defaults(
+            training_cfg,
+            default_micro_batch=256 if _lora_enabled else 1,
+            default_effective_batch=256 if _lora_enabled else 16,
+        )
+        probe_model = model
+        if peft_config is not None:
+            from peft import get_peft_model
 
-        probe_model = get_peft_model(model, peft_config)
-    maybe_autotune_batch_size(
-        training_cfg,
-        model=probe_model,
-        tokenizer=tokenizer,
-        base_model=base_model,
-        method="lora" if _lora_enabled else "full",
-        lora_rank=int(lora_cfg.get("r", 32)) if _lora_enabled else 0,
-    )
-    if probe_model is not model:
-        model = probe_model.unload()
+            probe_model = get_peft_model(model, peft_config)
+        maybe_autotune_batch_size(
+            training_cfg,
+            model=probe_model,
+            tokenizer=tokenizer,
+            base_model=base_model,
+            method="lora" if _lora_enabled else "full",
+            lora_rank=int(lora_cfg.get("r", 32)) if _lora_enabled else 0,
+        )
+        if probe_model is not model:
+            model = probe_model.unload()
 
     # Checkpoints dir
     checkpoint_output = str(run_dir / "checkpoints")
@@ -416,6 +504,16 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         dataloader_pin_memory=True,
         ddp_find_unused_parameters=False,
     )
+    if is_vision:
+        # The VLMCollator owns tokenization; TRL must not try to prepare
+        # (tokenize/truncate) the dataset itself — its truncation could
+        # sever an image-token span. Length enforcement happens in the
+        # collator (over-long samples are dropped, not truncated).
+        sft_kwargs.update(
+            max_length=None,
+            remove_unused_columns=False,
+            dataset_kwargs={"skip_prepare_dataset": True},
+        )
     if has_eval:
         # load_best_model_at_end with metric=eval_loss is SAFE for SFT
         # (unlike DPO, where we disabled it — see lqh/train/dpo.py).
@@ -442,17 +540,24 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         sft_kwargs["save_steps"] = training_cfg.get("save_steps", 500)
     sft_config = SFTConfig(**sft_kwargs)
 
-    # Progress callback
-    progress_cb = ProgressCallback(run_dir, config, tokenizer)
+    # Progress callback. For vision it gets the processor (checkpoint eval
+    # needs apply_chat_template with images), not the bare tokenizer.
+    progress_cb = ProgressCallback(run_dir, config, processor if is_vision else tokenizer)
 
     # Trainer
     trainer_kwargs: dict[str, Any] = {
         "model": model,
         "args": sft_config,
         "train_dataset": train_dataset,
-        "processing_class": tokenizer,
+        "processing_class": processor if is_vision else tokenizer,
         "callbacks": [progress_cb],
     }
+    if is_vision:
+        from lqh.train.vlm_data import VLMCollator
+
+        trainer_kwargs["data_collator"] = VLMCollator(
+            processor, max_length=training_cfg.get("max_seq_length", 2048),
+        )
     if eval_dataset is not None:
         trainer_kwargs["eval_dataset"] = eval_dataset
     if peft_config is not None:
@@ -502,7 +607,10 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     else:
         trainer.model.save_pretrained(str(final_model_dir))
 
-    tokenizer.save_pretrained(str(final_model_dir))
+    # Vision: save the full processor (tokenizer + image processor + chat
+    # template) so downstream loads (merge, serving) get the preprocessor
+    # config, not just the tokenizer.
+    (processor if is_vision else tokenizer).save_pretrained(str(final_model_dir))
     _write_checkpoint_lineage(
         final_model_dir,
         config=config,
@@ -524,11 +632,15 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         from lqh.train.load_model import load_for_inference
 
         eval_model, _ = load_for_inference(
-            str(final_model_dir), dtype=dtype, device_map="auto",
+            str(final_model_dir),
+            dtype=dtype,
+            device_map="auto",
+            modality=modality,
+            max_image_tokens=int(training_cfg.get("max_image_tokens", 256)) if is_vision else None,
         )
         _run_checkpoint_eval(
             model=eval_model,
-            tokenizer=tokenizer,
+            tokenizer=processor if is_vision else tokenizer,
             config=config,
             checkpoint_dir=final_checkpoint,
         )

@@ -1260,7 +1260,13 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "so the best checkpoint gets a real judge score; the call is rejected "
                 "unless you pass `scorer` or set `disable_scoring=true` (only when the "
                 "user explicitly asks not to score). The judge score is not returned by "
-                "this call — after the run completes, fetch it with `training_status`."
+                "this call — after the run completes, fetch it with `training_status`. "
+                "Vision-language bases (LFM2.5-VL-*) are supported for SFT only (not "
+                "DPO): the run automatically switches to the VLM path (image-aware "
+                "collation, the VLM LoRA recipe). The dataset must carry its images "
+                "inline as image_url data-URLs in the messages (the standard vision "
+                "data-gen output). Token budget note: each image costs up to "
+                "training.max_image_tokens (default 256) of the max_seq_length budget."
             ),
             parameters={
                 "type": "object",

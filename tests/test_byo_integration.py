@@ -160,11 +160,13 @@ async def test_byo_image_folder_end_to_end(
     write_pipeline,
     mock_openai_client,
 ) -> None:
+    from PIL import Image
+
     project = chdir_to_tmp
     images = project / "images" / "dog"
     images.mkdir(parents=True)
     for name in ("a.jpg", "b.jpg"):
-        (images / name).write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        Image.new("RGB", (24, 24), (120, 80, 40)).save(images / name)
 
     pipeline = write_pipeline(
         "data_gen/p.py",
@@ -203,3 +205,87 @@ async def test_byo_image_folder_end_to_end(
         max_retries=0,
     )
     assert result.succeeded == 2
+
+
+# ---------------------------------------------------------------------------
+# Vision pipeline: multi-part content with image_url flows into the request
+# and round-trips through the parquet output.
+# ---------------------------------------------------------------------------
+
+
+async def test_byo_vision_pipeline_end_to_end(
+    chdir_to_tmp: Path,
+    write_pipeline,
+    mock_openai_client,
+) -> None:
+    from PIL import Image
+
+    project = chdir_to_tmp
+    images = project / "images"
+    images.mkdir(parents=True)
+    Image.new("RGB", (48, 32), (220, 50, 47)).save(images / "red.png")
+
+    pipeline = write_pipeline(
+        "data_gen/p.py",
+        """
+        from lqh.pipeline import Pipeline, ChatMLMessage
+        import lqh.sources as sources
+
+        class VisionQA(Pipeline):
+            @classmethod
+            def source(cls, project_dir):
+                return sources.image_folder(project_dir / "images")
+
+            async def generate(self, client, input):
+                url = input.as_data_url()
+                resp = await client.chat.completions.create(
+                    model="medium",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": url}},
+                            {"type": "text", "text": "Inventory this image as JSON."},
+                        ],
+                    }],
+                    response_format={"type": "json_object"},
+                )
+                answer = resp.choices[0].message.content
+                return [
+                    ChatMLMessage("user", [
+                        {"type": "image_url", "image_url": {"url": url}},
+                        {"type": "text", "text": "What color is the rectangle?"},
+                    ]),
+                    ChatMLMessage("assistant", answer),
+                ]
+        """,
+    )
+
+    client = mock_openai_client(content='{"colors": ["red"]}')
+    output_dir = project / "datasets" / "v1"
+    result = await run_pipeline(
+        script_path=pipeline,
+        num_samples=1,
+        output_dir=output_dir,
+        client=client,
+        concurrency=1,
+        max_retries=0,
+    )
+    assert result.succeeded == 1
+
+    # The VLM request carried the actual image part and the response_format.
+    call = client.chat.completions.create.await_args_list[0]
+    sent = call.kwargs
+    assert sent["response_format"] == {"type": "json_object"}
+    parts = sent["messages"][0]["content"]
+    assert parts[0]["type"] == "image_url"
+    assert parts[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+    # The parquet stores the multi-part content intact (image inline).
+    table = pq.read_table(output_dir / "data.parquet")
+    [row] = [json.loads(m) for m in table.column("messages").to_pylist()]
+    user_parts = row[0]["content"]
+    assert isinstance(user_parts, list)
+    assert user_parts[0]["type"] == "image_url"
+    assert user_parts[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert user_parts[1] == {"type": "text", "text": "What color is the rectangle?"}
+    assert row[1]["content"] == '{"colors": ["red"]}'

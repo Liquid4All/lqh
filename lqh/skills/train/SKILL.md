@@ -227,6 +227,28 @@ To make a user's own GPU box available as a target, walk them through the one-ti
 
 After setup, the next `start_training` offers the new remote in the picker. The launcher then syncs the dataset, scorer, and config to it, starts the subprocess there, and returns a job ID. Use `training_status(run_name=...)` to monitor — progress and checkpoint scores are pulled back to the local mirror. The local machine does **not** need `lqh[train]` installed when training on a remote. To change a project's pinned target later, use `compute_set`.
 
+## Vision-language (LFM2.5-VL) training
+
+Fine-tuning the vision models (`lfm2.5-vl-450m`, `lfm2.5-vl-1.6b` — see
+`list_models`) works through the same `start_training` tool with **no extra
+arguments** — the harness detects the VL base and switches automatically:
+
+- **SFT only.** DPO is rejected for VL bases in this version.
+- **Dataset format**: the standard vision data-gen output — user turns whose
+  content is `[image_url part (data-URL), text part]`, assistant turns plain
+  text. Images stay inline in the parquet; nothing extra to upload.
+- **Recipe defaults** are applied for you (Liquid's VLM LoRA recipe: r=8,
+  α=16, lr 5e-4, expanded target modules including the multimodal projector).
+  The sweep works as usual.
+- **Token budget**: each image costs up to `training.max_image_tokens`
+  (default 256) of the `max_seq_length` (2048) budget. Samples that render
+  over-long are dropped with a warning, never truncated (truncation through
+  image tokens corrupts training) — keep conversations short or images few.
+- **Eval** works unchanged: checkpoint eval generates with the image inputs
+  and the judge scores against the actual images (vision judge routing).
+- **Serving**: `push_to_production` works (LoRA merge + deployment);
+  `gguf_convert` is NOT supported for VL models yet (missing mmproj support).
+
 ## Training Configuration
 
 ### Hyperparameter sweeping (default for scaled SFT and DPO; OFF for the pilot)

@@ -2835,6 +2835,21 @@ async def handle_start_training(
             return ToolResult(content=f"Error: scorer not found at {scorer}")
         scorer_path = scorer
 
+    # Vision-language (LFM-VL) bases switch the run into the vision path:
+    # AutoProcessor + image collation in the subprocess, the Liquid VLM
+    # LoRA recipe, and conservative batch defaults (the text calibration
+    # probe is skipped for vision). SFT-only for now.
+    from lqh.models import is_vlm_model_name
+
+    is_vision = is_vlm_model_name(base_model)
+    if is_vision and type != "sft":
+        return ToolResult(
+            content=(
+                f"Error: {type} is not supported for vision-language models yet — "
+                f"only SFT is. Train {base_model} with type='sft'."
+            )
+        )
+
     # Generate run name
     if not run_name:
         prefix = "sft" if type == "sft" else "dpo"
@@ -2847,8 +2862,15 @@ async def handle_start_training(
 
     # Build config
     default_lr = 2e-5 if type == "sft" else 5e-6
+    if is_vision:
+        default_lr = 5e-4  # Liquid VLM LoRA recipe
     lr = learning_rate if learning_rate is not None else default_lr
-    if lora:
+    if is_vision:
+        # No calibration probe for vision — start conservative and let the
+        # OOM self-heal (report_oom_downgrade) shrink further if needed.
+        default_micro_batch = 2
+        default_effective_batch = 16
+    elif lora:
         default_micro_batch = 256
         default_effective_batch = 256
     else:
@@ -2858,6 +2880,32 @@ async def handle_start_training(
         1,
         (default_effective_batch + default_micro_batch - 1) // default_micro_batch,
     )
+
+    if is_vision:
+        lora_defaults: dict[str, Any] = {
+            "enabled": lora,
+            "r": 8,
+            "alpha": 16,
+            "dropout": 0.05,
+            # Liquid VLM recipe: attention + FFN + vision-tower MLPs (fc1/
+            # fc2) + multimodal projector (linear). Intentionally different
+            # from the text LFM module list.
+            "target_modules": [
+                "q_proj", "v_proj", "fc1", "fc2", "linear",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+        }
+    else:
+        lora_defaults = {
+            "enabled": lora,
+            "r": 32,
+            "alpha": 64,
+            "dropout": 0.02,
+            "target_modules": [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "in_proj", "out_proj", "w1", "w2", "w3",
+            ],
+        }
 
     config: dict[str, Any] = {
         "type": type,
@@ -2871,18 +2919,14 @@ async def handle_start_training(
             "effective_batch_size": default_effective_batch,
             "auto_batch": True,
         },
-        "lora": {
-            "enabled": lora,
-            "r": 32,
-            "alpha": 64,
-            "dropout": 0.02,
-            "target_modules": [
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "in_proj", "out_proj", "w1", "w2", "w3",
-            ],
-        },
+        "lora": lora_defaults,
         "manifest": ["base_model", "dataset"],
     }
+    if is_vision:
+        config["modality"] = "vision"
+        # Per-image token budget for the processor. Effective text budget
+        # is roughly max_seq_length − n_images × max_image_tokens.
+        config["training"]["max_image_tokens"] = 256
 
     if eval_sources:
         config["eval_dataset"] = _sources_to_config(eval_sources)
@@ -2909,6 +2953,22 @@ async def handle_start_training(
     dataset_summary = " + ".join(_summarize(e) for e in dataset_sources)
     eval_summary = " + ".join(Path(e["path"]).parent.as_posix() for e in eval_sources)
 
+    # Cloud bundles are tarred fully in memory and uploaded in one POST —
+    # warn before shipping a very large dataset (image datasets inflate
+    # fast: base64 data-URLs inside the messages column).
+    size_warning = ""
+    try:
+        total_bytes = sum(p.stat().st_size for p in (*train_resolved, *eval_resolved) if p.exists())
+        if remote and total_bytes > 1 << 30:
+            size_warning = (
+                f"\n  ⚠️ Datasets total {total_bytes / (1 << 30):.1f} GB — the cloud "
+                "bundle is built in memory and uploaded in one request, which may "
+                "be slow or hit the upload timeout. Consider fewer/smaller samples"
+                + (" or smaller images (max_dim)." if is_vision else ".")
+            )
+    except OSError:
+        pass
+
     # Permission check. Training has its own permission domain (see
     # permissions.check_training_permission) so approving a run never grants
     # arbitrary pipeline/script execution.
@@ -2924,7 +2984,7 @@ async def handle_start_training(
                 f"  Model:     {base_model}\n"
                 f"  Dataset:   {dataset_summary}\n"
                 f"  Eval:      {eval_summary}\n"
-                f"  GPU:       {gpu_info}\n\n"
+                f"  GPU:       {gpu_info}{size_warning}\n\n"
                 f"Allow execution?"
             ),
             options=[

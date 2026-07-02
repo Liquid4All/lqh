@@ -58,6 +58,19 @@ async def submit_gguf(
 
     from lqh.auth import require_token
     from lqh.config import load_config
+    from lqh.models import is_vlm_model_name
+
+    # Vision-language checkpoints need a separate mmproj (vision tower)
+    # conversion that the single-file f16→quantize flow doesn't produce,
+    # and llama.cpp support for LFM2.5-VL is unverified. Reject early with
+    # a clear message instead of failing mid-sandbox.
+    if is_vlm_model_name(base_model):
+        raise RuntimeError(
+            f"GGUF conversion is not supported for vision-language models yet "
+            f"({base_model}): the vision tower needs a separate mmproj conversion "
+            f"that this pipeline doesn't produce. Serve the model via "
+            f"push_to_production (sglang) instead."
+        )
 
     config = load_config()
     token = require_token()
@@ -242,6 +255,16 @@ def run_gguf(
     source_artifact_id: str | None,
 ) -> None:
     from lqh.artifacts import BackendArtifactStore
+    from lqh.models import is_vlm_model_name
+
+    # Defense-in-depth mirror of the submit_gguf guard: a VL checkpoint
+    # would convert without its vision tower (mmproj) and produce a
+    # blind model.
+    if is_vlm_model_name(base_model):
+        raise RuntimeError(
+            f"GGUF conversion is not supported for vision-language models yet "
+            f"({base_model}): the vision tower needs a separate mmproj conversion."
+        )
 
     # Work under /workspace (the project volume) when available so large
     # f16 + quant files don't fill the small sandbox-local disk.

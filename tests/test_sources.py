@@ -20,10 +20,21 @@ def project(chdir_to_tmp: Path) -> Path:
     return chdir_to_tmp
 
 
-def _make_image(path: Path) -> None:
-    """Minimal 1x1 PNG — enough for ``read_bytes`` / ``mime_type``."""
+def _make_image(
+    path: Path,
+    *,
+    size: tuple[int, int] = (32, 32),
+    mode: str = "RGB",
+) -> None:
+    """Write a real (tiny) image so ``as_data_url`` preprocessing works."""
+    from PIL import Image
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+    color = (200, 60, 40) if mode == "RGB" else (200, 60, 40, 128)
+    fmt = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP"}[
+        path.suffix.lower()
+    ]
+    Image.new(mode, size, color).save(path, format=fmt)
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +90,69 @@ def test_image_item_mime_and_data_url(project: Path) -> None:
     assert item.mime_type() in ("image/jpeg",)
     url = item.as_data_url()
     assert url.startswith("data:image/jpeg;base64,")
+
+
+def _decode_data_url(url: str):
+    """Decode a data-URL back into a PIL image (and return the mime too)."""
+    import base64
+    from io import BytesIO
+
+    from PIL import Image
+
+    header, b64 = url.split(",", 1)
+    mime = header.removeprefix("data:").removesuffix(";base64")
+    img = Image.open(BytesIO(base64.b64decode(b64)))
+    img.load()
+    return img, mime
+
+
+def test_as_data_url_downscales_long_edge(project: Path) -> None:
+    _make_image(project / "images" / "big.png", size=(2048, 1024))
+    [item] = sources.image_folder("images")
+
+    img, mime = _decode_data_url(item.as_data_url(max_dim=512))
+    assert mime == "image/jpeg"  # opaque PNG re-encodes as JPEG
+    assert max(img.size) == 512
+    # Aspect ratio preserved (2:1)
+    assert img.size == (512, 256)
+
+
+def test_as_data_url_never_upscales(project: Path) -> None:
+    _make_image(project / "images" / "small.jpg", size=(32, 16))
+    [item] = sources.image_folder("images")
+
+    img, _ = _decode_data_url(item.as_data_url(max_dim=1024))
+    assert img.size == (32, 16)
+
+
+def test_as_data_url_preserves_alpha_as_png(project: Path) -> None:
+    _make_image(project / "images" / "overlay.png", size=(64, 64), mode="RGBA")
+    [item] = sources.image_folder("images")
+
+    img, mime = _decode_data_url(item.as_data_url())
+    assert mime == "image/png"
+    assert img.mode == "RGBA"
+
+
+def test_as_data_url_raw_passthrough(project: Path) -> None:
+    path = project / "images" / "a.png"
+    _make_image(path)
+    [item] = sources.image_folder("images")
+
+    import base64
+
+    url = item.as_data_url(max_dim=None)
+    assert url == f"data:image/png;base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+
+
+def test_as_data_url_round_trips_through_pil(project: Path) -> None:
+    _make_image(project / "images" / "a.jpg", size=(300, 200))
+    [item] = sources.image_folder("images")
+
+    img, _ = _decode_data_url(item.as_data_url())
+    # Default max_dim=1024: no resize, RGB JPEG out.
+    assert img.size == (300, 200)
+    assert img.mode == "RGB"
 
 
 # ---------------------------------------------------------------------------

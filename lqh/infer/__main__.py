@@ -58,12 +58,17 @@ def _run_inference(run_dir: Path, config: dict) -> None:
     print(f"Loading model: {base_model}")
     # load_for_inference transparently handles hub ids, merged dirs,
     # and adapter dirs (the latter via base+PeftModel+merge_and_unload).
+    # For vision (LFM-VL) models it returns the AutoProcessor in the
+    # tokenizer slot — the raw tokenizer is at ``.tokenizer``.
     model, tokenizer = load_for_inference(
         base_model,
         dtype=torch.bfloat16,
         device_map="auto",
         base_override=base_override,
     )
+    is_vision = hasattr(tokenizer, "image_processor")
+    if is_vision:
+        print("  vision model detected — processor-based generation")
 
     print(f"Loading dataset: {dataset_path}")
     # dataset_path may name one or more sources (eval-of-best passes the
@@ -124,7 +129,7 @@ def _run_inference(run_dir: Path, config: dict) -> None:
 
         parser = JsonSchemaParser(inner_schema)
         schema_prefix_fn = build_transformers_prefix_allowed_tokens_fn(
-            tokenizer, parser,
+            tokenizer.tokenizer if is_vision else tokenizer, parser,
         )
         print(
             f"  JSON-schema constrained decoding enabled "
@@ -149,50 +154,71 @@ def _run_inference(run_dir: Path, config: dict) -> None:
             prompt_msgs = [{"role": "system", "content": system_prompt}] + prompt_msgs
 
         try:
-            # Build chat template kwargs — pass tools when available
-            template_kwargs: dict = {
-                "return_tensors": "pt",
-                "add_generation_prompt": True,
-                "return_dict": True,
-            }
-            if sample_tools is not None:
-                template_kwargs["tools"] = sample_tools
+            if is_vision:
+                # Vision path: the processor handles image (data-URL)
+                # decoding and multimodal inputs. Tool parsing is not
+                # supported for vision datasets (no VL tool-calling data
+                # exists yet); the shared tail below is unchanged.
+                from lqh.train.vlm_data import vlm_generate
 
-            inputs = tokenizer.apply_chat_template(
-                prompt_msgs,
-                **template_kwargs,
-            )
-            input_ids = inputs["input_ids"].to(model.device)
-
-            with torch.no_grad():
-                generate_kwargs: dict[str, Any] = {
-                    "max_new_tokens": max_new_tokens,
-                    "do_sample": False,
-                }
+                vlm_kwargs: dict[str, Any] = {}
                 if schema_prefix_fn is not None:
-                    generate_kwargs["prefix_allowed_tokens_fn"] = schema_prefix_fn
-                output_ids = model.generate(input_ids, **generate_kwargs)
-            # Decode without skipping special tokens so we can parse
-            # tool call markers if present
-            raw_response = tokenizer.decode(
-                output_ids[0][input_ids.shape[-1]:],
-                skip_special_tokens=False,
-            )
-
-            # Parse tool calls from model output if formatter available
-            assistant_msg: dict[str, Any] = {"role": "assistant"}
-            if tool_formatter and sample_tools:
-                content, tool_calls = tool_formatter.parse_assistant_output(raw_response)
-                assistant_msg["content"] = content
-                if tool_calls:
-                    assistant_msg["tool_calls"] = tool_calls
+                    vlm_kwargs["prefix_allowed_tokens_fn"] = schema_prefix_fn
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": vlm_generate(
+                        model,
+                        tokenizer,
+                        prompt_msgs,
+                        max_new_tokens=max_new_tokens,
+                        **vlm_kwargs,
+                    ),
+                }
             else:
-                # Fallback: clean decode with special tokens skipped
-                response = tokenizer.decode(
-                    output_ids[0][input_ids.shape[-1]:],
-                    skip_special_tokens=True,
+                # Build chat template kwargs — pass tools when available
+                template_kwargs: dict = {
+                    "return_tensors": "pt",
+                    "add_generation_prompt": True,
+                    "return_dict": True,
+                }
+                if sample_tools is not None:
+                    template_kwargs["tools"] = sample_tools
+
+                inputs = tokenizer.apply_chat_template(
+                    prompt_msgs,
+                    **template_kwargs,
                 )
-                assistant_msg["content"] = response
+                input_ids = inputs["input_ids"].to(model.device)
+
+                with torch.no_grad():
+                    generate_kwargs: dict[str, Any] = {
+                        "max_new_tokens": max_new_tokens,
+                        "do_sample": False,
+                    }
+                    if schema_prefix_fn is not None:
+                        generate_kwargs["prefix_allowed_tokens_fn"] = schema_prefix_fn
+                    output_ids = model.generate(input_ids, **generate_kwargs)
+                # Decode without skipping special tokens so we can parse
+                # tool call markers if present
+                raw_response = tokenizer.decode(
+                    output_ids[0][input_ids.shape[-1]:],
+                    skip_special_tokens=False,
+                )
+
+                # Parse tool calls from model output if formatter available
+                assistant_msg = {"role": "assistant"}
+                if tool_formatter and sample_tools:
+                    content, tool_calls = tool_formatter.parse_assistant_output(raw_response)
+                    assistant_msg["content"] = content
+                    if tool_calls:
+                        assistant_msg["tool_calls"] = tool_calls
+                else:
+                    # Fallback: clean decode with special tokens skipped
+                    response = tokenizer.decode(
+                        output_ids[0][input_ids.shape[-1]:],
+                        skip_special_tokens=True,
+                    )
+                    assistant_msg["content"] = response
 
         except Exception as exc:
             assistant_msg = {"role": "assistant", "content": f"[generation error: {exc}]"}

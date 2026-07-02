@@ -71,10 +71,49 @@ class ImageItem:
         guess, _ = mimetypes.guess_type(self.path.name)
         return guess or "image/jpeg"
 
-    def as_data_url(self) -> str:
-        """Return a ``data:image/...;base64,...`` URL suitable for OpenAI vision."""
-        b64 = base64.b64encode(self.read_bytes()).decode("ascii")
-        return f"data:{self.mime_type()};base64,{b64}"
+    def as_data_url(
+        self,
+        *,
+        max_dim: int | None = 1024,
+        jpeg_quality: int = 90,
+    ) -> str:
+        """Return a ``data:image/...;base64,...`` URL suitable for OpenAI vision.
+
+        By default the image is preprocessed to a size that VLM APIs handle
+        well: decoded with PIL, converted to RGB, downscaled so the long edge
+        is at most *max_dim* pixels (never upscaled), and re-encoded as JPEG
+        at *jpeg_quality*. Images with an alpha channel are re-encoded as PNG
+        instead so transparency survives. This bounds both the base64 payload
+        (the API caps request bodies) and the per-image token cost.
+
+        Pass ``max_dim=None`` to skip preprocessing and embed the raw file
+        bytes unchanged.
+        """
+        if max_dim is None:
+            b64 = base64.b64encode(self.read_bytes()).decode("ascii")
+            return f"data:{self.mime_type()};base64,{b64}"
+
+        from io import BytesIO
+
+        from PIL import Image
+
+        with Image.open(BytesIO(self.read_bytes())) as img:
+            img.load()
+            has_alpha = img.mode in ("RGBA", "LA") or (
+                img.mode == "P" and "transparency" in img.info
+            )
+            if img.width > max_dim or img.height > max_dim:
+                img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+            buf = BytesIO()
+            if has_alpha:
+                img.convert("RGBA").save(buf, format="PNG")
+                mime = "image/png"
+            else:
+                img.convert("RGB").save(buf, format="JPEG", quality=jpeg_quality)
+                mime = "image/jpeg"
+
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:{mime};base64,{b64}"
 
 
 @dataclass

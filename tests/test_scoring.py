@@ -189,6 +189,83 @@ class TestBuildScoringPrompt:
         assert "Reference (ground truth)" in prompt[1]["content"]
         assert "reference" in prompt[1]["content"]
 
+    def test_vision_sample_attaches_images(self) -> None:
+        url = "data:image/jpeg;base64,QUJD"
+        prompt = _build_scoring_prompt(
+            "Score groundedness 1-10",
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": url}},
+                        {"type": "text", "text": "how many circles?"},
+                    ],
+                },
+                {"role": "assistant", "content": "there are two circles"},
+            ],
+        )
+        user = prompt[1]
+        # Multi-part content: text first, then the actual image part.
+        assert isinstance(user["content"], list)
+        text_part = user["content"][0]
+        assert text_part["type"] == "text"
+        assert "[image 1]" in text_part["text"]
+        assert "how many circles?" in text_part["text"]
+        assert "there are two circles" in text_part["text"]
+        # The raw content list must NOT be stringified into the transcript.
+        assert "image_url" not in text_part["text"]
+        image_parts = [p for p in user["content"] if p["type"] == "image_url"]
+        assert image_parts == [{"type": "image_url", "image_url": {"url": url}}]
+        # System message stays plain text.
+        assert isinstance(prompt[0]["content"], str)
+
+    def test_vision_images_deduplicated_across_reference(self) -> None:
+        url = "data:image/png;base64,WFla"
+        sample = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": url}},
+                    {"type": "text", "text": "describe"},
+                ],
+            },
+            {"role": "assistant", "content": "a red square"},
+        ]
+        reference = [
+            sample[0],
+            {"role": "assistant", "content": "one red square on white"},
+        ]
+        prompt = _build_scoring_prompt("criteria", sample, reference_messages=reference)
+        image_parts = [p for p in prompt[1]["content"] if p["type"] == "image_url"]
+        assert len(image_parts) == 1  # same image referenced twice, attached once
+        text = prompt[1]["content"][0]["text"]
+        assert text.count("[image 1]") == 2
+
+    def test_text_only_sample_keeps_string_content(self) -> None:
+        prompt = _build_scoring_prompt(
+            "criteria",
+            [
+                {"role": "user", "content": "plain question"},
+                {"role": "assistant", "content": "plain answer"},
+            ],
+        )
+        # Regression: no images -> user content stays a plain string.
+        assert isinstance(prompt[1]["content"], str)
+
+    def test_multipart_text_only_content_renders_without_images(self) -> None:
+        prompt = _build_scoring_prompt(
+            "criteria",
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "part-based question"}],
+                },
+                {"role": "assistant", "content": "answer"},
+            ],
+        )
+        assert isinstance(prompt[1]["content"], str)
+        assert "part-based question" in prompt[1]["content"]
+
 
 # ---------------------------------------------------------------------------
 # _parse_score_response
@@ -362,6 +439,57 @@ def make_results_parquet(tmp_path: Path) -> Callable[[list[float]], Path]:
         return path
 
     return _factory
+
+
+class TestZeroScoreIsValid:
+    """A judge-returned score of 0 is a real worst-quality grade, not a failure.
+
+    Regression for the harness bug where ``success = score > 0`` reclassified
+    every legitimate 0 (empty/refusal/"copied the draft") as ``num_failed`` and
+    silently dropped it from the mean — inflating base-model baselines.
+    """
+
+    @staticmethod
+    def _client_returning(content: str) -> MagicMock:
+        client = MagicMock()
+        response = MagicMock()
+        response.choices = [MagicMock(message=MagicMock(content=content))]
+        client.chat.completions.create = AsyncMock(return_value=response)
+        return client
+
+    async def test_zero_counts_as_scored_and_in_mean(
+        self, run_scoring_call, scoring_workspace: dict[str, Path],
+    ) -> None:
+        """Judge returns score 0 with normal reasoning → scored, mean includes it."""
+        client = self._client_returning(
+            '{"reasoning": "Empty/unrelated output.", "score": 0}'
+        )
+        result = await run_scoring_call(client=client)
+
+        assert result.total == 2
+        assert result.scored == 2          # both 0s are real scores
+        assert result.failed == 0
+        assert result.mean_score == 0.0
+
+        summary = json.loads(
+            (scoring_workspace["output_dir"] / "summary.json").read_text()
+        )
+        assert summary["num_scored"] == 2
+        assert summary["num_failed"] == 0
+        assert summary["scores"]["min"] == 0.0
+        assert summary["scores"]["max"] == 0.0
+
+    async def test_parse_error_still_counts_as_failed(
+        self, run_scoring_call, scoring_workspace: dict[str, Path],
+    ) -> None:
+        """Unparseable judge output is an infra failure: failed, excluded from mean."""
+        client = self._client_returning("not valid json at all")
+        result = await run_scoring_call(client=client)
+
+        assert result.total == 2
+        assert result.scored == 0
+        assert result.failed == 2
+        assert result.mean_score == 0.0   # no valid scores → empty mean, not a 0-grade
 
 
 class TestExtractFailures:

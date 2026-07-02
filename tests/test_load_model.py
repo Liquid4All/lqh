@@ -111,12 +111,31 @@ def stub_torch_transformers_peft(monkeypatch: pytest.MonkeyPatch):
         torch_stub.bfloat16 = "bf16-sentinel"  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "torch", torch_stub)
 
-    # transformers.AutoModelForCausalLM + AutoTokenizer
+    # transformers.AutoModelForCausalLM + AutoTokenizer (+ the vision twins
+    # and AutoConfig, which modality auto-detection reads). The default
+    # AutoConfig result is a text model; tests flip it to a VL config via
+    # `s.set_model_type(...)`.
     transformers_stub = types.ModuleType("transformers")
     auto_model = MagicMock(name="AutoModelForCausalLM")
     auto_tokenizer = MagicMock(name="AutoTokenizer")
+    auto_vlm = MagicMock(name="AutoModelForImageTextToText")
+    auto_processor = MagicMock(name="AutoProcessor")
+    auto_config = MagicMock(name="AutoConfig")
+
+    config_obj = types.SimpleNamespace(model_type="lfm2")
+    auto_config.from_pretrained.return_value = config_obj
+
+    def set_model_type(model_type: str, *, vision_config=None):
+        cfg = types.SimpleNamespace(model_type=model_type)
+        if vision_config is not None:
+            cfg.vision_config = vision_config
+        auto_config.from_pretrained.return_value = cfg
+
     transformers_stub.AutoModelForCausalLM = auto_model  # type: ignore[attr-defined]
     transformers_stub.AutoTokenizer = auto_tokenizer  # type: ignore[attr-defined]
+    transformers_stub.AutoModelForImageTextToText = auto_vlm  # type: ignore[attr-defined]
+    transformers_stub.AutoProcessor = auto_processor  # type: ignore[attr-defined]
+    transformers_stub.AutoConfig = auto_config  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "transformers", transformers_stub)
 
     # peft.PeftModel
@@ -128,7 +147,11 @@ def stub_torch_transformers_peft(monkeypatch: pytest.MonkeyPatch):
     return types.SimpleNamespace(
         AutoModelForCausalLM=auto_model,
         AutoTokenizer=auto_tokenizer,
+        AutoModelForImageTextToText=auto_vlm,
+        AutoProcessor=auto_processor,
+        AutoConfig=auto_config,
         PeftModel=peft_model,
+        set_model_type=set_model_type,
     )
 
 
@@ -246,3 +269,104 @@ def test_load_for_training_adapter_no_merge_returns_peft(stub_torch_transformers
     wrapped.merge_and_unload.assert_not_called()
     assert model is wrapped
     assert effective_base == "fake/base"
+
+
+# ---------------------------------------------------------------------------
+# detect_modality + vision dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_detect_modality_text(stub_torch_transformers_peft):
+    from lqh.train.load_model import detect_modality
+
+    stub_torch_transformers_peft.set_model_type("lfm2")
+    assert detect_modality("LiquidAI/LFM2.5-1.2B-Instruct") == "text"
+
+
+def test_detect_modality_vision_by_model_type(stub_torch_transformers_peft):
+    from lqh.train.load_model import detect_modality
+
+    stub_torch_transformers_peft.set_model_type("lfm2_vl")
+    assert detect_modality("LiquidAI/LFM2.5-VL-450M") == "vision"
+
+
+def test_detect_modality_vision_by_vision_config(stub_torch_transformers_peft):
+    from lqh.train.load_model import detect_modality
+
+    stub_torch_transformers_peft.set_model_type("some_multimodal", vision_config={"hidden": 1})
+    assert detect_modality("whatever/model") == "vision"
+
+
+def test_detect_modality_adapter_resolves_base(stub_torch_transformers_peft, tmp_path: Path):
+    from lqh.train.load_model import detect_modality
+
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps({"base_model_name_or_path": "fake/vl-base"})
+    )
+    s = stub_torch_transformers_peft
+    s.set_model_type("lfm2_vl")
+
+    assert detect_modality(str(tmp_path)) == "vision"
+    # AutoConfig must be read from the resolved BASE, not the adapter dir.
+    assert s.AutoConfig.from_pretrained.call_args.args[0] == "fake/vl-base"
+
+
+def test_load_for_inference_vision_uses_processor(stub_torch_transformers_peft):
+    from lqh.train.load_model import load_for_inference
+
+    s = stub_torch_transformers_peft
+    s.set_model_type("lfm2_vl")
+
+    model, tok = load_for_inference("fake/vl-id", max_image_tokens=128)
+
+    s.AutoModelForImageTextToText.from_pretrained.assert_called_once()
+    s.AutoModelForCausalLM.from_pretrained.assert_not_called()
+    s.AutoProcessor.from_pretrained.assert_called_once_with(
+        "fake/vl-id", max_image_tokens=128,
+    )
+    s.AutoTokenizer.from_pretrained.assert_not_called()
+
+
+def test_load_for_inference_text_path_untouched_by_vision_support(stub_torch_transformers_peft):
+    """Regression: text models must not touch the vision classes."""
+    from lqh.train.load_model import load_for_inference
+
+    s = stub_torch_transformers_peft
+    s.set_model_type("lfm2")
+
+    load_for_inference("fake/hub-id")
+
+    s.AutoModelForCausalLM.from_pretrained.assert_called_once()
+    s.AutoModelForImageTextToText.from_pretrained.assert_not_called()
+    s.AutoProcessor.from_pretrained.assert_not_called()
+
+
+def test_load_for_training_vision_adapter(stub_torch_transformers_peft, tmp_path: Path):
+    from lqh.train.load_model import load_for_training
+
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps({"base_model_name_or_path": "fake/vl-base"})
+    )
+    s = stub_torch_transformers_peft
+    s.set_model_type("lfm2_vl")
+    base_obj = MagicMock(name="vl_base_instance")
+    s.AutoModelForImageTextToText.from_pretrained.return_value = base_obj
+    wrapped = MagicMock(name="peft_wrapped")
+    s.PeftModel.from_pretrained.return_value = wrapped
+
+    model, tok, effective_base = load_for_training(str(tmp_path))
+
+    assert effective_base == "fake/vl-base"
+    assert s.AutoModelForImageTextToText.from_pretrained.call_args.args[0] == "fake/vl-base"
+    s.PeftModel.from_pretrained.assert_called_once_with(base_obj, str(tmp_path))
+    wrapped.merge_and_unload.assert_called_once()
+
+
+def test_explicit_modality_skips_detection(stub_torch_transformers_peft):
+    from lqh.train.load_model import load_for_inference
+
+    s = stub_torch_transformers_peft
+    load_for_inference("fake/hub-id", modality="text")
+
+    s.AutoConfig.from_pretrained.assert_not_called()
+    s.AutoModelForCausalLM.from_pretrained.assert_called_once()

@@ -26,6 +26,7 @@ __all__ = [
     "LIQUID_MODELS",
     "SIZE_RECOMMENDATION",
     "is_liquid_model_name",
+    "is_vlm_model_name",
     "format_catalog",
 ]
 
@@ -62,6 +63,7 @@ class LiquidModel:
     id: str          # short handle, e.g. "lfm2.5-1.2b-instruct"
     hf_id: str       # HuggingFace repo id, e.g. "LiquidAI/LFM2.5-1.2B-Instruct"
     kind: str        # "base" | "instruct" | "thinking"
+    vision: bool = False  # True for the LFM-VL vision-language models
 
     @property
     def good_finetune_base(self) -> bool:
@@ -73,8 +75,6 @@ class LiquidModel:
         return self.kind in ("base", "instruct")
 
 
-# NOTE: Vision-Language Models (LiquidAI/LFM2.5-VL-450M, LiquidAI/LFM2.5-VL-1.6B)
-# are intentionally deferred — MODELS.md adds them "at a later point".
 LIQUID_MODELS: list[LiquidModel] = [
     LiquidModel("lfm2.5-230m-base", "LiquidAI/LFM2.5-230M-Base", "base"),
     LiquidModel("lfm2.5-230m", "LiquidAI/LFM2.5-230M", "instruct"),
@@ -87,6 +87,10 @@ LIQUID_MODELS: list[LiquidModel] = [
     LiquidModel("lfm2.5-8b-a1b-base", "LiquidAI/LFM2.5-8B-A1B-Base", "base"),
     LiquidModel("lfm2-2.6b-exp", "LiquidAI/LFM2-2.6B-Exp", "instruct"),
     LiquidModel("lfm2-24b-a2b", "LiquidAI/LFM2-24B-A2B", "instruct"),
+    # Vision-language models (image + text → text). SFT-only for now
+    # (no DPO); datasets carry image_url data-URLs in the messages.
+    LiquidModel("lfm2.5-vl-450m", "LiquidAI/LFM2.5-VL-450M", "instruct", vision=True),
+    LiquidModel("lfm2.5-vl-1.6b", "LiquidAI/LFM2.5-VL-1.6B", "instruct", vision=True),
 ]
 
 
@@ -113,14 +117,32 @@ def is_liquid_model_name(name: str | None) -> bool:
     return n.startswith("liquidai/") or n.startswith("lfm")
 
 
+def is_vlm_model_name(name: str | None) -> bool:
+    """Return True if *name* refers to a Liquid vision-language (VL) model.
+
+    Matches catalog VL entries by short id or HF id, plus any id containing
+    a ``-vl-`` / ``-VL-`` segment under the LiquidAI prefix (covers future
+    VL checkpoints and local paths that embed the HF id). Used to switch
+    training/inference into the vision path (processor + image collation).
+    """
+    if not name:
+        return False
+    n = name.strip().lower()
+    for m in LIQUID_MODELS:
+        if m.vision and (n == m.id.lower() or n == m.hf_id.lower()):
+            return True
+    return ("lfm" in n) and ("-vl-" in n or n.endswith("-vl"))
+
+
 def format_catalog() -> str:
     """Render the catalog as an aligned table for the ``list_models`` tool."""
     lines = ["Liquid AI model catalog (evaluate via eval_hf_model / start_local_eval):\n"]
-    lines.append(f"{'Model ID':<24} {'Kind':<9} {'Finetune base':<13} {'HuggingFace ID'}")
+    lines.append(f"{'Model ID':<24} {'Kind':<9} {'Vision':<7} {'Finetune base':<13} {'HuggingFace ID'}")
     lines.append("-" * 92)
     for m in LIQUID_MODELS:
         ft = "yes" if m.good_finetune_base else "no"
-        lines.append(f"{m.id:<24} {m.kind:<9} {ft:<13} {m.hf_id}")
+        vis = "yes" if m.vision else "no"
+        lines.append(f"{m.id:<24} {m.kind:<9} {vis:<7} {ft:<13} {m.hf_id}")
     lines.append("")
     lines.append(SIZE_RECOMMENDATION)
     return "\n".join(lines)

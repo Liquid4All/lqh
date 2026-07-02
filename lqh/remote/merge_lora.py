@@ -64,10 +64,17 @@ def _extract_flat(tar_path: Path, dest: Path) -> Path:
 def _merge(base_model: str, adapter_dir: Path, out_dir: Path) -> None:
     import torch
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    print(f"merge: loading base {base_model} (bf16, cpu) ...", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=torch.bfloat16)
+    from lqh.train.load_model import _model_cls, detect_modality
+
+    # Vision (LFM-VL) bases need the image-text-to-text class; text bases
+    # keep AutoModelForCausalLM. merge_and_unload() itself is architecture-
+    # agnostic (LoRA targets are plain Linears, vision tower included).
+    modality = detect_modality(base_model)
+    model_cls = _model_cls(modality)
+
+    print(f"merge: loading base {base_model} (bf16, cpu, {modality}) ...", flush=True)
+    model = model_cls.from_pretrained(base_model, torch_dtype=torch.bfloat16)
     print("merge: applying adapter ...", flush=True)
     model = PeftModel.from_pretrained(model, str(adapter_dir))
     merged = model.merge_and_unload()
@@ -75,9 +82,17 @@ def _merge(base_model: str, adapter_dir: Path, out_dir: Path) -> None:
     merged.save_pretrained(str(out_dir), safe_serialization=True)
     # The tokenizer (and with it the chat_template — the known LFM
     # failure mode) must travel with the merged checkpoint, otherwise
-    # the serving pod renders prompts wrong or not at all.
-    tok = AutoTokenizer.from_pretrained(base_model)
-    tok.save_pretrained(str(out_dir))
+    # the serving pod renders prompts wrong or not at all. For vision
+    # bases the same applies to the image preprocessor config, so the
+    # full AutoProcessor is saved instead.
+    if modality == "vision":
+        from transformers import AutoProcessor
+
+        AutoProcessor.from_pretrained(base_model).save_pretrained(str(out_dir))
+    else:
+        from transformers import AutoTokenizer
+
+        AutoTokenizer.from_pretrained(base_model).save_pretrained(str(out_dir))
 
 
 def main() -> int:
