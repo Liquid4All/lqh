@@ -94,7 +94,7 @@ def test_smoke_test_rejects_empty_output(monkeypatch, tmp_path):
     gguf = tmp_path / "m.gguf"
     gguf.write_bytes(b"\x00")
 
-    def fake_run(cmd, *, capture=False):
+    def fake_run(cmd, *, capture=False, timeout=None):
         return subprocess.CompletedProcess(cmd, 0, stdout=gguf_convert._SMOKE_PROMPT, stderr="")
 
     monkeypatch.setattr(gguf_convert, "_run", fake_run)
@@ -106,7 +106,7 @@ def test_smoke_test_rejects_nonzero_exit(monkeypatch, tmp_path):
     gguf = tmp_path / "m.gguf"
     gguf.write_bytes(b"\x00")
 
-    def fake_run(cmd, *, capture=False):
+    def fake_run(cmd, *, capture=False, timeout=None):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="load error")
 
     monkeypatch.setattr(gguf_convert, "_run", fake_run)
@@ -118,7 +118,7 @@ def test_smoke_test_passes_on_generation(monkeypatch, tmp_path):
     gguf = tmp_path / "m.gguf"
     gguf.write_bytes(b"\x00")
 
-    def fake_run(cmd, *, capture=False):
+    def fake_run(cmd, *, capture=False, timeout=None):
         return subprocess.CompletedProcess(
             cmd, 0, stdout=gguf_convert._SMOKE_PROMPT + " Paris.", stderr=""
         )

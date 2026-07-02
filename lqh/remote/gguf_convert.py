@@ -117,15 +117,25 @@ def _bin(name: str, env_key: str) -> str:
     return name
 
 
-def _run(cmd: list[str], *, capture: bool = False) -> subprocess.CompletedProcess:
+def _run(
+    cmd: list[str], *, capture: bool = False, timeout: float | None = None,
+) -> subprocess.CompletedProcess:
     """Run a subprocess, echoing the command. When ``capture`` is False the
-    child inherits stdout/stderr so its logs tee through the launcher."""
+    child inherits stdout/stderr so its logs tee through the launcher.
+
+    stdin is always closed (DEVNULL): llama-cli otherwise blocks waiting
+    for interactive input even in non-conversation mode, which would hang
+    the whole job until the sandbox timeout. ``timeout`` (seconds) is a
+    hard cap so a wedged binary fails fast instead of burning the sandbox
+    lease."""
     print(f"gguf: $ {' '.join(cmd)}", flush=True)
     return subprocess.run(
         cmd,
         capture_output=capture,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
+        timeout=timeout,
     )
 
 
@@ -193,14 +203,17 @@ def _smoke_test(gguf_path: Path) -> None:
     """Run a short generation and fail if the model errors or produces no
     output beyond the prompt — catches broken conversions before the user
     downloads them (GGUF.md §Testing)."""
-    cp = _run([
-        _bin("llama-cli", "LLAMA_CLI_BIN"),
-        "-m", str(gguf_path),
-        "-p", _SMOKE_PROMPT,
-        "-n", "32",
-        "--temp", "0",
-        "-no-cnv",
-    ], capture=True)
+    try:
+        cp = _run([
+            _bin("llama-cli", "LLAMA_CLI_BIN"),
+            "-m", str(gguf_path),
+            "-p", _SMOKE_PROMPT,
+            "-n", "32",
+            "--temp", "0",
+            "-no-cnv",           # disable conversation mode (stdin is DEVNULL too)
+        ], capture=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"smoke test timed out for {gguf_path.name}")
     out = (cp.stdout or "") + (cp.stderr or "")
     if cp.returncode != 0:
         raise RuntimeError(
