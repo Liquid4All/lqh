@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lqh"
-version = "0.4.2"
+version = "0.4.3"
 description = "Liquid Harness – customize Liquid AI foundation models into task-specific models."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -848,6 +848,94 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
             },
         ),
         # ------------------------------------------------------------------
+        # gguf_convert
+        # ------------------------------------------------------------------
+        _tool(
+            name="gguf_convert",
+            description=(
+                "Convert an LQH checkpoint artifact to GGUF (the llama.cpp / "
+                "local-inference format) and quantize it, via a short CPU-only "
+                "cloud sandbox. Give it a checkpoint artifact id and one or more "
+                "quant types; it converts once to f16 and quantizes into each "
+                "type, registering every .gguf back as a downloadable artifact "
+                "(kind 'gguf'). If the checkpoint is a LoRA adapter it is merged "
+                "onto its base first (auto-detected from lineage; pass base_model "
+                "if it isn't recorded). Optionally also pushes the files to a HF "
+                "repo (requires a stored HF token via /hf_login). Use 'artifacts' "
+                "(action=list) to find checkpoint ids; check training_status for "
+                "progress. Common quant picks: Q4_K (fast, good), Q8_0 (near-"
+                "lossless, ~2x slower)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "artifact_id": {
+                        "type": "string",
+                        "description": (
+                            "The LQH checkpoint artifact id to convert "
+                            "(a UUID; from 'artifacts' list)."
+                        ),
+                    },
+                    "quant_types": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["Q4_0", "Q4_K", "Q5_K", "Q6_K", "Q8_0"],
+                        },
+                        "description": (
+                            "One or more quantization types to produce. "
+                            "Q4_0: fastest, lower quality (poor on <1B models); "
+                            "Q4_K: fast, better quality; Q5_K/Q6_K: better quality, "
+                            "slower and often lacking fast kernels; Q8_0: near "
+                            "full-precision, ~2x slower than Q4."
+                        ),
+                    },
+                    "target_hf_repo": {
+                        "type": "string",
+                        "description": (
+                            "Optional 'owner/repo' to also push the produced .gguf "
+                            "files to on Hugging Face. Requires a stored HF token."
+                        ),
+                    },
+                    "private": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether the HF repo should be private (only used with "
+                            "target_hf_repo). Defaults to true."
+                        ),
+                        "default": True,
+                    },
+                    "include_f16": {
+                        "type": "boolean",
+                        "description": (
+                            "Also register the intermediate f16 GGUF (unquantized). "
+                            "Defaults to false."
+                        ),
+                        "default": False,
+                    },
+                    "base_model": {
+                        "type": "string",
+                        "description": (
+                            "HF base model id (org/repo) to merge a LoRA adapter "
+                            "onto before conversion. Only needed when the adapter's "
+                            "lineage doesn't already record its base."
+                        ),
+                    },
+                    "artifact_format": {
+                        "type": "string",
+                        "enum": ["lora", "full"],
+                        "description": (
+                            "Override LoRA/full detection. Usually derived from the "
+                            "checkpoint's lineage; set 'lora' to force a merge for a "
+                            "pre-lineage adapter whose filename doesn't match the "
+                            "heuristic (pair it with base_model)."
+                        ),
+                    },
+                },
+                "required": ["artifact_id", "quant_types"],
+            },
+        ),
+        # ------------------------------------------------------------------
         # artifacts
         # ------------------------------------------------------------------
         _tool(

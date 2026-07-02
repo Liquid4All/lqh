@@ -1471,6 +1471,52 @@ async def _push_lqh_to_hf(
     )
 
 
+async def handle_gguf_convert(
+    project_dir: Path,
+    *,
+    artifact_id: str,
+    quant_types: list[str],
+    target_hf_repo: str | None = None,
+    private: bool = True,
+    include_f16: bool = False,
+    base_model: str | None = None,
+    artifact_format: str | None = None,
+    **kwargs: Any,
+) -> ToolResult:
+    """Submit a CPU-only cloud job that converts an LQH checkpoint to GGUF
+    and quantizes it into the requested types."""
+    from lqh.remote.gguf_convert import submit_gguf
+
+    if not quant_types:
+        return ToolResult(content="Error: quant_types must list at least one type.")
+
+    try:
+        job_id = await submit_gguf(
+            project_id=project_dir.name,
+            source_artifact_id=artifact_id,
+            quant_types=quant_types,
+            target_hf_repo=target_hf_repo,
+            private=private,
+            include_f16=include_f16,
+            base_model=base_model,
+            artifact_format=artifact_format,
+        )
+    except Exception as e:  # noqa: BLE001 - surface clearly to the agent
+        return ToolResult(content=f"Error starting gguf conversion of lqh:{artifact_id}: {e}")
+
+    quants = ", ".join(quant_types)
+    push = f" and pushing to hf:{target_hf_repo}" if target_hf_repo else ""
+    return ToolResult(
+        content=(
+            f"🧱 Converting lqh:{artifact_id} → GGUF ({quants}){push} via a CPU sandbox "
+            f"(job {job_id}). Each quant is converted from R2 directly and smoke-tested; "
+            "the produced .gguf files register as new artifacts (kind 'gguf'). Check "
+            "training_status for progress, then 'artifacts' (action=list) to download them."
+            + (" HF push requires a stored token (run /hf_login)." if target_hf_repo else "")
+        )
+    )
+
+
 async def handle_artifacts(
     project_dir: Path,
     *,
@@ -4708,6 +4754,7 @@ TOOL_HANDLERS: dict[str, Callable[..., Awaitable[ToolResult]]] = {
     "hf_repo_info": handle_hf_repo_info,
     "pull": handle_pull,
     "push": handle_push,
+    "gguf_convert": handle_gguf_convert,
     "artifacts": handle_artifacts,
     "push_to_production": handle_push_to_production,
     "list_deployments": handle_list_deployments,

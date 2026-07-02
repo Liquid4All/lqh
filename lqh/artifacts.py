@@ -40,7 +40,7 @@ __all__ = [
 
 # The kinds here mirror the CHECK constraint in migration 0006_artifacts.
 # Keep in sync with backend/internal/db/artifacts.go ArtifactKind.
-ArtifactKind = str  # one of: checkpoint predictions metrics logs eval_result dataset bundle other
+ArtifactKind = str  # one of: checkpoint predictions metrics logs eval_result dataset bundle gguf other
 
 def _augment_lineage_from_env(lineage: dict[str, Any] | None) -> dict[str, Any] | None:
     """Stamp environment-derived image provenance into a lineage payload.
@@ -81,6 +81,7 @@ _VALID_KINDS = frozenset(
         "eval_result",
         "dataset",
         "bundle",
+        "gguf",
         "other",
     }
 )
@@ -293,6 +294,7 @@ class BackendArtifactStore:
         sha256: str | None = None,
         lineage: dict[str, Any] | None = None,
         checkpoint_role: str | None = None,
+        hf_repo: str | None = None,
     ) -> ArtifactHandle:
         """Upload ``path`` to R2, then register it as an artifact.
 
@@ -302,6 +304,9 @@ class BackendArtifactStore:
         ``lineage`` is an optional dict matching ArtifactLineageInput
         in the OpenAPI spec — set when the caller knows the artifact's
         provenance (training method, base model, parents, metrics, ...).
+
+        ``hf_repo`` records that the artifact bytes were also published to
+        this Hugging Face repo (set it only after the push succeeds).
         """
         if kind not in _VALID_KINDS:
             raise ValueError(f"invalid artifact kind: {kind!r}")
@@ -345,7 +350,7 @@ class BackendArtifactStore:
                 size_bytes=size,
                 job_id=job_id,
                 sha256=sha256,
-                hf_repo=None,
+                hf_repo=hf_repo,
                 lineage=lineage,
                 checkpoint_role=checkpoint_role,
             )
