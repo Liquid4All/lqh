@@ -33,6 +33,9 @@ dependencies = [
 [project.optional-dependencies]
 train = [
     "torch",
+    # Lfm2VlImageProcessor (LFM2.5-VL) requires torchvision at processor
+    # load time — keep it version-paired with torch.
+    "torchvision",
     "transformers>=5.0,<6",
     "trl>=1.0",
     "peft>=0.15",
