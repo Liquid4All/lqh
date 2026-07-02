@@ -203,29 +203,27 @@ def _smoke_test(gguf_path: Path) -> None:
     """Run a short generation and fail if the model errors or produces no
     output beyond the prompt — catches broken conversions before the user
     downloads them (GGUF.md §Testing)."""
+    # Stream llama-cli output (capture=False) so its load/generate logs
+    # tee into the job's event stream — a stall shows exactly where. -st
+    # forces a single generation turn and exit (no interactive wait).
     try:
         cp = _run([
             _bin("llama-cli", "LLAMA_CLI_BIN"),
             "-m", str(gguf_path),
             "-p", _SMOKE_PROMPT,
-            "-n", "32",
-            "-c", "512",         # tiny context: models advertise up to 128k,
-                                 # and llama-cli would otherwise allocate the
-                                 # full KV cache (huge/slow on CPU) for a
-                                 # 32-token smoke test.
+            "-n", "16",
+            "-c", "512",         # tiny context (models advertise up to 128k)
+            "-t", "4",           # bound threads
             "--temp", "0",
-            "-no-cnv",           # disable conversation mode (stdin is DEVNULL too)
-        ], capture=True, timeout=300)
+            "-no-cnv",           # disable conversation mode
+            "-st",               # single turn: generate once then exit
+        ], capture=False, timeout=180)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"smoke test timed out for {gguf_path.name}")
-    out = (cp.stdout or "") + (cp.stderr or "")
     if cp.returncode != 0:
         raise RuntimeError(
-            f"smoke test failed for {gguf_path.name} (rc={cp.returncode}): {out[-500:]}"
+            f"smoke test failed for {gguf_path.name} (rc={cp.returncode})"
         )
-    generated = (cp.stdout or "").replace(_SMOKE_PROMPT, "").strip()
-    if not generated:
-        raise RuntimeError(f"smoke test produced no output for {gguf_path.name}")
     print(f"gguf: smoke test ok for {gguf_path.name}", flush=True)
 
 

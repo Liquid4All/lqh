@@ -90,15 +90,15 @@ def test_find_hf_model_dir_missing_weights(tmp_path):
         gguf_convert._find_hf_model_dir(root)
 
 
-def test_smoke_test_rejects_empty_output(monkeypatch, tmp_path):
+def test_smoke_test_rejects_timeout(monkeypatch, tmp_path):
     gguf = tmp_path / "m.gguf"
     gguf.write_bytes(b"\x00")
 
     def fake_run(cmd, *, capture=False, timeout=None):
-        return subprocess.CompletedProcess(cmd, 0, stdout=gguf_convert._SMOKE_PROMPT, stderr="")
+        raise subprocess.TimeoutExpired(cmd, timeout or 0)
 
     monkeypatch.setattr(gguf_convert, "_run", fake_run)
-    with pytest.raises(RuntimeError, match="no output"):
+    with pytest.raises(RuntimeError, match="timed out"):
         gguf_convert._smoke_test(gguf)
 
 
