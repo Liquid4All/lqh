@@ -209,6 +209,10 @@ def _smoke_test(gguf_path: Path) -> None:
             "-m", str(gguf_path),
             "-p", _SMOKE_PROMPT,
             "-n", "32",
+            "-c", "512",         # tiny context: models advertise up to 128k,
+                                 # and llama-cli would otherwise allocate the
+                                 # full KV cache (huge/slow on CPU) for a
+                                 # 32-token smoke test.
             "--temp", "0",
             "-no-cnv",           # disable conversation mode (stdin is DEVNULL too)
         ], capture=True, timeout=300)
