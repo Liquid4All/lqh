@@ -509,10 +509,19 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         # (tokenize/truncate) the dataset itself — its truncation could
         # sever an image-token span. Length enforcement happens in the
         # collator (over-long samples are dropped, not truncated).
+        #
+        # dataloader_num_workers MUST be 0: the collator runs torch/
+        # torchvision image-processing ops, and forked DataLoader workers
+        # deadlock on those after the parent has initialized CUDA (first
+        # cloud smoke run hung indefinitely at the first batch fetch).
+        # Text runs are unaffected — their collation is plain tokenizer
+        # work. PIL decode + preprocess is cheap next to the VLM forward,
+        # so in-process collation costs little.
         sft_kwargs.update(
             max_length=None,
             remove_unused_columns=False,
             dataset_kwargs={"skip_prepare_dataset": True},
+            dataloader_num_workers=0,
         )
     if has_eval:
         # load_best_model_at_end with metric=eval_loss is SAFE for SFT
