@@ -36,8 +36,14 @@ train = [
     # Lfm2VlImageProcessor (LFM2.5-VL) requires torchvision at processor
     # load time — keep it version-paired with torch.
     "torchvision",
-    "transformers>=5.0,<6",
-    "trl>=1.0",
+    # <5.4: transformers 5.12 broke lfm2_vl generation (generate() rejects
+    # the processor's pixel_attention_mask/spatial_shapes, and dropping
+    # them crashes the vision tower). 5.3.0 is validated end-to-end with
+    # LFM2.5-VL SFT + generation; revisit the cap on a deliberate bump.
+    "transformers>=5.0,<5.4",
+    # <1.1: the VLM SFT path relies on the custom-collator +
+    # dataset_kwargs={"skip_prepare_dataset"} contract validated on 1.0.
+    "trl>=1.0,<1.1",
     "peft>=0.15",
     # Constrained JSON-schema decoding for local eval; integrates with HF
     # transformers via prefix_allowed_tokens_fn. Pure Python, small.
