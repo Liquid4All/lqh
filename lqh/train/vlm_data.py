@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from io import BytesIO
 from typing import Any
 
@@ -265,13 +266,30 @@ def vlm_generate(
         k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in inputs.items()
     }
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            **generate_kwargs,
-        )
+    def _generate(model_inputs: dict[str, Any]):
+        with torch.no_grad():
+            return model.generate(
+                **model_inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                **generate_kwargs,
+            )
+
+    try:
+        output_ids = _generate(inputs)
+    except ValueError as exc:
+        # generate() validates model_kwargs against the model's
+        # prepare_inputs_for_generation, which may not route every key the
+        # processor emits (LFM2-VL: pixel_attention_mask, spatial_shapes —
+        # accepted by forward() during training but rejected here). Drop
+        # exactly the keys it names and retry once.
+        msg = str(exc)
+        bad = set(re.findall(r"'(\w+)'", msg)) if "not used by the model" in msg else set()
+        bad.discard("input_ids")
+        if not bad:
+            raise
+        output_ids = _generate({k: v for k, v in inputs.items() if k not in bad})
+
     prompt_len = inputs["input_ids"].shape[-1]
     return processor.tokenizer.decode(
         output_ids[0][prompt_len:], skip_special_tokens=True

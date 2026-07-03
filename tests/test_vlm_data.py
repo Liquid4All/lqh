@@ -479,3 +479,69 @@ def test_merge_lora_text_base_unchanged(tmp_path, monkeypatch):
         text_cls.from_pretrained.assert_called_once()
         auto_tok.from_pretrained.assert_called_once_with("fake/text-base")
         auto_proc.from_pretrained.assert_not_called()
+
+
+def test_vlm_generate_drops_rejected_model_kwargs() -> None:
+    """generate() may reject processor-emitted keys its
+    prepare_inputs_for_generation doesn't route (LFM2-VL:
+    pixel_attention_mask / spatial_shapes) — vlm_generate must drop the
+    named keys and retry once."""
+    import torch
+
+    processor = MagicMock()
+    inputs_dict = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "pixel_values": torch.zeros((1, 3, 4, 4)),
+        "pixel_attention_mask": torch.ones((1, 1)),
+        "spatial_shapes": torch.tensor([[4, 4]]),
+    }
+    processor.apply_chat_template = MagicMock(return_value=inputs_dict)
+    processor.tokenizer.decode.return_value = "two circles"
+
+    model = MagicMock()
+    model.device = "cpu"
+    calls = []
+
+    def _generate(**kwargs):
+        calls.append(set(kwargs))
+        if "pixel_attention_mask" in kwargs:
+            raise ValueError(
+                "The following `model_kwargs` are not used by the model: "
+                "['pixel_attention_mask', 'spatial_shapes']"
+            )
+        return torch.tensor([[1, 2, 3, 9]])
+
+    model.generate = MagicMock(side_effect=_generate)
+
+    prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": _data_url(_png_bytes())}},
+                {"type": "text", "text": "how many?"},
+            ],
+        }
+    ]
+    out = vlm_generate(model, processor, prompt, max_new_tokens=8)
+
+    assert out == "two circles"
+    assert len(calls) == 2
+    assert "pixel_attention_mask" not in calls[1]
+    assert "spatial_shapes" not in calls[1]
+    assert "pixel_values" in calls[1]  # only the named keys are dropped
+    assert "input_ids" in calls[1]
+
+
+def test_vlm_generate_reraises_unrelated_value_error() -> None:
+    import torch
+
+    processor = MagicMock()
+    processor.apply_chat_template = MagicMock(
+        return_value={"input_ids": torch.tensor([[1]])}
+    )
+    model = MagicMock()
+    model.device = "cpu"
+    model.generate = MagicMock(side_effect=ValueError("something else broke"))
+
+    with pytest.raises(ValueError, match="something else broke"):
+        vlm_generate(model, processor, [{"role": "user", "content": "hi"}])
