@@ -63,7 +63,12 @@ class TestSplitImageParts:
         user_parts = normalized[0]["content"]
         assert user_parts[0] == {"type": "image"}
         assert user_parts[1] == {"type": "text", "text": "how many circles?"}
-        assert normalized[1] == {"role": "assistant", "content": "two"}
+        # String contents are normalized to text parts — the multimodal
+        # chat template requires list-of-parts content on every turn.
+        assert normalized[1] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "two"}],
+        }
 
     def test_multi_image_document_order(self) -> None:
         raw_a = _png_bytes((10, 20, 30))
@@ -73,13 +78,16 @@ class TestSplitImageParts:
         _, images = split_image_parts(conv)
         assert images == [raw_a, raw_b]
 
-    def test_text_only_passthrough(self) -> None:
+    def test_text_only_contents_wrapped_as_parts(self) -> None:
         conv = [
             {"role": "user", "content": "plain"},
             {"role": "assistant", "content": "reply"},
         ]
         normalized, images = split_image_parts(conv)
-        assert normalized == conv
+        assert normalized == [
+            {"role": "user", "content": [{"type": "text", "text": "plain"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
+        ]
         assert images == []
 
     def test_input_not_mutated(self) -> None:

@@ -73,11 +73,21 @@ def split_image_parts(
     replaced (in place, in document order) with ``{"type": "image"}`` and
     *images* holds the corresponding decoded-but-still-compressed bytes.
     The input conversation is not mutated.
+
+    String contents are wrapped as single text parts: the multimodal chat
+    template (Liquid recipe) expects EVERY message's content to be a list
+    of typed parts — transformers' processor crashes on a plain-string
+    assistant turn ("string indices must be integers").
     """
     normalized: list[dict[str, Any]] = []
     images: list[bytes] = []
     for msg in conv:
         content = msg.get("content")
+        if isinstance(content, str):
+            new_msg = dict(msg)
+            new_msg["content"] = [{"type": "text", "text": content}]
+            normalized.append(new_msg)
+            continue
         if not isinstance(content, list):
             normalized.append(dict(msg))
             continue
