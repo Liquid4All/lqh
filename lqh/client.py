@@ -98,6 +98,27 @@ def _install_default_max_tokens(client: AsyncOpenAI) -> None:
     completions.create = create_with_default  # type: ignore[method-assign]
 
 
+def is_transient_upstream_error(exc: object) -> bool:
+    """True for a 400 that is really a transient upstream-model rejection.
+
+    The backend proxies to pooled upstream models. When a provider transiently
+    rejects a request (capacity, a spurious content flag, a hiccup handing the
+    payload to the model) it surfaces as a 400 with a message like
+    ``request rejected by upstream model`` rather than the 5xx you'd expect.
+    Unlike a genuinely malformed-request 400, re-sending the same payload can
+    succeed — often against a different pool member — so we treat this shape as
+    transient and retry it.
+    """
+    if not isinstance(exc, APIStatusError) or exc.status_code != 400:
+        return False
+    parts = [str(getattr(exc, "message", "") or ""), str(exc)]
+    body = getattr(exc, "body", None)
+    if body is not None:
+        parts.append(str(body))
+    text = " ".join(parts).lower()
+    return "rejected by upstream" in text or "upstream model" in text
+
+
 async def chat_with_retry(
     client: AsyncOpenAI,
     max_retries: int = 3,
@@ -170,7 +191,8 @@ async def chat_with_retry(
                 "status_code": exc.status_code,
             })
             _record_attempt(entry)
-            if exc.status_code in (502, 503) and attempt < max_retries:
+            retryable = exc.status_code in (502, 503) or is_transient_upstream_error(exc)
+            if retryable and attempt < max_retries:
                 wait = 2**attempt
                 logger.warning("chat_with_retry: %d on attempt %d, sleeping %.1fs", exc.status_code, attempt, wait)
                 await asyncio.sleep(wait)

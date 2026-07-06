@@ -7,46 +7,67 @@
 
 # lqh — Liquid Harness
 
+**From zero to a fine-tuned model in under an hour.**
+
+Liquid Harness is a terminal agent that turns a plain-English description of your task into a small, fast, task-specific [Liquid Foundation Model](https://www.liquid.ai/). You describe the problem; the agent interviews you, writes the specification, generates and curates training data, fine-tunes, evaluates, and iterates until the model beats baseline. No ML experience required.
+
+> [!IMPORTANT]
 > ⚠️ **Closed beta** — visit [lqh.ai](https://lqh.ai) to request access.
-
-From zero to a fine-tuned LFM in under an hour.
-
-Liquid Harness is a terminal user-interface (TUI) agent for customizing [Liquid Foundation Models](https://www.liquid.ai/). It guide the user to define clear specifications of what problem needs to be solved, writes the data pipeline, scores and filters samples, runs baselines, fine-tunes, and iterates. No ML experience required.
 
 ```bash
 pip install lqh
 lqh
 ```
 
-## ✨ Features
+---
 
-### 💬 Fully agentic
-You chat, the agent works. It interviews you about your task, writes and manages the specifications, then drives every downstream stage end-to-end.
+## 🤔 Why would I want this?
 
-### 📝 Specify in plain English
-No DSL, no boilerplate, no ML jargon. Just describe what you want the model to do — the agent captures requirements through dialogue and turns them into structured specs you can refine over time.
+Large general-purpose models are expensive, slow, and overkill for most production tasks. A 350M–1.2B model fine-tuned on *your* task is cheaper, faster, runs on-device, and often more accurate — but getting there normally requires an ML team: data pipelines, judges, training loops, eval harnesses.
 
-### 🧪 Synthetic data, scored & filtered
-The agent authors a per-task data generation pipeline, generates samples concurrently on LQH Cloud, and scores each one with an LLM judge against your rubric. The dataset that hits training is already curated.
+Liquid Harness collapses all of that into a conversation:
 
-### 🏋️ Fine-tune locally or in the cloud
-Eval and data generation run on LQH Cloud. Training can run locally on your own GPUs, or hand off to a beefier machine — just sync the dataset and continue.
+1. **💬 Describe your task** — the agent asks clarifying questions and writes a spec.
+2. **☕ Let it work** — it generates synthetic data, scores every sample against a rubric, filters, runs baselines, fine-tunes, and evaluates.
+3. **📦 Get a checkpoint** — a model that measurably beats the baseline on your task, ready to deploy.
 
-### 🤗 HuggingFace integration
-Push and pull datasets from the Hub. Set `HF_TOKEN` to enable private dataset access and dataset publishing.
+## 💡 What can you build?
 
-### 🤖 Hands-off `--auto` mode
-Point lqh at a directory and walk away. It either delivers a checkpoint that beats baseline or returns an explicit failure with the reason — never a hang, never a prompt.
+A few things people fine-tune with lqh:
 
-### 🖥️ Interactive TUI
-Provide input, guide the agent, visualize progress, and inspect dataset samples — all from a single terminal session with a slash-command palette and a live status bar.
+| Use case | You tell the agent… |
+|---|---|
+| 🎧 **Support-reply rewriter** | *"Rewrite draft replies into our brand voice: warm, concise, never over-promising."* |
+| 🧾 **Structured extraction** | *"Turn free-form purchase emails into strict JSON with vendor, amount, and date."* |
+| 🚦 **Classifier / router** | *"Label incoming tickets as billing, bug, or feature request — with high recall on billing."* |
+| 🖼️ **Vision Q&A** | *"Here's a folder of product photos — I need a model that answers questions about defects."* |
+| 📱 **On-device assistant** | *"A tiny model that summarizes meeting notes offline on a phone."* |
 
-### 📦 Project-as-directory
-Any directory is a project — fully git-compatible, so you can version, branch, and collaborate on specs, datasets, and runs like any other code. `cd` to switch projects.
+Point it at a folder of raw, unlabelled images and it can build a vision fine-tune too — the data pipeline synthesizes the question-answer pairs for you.
 
-## 🚀 The pipeline
+## 🚀 Quickstart
 
-One command runs all nine stages. Each is a real component you can inspect, stop at, or hand off.
+```bash
+pip install lqh
+mkdir my-task && cd my-task
+lqh
+```
+
+Inside the TUI:
+
+```
+> /login          # authenticate with lqh.ai (one-time)
+> I want a model that rewrites support replies into our brand voice.
+```
+
+That's it. The agent takes it from there — it interviews you about requirements, writes `SPEC.md`, and offers to run the pipeline stage by stage. You can interject, inspect data samples, or change direction at any point.
+
+> [!TIP]
+> Run `/hf_login` (or set `HF_TOKEN`) to enable private HuggingFace dataset access and publishing.
+
+## 🔁 The pipeline
+
+One command runs all nine stages. Each is a real artifact you can inspect, stop at, or hand off.
 
 ```
 spec → rubric → data gen → filter → baseline → SFT → DPO → eval → checkpoint
@@ -62,6 +83,94 @@ $ lqh --auto ./my-task
 [final: success]           DPO checkpoint beats baseline by +3.3
 ```
 
+## ✨ Features
+
+### 💬 Fully agentic
+You chat, the agent works. It captures requirements through dialogue, manages the specs, and drives every downstream stage end-to-end.
+
+### 📝 Specify in plain English
+No DSL, no boilerplate, no ML jargon. Just describe what you want — the agent turns it into structured specs you can refine over time.
+
+### 🧪 Synthetic data, scored & filtered
+The agent authors a per-task data generation pipeline, generates samples concurrently on LQH Cloud, and scores each one with an LLM judge against your rubric. The dataset that hits training is already curated.
+
+### 🖼️ Vision fine-tuning
+Bring a folder of raw images — no labels needed. The agent synthesizes an image-question-answer dataset and fine-tunes the LFM2.5-VL vision models on it.
+
+### 🏋️ Train anywhere
+Eval and data generation run on LQH Cloud. Training runs locally on your own GPUs, or hands off to a remote machine over SSH — including SLURM clusters — with dataset sync handled for you.
+
+### 🤖 Hands-off `--auto` mode
+Point lqh at a directory with a spec and walk away. It either delivers a checkpoint that beats baseline or returns an explicit failure with the reason — never a hang, never a prompt.
+
+### 🤗 HuggingFace integration
+Push and pull datasets from the Hub, publish checkpoints, and convert to GGUF for deployment.
+
+### 🖥️ Interactive TUI
+Guide the agent, visualize progress, and inspect dataset samples — all from one terminal session with a slash-command palette and a live status bar.
+
+### 📦 Project-as-directory
+Any directory is a project — fully git-compatible, so you can version, branch, and collaborate on specs, datasets, and runs like any other code. `cd` to switch projects.
+
+## 🧬 Models
+
+Fine-tunes the **LFM2.5** family — pick a size for your task, from tiny on-device to MoE:
+
+| Size | Best for |
+|---|---|
+| 230M / 350M | Very simple tasks, extreme on-device constraints |
+| **1.2B** ⭐ | Recommended starting point for most tasks |
+| 2.6B / 8B-A1B (MoE) | More complex tasks |
+| 24B-A2B | Only when the task clearly calls for it |
+| LFM2.5-VL 450M / 1.6B | Vision (image + text) tasks |
+
+Base, instruct, and thinking variants are available; the agent recommends the right starting size and variant for your task and steps up if fine-tuning struggles.
+
+## ⌨️ Slash commands
+
+| Command | What it does |
+|---|---|
+| `/login` | Log in to lqh.ai |
+| `/hf_login` | Store a HuggingFace token for cloud jobs |
+| `/spec` | Start specification capture |
+| `/datagen` | Start data generation |
+| `/validate` | Start data validation |
+| `/train` | Start training (requires `torch`) |
+| `/eval` | Start evaluation |
+| `/prompt` | Start prompt optimization |
+| `/resume` | Resume a previous conversation |
+| `/clear` | Start a fresh conversation |
+| `/reconnect` | Retry a failed network/API operation |
+| `/help` · `/quit` | Show commands · exit |
+
+## 🤖 Auto mode
+
+For CI, batch jobs, or when you just want a result:
+
+```bash
+lqh --auto ./my-task                # runs the full pipeline against ./my-task/SPEC.md
+lqh --spec "use the smallest base model"   # sticky run-time directive (works in both modes)
+```
+
+Auto mode requires an existing `SPEC.md` (write one interactively first, or by hand). It runs rubric → data gen → filter → baseline → SFT → DPO → report without ever prompting, and always terminates with an explicit success or failure.
+
+## 📁 Your project is just a directory
+
+`cd` into any directory and run `lqh` — the agent reads what's there to understand current state. No init command, no project marker file.
+
+```
+my-task/
+├── SPEC.md              # the heart of the project: what you want the model to do
+├── other_specs/         # additional specs for edge cases or sub-requirements
+├── data_gen/            # generated pipeline scripts
+├── evals/               # eval definitions and results, versioned (v1/, v2/, ...)
+├── datasets/            # generated and curated datasets as parquet (v1/, v2/, ...)
+├── runs/                # training runs with checkpoints, logs, and configs
+└── .lqh/                # conversation logs and permissions (add to .gitignore)
+```
+
+Everything is plain files — specs are markdown, pipelines are Python, datasets are parquet. Edit `SPEC.md` directly any time; the agent picks up your changes on the next turn.
+
 ## 🔧 Requirements
 
 - Python 3.11+
@@ -69,51 +178,18 @@ $ lqh --auto ./my-task
 - Optional: `torch` + `transformers` for local fine-tuning
 - Optional: `HF_TOKEN` for HuggingFace dataset sync
 
-## 🔐 Authentication
+## 🗺️ Roadmap
 
-```
-lqh
-> /login
-```
+Things we're actively building. Open an issue if you want to weigh in.
 
-The CLI stores your token in `~/.lqh/config.json` and authenticates all requests to LQH Cloud.
-
-## 🧬 Base model
-
-Default: **LFM2-1.2B-Instruct** — small, capable, runs anywhere.
-
-## 📁 Project layout
-
-A project is just a directory. `cd` into it, run `lqh`, and the agent reads the directory contents to understand current state. There is no init command and no project marker file — the files themselves are the project.
-
-```
-my-task/
-├── SPEC.md              # main spec: what you want the model to do
-├── other_specs/         # additional specs for edge cases or sub-requirements
-├── data_gen/            # generated pipeline scripts (one .py per pipeline)
-├── evals/               # eval definitions and results, versioned (v1/, v2/, ...)
-├── datasets/            # generated and curated datasets as parquet (v1/, v2/, ...)
-├── runs/                # training runs with checkpoints, logs, and configs
-└── .lqh/                # conversation logs and per-project permissions (gitignored)
-```
-
-- **`SPEC.md`** is the heart of the project. The agent creates it during the spec-capture interview and refers back to it at every downstream stage. Edit it directly any time — the agent will pick up the changes on the next turn.
-- **Everything is plain files.** Specs are markdown, pipelines are Python, datasets are parquet, runs are directories of artifacts. Inspect, diff, and version-control them like any other code.
-- **`.lqh/` holds session state** (conversation logs, tool permissions). Add it to `.gitignore`. Depending on size, you may also want to gitignore `datasets/` and `runs/`.
-
-## 🗺️ Roadmap / work in progress
-
-Things we're actively building or planning. Open an issue if you want to weigh in.
-
-- **Quantized evals** — run the local evaluation using a quantized model (llama.cpp) so we measure the *exact* artifact that will be deployed (e.g. Q4_0). Includes checkpoint → GGUF conversion as part of the pipeline.
-- **Quantization-aware training (QAT)** — once quantized evals are in place, train against the quantization noise so the deployed quantized model matches the full-precision score.
-- **Sub-agent spawning** — today there's a single main agent loop. We're adding the ability for the agent to fork or spawn sub-agent processes in parallel for independent subtasks (e.g. drafting multiple data pipelines, running evals concurrently).
-- **Training via API or SLURM** — local and direct-SSH training work today. The training backend is already abstracted so SSH+SLURM cluster submission and a hosted training API can drop in, but neither is implemented or end-to-end tested yet.
-- **Multi-modal support** — scaffolding for image and audio inputs is in place, but the concrete pipelines, data generators, and end-to-end tests have not been written yet.
+- **Quantized evals** — run local evaluation on the quantized artifact (llama.cpp) so we measure exactly what ships. GGUF export already works; the eval loop on top is in progress.
+- **Quantization-aware training (QAT)** — train against quantization noise so the deployed quantized model matches the full-precision score.
+- **Sub-agent spawning** — parallel sub-agents for independent subtasks (drafting multiple data pipelines, running evals concurrently).
+- **Hosted training API** — train on LQH Cloud without bringing your own GPUs.
 
 ## 🤝 Contributing
 
-Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening a pull request. **Random PRs will be rejected** — discuss first via an issue, and the discussion will usually conclude with a *prompt* (not a patch) that a coding agent will execute. Security hot fixes are the one exception. See the contribution policy for details.
+Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening a pull request. **Random PRs will be rejected** — open an issue first and agree on the approach with a maintainer; security hot fixes are the one exception. See the contribution policy for details.
 
 ---
 

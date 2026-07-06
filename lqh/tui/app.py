@@ -811,7 +811,14 @@ class LqhApp:
             if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError)):
                 return True
             if isinstance(exc, APIStatusError):
-                return exc.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+                if exc.status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+                    return True
+                # A 400 "request rejected by upstream model" is a transient
+                # pool-side rejection, not a malformed request — re-sending the
+                # same turn can land on a healthy pool member.
+                from lqh.client import is_transient_upstream_error
+                if is_transient_upstream_error(exc):
+                    return True
         except Exception:
             pass
 
