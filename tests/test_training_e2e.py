@@ -260,15 +260,16 @@ class TestTrainingE2EShellHelper:
 
 @pytest.mark.gpu
 class TestTrainingE2ECrashRecovery:
-    """Verify that a subprocess crash (e.g. CUDA OOM) is detected and reported.
+    """Verify that a subprocess crash is detected and reported.
 
-    We provoke a crash by requesting an absurdly large batch size and
-    sequence length that will exceed GPU memory.  The test verifies:
-
-    1. The subprocess exits with a non-zero status.
-    2. The main process detects the failure via ``progress.jsonl`` or
-       a PID check.
-    3. ``stderr.log`` contains the error details.
+    We provoke a crash by pointing ``base_model`` at a nonexistent model
+    so the training subprocess fails fast at model-load time. CUDA OOM
+    works too, but OOM depends on hardware: the same config that OOMs a
+    24 GB GPU completes successfully on H100/H200 — making OOM a flaky
+    crash trigger across the dev fleet. A bad model path is
+    GPU-size-agnostic and tests the same plumbing: the subprocess exits
+    non-zero, the main process detects the failure, and ``stderr.log``
+    captures the traceback.
     """
 
     @pytest.fixture
@@ -287,30 +288,27 @@ class TestTrainingE2ECrashRecovery:
         )
         return {"project": tmp_path, "train_path": train_path}
 
-    def test_oom_crash_detected(self, crash_workspace: dict[str, Path]) -> None:
-        """Subprocess should crash with OOM and main process should detect it."""
+    def test_subprocess_crash_detected(self, crash_workspace: dict[str, Path]) -> None:
+        """Subprocess crash should propagate to ``status.state == 'failed'``."""
         from lqh.subprocess_manager import SubprocessManager
 
         manager = SubprocessManager()
-        run = crash_workspace["project"] / "runs" / "oom_crash"
+        run = crash_workspace["project"] / "runs" / "crash"
 
-        # Absurd config: huge batch size + long sequences + no gradient checkpointing.
-        # Should OOM on any reasonable GPU.
         config = {
             "type": "sft",
-            "base_model": "LiquidAI/LFM2.5-1.2B-Instruct",
+            # Nonexistent model → HuggingFace download fails → subprocess
+            # crashes deterministically, independent of GPU memory.
+            "base_model": "lqh-test/nonexistent-model-for-crash-recovery",
             "dataset": str(crash_workspace["train_path"]),
-            "lora": {"enabled": False},  # full fine-tune = more memory
+            "lora": {"enabled": False},
             "training": {
                 "num_epochs": 1,
-                "per_device_batch_size": 512,
-                "gradient_accumulation_steps": 1,
+                "per_device_batch_size": 1,
                 "learning_rate": 1e-4,
                 "logging_steps": 1,
                 "save_steps": 9999,
-                "gradient_checkpointing": False,
-                "bf16": True,
-                "max_seq_length": 8192,
+                "max_seq_length": 128,
                 "dataloader_num_workers": 0,
             },
         }
@@ -318,7 +316,7 @@ class TestTrainingE2ECrashRecovery:
         pid = manager.start(run, config, project_dir=crash_workspace["project"])
         print(f"\nCrash test started (PID {pid})")
 
-        deadline = time.monotonic() + 180  # 3 min max
+        deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             status = manager.get_status(run)
             if status.state in ("completed", "failed"):
@@ -327,7 +325,7 @@ class TestTrainingE2ECrashRecovery:
                 time.sleep(2)  # let progress.jsonl flush
                 status = manager.get_status(run)
                 break
-            time.sleep(3)
+            time.sleep(2)
 
         print(f"Subprocess state: {status.state}")
         if status.error:
@@ -340,13 +338,7 @@ class TestTrainingE2ECrashRecovery:
         stderr_content = stderr_log.read_text()
         print(f"\n--- stderr.log (last 1000 chars) ---\n{stderr_content[-1000:]}")
 
-        indicators = (
-            "CUDA out of memory",
-            "OutOfMemoryError",
-            "RuntimeError",
-            "Error",
-            "Traceback",
-        )
+        indicators = ("Error", "Traceback", "not a valid model identifier")
         assert any(i in stderr_content for i in indicators), (
             f"stderr should contain an error indicator, got:\n{stderr_content[-500:]}"
         )
