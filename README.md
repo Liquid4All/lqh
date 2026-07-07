@@ -183,10 +183,9 @@ Everything is plain files — specs are markdown, pipelines are Python, datasets
 
 Things we're actively building. Open an issue if you want to weigh in.
 
-- **Quantized evals** — run local evaluation on the quantized artifact (llama.cpp) so we measure exactly what ships. GGUF export already works; the eval loop on top is in progress.
-- **Quantization-aware training (QAT)** — train against quantization noise so the deployed quantized model matches the full-precision score.
-- **Sub-agent spawning** — parallel sub-agents for independent subtasks (drafting multiple data pipelines, running evals concurrently).
-- **Hosted training API** — train on LQH Cloud without bringing your own GPUs.
+- **QAT with evals** — quantization-aware training (train against quantization noise so the deployed quantized model matches its full-precision score), paired with local evaluation on the quantized artifact (llama.cpp) so we measure exactly what ships. GGUF export already works.
+- **Async runner** — run `lqh` asynchronously on LQH Cloud and connect from the web app or mobile, so long jobs keep going after you close the terminal.
+- **Audio models (LFM2-Audio)** — fine-tuning and data support for our LFM2-Audio series of audio language models.
 
 ## 🤝 Contributing
 
