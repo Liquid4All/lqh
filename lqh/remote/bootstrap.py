@@ -20,22 +20,67 @@ __all__ = [
 ]
 
 
+# Where uv tends to live. Astral's installer lands in ~/.local/bin;
+# `cargo install` in ~/.cargo/bin; `snap install` in /snap/bin; the
+# rest cover manual installs and Homebrew on macOS / Linux. We probe
+# these directly so a user whose login shell is fish/zsh (and whose
+# uv PATH config lives in ~/.config/fish/conf.d/ rather than ~/.bashrc)
+# still gets detected from inside our `bash -lc` wrapper.
+_UV_CANDIDATE_PATHS: tuple[str, ...] = (
+    "$HOME/.local/bin/uv",
+    "$HOME/.cargo/bin/uv",
+    "/snap/bin/uv",
+    "/usr/local/bin/uv",
+    "/opt/homebrew/bin/uv",
+    "/home/linuxbrew/.linuxbrew/bin/uv",
+    "/usr/bin/uv",
+)
+
+
+async def _locate_uv(hostname: str) -> str | None:
+    """Return the absolute path to ``uv`` on the remote host, or ``None``.
+
+    Tries bash's PATH first, then probes ``_UV_CANDIDATE_PATHS`` directly
+    so installs that live outside bash's idea of PATH (snap, Astral's
+    installer for a fish user, …) still get found.
+    """
+    stdout, _, rc = await ssh_run(
+        hostname, "command -v uv 2>/dev/null", timeout=10.0,
+    )
+    if rc == 0 and stdout.strip():
+        return stdout.strip()
+
+    candidates = " ".join(f'"{p}"' for p in _UV_CANDIDATE_PATHS)
+    probe = (
+        f'for p in {candidates}; do '
+        f'[ -x "$p" ] && {{ echo "$p"; exit 0; }}; '
+        f'done; exit 1'
+    )
+    stdout, _, rc = await ssh_run(hostname, probe, timeout=10.0)
+    if rc == 0 and stdout.strip():
+        return stdout.strip()
+    return None
+
+
 async def detect_environment(hostname: str) -> dict[str, bool | str | None]:
     """Probe the remote host for available tools.
 
-    Returns a dict mapping tool names to availability:
-    ``python3``, ``uv``, ``pip``, ``module`` (bool),
-    and ``gpu_vendor`` (``"nvidia"`` | ``"amd"`` | ``None``).
+    Returns a dict with:
+    - ``uv`` — absolute path (or ``None`` if not installed anywhere we
+      know to look)
+    - ``python3``, ``pip``, ``module`` — bool
+    - ``gpu_vendor`` — ``"nvidia"`` | ``"amd"`` | ``None``
     """
     from lqh.remote.gpu import detect_gpu_vendor
 
+    result: dict[str, bool | str | None] = {}
+    result["uv"] = await _locate_uv(hostname)
+
     checks = {
         "python3": "command -v python3",
-        "uv": "command -v uv",
         "pip": "command -v pip3 || command -v pip",
         "module": "type module 2>/dev/null",  # Lmod / Environment Modules
     }
-    result: dict[str, bool | str | None] = {}
     for tool, cmd in checks.items():
         _, _, rc = await ssh_run(hostname, cmd, timeout=10.0)
         result[tool] = rc == 0
@@ -72,7 +117,8 @@ async def bootstrap_remote(
     log(f"Detecting environment on {hostname}...")
     env = await detect_environment(hostname)
     gpu_vendor = env["gpu_vendor"]
-    log(f"  python3: {env['python3']}, uv: {env['uv']}, "
+    uv_path: str | None = env["uv"] if isinstance(env["uv"], str) else None
+    log(f"  python3: {env['python3']}, uv: {uv_path or 'not found'}, "
         f"pip: {env['pip']}, gpu: {gpu_vendor or 'none'}")
 
     if not env["python3"]:
@@ -99,9 +145,9 @@ async def bootstrap_remote(
     if exists_rc == 0:
         log("  venv already exists, reusing.")
     else:
-        if env["uv"]:
-            log("Creating venv with uv...")
-            cmd = f"uv venv {venv_path}"
+        if uv_path:
+            log(f"Creating venv with uv ({uv_path})...")
+            cmd = f"{uv_path} venv {venv_path}"
         else:
             log("Creating venv with python3 -m venv...")
             cmd = f"python3 -m venv {venv_path}"
@@ -113,74 +159,57 @@ async def bootstrap_remote(
 
     # Step 4: Sync local lqh source and install with train extras
     activate = f"source {venv_path}/bin/activate"
+    pip_cmd = f"{uv_path} pip" if uv_path else "pip"
 
-    # Find the local lqh package root (directory containing pyproject.toml)
-    lqh_pkg_root = _find_lqh_package_root()
-    if lqh_pkg_root:
-        log(f"Syncing lqh source from {lqh_pkg_root}...")
-        lqh_remote_src = f"{remote_root}/.lqh-src"
-        await ssh_run(hostname, f"mkdir -p {lqh_remote_src}", timeout=10.0)
-        # Sync the full project root using rsync with include/exclude filters
-        # to get just lqh/, pyproject.toml, README.md
-        from lqh.remote.ssh_helpers import _multiplex_args, _ensure_control_dir
-        _ensure_control_dir()
-        import asyncio as _asyncio
-        ssh_opts = " ".join(_multiplex_args(hostname))
-        rsync_cmd = [
-            "rsync", "-az", "--partial",
-            "-e", f"ssh {ssh_opts}",
-            # Drop build artifacts so the install_hash matches what arrives.
-            "--exclude", "__pycache__/",
-            "--exclude", "*.pyc",
-            "--exclude", "*.pyo",
-            "--exclude", ".pytest_cache/",
-            "--exclude", ".mypy_cache/",
-            "--include", "lqh/***",
-            "--include", "pyproject.toml",
-            "--include", "README.md",
-            "--exclude", "*",
-            str(lqh_pkg_root) + "/",
-            f"{hostname}:{lqh_remote_src}/",
-        ]
-        proc = await _asyncio.create_subprocess_exec(
-            *rsync_cmd,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
+    src_root = _local_lqh_root()
+    if src_root is None:
+        raise RuntimeError(
+            "Could not locate the local lqh package. remote_setup must "
+            "run in an environment where `import lqh` succeeds."
         )
-        _, stderr_bytes = await proc.communicate()
-        if proc.returncode != 0:
+
+    lqh_remote_src = f"{remote_root}/.lqh-src"
+    await ssh_run(hostname, f"mkdir -p {lqh_remote_src}", timeout=10.0)
+    log(f"Syncing lqh source from {src_root}...")
+    await _rsync_lqh_source(hostname, src_root, lqh_remote_src)
+
+    # pip needs a pyproject.toml to build the synced tree. A source
+    # checkout ships its own; a wheel-installed lqh has none, so
+    # synthesize one from the installed distribution's metadata. Either
+    # way the remote installs the exact lqh that's running locally —
+    # never a same-named package off PyPI.
+    if not (src_root / "pyproject.toml").exists():
+        log("  no local pyproject.toml — synthesizing from installed metadata.")
+        synthetic = _synthesize_pyproject()
+        if synthetic is None:
             raise RuntimeError(
-                f"Failed to sync lqh source: {stderr_bytes.decode('utf-8', errors='replace')}"
+                "lqh has neither a pyproject.toml nor installed metadata; "
+                "cannot resolve dependencies for the remote install."
             )
+        await ssh_run(
+            hostname,
+            f"cat > {lqh_remote_src}/pyproject.toml << 'LQH_PYPROJECT_EOF'\n"
+            f"{synthetic}\nLQH_PYPROJECT_EOF",
+            timeout=10.0,
+        )
 
-        if env["uv"]:
-            log("Installing lqh[train] from source with uv pip...")
-            install_cmd = f"{activate} && uv pip install --upgrade '{lqh_remote_src}[train]'"
-        else:
-            log("Installing lqh[train] from source with pip...")
-            install_cmd = f"{activate} && pip install --upgrade '{lqh_remote_src}[train]'"
-    else:
-        # Fallback: try installing from PyPI
-        log("Local lqh source not found, trying PyPI...")
-        if env["uv"]:
-            install_cmd = f"{activate} && uv pip install --upgrade 'lqh[train]'"
-        else:
-            install_cmd = f"{activate} && pip install --upgrade 'lqh[train]'"
-
+    log("Installing lqh[train] from synced source...")
+    install_cmd = (
+        f"{activate} && {pip_cmd} install --upgrade '{lqh_remote_src}[train]'"
+    )
     stdout, stderr, rc = await ssh_run(hostname, install_cmd, timeout=600.0)
     if rc != 0:
         raise RuntimeError(f"Failed to install lqh[train]: {stderr}")
     log("  lqh[train] installed.")
 
     # Write the install-hash sentinel so remote_status can detect drift.
-    if lqh_pkg_root:
-        digest = compute_local_lqh_hash(lqh_pkg_root)
-        if digest:
-            sentinel = f"{remote_root}/.lqh-src/.install_hash"
-            await ssh_run(
-                hostname, f"printf '%s' '{digest}' > {sentinel}", timeout=10.0,
-            )
-            log(f"  lqh version: {short_hash(digest)}")
+    digest = compute_local_lqh_hash(src_root)
+    if digest:
+        sentinel = f"{remote_root}/.lqh-src/.install_hash"
+        await ssh_run(
+            hostname, f"printf '%s' '{digest}' > {sentinel}", timeout=10.0,
+        )
+        log(f"  lqh version: {short_hash(digest)}")
 
     # Step 5: Configure HF_TOKEN
     if hf_token:
@@ -203,21 +232,127 @@ async def bootstrap_remote(
     return "\n".join(log_lines)
 
 
-def _find_lqh_package_root() -> Path | None:
-    """Find the root of the local lqh package (directory with pyproject.toml).
+def _local_lqh_root() -> Path | None:
+    """Return the directory that contains the importable ``lqh`` package.
 
-    Walks up from the lqh package's __file__ looking for pyproject.toml.
-    Returns None if not found (e.g., installed from PyPI).
+    This is the parent of ``lqh/__init__.py`` — always resolvable while
+    lqh is running, whether it was installed as a wheel (then this is
+    site-packages), installed editable, or run straight from a source
+    checkout. Returns ``None`` only if the location can't be determined
+    (e.g. a frozen / zipapp build).
     """
     try:
         import lqh
-        pkg_dir = Path(lqh.__file__).parent  # lqh/
-        candidate = pkg_dir.parent  # parent of lqh/
-        if (candidate / "pyproject.toml").exists():
-            return candidate
+        if not lqh.__file__:
+            return None
+        return Path(lqh.__file__).parent.parent
     except Exception:
-        pass
-    return None
+        return None
+
+
+async def _rsync_lqh_source(
+    hostname: str, src_root: Path, remote_dest: str,
+) -> None:
+    """rsync the local lqh package tree to ``remote_dest`` on the host.
+
+    Transfers ``lqh/`` plus ``pyproject.toml`` / ``README.md`` when those
+    sit alongside it (a source checkout). For a wheel-installed lqh,
+    ``src_root`` is site-packages and only ``lqh/`` matches the filter —
+    which is all the remote needs.
+    """
+    import asyncio
+
+    from lqh.remote.ssh_helpers import _ensure_control_dir, _multiplex_args
+
+    _ensure_control_dir()
+    ssh_opts = " ".join(_multiplex_args(hostname))
+    rsync_cmd = [
+        "rsync", "-az", "--partial",
+        "-e", f"ssh {ssh_opts}",
+        # Drop build artifacts so the install_hash matches what arrives.
+        "--exclude", "__pycache__/",
+        "--exclude", "*.pyc",
+        "--exclude", "*.pyo",
+        "--exclude", ".pytest_cache/",
+        "--exclude", ".mypy_cache/",
+        "--include", "lqh/***",
+        "--include", "pyproject.toml",
+        "--include", "README.md",
+        "--exclude", "*",
+        str(src_root) + "/",
+        f"{hostname}:{remote_dest}/",
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *rsync_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr_bytes = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Failed to sync lqh source: "
+            f"{stderr_bytes.decode('utf-8', errors='replace')}"
+        )
+
+
+def _synthesize_pyproject() -> str | None:
+    """Build a minimal ``pyproject.toml`` for the installed lqh distribution.
+
+    Used by ``bootstrap_remote`` when lqh was pip-installed without a
+    source checkout: the synced ``lqh/`` tree then has no pyproject.toml
+    for pip to build from. Version, ``requires-python``, and dependencies
+    (including the ``train`` extra) are read from the installed
+    distribution metadata.
+
+    Returns ``None`` if lqh has no installed metadata — which only
+    happens when it's run purely from source, in which case a real
+    pyproject.toml exists and this isn't needed.
+    """
+    import importlib.metadata as md
+
+    try:
+        dist = md.distribution("lqh")
+    except md.PackageNotFoundError:
+        return None
+
+    requires_python = dist.metadata.get("Requires-Python", ">=3.11")
+    base: list[str] = []
+    train: list[str] = []
+    for raw in dist.requires or []:
+        # Entries look like 'rich>=13.0' or 'torch; extra == "train"'.
+        spec, _, marker = raw.partition(";")
+        spec, marker = spec.strip(), marker.strip()
+        if not marker:
+            base.append(spec)
+        elif 'extra == "train"' in marker or "extra == 'train'" in marker:
+            # Other extras (dev, …) are intentionally dropped — the
+            # remote needs only runtime + train dependencies.
+            train.append(spec)
+
+    def _toml_list(items: list[str]) -> str:
+        return "".join(f'    "{item}",\n' for item in items)
+
+    return (
+        "[build-system]\n"
+        'requires = ["hatchling"]\n'
+        'build-backend = "hatchling.build"\n'
+        "\n"
+        "[project]\n"
+        'name = "lqh"\n'
+        f'version = "{dist.version}"\n'
+        f'requires-python = "{requires_python}"\n'
+        "dependencies = [\n"
+        f"{_toml_list(base)}"
+        "]\n"
+        "\n"
+        "[project.optional-dependencies]\n"
+        "train = [\n"
+        f"{_toml_list(train)}"
+        "]\n"
+        "\n"
+        "[tool.hatch.build.targets.wheel]\n"
+        'packages = ["lqh"]\n'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -261,13 +396,12 @@ def compute_local_lqh_hash(pkg_root: Path | None = None) -> str | None:
     """Hash the local lqh source tree to identify the installed version.
 
     Hashes ``lqh/**`` (excluding pycache / build artifacts) plus
-    ``pyproject.toml``. Returns a hex digest, or ``None`` if the local
-    package root can't be found (e.g. lqh was installed from PyPI rather
-    than a source checkout).
+    ``pyproject.toml`` when one sits alongside the package. Returns a hex
+    digest, or ``None`` only if the package location can't be determined.
     """
     import hashlib
 
-    root = pkg_root or _find_lqh_package_root()
+    root = pkg_root or _local_lqh_root()
     if root is None:
         return None
 

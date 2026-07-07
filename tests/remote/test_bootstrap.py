@@ -7,6 +7,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from lqh.remote.bootstrap import (
+    _UV_CANDIDATE_PATHS,
+    _local_lqh_root,
+    _locate_uv,
+    _synthesize_pyproject,
     bootstrap_remote,
     check_hf_token,
     configure_hf_token,
@@ -20,6 +24,8 @@ class TestDetectEnvironment:
     @pytest.mark.asyncio
     async def test_all_tools_available(self):
         async def mock_ssh(hostname, cmd, **kw):
+            if "command -v uv" in cmd:
+                return ("/usr/local/bin/uv", "", 0)
             return ("", "", 0)
 
         with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh), \
@@ -27,7 +33,7 @@ class TestDetectEnvironment:
             env = await detect_environment("host")
 
         assert env["python3"] is True
-        assert env["uv"] is True
+        assert env["uv"] == "/usr/local/bin/uv"
         assert env["pip"] is True
         assert env["gpu_vendor"] == "nvidia"
         assert env["module"] is True
@@ -44,25 +50,173 @@ class TestDetectEnvironment:
             env = await detect_environment("host")
 
         assert env["python3"] is True
-        assert env["uv"] is False
+        assert env["uv"] is None
         assert env["pip"] is False
         assert env["gpu_vendor"] is None
 
 
-def _mock_rsync_noop(*args, **kwargs):
-    """No-op async mock for rsync and subprocess calls in bootstrap."""
+class TestLocateUv:
+    """Test the uv discovery helper."""
 
-    async def _noop():
-        pass
+    @pytest.mark.asyncio
+    async def test_found_on_path(self):
+        async def mock_ssh(hostname, cmd, **kw):
+            if "command -v uv" in cmd:
+                return ("/usr/bin/uv", "", 0)
+            pytest.fail(f"unexpected probe after PATH hit: {cmd}")
 
-    return _noop()
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _locate_uv("host") == "/usr/bin/uv"
+
+    @pytest.mark.asyncio
+    async def test_found_via_snap(self):
+        async def mock_ssh(hostname, cmd, **kw):
+            if "command -v uv" in cmd:
+                return ("", "", 1)
+            # Probe runs the for-loop and finds /snap/bin/uv.
+            assert "/snap/bin/uv" in cmd
+            return ("/snap/bin/uv", "", 0)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _locate_uv("host") == "/snap/bin/uv"
+
+    @pytest.mark.asyncio
+    async def test_probe_covers_canonical_locations(self):
+        """The probe script must reference every documented install dir."""
+        captured: dict[str, str] = {}
+
+        async def mock_ssh(hostname, cmd, **kw):
+            if "command -v uv" in cmd:
+                return ("", "", 1)
+            captured["probe"] = cmd
+            return ("", "", 1)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _locate_uv("host") is None
+
+        for expected in _UV_CANDIDATE_PATHS:
+            assert expected in captured["probe"]
+
+    @pytest.mark.asyncio
+    async def test_not_found(self):
+        async def mock_ssh(hostname, cmd, **kw):
+            return ("", "", 1)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh):
+            assert await _locate_uv("host") is None
+
+
+class TestLocalLqhRoot:
+    """Test discovery of the local lqh package directory."""
+
+    def test_points_at_dir_containing_lqh(self):
+        # lqh is importable in the test env, so this always resolves.
+        root = _local_lqh_root()
+        assert root is not None
+        assert (root / "lqh" / "__init__.py").is_file()
+
+
+class TestSynthesizePyproject:
+    """Test synthetic pyproject.toml generation from installed metadata."""
+
+    def test_has_buildable_structure(self):
+        # lqh is installed in the test env → metadata is available.
+        text = _synthesize_pyproject()
+        assert text is not None
+        assert "[build-system]" in text
+        assert 'name = "lqh"' in text
+        assert "[project.optional-dependencies]" in text
+        assert "train = [" in text
+
+    def test_includes_base_and_train_deps(self):
+        text = _synthesize_pyproject()
+        assert text is not None
+        # A base runtime dep and a train-extra dep both get pulled in.
+        assert "rich" in text       # [project.dependencies]
+        assert "torch" in text      # [project.optional-dependencies.train]
 
 
 class TestBootstrapRemote:
     """Test the full bootstrap flow."""
 
     @pytest.mark.asyncio
-    async def test_bootstrap_with_uv(self):
+    async def test_bootstrap_with_uv(self, tmp_path):
+        """uv present + a source checkout (pyproject.toml beside lqh/):
+        installs straight from the synced tree, nothing synthesized."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'lqh'\n")
+        calls: list[str] = []
+
+        async def mock_ssh(hostname, cmd, **kw):
+            calls.append(cmd)
+            if "command -v python3" in cmd:
+                return ("/usr/bin/python3", "", 0)
+            if "command -v uv" in cmd:
+                return ("/opt/uv-build/uv", "", 0)
+            if "command -v nvidia-smi" in cmd:
+                return ("/usr/bin/nvidia-smi", "", 0)
+            if "nvidia-smi --query-gpu=index,name,memory.total" in cmd:
+                return ("0, NVIDIA A100-SXM4-80GB, 81920", "", 0)
+            # Force venv-doesn't-exist so the creation branch runs.
+            if cmd.startswith("test -x") and "/bin/python" in cmd:
+                return ("", "", 1)
+            return ("", "", 0)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh), \
+             patch("lqh.remote.gpu.ssh_run", side_effect=mock_ssh), \
+             patch("lqh.remote.bootstrap._local_lqh_root", return_value=tmp_path), \
+             patch("lqh.remote.bootstrap._rsync_lqh_source", new_callable=AsyncMock):
+            await bootstrap_remote("host", "/remote/root")
+
+        # The absolute uv path from detection is threaded into venv
+        # creation and the install command.
+        venv_cmds = [c for c in calls if "venv" in c]
+        assert any("/opt/uv-build/uv venv" in c for c in venv_cmds), venv_cmds
+        install_cmds = [c for c in calls if "pip install" in c]
+        assert install_cmds
+        assert all("/opt/uv-build/uv pip install" in c for c in install_cmds), install_cmds
+        assert all(".lqh-src[train]" in c for c in install_cmds), install_cmds
+        # A real pyproject.toml is present → none synthesized.
+        assert not any("LQH_PYPROJECT_EOF" in c for c in calls), calls
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_without_uv(self, tmp_path):
+        """No uv → `python3 -m venv` + plain `pip install`."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'lqh'\n")
+        calls: list[str] = []
+
+        async def mock_ssh(hostname, cmd, **kw):
+            calls.append(cmd)
+            if "command -v python3" in cmd:
+                return ("/usr/bin/python3", "", 0)
+            if "command -v uv" in cmd:
+                return ("", "", 1)
+            if "command -v nvidia-smi" in cmd:
+                return ("", "", 1)
+            if "command -v amd-smi" in cmd or "command -v rocm-smi" in cmd:
+                return ("", "", 1)
+            if cmd.startswith("test -x") and "/bin/python" in cmd:
+                return ("", "", 1)
+            return ("", "", 0)
+
+        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh), \
+             patch("lqh.remote.gpu.ssh_run", side_effect=mock_ssh), \
+             patch("lqh.remote.bootstrap._local_lqh_root", return_value=tmp_path), \
+             patch("lqh.remote.bootstrap._rsync_lqh_source", new_callable=AsyncMock):
+            await bootstrap_remote("host", "/remote/root")
+
+        venv_cmds = [c for c in calls if "venv" in c]
+        assert any("python3 -m venv" in c for c in venv_cmds), venv_cmds
+        install_cmds = [c for c in calls if "pip install" in c]
+        assert install_cmds
+        assert all(".lqh-src[train]" in c for c in install_cmds), install_cmds
+        assert not any("uv pip install" in c for c in install_cmds), install_cmds
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_synthesizes_pyproject_when_no_checkout(self, tmp_path):
+        """When lqh is installed without a checkout (no pyproject.toml
+        beside lqh/), bootstrap synthesizes one on the remote and installs
+        from the synced tree — never `pip install lqh` off PyPI."""
+        # tmp_path deliberately has NO pyproject.toml.
         calls: list[str] = []
 
         async def mock_ssh(hostname, cmd, **kw):
@@ -72,48 +226,30 @@ class TestBootstrapRemote:
             if "command -v uv" in cmd:
                 return ("/usr/bin/uv", "", 0)
             if "command -v nvidia-smi" in cmd:
-                return ("/usr/bin/nvidia-smi", "", 0)
-            if "nvidia-smi --query-gpu=index,name,memory.total" in cmd:
-                return ("0, NVIDIA A100-SXM4-80GB, 81920", "", 0)
-            return ("", "", 0)
-
-        mock_proc = AsyncMock()
-        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
-        mock_proc.returncode = 0
-
-        with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh), \
-             patch("lqh.remote.gpu.ssh_run", side_effect=mock_ssh), \
-             patch("lqh.remote.bootstrap._find_lqh_package_root", return_value=None):
-            log = await bootstrap_remote("host", "/remote/root")
-
-        assert "uv" in log.lower() or "venv" in log.lower()
-        # Should have used uv venv, not python3 -m venv
-        venv_cmds = [c for c in calls if "venv" in c]
-        assert any("uv venv" in c for c in venv_cmds)
-
-    @pytest.mark.asyncio
-    async def test_bootstrap_without_uv(self):
-        calls: list[str] = []
-
-        async def mock_ssh(hostname, cmd, **kw):
-            calls.append(cmd)
-            if "command -v python3" in cmd:
-                return ("/usr/bin/python3", "", 0)
-            if "command -v uv" in cmd:
-                return ("", "", 1)  # uv not available
-            if "command -v nvidia-smi" in cmd:
                 return ("", "", 1)
-            if "command -v amd-smi" in cmd or "command -v rocm-smi" in cmd:
+            if cmd.startswith("test -x") and "/bin/python" in cmd:
                 return ("", "", 1)
             return ("", "", 0)
 
         with patch("lqh.remote.bootstrap.ssh_run", side_effect=mock_ssh), \
              patch("lqh.remote.gpu.ssh_run", side_effect=mock_ssh), \
-             patch("lqh.remote.bootstrap._find_lqh_package_root", return_value=None):
+             patch("lqh.remote.bootstrap._local_lqh_root", return_value=tmp_path), \
+             patch("lqh.remote.bootstrap._rsync_lqh_source", new_callable=AsyncMock), \
+             patch("lqh.remote.bootstrap._synthesize_pyproject",
+                   return_value="SYNTHETIC_PYPROJECT_BODY"):
             await bootstrap_remote("host", "/remote/root")
 
-        venv_cmds = [c for c in calls if "venv" in c]
-        assert any("python3 -m venv" in c for c in venv_cmds)
+        # The synthetic pyproject.toml is written to the remote .lqh-src.
+        synth_writes = [
+            c for c in calls
+            if "LQH_PYPROJECT_EOF" in c and "SYNTHETIC_PYPROJECT_BODY" in c
+        ]
+        assert synth_writes, calls
+        assert "/remote/root/.lqh-src/pyproject.toml" in synth_writes[0]
+        # Install targets the synced tree, not a PyPI package.
+        install_cmds = [c for c in calls if "pip install" in c]
+        assert install_cmds
+        assert all(".lqh-src[train]" in c for c in install_cmds), install_cmds
 
     @pytest.mark.asyncio
     async def test_bootstrap_no_python(self):
