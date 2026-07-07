@@ -141,6 +141,7 @@ Base, instruct, and thinking variants are available; the agent recommends the ri
 | `/resume` | Resume a previous conversation |
 | `/clear` | Start a fresh conversation |
 | `/reconnect` | Retry a failed network/API operation |
+| `/feedback` | Send feedback (with the current conversation) to the lqh team |
 | `/help` · `/quit` | Show commands · exit |
 
 ## 🤖 Auto mode
