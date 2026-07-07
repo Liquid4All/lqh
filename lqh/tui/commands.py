@@ -30,6 +30,7 @@ COMMANDS: list[SlashCommand] = [
     SlashCommand("/eval", "Start evaluation mode"),
     SlashCommand("/prompt", "Start prompt optimization mode"),
     SlashCommand("/reconnect", "Retry a failed network/API operation"),
+    SlashCommand("/feedback", "Send feedback to the lqh team"),
     SlashCommand("/help", "Show available commands"),
     SlashCommand("/quit", "Exit lqh"),
 ]

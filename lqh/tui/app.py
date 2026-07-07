@@ -626,6 +626,10 @@ class LqhApp:
             await self._do_reconnect()
             return True
 
+        if command == "/feedback":
+            await self._do_feedback(_args)
+            return True
+
         if command == "/login":
             await self._do_login()
             return True
@@ -891,6 +895,48 @@ class LqhApp:
         await self._emit(render_system_message(
             "✅ Hugging Face token stored (encrypted on the backend). Cloud jobs will "
             "use it for private models/datasets and pushes — the laptop env is not needed."
+        ))
+        self._invalidate()
+
+    async def _do_feedback(self, args: str) -> None:
+        """Handle /feedback: collect free-text feedback and send it (along with
+        the current conversation context) to the backend for super-admin
+        review. The conversation is attached so the team can understand the
+        feedback in context (FEEDBACK.md)."""
+        from lqh.auth import send_feedback
+
+        if not get_token():
+            await self._emit(render_error("Not logged in. Please run /login first."))
+            return
+
+        await self._emit(render_system_message(
+            "Your feedback and this session's full conversation — including "
+            "system and tool messages, not just your chat — will be sent to the "
+            "lqh team for review. By submitting, you agree to our privacy "
+            "policy: https://lqh.ai/privacy/"
+        ))
+
+        message = (args or "").strip()
+        if not message:
+            message = (await self._wait_for_user_response(
+                managed_text=render_system_message(
+                    "Type your feedback and press Enter (empty to cancel):",
+                    separated=False,
+                )
+            )).strip()
+        if not message:
+            await self._emit(render_system_message("Feedback cancelled (nothing entered)."))
+            return
+
+        context = list(self._session.messages) if self._session else []
+        session_id = self._session.id if self._session else None
+        try:
+            await send_feedback(message, context, session_id)
+        except Exception as e:
+            await self._emit(render_error(f"Failed to send feedback: {type(e).__name__}: {e}"))
+            return
+        await self._emit(render_system_message(
+            "✅ Thanks — your feedback was sent to the lqh team."
         ))
         self._invalidate()
 

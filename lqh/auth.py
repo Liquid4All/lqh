@@ -71,6 +71,41 @@ async def set_hf_token(token: str) -> None:
             raise LoginError(f"failed to store HF token ({r.status_code}): {r.text[:200]}")
 
 
+def _trim_feedback_context(messages: list[dict], max_bytes: int = 480_000) -> list[dict]:
+    """Keep the most recent messages that fit under the backend's context
+    size cap (512 KiB), dropping oldest first so a long conversation still
+    submits rather than being rejected wholesale."""
+    import json
+
+    trimmed = list(messages)
+    while trimmed and len(json.dumps(trimmed)) > max_bytes:
+        trimmed = trimmed[1:]
+    return trimmed
+
+
+async def send_feedback(
+    message: str, context: list[dict] | None, session_id: str | None
+) -> None:
+    """Submit user feedback plus the current conversation context to the
+    backend for super-admin review (FEEDBACK.md). Raises on a non-2xx
+    response. The conversation is trimmed (oldest-first) to fit the backend's
+    size cap."""
+    payload = {
+        "message": message,
+        "context": _trim_feedback_context(context or []),
+        "session_id": session_id,
+        "client_version": __version__,
+    }
+    async with httpx.AsyncClient(base_url=api_root(), timeout=30.0) as http:
+        r = await http.post(
+            "/v1/feedback",
+            json=payload,
+            headers={"Authorization": f"Bearer {require_token()}"},
+        )
+        if r.status_code not in (200, 201, 204):
+            raise LoginError(f"failed to send feedback ({r.status_code}): {r.text[:200]}")
+
+
 async def hf_token_status() -> dict[str, Any]:
     """Return {"configured": bool, "last_used_at": str|None} for the
     stored HF token (the one cloud jobs use). Empty dict on error."""
