@@ -903,6 +903,8 @@ class LqhApp:
         the current conversation context) to the backend for super-admin
         review. The conversation is attached so the team can understand the
         feedback in context (FEEDBACK.md)."""
+        import httpx
+
         from lqh.auth import send_feedback
 
         if not get_token():
@@ -930,11 +932,27 @@ class LqhApp:
 
         context = list(self._session.messages) if self._session else []
         session_id = self._session.id if self._session else None
+
+        # Lock input and show an in-flight indicator so the user knows the
+        # request is outstanding and stray keystrokes aren't taken as a new
+        # message while it's in flight.
+        self._lock_input()
+        await self._emit(render_system_message("⏳ Sending your feedback…"))
         try:
             await send_feedback(message, context, session_id)
-        except Exception as e:
-            await self._emit(render_error(f"Failed to send feedback: {type(e).__name__}: {e}"))
+        except httpx.TransportError:
+            await self._emit(render_error(
+                "Couldn't reach the lqh server (network/timeout). Your feedback "
+                "was not sent — check your connection and run /feedback again."
+            ))
             return
+        except Exception as e:
+            detail = str(e).strip() or type(e).__name__
+            await self._emit(render_error(f"Failed to send feedback: {detail}"))
+            return
+        finally:
+            self._unlock_input()
+
         await self._emit(render_system_message(
             "✅ Thanks — your feedback was sent to the lqh team."
         ))
