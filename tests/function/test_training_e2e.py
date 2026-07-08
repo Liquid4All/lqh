@@ -7,7 +7,7 @@ Requires:
 
 Run via pytest::
 
-    pytest tests/unit/test_training_e2e.py -v -s
+    pytest tests/function/test_training_e2e.py -v -s
 
 Both tests are gated on ``@pytest.mark.gpu``; ``conftest.py`` auto-skips
 them when no CUDA device is visible.

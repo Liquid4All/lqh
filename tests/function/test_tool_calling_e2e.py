@@ -15,7 +15,7 @@ present.
 
 Usage::
 
-    pytest tests/unit/test_tool_calling_e2e.py -v -s
+    pytest tests/function/test_tool_calling_e2e.py -v -s
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ class TestToolCallingE2E:
     ) -> None:
         # ---- 1. Generate tool-calling samples ----
         pipeline_path = (
-            Path(__file__).parent.parent / "function" / "tool_calling_e2e_pipeline.py"
+            Path(__file__).parent / "tool_calling_e2e_pipeline.py"
         )
         assert pipeline_path.exists(), f"Pipeline not found: {pipeline_path}"
 

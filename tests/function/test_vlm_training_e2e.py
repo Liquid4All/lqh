@@ -8,7 +8,7 @@ Requires:
 
 Run via pytest::
 
-    pytest tests/unit/test_vlm_training_e2e.py -v -s
+    pytest tests/function/test_vlm_training_e2e.py -v -s
 
 Gated on ``@pytest.mark.gpu``; ``conftest.py`` auto-skips without CUDA.
 

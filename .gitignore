@@ -19,6 +19,10 @@ env/
 # lqh runtime data
 .lqh/
 
+# Generated test-run reports (existing files stay tracked as history;
+# use `git add -f` to deliberately commit a new report)
+tests/harness/reports/
+
 # Local training data + lqh project working dirs (not package code)
 bvi-10k-sft/
 bvi-256-sft/

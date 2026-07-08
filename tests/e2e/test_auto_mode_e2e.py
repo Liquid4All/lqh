@@ -51,6 +51,10 @@ def _has_api_access() -> bool:
 
 
 @unittest.skipUnless(_has_api_access(), "No API token; skipping auto-mode e2e")
+@unittest.skipUnless(
+    os.environ.get("LQH_E2E") == "1",
+    "Set LQH_E2E=1 to run (spends real training money, 30+ minutes)",
+)
 class TestAutoModeE2E(unittest.TestCase):
     """Full-pipeline auto-mode tests, one per spec fixture."""
 

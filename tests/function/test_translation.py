@@ -5,15 +5,15 @@ a translation model that outputs JSON with 5 languages.
 
 Usage:
     # Default orchestration model (orchestration:12), no timeout:
-    python -m tests.e2e.test_translation
+    python -m tests.function.test_translation
 
     # Compare orchestration models:
-    python -m tests.e2e.test_translation orchestration:1
-    python -m tests.e2e.test_translation orchestration:12
-    python -m tests.e2e.test_translation orchestration:3
+    python -m tests.function.test_translation orchestration:1
+    python -m tests.function.test_translation orchestration:12
+    python -m tests.function.test_translation orchestration:3
 
     # With timeout (seconds):
-    python -m tests.e2e.test_translation orchestration:12 --timeout=600
+    python -m tests.function.test_translation orchestration:12 --timeout=600
 """
 
 from __future__ import annotations
