@@ -831,3 +831,76 @@ FULL_PIPELINE_TOOLS = Scenario(
     stage_limits={"train": 25},
     seed_fn=seed_full_pipeline_tools_async,
 )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 9: Full app flow from scratch — observability model → GGUF Q4_K
+# ---------------------------------------------------------------------------
+
+OBSERVABILITY_GGUF_350M = Scenario(
+    name="observability_gguf_350m",
+    description=(
+        "You are a sysadmin who wants a tiny local model that watches running "
+        "processes with their CPU and memory usage and decides, based on a "
+        "natural-language instruction you give it, whether to alert you or "
+        "kill a process. The model input is a ps/top-style process table "
+        "(pid, name, cpu%, mem%) plus one instruction like 'kill anything "
+        "using more than 90% CPU that is not postgres'. The output must be a "
+        "JSON object like {\"action\": \"alert\"|\"kill\"|\"none\", \"pid\": "
+        "<int or null>, \"reason\": \"...\"}. The model must only kill when "
+        "the instruction explicitly allows it; when in doubt it should alert. "
+        "You want the base model to be LFM2.5-350M because it must run on "
+        "small edge boxes, and at the end you want the trained model exported "
+        "to GGUF with Q4_K quantization so you can run it with llama.cpp.\n\n"
+        "Behavior rules:\n"
+        "- Answer spec questions concretely using the details above; accept "
+        "the agent's suggestions for edge cases (no matching process, "
+        "ambiguous instruction, protected system processes → alert, not kill)\n"
+        "- When offered next steps after the spec, choose 'Start generating data'\n"
+        "- When shown draft data samples, say they look good or point out "
+        "obvious issues once, then approve\n"
+        "- Accept small dataset sizes (around 80 training / 20 eval samples) — "
+        "this is a smoke-scale run\n"
+        "- When asked which base model, insist on LFM2.5-350M. If the agent "
+        "proposes any other size, say it must be LFM2.5-350M because of the "
+        "edge deployment\n"
+        "- When asked about training config or LoRA, accept the defaults\n"
+        "- After training completes, ask the agent to export the trained "
+        "model to GGUF with Q4_K quantization\n"
+        "- Once the agent reports the GGUF conversion job was started or "
+        "completed, say 'I'm done for now'"
+    ),
+    initial_message=(
+        "I want a small observability model that monitors running processes, "
+        "CPU and memory usage, and either alerts me or kills processes based "
+        "on my instructions. Use LFM2.5 350M as the base model — and at the "
+        "end I want the model exported to GGUF with Q4_K quantization."
+    ),
+    expected_tools=[
+        "ask_user",
+        "create_file",
+        "run_data_gen_pipeline",
+        "start_training",
+        "training_status",
+        "gguf_convert",
+    ],
+    expected_files=["SPEC.md"],
+    judge_criteria=(
+        "Score the artifact for how well it captures a process-observability "
+        "action model.\n"
+        "The task: input is a process table (pid, name, cpu%, mem%) plus a "
+        "natural-language instruction; output is a JSON action object "
+        "{action: alert|kill|none, pid, reason}.\n\n"
+        "Check for:\n"
+        "- Input contract: process table format AND the instruction are both described\n"
+        "- Output contract: JSON schema with the action/pid/reason keys\n"
+        "- Safety rules: kill only when the instruction explicitly allows it; "
+        "alert on ambiguity; protected/system processes are not killed\n"
+        "- Examples and edge cases (no matching process, ambiguous instruction)\n"
+        "- Base model LFM2.5-350M is recorded\n\n"
+        "10 = precise and actionable, 5 = vague or missing key contracts, "
+        "1 = does not describe the observability task"
+    ),
+    max_turns=60,
+    stage_limits={"spec_capture": 12, "data_generation": 20, "train": 25},
+)
