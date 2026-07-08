@@ -28,9 +28,9 @@ from lqh.config import load_config
 
 from tests.e2e.benchmark.scoring import BenchmarkScore, score_result
 from tests.e2e.benchmark.aggregate_report import generate_aggregate_report
-from tests.e2e.harness import E2EHarness
-from tests.e2e.report import generate_report
-from tests.e2e.scenarios import Scenario
+from tests.harness.harness import E2EHarness
+from tests.harness.report import generate_report
+from tests.harness.scenarios import Scenario
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)

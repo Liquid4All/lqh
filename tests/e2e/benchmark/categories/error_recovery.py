@@ -8,7 +8,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from tests.e2e.scenarios import Scenario
+from tests.harness.scenarios import Scenario
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 

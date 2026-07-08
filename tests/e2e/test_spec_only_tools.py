@@ -14,10 +14,10 @@ import sys
 import time
 import unittest
 
-from tests.e2e.harness import E2EHarness
-from tests.e2e.judge import judge_artifacts
-from tests.e2e.report import generate_report
-from tests.e2e.scenarios import SPEC_ONLY_TOOLS_SUPPORT
+from tests.harness.harness import E2EHarness
+from tests.harness.judge import judge_artifacts
+from tests.harness.report import generate_report
+from tests.harness.scenarios import SPEC_ONLY_TOOLS_SUPPORT
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)

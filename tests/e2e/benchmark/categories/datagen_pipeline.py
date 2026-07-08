@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tests.e2e.scenarios import Scenario
+from tests.harness.scenarios import Scenario
 
 
 _SENTIMENT_SPEC = """\

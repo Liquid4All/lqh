@@ -17,7 +17,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from tests.e2e.scenarios import Scenario
+from tests.harness.scenarios import Scenario
 
 
 def _write_mixed_quality_parquet(path: Path, num_good: int, num_bad: int) -> None:

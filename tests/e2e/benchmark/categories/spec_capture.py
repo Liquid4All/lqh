@@ -6,7 +6,7 @@ requirements before creating SPEC.md.
 
 from __future__ import annotations
 
-from tests.e2e.scenarios import Scenario
+from tests.harness.scenarios import Scenario
 
 SPEC_CAPTURE_AMBIGUOUS_OUTPUT = Scenario(
     name="bench_spec_capture_ambiguous_output",

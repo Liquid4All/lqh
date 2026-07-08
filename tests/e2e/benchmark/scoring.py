@@ -11,9 +11,9 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from tests.e2e.harness import E2EResult
-from tests.e2e.judge import judge_artifacts, JudgeResult, JUDGE_SCHEMA, _coerce_judge_payload
-from tests.e2e.scenarios import Scenario
+from tests.harness.harness import E2EResult
+from tests.harness.judge import judge_artifacts, JudgeResult, JUDGE_SCHEMA, _coerce_judge_payload
+from tests.harness.scenarios import Scenario
 
 logger = logging.getLogger(__name__)
 

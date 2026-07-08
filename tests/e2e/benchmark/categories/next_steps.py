@@ -12,7 +12,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from tests.e2e.scenarios import Scenario
+from tests.harness.scenarios import Scenario
 
 
 _TRANSLATION_SPEC = """\

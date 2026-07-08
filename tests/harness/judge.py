@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 
-from tests.e2e.scenarios import Scenario
+from tests.harness.scenarios import Scenario
 
 logger = logging.getLogger(__name__)
 

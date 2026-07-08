@@ -20,7 +20,7 @@ from lqh.config import load_config
 from lqh.context_stats import ContextStats
 from lqh.session import Session
 
-from tests.e2e.scenarios import Scenario
+from tests.harness.scenarios import Scenario
 
 logger = logging.getLogger(__name__)
 

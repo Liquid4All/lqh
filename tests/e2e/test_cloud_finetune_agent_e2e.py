@@ -24,8 +24,8 @@ from typing import Any
 import pytest
 
 from lqh.remote.backend import JobStatus
-from tests.e2e.harness import E2EHarness
-from tests.e2e.scenarios import Scenario
+from tests.harness.harness import E2EHarness
+from tests.harness.scenarios import Scenario
 
 
 BASE_MODEL = "LiquidAI/LFM2.5-1.2B-Instruct"
@@ -330,9 +330,9 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, train_type: str, run_name: s
     monkeypatch.setattr("lqh.agent.get_token", lambda: "test-token")
     monkeypatch.setattr("lqh.agent.create_client", lambda token, base_url: object())
     monkeypatch.setattr("lqh.agent.chat_with_retry", fake_chat_with_retry)
-    monkeypatch.setattr("tests.e2e.harness.require_token", lambda: "test-token")
+    monkeypatch.setattr("tests.harness.harness.require_token", lambda: "test-token")
     monkeypatch.setattr(
-        "tests.e2e.harness.create_client",
+        "tests.harness.harness.create_client",
         lambda token, base_url: _FakeHumanClient(),
     )
     monkeypatch.setattr("lqh.remote.cloud.CloudBackend", _FakeCloudBackend)

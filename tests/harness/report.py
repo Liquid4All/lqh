@@ -6,7 +6,7 @@ import json
 import time
 from pathlib import Path
 
-from tests.e2e.harness import E2EResult
+from tests.harness.harness import E2EResult
 
 REPORTS_DIR = Path(__file__).parent / "reports"
 
