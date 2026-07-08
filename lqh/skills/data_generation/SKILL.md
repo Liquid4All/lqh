@@ -484,7 +484,7 @@ Invariants every tool-calling pipeline MUST satisfy:
    ```
 6. Return a **flat list** (not a `Conversation(...)` constructor call) containing these turns in order: system → user → assistant(tool_call) → tool → assistant(text).
 
-If any invariant is unclear, open `data_gen/tool_calling.py` or `tests/e2e/benchmark/fixtures/broken_pipeline_system_msg.py` (for a counter-example of what NOT to do).
+If any invariant is unclear, open `data_gen/tool_calling.py` or `tests/benchmarks/orchestration/fixtures/broken_pipeline_system_msg.py` (for a counter-example of what NOT to do).
 
 ### Pattern 5: Bring-Your-Own-Data
 

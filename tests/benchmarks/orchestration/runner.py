@@ -4,12 +4,12 @@ Iterates all (model, scenario) pairs, collects results, and generates
 an aggregate report.
 
 Usage:
-    python -m tests.e2e.benchmark.runner
-    python -m tests.e2e.benchmark.runner --models orchestration:12,orchestration:3
-    python -m tests.e2e.benchmark.runner --categories datagen_pipeline,error_recovery
-    python -m tests.e2e.benchmark.runner --timeout=900
-    python -m tests.e2e.benchmark.runner --parallel=3
-    python -m tests.e2e.benchmark.runner --resume results/run_20260414/
+    python -m tests.benchmarks.orchestration.runner
+    python -m tests.benchmarks.orchestration.runner --models orchestration:12,orchestration:3
+    python -m tests.benchmarks.orchestration.runner --categories datagen_pipeline,error_recovery
+    python -m tests.benchmarks.orchestration.runner --timeout=900
+    python -m tests.benchmarks.orchestration.runner --parallel=3
+    python -m tests.benchmarks.orchestration.runner --resume results/run_20260414/
 """
 
 from __future__ import annotations
@@ -26,8 +26,8 @@ from lqh.auth import require_token
 from lqh.client import create_client
 from lqh.config import load_config
 
-from tests.e2e.benchmark.scoring import BenchmarkScore, score_result
-from tests.e2e.benchmark.aggregate_report import generate_aggregate_report
+from tests.benchmarks.orchestration.scoring import BenchmarkScore, score_result
+from tests.benchmarks.orchestration.aggregate_report import generate_aggregate_report
 from tests.harness.harness import E2EHarness
 from tests.harness.report import generate_report
 from tests.harness.scenarios import Scenario
@@ -54,34 +54,34 @@ def _load_all_scenarios() -> list[tuple[str, Scenario]]:
     """Import and collect all benchmark scenarios with their category names."""
     scenarios: list[tuple[str, Scenario]] = []
 
-    from tests.e2e.benchmark.categories.spec_capture import SCENARIOS as sc
+    from tests.benchmarks.orchestration.categories.spec_capture import SCENARIOS as sc
     scenarios.extend(("spec_capture", s) for s in sc)
 
-    from tests.e2e.benchmark.categories.spec_generation import SCENARIOS as sg
+    from tests.benchmarks.orchestration.categories.spec_generation import SCENARIOS as sg
     scenarios.extend(("spec_generation", s) for s in sg)
 
-    from tests.e2e.benchmark.categories.datagen_pipeline import SCENARIOS as dp
+    from tests.benchmarks.orchestration.categories.datagen_pipeline import SCENARIOS as dp
     scenarios.extend(("datagen_pipeline", s) for s in dp)
 
-    from tests.e2e.benchmark.categories.scorer_validation import SCENARIOS as sv
+    from tests.benchmarks.orchestration.categories.scorer_validation import SCENARIOS as sv
     scenarios.extend(("scorer_validation", s) for s in sv)
 
-    from tests.e2e.benchmark.categories.data_filtering import SCENARIOS as df
+    from tests.benchmarks.orchestration.categories.data_filtering import SCENARIOS as df
     scenarios.extend(("data_filtering", s) for s in df)
 
-    from tests.e2e.benchmark.categories.error_recovery import SCENARIOS as er
+    from tests.benchmarks.orchestration.categories.error_recovery import SCENARIOS as er
     scenarios.extend(("error_recovery", s) for s in er)
 
-    from tests.e2e.benchmark.categories.next_steps import SCENARIOS as ns
+    from tests.benchmarks.orchestration.categories.next_steps import SCENARIOS as ns
     scenarios.extend(("next_steps", s) for s in ns)
 
-    from tests.e2e.benchmark.categories.edit import SCENARIOS as ed
+    from tests.benchmarks.orchestration.categories.edit import SCENARIOS as ed
     scenarios.extend(("edit", s) for s in ed)
 
-    from tests.e2e.benchmark.categories.context_management import SCENARIOS as cm
+    from tests.benchmarks.orchestration.categories.context_management import SCENARIOS as cm
     scenarios.extend(("context_management", s) for s in cm)
 
-    from tests.e2e.benchmark.categories.auto_mode import SCENARIOS as am
+    from tests.benchmarks.orchestration.categories.auto_mode import SCENARIOS as am
     scenarios.extend(("auto_mode", s) for s in am)
 
     return scenarios

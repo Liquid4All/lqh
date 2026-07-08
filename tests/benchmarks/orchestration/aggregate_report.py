@@ -6,7 +6,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from tests.e2e.benchmark.scoring import BenchmarkScore
+from tests.benchmarks.orchestration.scoring import BenchmarkScore
 
 
 def generate_aggregate_report(
