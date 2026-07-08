@@ -22,6 +22,7 @@ from .pipelines import extraction as _extraction
 from .pipelines import messy_extraction as _messy_extraction
 from .pipelines import style_rewrite as _style_rewrite
 from .pipelines import translation as _translation
+from .pipelines import voice_satisfaction as _voice_satisfaction
 
 _PIPELINE_DIR = Path(__file__).parent / "pipelines"
 
@@ -141,6 +142,49 @@ phrases, concision, and natural support-writing quality.
 Return JSON exactly: `{"score": <int 0-10>, "reasoning": "<one sentence>"}`.
 """
 
+_VOICE_SATISFACTION_SCORER = """\
+# Voice-assistant satisfaction scorer (observability output) scorer
+
+The user gave a voice-assistant interaction (a `User:`/`Assistant:` transcript
+OR a JSON event log) and asked for a satisfaction assessment. The assistant
+should output ONLY one JSON object with exactly these keys, in this order:
+reasoning, score, failure_tags, success_tags, failed_turns, successful_turns —
+where `score` is an integer 1 (very dissatisfied) to 5 (very satisfied).
+
+Read the interaction YOURSELF, decide the correct assessment, then grade the
+assistant's JSON against it. Score 0-10 on ALL of:
+
+- Format: valid JSON, exactly those six keys, reasoning before score, integer
+  score in 1-5, tags only from the allowed taxonomies (failure: misrecognition,
+  wrong_action, no_action, noise_trigger, user_correction, incomplete_action,
+  unrelated_response, repeated_failure, hallucination, canceled, wrong_entity,
+  context_loss; success: success, multi_turn_success, graceful_recovery), turn
+  numbers in range, no prose/code fences.
+- Score correctness: matches how satisfied the user actually was (±1 tolerated;
+  a 4-5 on a clearly failed interaction is not).
+- Frustration sensitivity (MOST IMPORTANT): every genuine frustration signal in
+  the interaction (a correction, repeat, "ugh", a noise trigger, a wrong entity,
+  a hallucination) must be reflected by a low score AND a failure tag. MISSING a
+  real frustration signal is the worst error.
+- Tag accuracy & coupling: tags correctly describe what happened; score 1-3
+  carries >=1 failure tag (unless a pure `canceled` ambiguity); score 4-5
+  carries >=1 success tag.
+- Reasoning quality: 2-4 sentences referencing specific turns/events, not
+  generic ("the user seemed unhappy").
+
+- 10: valid JSON, correct score, accurate tags, specific reasoning, nothing
+      genuine missed.
+- 8-9: correct assessment with a minor tag or reasoning slip.
+- 5-7: defensible score but a wrong/missing tag, an off-by-one turn, or vague
+       reasoning.
+- 3-4: wrong score direction, malformed JSON, or a tag that contradicts the
+       interaction.
+- 0-2: MISSED a genuine frustration signal (rated a frustrated user as
+       satisfied), not JSON, empty, a refusal, or wrong field structure.
+
+Return JSON exactly: `{"score": <int 0-10>, "reasoning": "<one sentence>"}`.
+"""
+
 
 ALL_TASKS: dict[str, Task] = {
     "translation": Task(
@@ -172,6 +216,12 @@ ALL_TASKS: dict[str, Task] = {
         pipeline_path=_PIPELINE_DIR / "style_rewrite.py",
         system_prompt=_style_rewrite.SYSTEM_PROMPT,
         scorer_md=_STYLE_REWRITE_SCORER,
+    ),
+    "voice_satisfaction": Task(
+        name="voice_satisfaction",
+        pipeline_path=_PIPELINE_DIR / "voice_satisfaction.py",
+        system_prompt=_voice_satisfaction.SYSTEM_PROMPT,
+        scorer_md=_VOICE_SATISFACTION_SCORER,
     ),
 }
 

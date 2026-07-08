@@ -32,7 +32,12 @@ logging.getLogger("openai").setLevel(logging.WARNING)
 # Strict global caps for E2E tests.  If any of these trip, the run is
 # considered a failure — the agent is either stuck in a loop or using
 # too much context.
-MAX_TOTAL_TOOL_CALLS = 50
+#
+# The total cap was raised from 50 to 70 with the v0.3.1 workflow: a single
+# data-generation scenario now legitimately spans pipeline write + draft run +
+# read-back + scorer authoring + scorer-validation scoring + (optionally) a
+# validation set + filter, which can exceed 50 calls without any looping.
+MAX_TOTAL_TOOL_CALLS = 70
 MAX_TOOL_CALLS_PER_TURN = 20
 
 # Context compaction tolerance. A single compaction at a skill boundary is
@@ -45,6 +50,11 @@ COMPACTION_TOKEN_ABORT_THRESHOLD = 150_000
 
 class E2EAbort(Exception):
     """Raised to abort the E2E run immediately on a strict-limit violation."""
+    pass
+
+
+class _AutoModeDone(Exception):
+    """Internal: signals a clean end of an auto-mode run (no follow-up loop)."""
     pass
 
 
@@ -376,7 +386,12 @@ class E2EHarness:
                     self._seeded_files.add(rel)
 
         session = Session.create(self.project_dir)
-        agent = Agent(self.project_dir, session, callbacks=self._make_callbacks())
+        agent = Agent(
+            self.project_dir,
+            session,
+            callbacks=self._make_callbacks(),
+            auto_mode=self.scenario.auto_mode,
+        )
         agent.orchestration_model = self.orchestration_model
         agent.max_tool_calls_per_turn = MAX_TOOL_CALLS_PER_TURN  # strict E2E cap
 
@@ -393,6 +408,12 @@ class E2EHarness:
             self._turn_count += 1
 
             await agent.process_user_input(msg)
+
+            # Auto mode: there is no user. A single process_user_input drives the
+            # agent's internal loop until it calls exit_auto_mode (or trips a
+            # strict cap / timeout). Skip the simulated-human follow-up loop.
+            if self.scenario.auto_mode:
+                raise _AutoModeDone()
 
             # The agent may ask the user what to do next via ask_user.
             # The simulated human's scenario description guides transitions.
@@ -462,6 +483,9 @@ class E2EHarness:
                 self._stage_turns += 1
                 self._record("user", follow_up)
                 await agent.process_user_input(follow_up)
+        except _AutoModeDone:
+            # Auto-mode run finished its single self-driven turn cleanly.
+            pass
         except E2EAbort as exc:
             # Strict limit violation — reason already appended to errors
             logger.warning("E2E aborted by strict limit: %s", exc)

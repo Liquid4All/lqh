@@ -40,9 +40,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
-DEFAULT_MODELS = [f"orchestration:{i}" for i in range(1, 11)]  # 1..10
+DEFAULT_MODELS = [f"orchestration:{i}" for i in range(1, 15)]  # 1..14
 
 RESULTS_DIR = Path(__file__).parent / "results"
+
+# Categories excluded from the default "all" sweep because they are expensive
+# and/or can launch real training. Run them explicitly with
+# `--categories auto_mode`.
+EXPENSIVE_CATEGORIES = {"auto_mode"}
 
 
 def _load_all_scenarios() -> list[tuple[str, Scenario]]:
@@ -58,6 +63,12 @@ def _load_all_scenarios() -> list[tuple[str, Scenario]]:
     from tests.e2e.benchmark.categories.datagen_pipeline import SCENARIOS as dp
     scenarios.extend(("datagen_pipeline", s) for s in dp)
 
+    from tests.e2e.benchmark.categories.scorer_validation import SCENARIOS as sv
+    scenarios.extend(("scorer_validation", s) for s in sv)
+
+    from tests.e2e.benchmark.categories.data_filtering import SCENARIOS as df
+    scenarios.extend(("data_filtering", s) for s in df)
+
     from tests.e2e.benchmark.categories.error_recovery import SCENARIOS as er
     scenarios.extend(("error_recovery", s) for s in er)
 
@@ -69,6 +80,9 @@ def _load_all_scenarios() -> list[tuple[str, Scenario]]:
 
     from tests.e2e.benchmark.categories.context_management import SCENARIOS as cm
     scenarios.extend(("context_management", s) for s in cm)
+
+    from tests.e2e.benchmark.categories.auto_mode import SCENARIOS as am
+    scenarios.extend(("auto_mode", s) for s in am)
 
     return scenarios
 
@@ -85,7 +99,10 @@ def _parse_args() -> argparse.Namespace:
         "--categories",
         type=str,
         default="",
-        help="Comma-separated list of categories to run (empty = all)",
+        help=(
+            "Comma-separated list of categories to run (empty = all non-expensive). "
+            "Expensive/opt-in categories (auto_mode) only run when named explicitly."
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -179,6 +196,18 @@ async def main() -> None:
     all_scenarios = _load_all_scenarios()
     if category_filter:
         all_scenarios = [(c, s) for c, s in all_scenarios if c in category_filter]
+    else:
+        # Default sweep excludes expensive, opt-in categories (e.g. auto_mode,
+        # which can launch real training). Request them explicitly via
+        # --categories auto_mode.
+        skipped = sorted({c for c, _ in all_scenarios if c in EXPENSIVE_CATEGORIES})
+        if skipped:
+            logger.info("Excluding expensive categories from default run: %s "
+                        "(run explicitly with --categories %s)",
+                        ", ".join(skipped), ",".join(skipped))
+        all_scenarios = [
+            (c, s) for c, s in all_scenarios if c not in EXPENSIVE_CATEGORIES
+        ]
 
     logger.info("Benchmark: %d scenarios x %d models = %d runs",
                 len(all_scenarios), len(models), len(all_scenarios) * len(models))

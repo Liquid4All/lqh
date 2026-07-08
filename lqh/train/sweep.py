@@ -726,6 +726,60 @@ def _dpo_no_proxy_message(run_dir: Path, rows: list[dict[str, Any]]) -> str | No
     )
 
 
+def _no_winner_message(run_dir: Path, rows: list[dict[str, Any]]) -> str:
+    """Explain *why* no winner was selected, broken down by failure mode.
+
+    The old message ("all N configs failed or collapsed") conflated three
+    very different outcomes — children that crashed (rc != 0), children that
+    collapsed (proxy past the threshold), and children that completed but
+    produced no usable proxy metric. They want different fixes, so spell out
+    which configs landed where and point crashed ones at their stderr.log.
+    """
+    if not rows:
+        return "sweep produced no configs to evaluate; no model selected"
+
+    crashed = [r for r in rows if r.get("rc") not in (0, None)]
+    collapsed = [r for r in rows if r.get("rc") in (0, None) and r.get("collapsed")]
+    no_proxy = [
+        r for r in rows
+        if r.get("rc") in (0, None)
+        and not r.get("collapsed")
+        and r.get("primary") is None
+    ]
+
+    def _ids(items: list[dict[str, Any]]) -> str:
+        return ", ".join(str(r.get("config_id", "?")) for r in items)
+
+    parts: list[str] = [
+        f"no model selected: none of {len(rows)} sweep config(s) "
+        f"produced a usable winner."
+    ]
+    if crashed:
+        # Surface the actual log path for the first crashed child so the
+        # cause (e.g. a bad base_model path) is one click away.
+        first = crashed[0]
+        log_hint = ""
+        sub_dir = first.get("sub_dir")
+        if isinstance(sub_dir, str):
+            log_hint = f" (see {run_dir / sub_dir / 'stderr.log'})"
+        rcs = sorted({r.get("rc") for r in crashed})
+        parts.append(
+            f"{len(crashed)} crashed before completing "
+            f"[rc={','.join(str(c) for c in rcs)}]: {_ids(crashed)}{log_hint}"
+        )
+    if collapsed:
+        parts.append(
+            f"{len(collapsed)} collapsed "
+            f"(proxy past the {COLLAPSE_DELTA_REF_THRESHOLD} threshold): "
+            f"{_ids(collapsed)}"
+        )
+    if no_proxy:
+        parts.append(
+            f"{len(no_proxy)} completed but wrote no proxy metric: {_ids(no_proxy)}"
+        )
+    return " ".join(parts)
+
+
 def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
     """Sweep entry point invoked by ``python -m lqh.train.sweep <cfg>``."""
     base = sweep_config["base_config"]
@@ -900,10 +954,7 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
     winner = _pick_winner(rows, run_type)
     if winner is None:
         dpo_msg = _dpo_no_proxy_message(run_dir, rows) if run_type != "sft" else None
-        msg = dpo_msg or (
-            f"all {len(rows)} sweep configs failed or collapsed; "
-            f"no model selected"
-        )
+        msg = dpo_msg or _no_winner_message(run_dir, rows)
         print(msg, flush=True)
         write_status(run_dir, "failed", error=msg)
         raise SystemExit(1)

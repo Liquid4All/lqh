@@ -116,7 +116,7 @@ async def _judge_transcript(
     """Run LLM judge on a transcript for a specific criterion. Returns score 1-10."""
     try:
         response = await client.chat.completions.create(
-            model="judge:medium",
+            model="judge:large",
             messages=[
                 {
                     "role": "system",
@@ -404,7 +404,7 @@ async def _judge_pipeline_and_samples(
             f"it for display — the actual file is intact and passed a local syntax check."
         )
         response = await client.chat.completions.create(
-            model="judge:medium",
+            model="judge:large",
             messages=[
                 {
                     "role": "system",
@@ -465,6 +465,35 @@ async def score_datagen_pipeline(
 
     pipeline_ran = pa["succeeded"] > 0
 
+    # v0.3.1: data generation is NOT done when the samples look good — it
+    # "includes the scorer and verifying that the scorer actually works"
+    # (data_generation/SKILL.md). Credit the scorer-creation + scorer-validation
+    # loop: a scorer file under evals/scorers/, plus a data_quality scoring run
+    # over the drafts (run_scoring mode="data_quality" or a scores.parquet).
+    scorer_files = [
+        p for p in artifacts if p.startswith("evals/scorers/") and p.endswith(".md")
+    ]
+    scorer_created = len(scorer_files) > 0
+    ran_data_quality_scoring = any(
+        t.role == "tool_call"
+        and t.tool_name == "run_scoring"
+        and (t.tool_args or {}).get("mode") == "data_quality"
+        for t in result.transcript
+    )
+    scores_parquet_exists = any(result.project_dir.glob("datasets/*/scores.parquet"))
+    scorer_validated = ran_data_quality_scoring or scores_parquet_exists
+
+    # Surface whether the agent passed an explicit judge model_size (the
+    # validated-judge escalation lever) rather than relying on the silent
+    # default. Recorded for visibility; not hard-scored.
+    judge_model_sizes = sorted({
+        (t.tool_args or {}).get("model_size")
+        for t in result.transcript
+        if t.role == "tool_call"
+        and t.tool_name in ("run_scoring", "run_data_filter")
+        and (t.tool_args or {}).get("model_size")
+    })
+
     # Locate a generated dataset and pull the first 3 rows for judge input
     dataset_parquets = sorted(
         result.project_dir.glob("datasets/*/data.parquet")
@@ -482,7 +511,7 @@ async def score_datagen_pipeline(
             client, scenario, pipeline_code, sample_strs,
         )
 
-    # Composite: 50% ran successfully + 30% local structure checks + 20% judge
+    # Composite: pipeline ran + local structure checks + scorer step + judge.
     structure_score = (
         (25 if syntax_valid else 0)
         + (25 if imports_correct else 0)
@@ -490,10 +519,15 @@ async def score_datagen_pipeline(
         + (25 if pipeline_created else 0)
     )
 
+    # Scorer step (created + validated) — the v0.3.1 definition of "done" for
+    # data generation. Half credit for creating it, half for validating it.
+    scorer_step_score = (50 if scorer_created else 0) + (50 if scorer_validated else 0)
+
     composite = (
-        0.5 * (100 if pipeline_ran else 0)
-        + 0.3 * structure_score
-        + 0.2 * (category_judge_score / 10 * 100)
+        0.40 * (100 if pipeline_ran else 0)
+        + 0.20 * structure_score
+        + 0.15 * scorer_step_score
+        + 0.25 * (category_judge_score / 10 * 100)
     )
 
     # Build a judge_results entry exposing the category-specific judge result
@@ -528,6 +562,11 @@ async def score_datagen_pipeline(
             "pipeline_attempts_failed": pa["failed"],
             "samples_generated": samples_generated,
             "samples_judged": len(sample_strs),
+            "scorer_created": scorer_created,
+            "scorer_validated": scorer_validated,
+            "ran_data_quality_scoring": ran_data_quality_scoring,
+            "scorer_step_score": scorer_step_score,
+            "judge_model_sizes": judge_model_sizes,
         },
         judge_results=judge_results_out,
     )
@@ -590,17 +629,32 @@ async def score_error_recovery(
     )
 
 
-def _detect_next_step(result: E2EResult, expected: str) -> tuple[str, list[str]]:
+def _detect_next_step(
+    result: E2EResult, expected_buckets: list[str]
+) -> tuple[str, list[str]]:
     """Detect which next-step bucket the agent landed in.
 
-    Returns (actual, signals) where signals is a list of evidence strings for debugging.
+    Returns (actual, signals) where signals is a list of evidence strings for
+    debugging. ``expected_buckets`` is the list of acceptable next steps for the
+    scenario (a single scenario may legitimately have more than one correct next
+    step, e.g. "prompt_optimization" OR "train" after a baseline eval).
 
     Detection buckets and their signals (any one triggers a match):
-    - data_generation: run_data_gen_pipeline; files under data_gen/, evals/scorers/, datasets/;
-      load_skill(data_generation|data_validation|data_filtering); skill loaded
-    - evaluation: run_scoring, start_local_eval; files under evals/runs/; load_skill(evaluation); skill loaded
-    - prompt_optimization: files under prompts/; load_skill(prompt_optimization); skill loaded
-    - train: start_training; load_skill(train); skill loaded
+    - data_generation: run_data_gen_pipeline; run_scoring(mode="data_quality")
+      (scorer-validation on drafts is part of data generation); files under
+      data_gen/, evals/scorers/, datasets/; load_skill(data_generation|data_validation)
+    - data_filtering: run_data_filter; load_skill(data_filtering). The
+      filter-before-eval/train gate (v0.3.1) is its own step.
+    - evaluation: run_scoring(mode="model_eval"), start_local_eval; files under
+      evals/runs/; load_skill(evaluation)
+    - prompt_optimization: files under prompts/; get_eval_failures (drives prompt
+      refinement); load_skill(prompt_optimization)
+    - train: start_training; load_skill(train)
+
+    Note: ``run_scoring`` is split by its ``mode`` argument — ``data_quality``
+    (scoring drafts during data generation) maps to data_generation, while
+    ``model_eval`` (benchmarking a model) maps to evaluation. Treating every
+    run_scoring as "evaluation" mis-attributes the v0.3.1 scorer-validation loop.
     """
 
     def _args_str(rec: Any) -> str:
@@ -608,16 +662,19 @@ def _detect_next_step(result: E2EResult, expected: str) -> tuple[str, list[str]]
 
     matches: dict[str, list[str]] = {
         "data_generation": [],
+        "data_filtering": [],
         "evaluation": [],
         "prompt_optimization": [],
         "train": [],
     }
 
-    # Skills loaded (any, not just first)
+    # Skills loaded (any, not just first). data_filtering is now its own bucket
+    # (run_data_filter is a load-bearing gate before eval/train), but
+    # data_validation still rolls up under data_generation.
     skill_to_bucket = {
         "data_generation": "data_generation",
         "data_validation": "data_generation",
-        "data_filtering": "data_generation",
+        "data_filtering": "data_filtering",
         "evaluation": "evaluation",
         "prompt_optimization": "prompt_optimization",
         "train": "train",
@@ -637,8 +694,18 @@ def _detect_next_step(result: E2EResult, expected: str) -> tuple[str, list[str]]
 
         if name == "run_data_gen_pipeline":
             matches["data_generation"].append("run_data_gen_pipeline")
-        elif name in ("run_scoring", "start_local_eval"):
+        elif name == "run_data_filter":
+            matches["data_filtering"].append("run_data_filter")
+        elif name == "run_scoring":
+            mode = (rec.tool_args or {}).get("mode", "")
+            if mode == "data_quality":
+                matches["data_generation"].append("run_scoring:data_quality")
+            else:
+                matches["evaluation"].append(f"run_scoring:{mode or 'model_eval'}")
+        elif name == "start_local_eval":
             matches["evaluation"].append(name)
+        elif name == "get_eval_failures":
+            matches["prompt_optimization"].append("get_eval_failures")
         elif name == "start_training":
             matches["train"].append("start_training")
         elif name == "load_skill":
@@ -647,7 +714,8 @@ def _detect_next_step(result: E2EResult, expected: str) -> tuple[str, list[str]]
             if bucket:
                 matches[bucket].append(f"load_skill:{skill}")
         elif name in file_tool_names:
-            # Map target path prefix to bucket.
+            # Map target path prefix to bucket. evals/scorers/ is scorer
+            # authoring (data generation); evals/runs/ is an eval run.
             if any(p in args for p in ("data_gen/", "evals/scorers/", "datasets/")):
                 matches["data_generation"].append(f"{name}:datagen_path")
             elif "evals/runs/" in args:
@@ -655,10 +723,11 @@ def _detect_next_step(result: E2EResult, expected: str) -> tuple[str, list[str]]
             elif "prompts/" in args:
                 matches["prompt_optimization"].append(f"{name}:prompts/")
 
-    # Prefer the expected bucket when it has signals; otherwise pick the bucket
-    # with the most signals; otherwise unknown.
-    if matches.get(expected):
-        return expected, matches[expected]
+    # Prefer the FIRST acceptable bucket that has signals; otherwise pick the
+    # bucket with the most signals; otherwise unknown.
+    for expected in expected_buckets:
+        if matches.get(expected):
+            return expected, matches[expected]
     ranked = sorted(matches.items(), key=lambda kv: -len(kv[1]))
     if ranked and ranked[0][1]:
         return ranked[0][0], ranked[0][1]
@@ -672,37 +741,42 @@ async def score_next_steps(
     judge_results: list[JudgeResult],
 ) -> BenchmarkScore:
     """Score a next steps benchmark run."""
-    # Determine what the agent actually did
-    expected = scenario.judge_criteria  # Expected step encoded in judge_criteria for this category
+    # Determine what the agent actually did. The expected next step is encoded
+    # in judge_criteria; a comma-separated list means more than one next step is
+    # acceptable (e.g. "prompt_optimization,train" after a baseline eval, or
+    # "evaluation,data_filtering" when a raw eval set still needs filtering).
+    expected_buckets = [e.strip() for e in scenario.judge_criteria.split(",") if e.strip()]
+    primary_expected = expected_buckets[0] if expected_buckets else "unknown"
 
-    actual, signals = _detect_next_step(result, expected)
+    actual, signals = _detect_next_step(result, expected_buckets)
 
-    # If no deterministic signals, fall back to LLM judge: did the agent attempt `expected`?
+    # If no deterministic signals, fall back to LLM judge: did the agent attempt
+    # any of the acceptable next steps?
     judge_fallback_used = False
     judge_fallback_says_correct = False
     if actual == "unknown":
         judge_fallback_used = True
+        accepted = " or ".join(f"'{e}'" for e in expected_buckets)
         fallback_score = await _judge_transcript(
             client,
             _transcript_text(result),
-            f"The correct next step in this workflow is: '{expected}'. "
-            f"Rate whether the agent correctly attempted or recommended this specific next step (1-10). "
-            f"10 = clearly attempted {expected}, 6 = verbally recommended it but did not act, "
+            f"The correct next step(s) in this workflow: {accepted}. "
+            f"Rate whether the agent correctly attempted or recommended one of these next steps (1-10). "
+            f"10 = clearly attempted one of {accepted}, 6 = verbally recommended it but did not act, "
             f"1 = did something unrelated or wrong.",
         )
         if fallback_score >= 7:
-            actual = expected
+            actual = primary_expected
             judge_fallback_says_correct = True
 
-    # Ambiguity escape for "post prompt-opt" state: if the expected step is
-    # 'train' but the agent chose 'data_generation' with a modest sample count
-    # (<=1000), accept that as a legitimate "scale up training data before
-    # kicking off training" step rather than penalising it as wrong. This
-    # matches reasonable production behaviour where 200 seeded samples is
-    # borderline for SFT.  Only a massive unchecked generation counts as
-    # wrong (agent skipping ahead without evaluating first).
+    # Ambiguity escape for "post prompt-opt" state: if 'train' is acceptable but
+    # the agent chose 'data_generation' with a modest sample count (<=1000),
+    # accept that as a legitimate "scale up training data before kicking off
+    # training" step rather than penalising it as wrong. This matches reasonable
+    # production behaviour where 200 seeded samples is borderline for SFT. Only a
+    # massive unchecked generation counts as wrong (skipping ahead).
     scale_up_instead_of_train = False
-    if expected == "train" and actual == "data_generation":
+    if "train" in expected_buckets and actual == "data_generation":
         max_samples_requested = 0
         for rec in result.transcript:
             if rec.role == "tool_call" and rec.tool_name == "run_data_gen_pipeline":
@@ -714,20 +788,32 @@ async def score_next_steps(
                 if n > max_samples_requested:
                     max_samples_requested = n
         if 0 < max_samples_requested <= 1000:
-            actual = expected  # accept as correct
+            actual = "train"  # accept as correct
             scale_up_instead_of_train = True
 
-    correct = actual == expected
+    correct = actual in expected_buckets
 
-    # Judge rationale quality
-    rationale_score = await _judge_transcript(
-        client,
-        _transcript_text(result),
-        "Rate whether the agent provided a clear rationale for the next step it chose (1-10). "
-        "Did it explain why this is the right next step given the current project state? "
-        "10 = clear reasoning about project state, 5 = just picked an action without explanation, "
-        "1 = confused about project state or chose wrong action.",
-    )
+    # Second sub-score (30% weight). By default this judges the *rationale* the
+    # agent gave for its choice. When the scenario defines
+    # ``next_step_quality_criteria``, the bucket only tells us the agent entered
+    # the right phase — the targeted judge measures whether it did the right
+    # thing *within* that phase (e.g. set a system prompt for the zero-shot eval,
+    # generated a small batch before scaling, audited the data, inspected the
+    # fine-tuned model's failing responses before retraining).
+    quality_criteria = (scenario.next_step_quality_criteria or "").strip()
+    if quality_criteria:
+        rationale_score = await _judge_transcript(
+            client, _transcript_text(result), quality_criteria
+        )
+    else:
+        rationale_score = await _judge_transcript(
+            client,
+            _transcript_text(result),
+            "Rate whether the agent provided a clear rationale for the next step it chose (1-10). "
+            "Did it explain why this is the right next step given the current project state? "
+            "10 = clear reasoning about project state, 5 = just picked an action without explanation, "
+            "1 = confused about project state or chose wrong action.",
+        )
 
     composite = (
         0.7 * (100 if correct else 0)
@@ -748,10 +834,12 @@ async def score_next_steps(
         total_tool_calls=result.total_tool_calls,
         total_turns=result.total_turns,
         category_details={
-            "expected_next_step": expected,
+            "expected_next_step": primary_expected,
+            "accepted_next_steps": expected_buckets,
             "actual_next_step": actual,
             "correct": correct,
             "rationale_score": rationale_score,
+            "quality_criteria_used": bool(quality_criteria),
             "detection_signals": signals,
             "judge_fallback_used": judge_fallback_used,
             "judge_fallback_says_correct": judge_fallback_says_correct,
@@ -901,6 +989,217 @@ async def score_context_management(
     )
 
 
+def _model_sizes_used(result: E2EResult, tools: tuple[str, ...]) -> list[str]:
+    """Distinct, non-empty ``model_size`` args passed to the given tools."""
+    return sorted({
+        (t.tool_args or {}).get("model_size")
+        for t in result.transcript
+        if t.role == "tool_call"
+        and t.tool_name in tools
+        and (t.tool_args or {}).get("model_size")
+    })
+
+
+async def score_data_filtering(
+    result: E2EResult,
+    scenario: Scenario,
+    client: AsyncOpenAI,
+    judge_results: list[JudgeResult],
+) -> BenchmarkScore:
+    """Score a data-filtering (bring-your-own-data) benchmark run.
+
+    Tests the v0.3.1 ``run_data_filter`` flow: turn the user's quality intent
+    into a scorer, dry-run, then filter the user-brought dataset into a kept
+    subset (data.parquet + scores.parquet + summary.json).
+    """
+    artifacts = result.artifacts
+
+    # A scorer file the filter reads — data_filtering/SKILL.md writes
+    # evals/filter_<task>.md, but evals/scorers/<task>.md is also valid.
+    scorer_created = any(
+        p.startswith("evals/") and p.endswith(".md") for p in artifacts
+    )
+    ran_filter = any(
+        t.role == "tool_call" and t.tool_name == "run_data_filter"
+        for t in result.transcript
+    )
+    # run_data_filter writes summary.json + scores.parquet + data.parquet under
+    # datasets/<output>/. A summary.json under datasets/ that is the agent's
+    # work (not a seeded input) marks a real filter output.
+    filter_summaries = [
+        p for p in result.project_dir.glob("datasets/*/summary.json")
+        if str(p.relative_to(result.project_dir)) not in result.seeded_files
+    ]
+    filter_output_exists = len(filter_summaries) > 0
+    # The skill requires showing the scorer to the user before the full run.
+    showed_scorer = any(
+        t.role == "tool_result" and t.tool_name == "show_file"
+        for t in result.transcript
+    )
+
+    avg_judge = sum(jr.score for jr in judge_results) / len(judge_results) if judge_results else 0
+
+    composite = (
+        0.40 * (100 if filter_output_exists else 0)
+        + 0.25 * (100 if scorer_created else 0)
+        + 0.15 * (100 if ran_filter else 0)
+        + 0.20 * (avg_judge / 10 * 100)
+    )
+
+    return BenchmarkScore(
+        scenario_name=scenario.name,
+        category="data_filtering",
+        model=result.orchestration_model,
+        completed_without_abort=not result.has_errors(),
+        expected_tools_called=set(scenario.expected_tools).issubset(result.tools_called()),
+        expected_files_exist=all(f in artifacts for f in scenario.expected_files),
+        artifact_judge_score=avg_judge,
+        composite_score=round(composite, 1),
+        is_catastrophic_failure=not filter_output_exists,
+        duration_seconds=result.duration_seconds,
+        total_tool_calls=result.total_tool_calls,
+        total_turns=result.total_turns,
+        category_details={
+            "scorer_created": scorer_created,
+            "ran_data_filter": ran_filter,
+            "filter_output_exists": filter_output_exists,
+            "showed_scorer_before_run": showed_scorer,
+            "filter_model_sizes": _model_sizes_used(result, ("run_data_filter",)),
+        },
+        judge_results=[{"artifact": jr.artifact, "score": jr.score, "reasoning": jr.reasoning} for jr in judge_results],
+    )
+
+
+async def score_scorer_validation(
+    result: E2EResult,
+    scenario: Scenario,
+    client: AsyncOpenAI,
+    judge_results: list[JudgeResult],
+) -> BenchmarkScore:
+    """Score the scorer-validation loop (v0.3.1).
+
+    Given an approved draft dataset, the agent must (a) author a scorer from the
+    spec and (b) validate it on the drafts via ``run_scoring(mode="data_quality")``,
+    then inspect scores.parquet. A scorer that was created but never run on real
+    samples is not validated — that is the whole point of the loop.
+    """
+    artifacts = result.artifacts
+
+    scorer_created = any(
+        p.startswith("evals/scorers/") and p.endswith(".md") for p in artifacts
+    )
+    ran_data_quality = any(
+        t.role == "tool_call"
+        and t.tool_name == "run_scoring"
+        and (t.tool_args or {}).get("mode") == "data_quality"
+        for t in result.transcript
+    )
+    scores_parquet_exists = any(result.project_dir.glob("datasets/*/scores.parquet"))
+    inspected_scores = any(
+        t.role == "tool_call"
+        and t.tool_name in ("read_file", "show_file")
+        and "scores.parquet" in json.dumps(t.tool_args or {})
+        for t in result.transcript
+    )
+    validated = ran_data_quality or scores_parquet_exists
+
+    avg_judge = sum(jr.score for jr in judge_results) / len(judge_results) if judge_results else 0
+
+    composite = (
+        0.35 * (100 if scorer_created else 0)
+        + 0.35 * (100 if validated else 0)
+        + 0.30 * (avg_judge / 10 * 100)
+    )
+
+    return BenchmarkScore(
+        scenario_name=scenario.name,
+        category="scorer_validation",
+        model=result.orchestration_model,
+        completed_without_abort=not result.has_errors(),
+        expected_tools_called=set(scenario.expected_tools).issubset(result.tools_called()),
+        expected_files_exist=all(f in artifacts for f in scenario.expected_files),
+        artifact_judge_score=avg_judge,
+        composite_score=round(composite, 1),
+        is_catastrophic_failure=not (scorer_created and validated),
+        duration_seconds=result.duration_seconds,
+        total_tool_calls=result.total_tool_calls,
+        total_turns=result.total_turns,
+        category_details={
+            "scorer_created": scorer_created,
+            "ran_data_quality_scoring": ran_data_quality,
+            "scores_parquet_exists": scores_parquet_exists,
+            "inspected_scores": inspected_scores,
+            "judge_model_sizes": _model_sizes_used(result, ("run_scoring",)),
+        },
+        judge_results=[{"artifact": jr.artifact, "score": jr.score, "reasoning": jr.reasoning} for jr in judge_results],
+    )
+
+
+async def score_auto_mode(
+    result: E2EResult,
+    scenario: Scenario,
+    client: AsyncOpenAI,
+    judge_results: list[JudgeResult],
+) -> BenchmarkScore:
+    """Score an auto-mode run (no user).
+
+    The hard auto-mode rules (auto/SKILL.md): never call ``ask_user``, always
+    terminate via ``exit_auto_mode(status, reason)``, and report stage
+    transitions with ``set_auto_stage``. These scenarios seed a near-complete
+    project so the correct terminal action is reachable cheaply; the goal is to
+    test the control loop, not to run a full multi-hour pipeline.
+    """
+    tool_calls = result.tool_calls
+
+    called_ask_user = any(t.tool_name == "ask_user" for t in tool_calls)
+    exit_calls = [t for t in tool_calls if t.tool_name == "exit_auto_mode"]
+    called_exit = len(exit_calls) > 0
+    exit_status = (exit_calls[-1].tool_args or {}).get("status") if exit_calls else None
+    used_set_auto_stage = any(t.tool_name == "set_auto_stage" for t in tool_calls)
+    # The seeded state already has a winning checkpoint, so kicking off a fresh
+    # training run is wasted compute rather than the correct terminal action.
+    started_training = any(t.tool_name == "start_training" for t in tool_calls)
+
+    expected_status = scenario.judge_criteria.strip() or "success"
+    correct_terminal = called_exit and exit_status == expected_status
+
+    composite = (
+        0.50 * (100 if correct_terminal else (50 if called_exit else 0))
+        + 0.20 * (0 if called_ask_user else 100)
+        + 0.15 * (100 if used_set_auto_stage else 0)
+        + 0.15 * (0 if started_training else 100)
+    )
+
+    # Auto mode is catastrophic if it never terminated cleanly or it broke the
+    # cardinal rule and asked a (non-existent) user.
+    is_catastrophic = (not called_exit) or called_ask_user
+
+    return BenchmarkScore(
+        scenario_name=scenario.name,
+        category="auto_mode",
+        model=result.orchestration_model,
+        completed_without_abort=not result.has_errors(),
+        expected_tools_called=set(scenario.expected_tools).issubset(result.tools_called()),
+        expected_files_exist=all(f in result.artifacts for f in scenario.expected_files),
+        artifact_judge_score=0,
+        composite_score=round(composite, 1),
+        is_catastrophic_failure=is_catastrophic,
+        duration_seconds=result.duration_seconds,
+        total_tool_calls=result.total_tool_calls,
+        total_turns=result.total_turns,
+        category_details={
+            "called_exit_auto_mode": called_exit,
+            "exit_status": exit_status,
+            "expected_status": expected_status,
+            "correct_terminal": correct_terminal,
+            "called_ask_user": called_ask_user,
+            "used_set_auto_stage": used_set_auto_stage,
+            "started_redundant_training": started_training,
+        },
+        judge_results=[],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -909,10 +1208,13 @@ CATEGORY_SCORERS = {
     "spec_capture": score_spec_capture,
     "spec_generation": score_spec_generation,
     "datagen_pipeline": score_datagen_pipeline,
+    "data_filtering": score_data_filtering,
+    "scorer_validation": score_scorer_validation,
     "error_recovery": score_error_recovery,
     "next_steps": score_next_steps,
     "edit": score_edit,
     "context_management": score_context_management,
+    "auto_mode": score_auto_mode,
 }
 
 

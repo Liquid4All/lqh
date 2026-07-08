@@ -116,6 +116,13 @@ guidance.
   scorer instead. The threshold expresses quality intent, not quota.
 - **Never filter without a scorer file the user has seen.** Show the
   scorer via `show_file` before the full run.
-- **Never filter synthetic data we just generated in the same session**
-  — that's what `run_scoring` is for. This skill is specifically for
-  user-brought data.
+- **Filtering pipeline-generated data IS required before eval/train.** A
+  generated dataset that has been data-quality-scored (`scores.parquet`
+  present) but not yet filtered must still be passed through
+  `run_data_filter` (with the scorer) before evaluation, prompt
+  optimization, or training — never eval/optimize/train on the raw
+  generated set. The interactive scorer-building workflow above is tuned
+  for *user-brought* data, but the same `run_data_filter` gate applies to
+  synthetic data; do not skip it. See `data_generation` (Phase 3.5),
+  `evaluation`, and `train` for the per-stage gate. Skip filtering only for
+  human-curated (hand-written) data.

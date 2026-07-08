@@ -1,0 +1,225 @@
+{
+  "scenario": "bench_spec_capture_already_detailed",
+  "description": "You are a user who has already thought everything through. Your initial message contains all requirements. You get mildly annoyed if the agent asks questions about things you already stated.\n\nBehavior rules:\n- If the agent asks about something already in your initial message, say 'I already specified that in my first message'\n- If the agent asks a genuinely new question not covered in the initial message, answer helpfully\n- When asked about examples, say 'the examples in my message should be enough'\n- When offered next steps after spec creation, say 'I'm done for now'",
+  "orchestration_model": "orchestration:1",
+  "context_stats": {
+    "turns": 11,
+    "total_prompt_tokens": 215423,
+    "total_completion_tokens": 3766,
+    "total_tokens": 219189,
+    "peak_prompt_tokens": 22930,
+    "avg_prompt_tokens": 19583,
+    "compactions": 0
+  },
+  "pipeline_attempts": {
+    "total": 0,
+    "failed": 0,
+    "succeeded": 0
+  },
+  "duration_seconds": 129.31,
+  "total_turns": 2,
+  "total_tool_calls": 9,
+  "skills_loaded": [],
+  "errors": [],
+  "tools_called": [
+    "ask_user",
+    "create_file",
+    "read_file",
+    "show_file"
+  ],
+  "artifacts": {
+    "SPEC.md": "# Specification: Customer Support Ticket Classification\n\n## Overview\n\nThis model classifies customer support tickets into predefined categories and priority levels. The task is to analyze plain text support tickets and output structured JSON containing the ticket category, priority level, confidence score, and a brief reasoning explanation. This enables automated ticket routing and prioritization in customer support workflows.\n\n## Input Format\n\n- **Type**: Plain text customer support ticket\n- **Domain**: Customer support / help desk\n- **Typical length**: 1-10 sentences\n- **Language(s)**: English (initially), designed to be extensible to other languages\n- **Preprocessing**: None required - raw ticket text as received\n\nInput is unstructured natural language describing a customer issue, question, or request.\n\n## Output Format\n\n- **Type**: JSON object\n- **Structure**: \n  ```json\n  {\n    \"category\": \"billing | technical | account | shipping | general\",\n    \"priority\": \"low | medium | high | urgent\",\n    \"confidence\": 0.0-1.0,\n    \"reasoning\": \"single sentence explaining key trigger words\"\n  }\n  ```\n- **Typical length**: Single JSON object (compact, ~100-200 characters)\n- **Reasoning**: Model must include a `reasoning` field with a single sentence explanation\n\n## Requirements\n\n1. The model MUST output valid JSON with exactly four fields: `category`, `priority`, `confidence`, and `reasoning`.\n2. The model MUST select `category` from exactly these five values: `billing`, `technical`, `account`, `shipping`, `general`.\n3. The model MUST select `priority` from exactly these four values: `low`, `medium`, `high`, `urgent`.\n4. The model MUST assign `confidence` as a float between 0.0 and 1.0.\n5. The model MUST provide `reasoning` as a single sentence identifying the key trigger words or phrases that led to the classification.\n6. When a ticket mentions money, refund, or charge, the model SHOULD classify as `billing`.\n7. When a ticket mentions error, crash, or bug, the model SHOULD classify as `technical`.\n8. When a ticket mentions password, login, or access, the model SHOULD classify as `account`.\n9. When a ticket mentions delivery, tracking, or package, the model SHOULD classify as `shipping`.\n10. When a ticket could match multiple categories, the model MUST pick the most specific category based on context.\n11. Priority is `urgent` if the customer mentions legal action or regulatory issues.\n12. Priority is `high` if the customer is clearly frustrated or it's a business-critical issue.\n13. Priority is `medium` for standard requests.\n14. Priority is `low` for informational questions.\n15. For out-of-scope or nonsensical inputs (gibberish, spam), the model MUST classify as `general` with low confidence (< 0.5).\n16. The model MUST NOT hallucinate details not present in the ticket.\n17. The model MUST NOT output any text outside the JSON structure.\n\n## Examples\n\n### Example 1: Billing issue with urgency\n\n**Input:**\n\"I was charged twice for my subscription last month and I want a refund immediately\"\n\n**Expected Output:**\n```json\n{\n  \"category\": \"billing\",\n  \"priority\": \"high\",\n  \"confidence\": 0.95,\n  \"reasoning\": \"The ticket mentions 'charged twice' and 'refund' which are billing keywords, and 'immediately' indicates urgency.\"\n}\n```\n\n### Example 2: Technical issue with standard priority\n\n**Input:**\n\"The app keeps crashing whenever I try to upload a photo. I've tried restarting but it still doesn't work.\"\n\n**Expected Output:**\n```json\n{\n  \"category\": \"technical\",\n  \"priority\": \"medium\",\n  \"confidence\": 0.92,\n  \"reasoning\": \"The ticket mentions 'crashing' and 'doesn't work' which are technical issue keywords.\"\n}\n```\n\n### Example 3: Account access issue with high priority\n\n**Input:**\n\"I cannot login to my account and I need to access my files for a presentation in 2 hours. This is extremely frustrating!\"\n\n**Expected Output:**\n```json\n{\n  \"category\": \"account\",\n  \"priority\": \"high\",\n  \"confidence\": 0.90,\n  \"reasoning\": \"The ticket mentions 'login' and 'access my account' which are account keywords, and customer expresses frustration with time-sensitive need.\"\n}\n```\n\n### Example 4: Shipping inquiry with low priority\n\n**Input:**\n\"Hi, I was wondering when my package will arrive? The tracking shows it's been in transit for 5 days.\"\n\n**Expected Output:**\n```json\n{\n  \"category\": \"shipping\",\n  \"priority\": \"low\",\n  \"confidence\": 0.88,\n  \"reasoning\": \"The ticket mentions 'package' and 'tracking' which are shipping keywords, and is an informational question.\"\n}\n```\n\n### Example 5: Out-of-scope input\n\n**Input:**\n\"asdfkjhsdkfjh random gibberish text here zzz\"\n\n**Expected Output:**\n```json\n{\n  \"category\": \"general\",\n  \"priority\": \"low\",\n  \"confidence\": 0.25,\n  \"reasoning\": \"The input appears to be gibberish with no recognizable support ticket content.\"\n}\n```\n\n## Edge Cases\n\n| Scenario | Expected Behavior |\n|----------|-------------------|\n| Ticket mentions both \"refund\" and \"error\" | Pick most specific based on context - if the error caused the "
+  },
+  "transcript": [
+    {
+      "role": "user",
+      "content": "I need a model that classifies customer support tickets into categories. Here are the exact requirements:\n\nInput: plain text customer support ticket, 1-10 sentences\nOutput: JSON with 'category' (one of: billing, technical, account, shipping, general) and 'priority' (low, medium, high, urgent)\n\nRules:\n- If the ticket mentions money, refund, or charge, it's 'billing'\n- If it mentions error, crash, or bug, it's 'technical'\n- If it mentions password, login, or access, it's 'account'\n- If it mentions delivery, tracking, or package, it's 'shipping'\n- Everything else is 'general'\n- Priority is 'urgent' if the customer mentions legal action or regulatory issues\n- Priority is 'high' if the customer is clearly frustrated or it's a business-critical issue\n- Priority is 'medium' for standard requests\n- Priority is 'low' for informational questions\n\nExample:\nInput: 'I was charged twice for my subscription last month and I want a refund immediately'\nOutput: {\"category\": \"billing\", \"priority\": \"high\"}\n\nPlease create the SPEC.md.",
+      "tool_name": null
+    },
+    {
+      "role": "agent",
+      "content": "Thanks for the detailed requirements! This is a well-structured specification. Before I create the SPEC.md, I have a few quick confirmation questions to make sure I capture everything correctly:\n\n",
+      "tool_name": null
+    },
+    {
+      "role": "tool_call",
+      "content": "ask_user({\"question\": \"Which languages should the model support?\", \"options\": [\"English (only)\", \"English (later extensible to other languages)\", \"English + Spanish + Chinese\", \"EU major (English, French, Germ)",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "ask_user_q",
+      "content": "Which languages should the model support?",
+      "tool_name": null
+    },
+    {
+      "role": "ask_user_a",
+      "content": "English (later extensible to other languages)",
+      "tool_name": null
+    },
+    {
+      "role": "tool_result",
+      "content": "English (later extensible to other languages)",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "tool_call",
+      "content": "ask_user({\"question\": \"What should the model do if a ticket could match multiple categories (e.g., mentions both 'refund' and 'error')?\", \"options\": [\"Pick the first matching rule in priority order (billing > )",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "ask_user_q",
+      "content": "What should the model do if a ticket could match multiple categories (e.g., mentions both 'refund' and 'error')?",
+      "tool_name": null
+    },
+    {
+      "role": "ask_user_a",
+      "content": "Pick the most specific category based on context",
+      "tool_name": null
+    },
+    {
+      "role": "tool_result",
+      "content": "Pick the most specific category based on context",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "tool_call",
+      "content": "ask_user({\"question\": \"How should the model handle tickets that are out of scope or nonsensical (e.g., gibberish, spam, or completely unrelated content)?\", \"options\": [\"Classify as 'general' with 'low' priorit)",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "ask_user_q",
+      "content": "How should the model handle tickets that are out of scope or nonsensical (e.g., gibberish, spam, or completely unrelated content)?",
+      "tool_name": null
+    },
+    {
+      "role": "ask_user_a",
+      "content": "Classify as 'general' but add a confidence flag",
+      "tool_name": null
+    },
+    {
+      "role": "tool_result",
+      "content": "Classify as 'general' but add a confidence flag",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "tool_call",
+      "content": "ask_user({\"question\": \"Should the JSON output include any additional fields beyond 'category' and 'priority'?\", \"options\": [\"No, just category and priority\", \"Add a 'confidence' score (0-1)\", \"Add a 'reasoning)",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "ask_user_q",
+      "content": "Should the JSON output include any additional fields beyond 'category' and 'priority'?",
+      "tool_name": null
+    },
+    {
+      "role": "ask_user_a",
+      "content": "Add both confidence and reasoning",
+      "tool_name": null
+    },
+    {
+      "role": "tool_result",
+      "content": "Add both confidence and reasoning",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "tool_call",
+      "content": "ask_user({\"question\": \"For the 'reasoning' field, what format should it take?\", \"options\": [\"A single sentence explaining the key trigger words\", \"A brief bullet list of matching criteria\", \"A short paragraph )",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "ask_user_q",
+      "content": "For the 'reasoning' field, what format should it take?",
+      "tool_name": null
+    },
+    {
+      "role": "ask_user_a",
+      "content": "A single sentence explaining the key trigger words",
+      "tool_name": null
+    },
+    {
+      "role": "tool_result",
+      "content": "A single sentence explaining the key trigger words",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "agent",
+      "content": "Let me confirm my understanding before creating the spec:\n\n**Summary of requirements:**\n- **Task**: Classify customer support tickets into category + priority\n- **Input**: Plain text ticket (1-10 sentences), English (extensible later)\n- **Output**: JSON with 4 fields:\n  - `category`: billing | technical | account | shipping | general\n  - `priority`: low | medium | high | urgent\n  - `confidence`: 0-1 score\n  - `reasoning`: single sentence explaining key trigger words\n- **Category rules**: billing (money/refund/charge), technical (error/crash/bug), account (password/login/access), shipping (delivery/tracking/package), general (else)\n- **Priority rules**: urgent (legal/regulatory), high (frustrated/business-critical), medium (standard), low (informational)\n- **Edge cases**: \n  - Multiple category matches → pick most specific based on context\n  - Out-of-scope/nonsensical → classify as 'general' with low confidence\n- **Example**: `{\"category\": \"billing\", \"priority\": \"high\"}` for double-charge refund request\n\nAnything to add or change before I create the SPEC.md?",
+      "tool_name": null
+    },
+    {
+      "role": "chat_q",
+      "content": "Let me confirm my understanding before creating the spec:\n\n**Summary of requirements:**\n- **Task**: Classify customer support tickets into category + priority\n- **Input**: Plain text ticket (1-10 sentences), English (extensible later)\n- **Output**: JSON with 4 fields:\n  - `category`: billing | technical | account | shipping | general\n  - `priority`: low | medium | high | urgent\n  - `confidence`: 0-1 score\n  - `reasoning`: single sentence explaining key trigger words\n- **Category rules**: billing (money/refund/charge), technical (error/crash/bug), account (password/login/access), shipping (delivery/tracking/package), general (else)\n- **Priority rules**: urgent (legal/regulatory), high (frustrated/business-critical), medium (standard), low (informational)\n- **Edge cases**: \n  - Multiple category matches → pick most specific based on context\n  - Out-of-scope/nonsensical → classify as 'general' with low confidence\n- **Example**: `{\"category\": \"billing\", \"priority\": \"high\"}` for double-charge refund request\n\nAnything to add or change before I create the SPEC.md?",
+      "tool_name": null
+    },
+    {
+      "role": "chat_a",
+      "content": "Looks accurate, go ahead and create the spec",
+      "tool_name": null
+    },
+    {
+      "role": "user",
+      "content": "Looks accurate, go ahead and create the spec",
+      "tool_name": null
+    },
+    {
+      "role": "tool_call",
+      "content": "create_file({\"path\": \"SPEC.md\", \"content\": \"# Specification: Customer Support Ticket Classification\\n\\n## Overview\\n\\nThis model classifies customer support tickets into predefined categories and priority levels.)",
+      "tool_name": "create_file"
+    },
+    {
+      "role": "tool_result",
+      "content": "✅ Created SPEC.md (152 lines, 6,762 chars)",
+      "tool_name": "create_file"
+    },
+    {
+      "role": "tool_call",
+      "content": "read_file({\"path\": \"SPEC.md\"})",
+      "tool_name": "read_file"
+    },
+    {
+      "role": "tool_result",
+      "content": "File: SPEC.md (152 lines)\n\n# Specification: Customer Support Ticket Classification\n\n## Overview\n\nThis model classifies customer support tickets into predefined categories and priority levels. The task is to analyze plain text support tickets and output structured JSON containing the ticket category, priority level, confidence score, and a brief reasoning explanation. This enables automated ticket routing and prioritization in customer support workflows.\n\n## Input Format\n\n- **Type**: Plain text c",
+      "tool_name": "read_file"
+    },
+    {
+      "role": "tool_call",
+      "content": "show_file({\"path\": \"SPEC.md\"})",
+      "tool_name": "show_file"
+    },
+    {
+      "role": "tool_result",
+      "content": "[show_file: SPEC.md]",
+      "tool_name": "show_file"
+    },
+    {
+      "role": "tool_result",
+      "content": "Displayed SPEC.md to user (152 lines)\nFirst 50 lines:\n# Specification: Customer Support Ticket Classification\n\n## Overview\n\nThis model classifies customer support tickets into predefined categories and priority levels. The task is to analyze plain text support tickets and output structured JSON containing the ticket category, priority level, confidence score, and a brief reasoning explanation. This enables automated ticket routing and prioritization in customer support workflows.\n\n## Input Forma",
+      "tool_name": "show_file"
+    },
+    {
+      "role": "tool_call",
+      "content": "ask_user({\"question\": \"Here's the spec. What would you like to do next?\", \"options\": [\"Start generating data (recommended)\", \"Edit or refine the spec\", \"I'm done for now\"]})",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "ask_user_q",
+      "content": "Here's the spec. What would you like to do next?",
+      "tool_name": null
+    },
+    {
+      "role": "ask_user_a",
+      "content": "I'm done for now",
+      "tool_name": null
+    },
+    {
+      "role": "tool_result",
+      "content": "I'm done for now",
+      "tool_name": "ask_user"
+    },
+    {
+      "role": "agent",
+      "content": "Perfect! I've created a comprehensive `SPEC.md` for your customer support ticket classification model. The spec includes:\n\n✅ **Task definition**: JSON classification with category, priority, confidence, and reasoning\n✅ **5 categories**: billing, technical, account, shipping, general\n✅ **4 priority levels**: low, medium, high, urgent\n✅ **Clear rules** for category assignment and priority determination\n✅ **5 concrete examples** covering different scenarios\n✅ **Edge case handling** for ambiguous inputs, gibberish, mixed signals, etc.\n✅ **Quality criteria** for evaluation\n\n**When you're ready to continue**, the next step will be **data generation** (`/datagen`), where we'll:\n1. Create a data generation pipeline based on this spec\n2. Generate ~10-20 draft samples for you to review\n3. Iterate on the samples until they look right\n4. Create evaluation/scoring criteria\n5. Generate a full validation set (100-500 samples)\n\nJust say \"let's start data generation\" or `/datagen` when you're ready to proceed. Good luck with your project! 🚀",
+      "tool_name": null
+    }
+  ]
+}

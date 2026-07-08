@@ -52,26 +52,33 @@ def _coerce_judge_payload(data: object) -> tuple[int, str]:
     zero-out a benchmark score via an ``AttributeError: 'float' object has
     no attribute 'get'`` down the line.
     """
+    # The judge scores on a 0-10 scale. Clamp every parsed value into that
+    # range: a model occasionally emits a wildly out-of-range bare number
+    # (e.g. "1" followed by hundreds of zeros), which would otherwise poison
+    # artifact_judge_score -> composite_score and every downstream average.
+    def _clamp(raw: object) -> int:
+        try:
+            return max(0, min(10, int(float(raw))))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
     # Normal case: JSON object with the expected keys.
     if isinstance(data, dict):
-        raw_score = data.get("score", 0)
-        try:
-            score = int(raw_score)
-        except (TypeError, ValueError):
-            score = 0
+        score = _clamp(data.get("score", 0))
         reasoning = str(data.get("reasoning", ""))
         return score, reasoning
 
     # Model returned a bare number ("7", 7.5, etc.) — treat it as the score.
     if isinstance(data, (int, float)):
-        return int(data), "(judge returned bare number instead of JSON object)"
+        return _clamp(data), "(judge returned bare number instead of JSON object)"
 
     # Model returned a string — try to coerce, otherwise fall through to 0.
     if isinstance(data, str):
         try:
-            return int(float(data.strip())), f"(judge returned bare string: {data[:120]!r})"
+            float(data.strip())  # validate it parses
         except (TypeError, ValueError):
             return 0, f"(judge returned unparseable string: {data[:200]!r})"
+        return _clamp(data.strip()), f"(judge returned bare string: {data[:120]!r})"
 
     # Model returned a list or something else — give up but record the shape.
     return 0, f"(judge returned unexpected type {type(data).__name__}: {str(data)[:200]!r})"
@@ -116,7 +123,7 @@ async def judge_artifacts(
     for path, content in judgeable.items():
         try:
             response = await client.chat.completions.create(
-                model="judge:medium",
+                model="judge:large",
                 messages=[
                     {
                         "role": "system",

@@ -195,7 +195,191 @@ SPEC_GEN_TOOL_CALLING = Scenario(
 )
 
 
+# ---------------------------------------------------------------------------
+# Planted conversation: Summarization task
+# ---------------------------------------------------------------------------
+
+_SUMMARIZATION_CONVERSATION = """\
+# Prior Conversation Transcript
+
+**Turn 1 - User**: I want a model that summarizes customer support email threads for our agents.
+
+**Turn 2 - Agent**: What should the summary contain?
+
+**Turn 3 - User**: Three things: a one-sentence TL;DR, the customer's main issue, and whether the issue is resolved or still open.
+
+**Turn 4 - Agent**: What's the input?
+
+**Turn 5 - User**: The full email thread - could be 2 to 20 messages back and forth. Each message is labeled with who sent it (customer or agent).
+
+**Turn 6 - Agent**: What output format do you want?
+
+**Turn 7 - User**: JSON with keys: tldr (string), issue (string), status (one of "resolved", "open", "needs_followup"). Status must be exactly one of those three values.
+
+**Turn 8 - Agent**: How long should the TL;DR and issue fields be?
+
+**Turn 9 - User**: TL;DR is one sentence, max 25 words. The issue description can be up to 3 sentences. Keep it factual, no marketing language.
+
+**Turn 10 - Agent**: Should it handle threads in other languages?
+
+**Turn 11 - User**: Yes, the thread could be in English or German, but the summary itself should always be written in English.
+
+**Turn 12 - Agent**: Any edge cases to handle?
+
+**Turn 13 - User**: A couple. If the thread is just spam or has no real support issue, set issue to "no_issue" and status to "resolved". And never include any personal data like full credit card numbers in the summary - mask them if they appear.
+
+**Turn 14 - Agent**: Anything about tone or audience?
+
+**Turn 15 - User**: The reader is an internal support agent, so be concise and direct. No need for greetings or sign-offs in the summary.
+"""
+
+# Requirements:
+# REQ-1: Summary contains TL;DR, main issue, and resolution status
+# REQ-2: Input is a labeled multi-message email thread (2-20 messages)
+# REQ-3: JSON output: tldr, issue, status
+# REQ-4: status is exactly one of resolved/open/needs_followup
+# REQ-5: TL;DR <= 25 words / one sentence; issue <= 3 sentences; factual
+# REQ-6: Input English or German; summary always in English
+# REQ-7: Spam/no-issue -> issue="no_issue", status="resolved"
+# REQ-8: Mask personal data (e.g. credit card numbers)
+# REQ-9: Concise internal-agent tone, no greetings/sign-offs
+
+SPEC_GEN_SUMMARIZATION = Scenario(
+    name="bench_spec_gen_summarization",
+    description=(
+        "You are a user who already discussed a support-email summarization task. "
+        "The transcript is in prior_conversation.md. You want the agent to create "
+        "SPEC.md from it.\n\n"
+        "Behavior rules:\n"
+        "- If the agent asks to clarify something from the conversation, answer briefly\n"
+        "- If the agent asks about something NOT in the conversation, say 'that's not "
+        "needed, just use what's in the conversation'\n"
+        "- When shown the SPEC.md, check it briefly and say 'looks good' or point out "
+        "if something obvious is missing\n"
+        "- When offered next steps, say 'I'm done for now'"
+    ),
+    initial_message=(
+        "I've been discussing a support-email summarization task. The transcript is "
+        "at prior_conversation.md. Please read it and create SPEC.md based on "
+        "everything we discussed."
+    ),
+    expected_tools=["read_file", "create_file"],
+    expected_files=["SPEC.md"],
+    judge_criteria=(
+        "Check the SPEC.md against these requirements from the conversation:\n"
+        "1. Summary contains TL;DR, main issue, and resolution status\n"
+        "2. Input is a labeled multi-message email thread (2-20 messages)\n"
+        "3. JSON output with keys tldr, issue, status\n"
+        "4. status is exactly one of resolved/open/needs_followup\n"
+        "5. TL;DR <= 25 words (one sentence); issue <= 3 sentences; factual\n"
+        "6. Input may be English or German; summary always in English\n"
+        "7. Spam/no real issue -> issue='no_issue', status='resolved'\n"
+        "8. Mask personal data such as credit card numbers\n"
+        "9. Concise internal-agent tone, no greetings/sign-offs\n\n"
+        "Score: count how many of these 9 requirements are captured.\n"
+        "10 = all 9, 7 = 6-7, 5 = 4-5, 3 = 2-3, 1 = 0-1"
+    ),
+    max_turns=15,
+    stage_limits={"spec_capture": 12},
+    seed_fn=lambda project_dir: Path(project_dir / "prior_conversation.md").write_text(
+        _SUMMARIZATION_CONVERSATION, encoding="utf-8"
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Planted conversation: Content moderation task
+# ---------------------------------------------------------------------------
+
+_MODERATION_CONVERSATION = """\
+# Prior Conversation Transcript
+
+**Turn 1 - User**: We need a content moderation model for user-generated comments on our forum.
+
+**Turn 2 - Agent**: What categories of harmful content should it detect?
+
+**Turn 3 - User**: Four: harassment, hate_speech, sexual_content, and self_harm. A comment can match more than one.
+
+**Turn 4 - Agent**: So it's multi-label?
+
+**Turn 5 - User**: Yes, multi-label. Output a JSON object with each of the four categories mapped to true or false. All four keys must always be present.
+
+**Turn 6 - Agent**: Do you also need an overall action?
+
+**Turn 7 - User**: Good point - yes. Add an "action" field that is one of: allow, flag_for_review, or remove. If self_harm is true, the action must always be flag_for_review regardless of anything else, because we want a human to reach out.
+
+**Turn 8 - Agent**: What about borderline cases?
+
+**Turn 9 - User**: Mild profanity on its own is NOT harassment or hate_speech - allow it. Only flag profanity when it's directed at a person or group. And quoting someone else's hateful comment to criticize it should not be labeled hate_speech.
+
+**Turn 10 - Agent**: What languages?
+
+**Turn 11 - User**: English and Spanish comments. The category labels stay in English.
+
+**Turn 12 - Agent**: Any input constraints?
+
+**Turn 13 - User**: Comments are short, up to 1000 characters. If a comment is empty or just whitespace, return all four categories false and action allow.
+
+**Turn 14 - Agent**: Should it explain its decisions?
+
+**Turn 15 - User**: Yes - include a short "reason" string (max one sentence) explaining the most severe label, or "clean" if nothing was flagged.
+"""
+
+# Requirements:
+# REQ-1: 4 categories: harassment, hate_speech, sexual_content, self_harm
+# REQ-2: Multi-label; all four keys always present (bool each)
+# REQ-3: "action" field: allow / flag_for_review / remove
+# REQ-4: self_harm true -> action must be flag_for_review
+# REQ-5: Mild standalone profanity is allowed; only directed profanity flagged
+# REQ-6: Quoting hateful content to criticize is not hate_speech
+# REQ-7: English + Spanish input; labels in English
+# REQ-8: Up to 1000 chars; empty/whitespace -> all false + action allow
+# REQ-9: "reason" string (<= one sentence) or "clean"
+
+SPEC_GEN_MODERATION = Scenario(
+    name="bench_spec_gen_moderation",
+    description=(
+        "You are a user who already discussed a content-moderation task. The "
+        "transcript is in prior_conversation.md. You want the agent to create "
+        "SPEC.md from it.\n\n"
+        "Behavior rules:\n"
+        "- If the agent asks to clarify something from the conversation, answer briefly\n"
+        "- If the agent asks about something NOT in the conversation, say 'stick to "
+        "what we discussed'\n"
+        "- When shown the SPEC.md, say 'looks good' or point out an obvious gap\n"
+        "- When offered next steps, say 'I'm done for now'"
+    ),
+    initial_message=(
+        "The conversation transcript for my content-moderation model is at "
+        "prior_conversation.md. Please read it and create SPEC.md."
+    ),
+    expected_tools=["read_file", "create_file"],
+    expected_files=["SPEC.md"],
+    judge_criteria=(
+        "Check the SPEC.md against these requirements from the conversation:\n"
+        "1. Four categories: harassment, hate_speech, sexual_content, self_harm\n"
+        "2. Multi-label; all four keys always present as booleans\n"
+        "3. 'action' field: allow / flag_for_review / remove\n"
+        "4. self_harm true forces action=flag_for_review\n"
+        "5. Mild standalone profanity allowed; only directed profanity flagged\n"
+        "6. Quoting hateful content to criticize is not hate_speech\n"
+        "7. English + Spanish input; labels stay in English\n"
+        "8. <=1000 chars; empty/whitespace -> all false + action allow\n"
+        "9. 'reason' string (<= one sentence) or 'clean'\n\n"
+        "Score: count captured out of 9.\n"
+        "10 = all 9, 7 = 6-7, 5 = 4-5, 3 = 2-3, 1 = 0-1"
+    ),
+    max_turns=15,
+    stage_limits={"spec_capture": 12},
+    seed_fn=lambda project_dir: Path(project_dir / "prior_conversation.md").write_text(
+        _MODERATION_CONVERSATION, encoding="utf-8"
+    ),
+)
+
+
 SCENARIOS = [
     SPEC_GEN_NLP_TASK,
     SPEC_GEN_TOOL_CALLING,
+    SPEC_GEN_SUMMARIZATION,
+    SPEC_GEN_MODERATION,
 ]

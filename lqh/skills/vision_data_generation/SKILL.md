@@ -3,6 +3,15 @@
 Turn a user-provided **image folder** into an image-question-answer dataset
 suitable for fine-tuning the LFM2.5-VL vision models.
 
+**Currently the user must supply the images themselves** — typically a local
+folder of raw images. They can be **unlabelled** (no captions, no annotations);
+the data pipeline's job is exactly to take those raw images and synthesize
+structured training data from them: conversational (image-question-answer) turns
+or input-output pairs. If the user has no images, this skill can't proceed —
+ask them to point at a folder. (Future: we may add pulling images from Liquid's
+own image sources so the user doesn't have to bring their own — not available
+today.)
+
 This skill **extends the `data_generation` skill** — load that one too if you
 have not already. All of its rules apply unchanged: the pipeline interface
 (`lqh.pipeline`), one `Pipeline` subclass per file, `@step` retries,

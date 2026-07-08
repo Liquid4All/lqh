@@ -25,6 +25,8 @@ class Scenario:
     max_turns: int = 20  # Safety limit
     stage_limits: dict[str, int] = field(default_factory=dict)  # per-skill turn limits
     seed_fn: Callable | None = None  # async or sync fn(project_dir) to pre-populate before agent starts
+    auto_mode: bool = False  # run the agent in auto mode (no simulated user; agent self-drives to exit_auto_mode)
+    next_step_quality_criteria: str = ""  # next_steps only: targeted judge rubric for the *quality* of the chosen step (e.g. "did it set a system prompt for the zero-shot eval?"). When set, replaces the generic rationale judge in score_next_steps.
 
 
 TRANSLATION_5LANG = Scenario(

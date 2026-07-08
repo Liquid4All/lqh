@@ -400,7 +400,12 @@ class TestSweepOrchestration:
             for line in (run_dir / "progress.jsonl").read_text().splitlines()
         ]
         assert rows[-1]["status"] == "failed"
-        assert "all 1 sweep configs failed" in rows[-1]["error"]
+        err = rows[-1]["error"]
+        assert "no model selected" in err
+        # The message must distinguish a crash (rc != 0) from a collapse and
+        # point at the child's stderr.log.
+        assert "crashed" in err
+        assert "stderr.log" in err
 
     def test_dpo_no_proxy_error_explains_low_preference_yield(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

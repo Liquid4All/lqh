@@ -111,6 +111,12 @@ def _render_markdown(scores: list[BenchmarkScore]) -> str:
                     details = f" (ran={s.category_details.get('pipeline_ran_successfully', False)})"
                 elif s.category == "next_steps":
                     details = f" (expected={s.category_details.get('expected_next_step', '?')}, actual={s.category_details.get('actual_next_step', '?')})"
+                elif s.category == "data_filtering":
+                    details = f" (filtered={s.category_details.get('filter_output_exists', False)}, scorer={s.category_details.get('scorer_created', False)})"
+                elif s.category == "scorer_validation":
+                    details = f" (scorer={s.category_details.get('scorer_created', False)}, validated={s.category_details.get('ran_data_quality_scoring', False)})"
+                elif s.category == "auto_mode":
+                    details = f" (exit={s.category_details.get('exit_status', None)}, ask_user={s.category_details.get('called_ask_user', False)})"
                 lines.append(f"- `{s.category}/{s.scenario_name}`: score={s.composite_score:.0f}{details}")
             lines.append("")
         else:

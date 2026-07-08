@@ -185,7 +185,18 @@ def _render_md(meta: dict[str, Any], results: list[ModelResult]) -> str:
         lines.append("## Notes")
         lines.append("")
         for r, n in noted:
-            lines.append(f"- `{r.task}/{r.model}`: {n}")
+            # Multi-line notes (e.g. a failure carrying a stderr tail) render
+            # as a summary bullet + fenced block so the detail survives intact
+            # instead of being mangled into a one-line list item.
+            if "\n" in n:
+                summary, _, detail = n.partition("\n")
+                lines.append(f"- `{r.task}/{r.model}`: {summary}")
+                lines.append("")
+                lines.append("  ```")
+                lines.extend(f"  {ln}" for ln in detail.splitlines())
+                lines.append("  ```")
+            else:
+                lines.append(f"- `{r.task}/{r.model}`: {n}")
         lines.append("")
 
     timed = [

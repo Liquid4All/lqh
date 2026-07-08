@@ -197,6 +197,13 @@ class TestAutoModeHandlers:
 
 
 class TestStickySystemMessages:
+    def test_default_orchestration_model_is_known_good(
+        self, make_agent: Callable[..., Agent],
+    ) -> None:
+        agent = make_agent()
+
+        assert agent.orchestration_model == "orchestration:12"
+
     def test_auto_mode_injects_skill_as_sticky(self, make_agent: Callable[..., Agent]) -> None:
         agent = make_agent(auto_mode=True)
         assert len(agent.sticky_system_messages) == 1
@@ -349,6 +356,80 @@ class TestAutoModeAgentBehavior:
             and "without a tool call" in (m.get("content") or "").lower()
         ]
         assert nudges == []
+
+    async def test_empty_tool_call_finish_retries_in_interactive_mode(
+        self, scripted_agent: Callable[..., ScriptedAgent],
+    ) -> None:
+        messages: list[str] = []
+
+        async def on_agent_message(content: str) -> None:
+            messages.append(content)
+
+        scripted = scripted_agent(
+            auto_mode=False,
+            responses=[
+                _make_completion(
+                    content="Let me check that right now.",
+                    finish_reason="tool_calls",
+                ),
+                _make_completion(content="Done after retry."),
+            ],
+            callbacks=AgentCallbacks(on_agent_message=on_agent_message),
+        )
+        agent = await scripted.run()
+
+        recovery_messages = [
+            m for m in agent.session.messages
+            if m.get("role") == "user"
+            and "finish_reason='tool_calls'" in (m.get("content") or "")
+            and "no tool_calls payload" in (m.get("content") or "")
+        ]
+        assert len(recovery_messages) == 1
+        assert messages == ["Done after retry."]
+
+    async def test_empty_tool_call_finish_escalates_after_retries(
+        self, scripted_agent: Callable[..., ScriptedAgent],
+    ) -> None:
+        messages: list[str] = []
+
+        async def on_agent_message(content: str) -> None:
+            messages.append(content)
+
+        scripted = scripted_agent(
+            auto_mode=False,
+            responses=[
+                _make_completion(
+                    content="Let me check that right now.",
+                    finish_reason="tool_calls",
+                ),
+                _make_completion(
+                    content="Trying the tool again.",
+                    finish_reason="tool_calls",
+                ),
+            ],
+            callbacks=AgentCallbacks(on_agent_message=on_agent_message),
+        )
+        scripted.agent.max_empty_tool_call_retries = 1
+
+        agent = await scripted.run()
+
+        recovery_messages = [
+            m for m in agent.session.messages
+            if m.get("role") == "user"
+            and "finish_reason='tool_calls'" in (m.get("content") or "")
+            and "no tool_calls payload" in (m.get("content") or "")
+        ]
+        assert len(recovery_messages) == 1
+        assert len([
+            m for m in agent.session.messages
+            if m.get("role") == "tool"
+        ]) == 0
+        assert messages == [
+            "❌ Tool-call backend error: the orchestration model repeatedly "
+            "returned finish_reason='tool_calls' but the response contained "
+            "no tool_calls payload, so no tool could be executed. Please "
+            "retry the request or switch orchestration models if this repeats."
+        ]
 
     async def test_set_auto_stage_fires_callback(
         self, scripted_agent: Callable[..., ScriptedAgent],

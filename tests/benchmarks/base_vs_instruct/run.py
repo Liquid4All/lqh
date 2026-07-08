@@ -28,15 +28,19 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
+import shutil
 import time
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lqh.auth import api_root, get_token
 from lqh.client import create_client
 from lqh.engine import run_pipeline
+from lqh.scoring import run_data_filter
 from lqh.subprocess_manager import SubprocessManager
 
 from .eval_local import _await_run, eval_local
@@ -57,11 +61,22 @@ def _suppress_noisy_http_logs() -> None:
 
 # Friendly key -> HuggingFace id. The 350M instruct variant has no -Instruct
 # suffix upstream (see BASE_VS_INSTRUCT.md).
+#
+# The LFM2.5-* rows are the newer generation; the LFM2-* rows are the previous
+# generation, included so the benchmark also answers "how fine-tuneable is the
+# older model vs the newer one?". LFM2 ships only instruct repos (no separately
+# published -Base), so just the two instruct ids are added. NOTE: the two
+# generations may have been saved with different transformers versions (the
+# v4→v5 transition) — ``preflight.py`` verifies every id loads under the
+# installed transformers before the run spends any GPU time.
 MODELS: dict[str, str] = {
     "350M-Instruct": "LiquidAI/LFM2.5-350M",
     "350M-Base": "LiquidAI/LFM2.5-350M-Base",
     "1.2B-Instruct": "LiquidAI/LFM2.5-1.2B-Instruct",
     "1.2B-Base": "LiquidAI/LFM2.5-1.2B-Base",
+    # Previous generation (instruct only) — finetuneability comparison.
+    "LFM2-1.2B": "LiquidAI/LFM2-1.2B",
+    "LFM2-350M": "LiquidAI/LFM2-350M",
 }
 
 # LoRA target modules — mirrors handler/handle_start_training so the sweep
@@ -85,13 +100,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--models", default="",
-        help="comma list of model keys (default: all 4). Keys: "
+        help="comma list of model keys (default: all). Keys: "
         + ", ".join(MODELS),
     )
     p.add_argument(
         "--tasks", default="",
         help="comma list: translation, extraction, classification, "
-        "messy_extraction, style_rewrite (default: all).",
+        "messy_extraction, style_rewrite, voice_satisfaction (default: all).",
     )
     p.add_argument("--train-size", type=int, default=200, help="train samples per task")
     p.add_argument("--eval-size", type=int, default=40, help="eval samples per task")
@@ -121,7 +136,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-resume", action="store_true",
         help="recompute every stage even if outputs exist.",
     )
+    p.add_argument(
+        "--skip-preflight", action="store_true",
+        help="skip the transformers v4/v5 model-compatibility preflight "
+        "(by default each model's config + chat template are verified to load "
+        "under the installed transformers before any GPU time is spent).",
+    )
     p.add_argument("--datagen-concurrency", type=int, default=100)
+    p.add_argument(
+        "--no-filter", action="store_true",
+        help="skip scorer-based quality filtering of generated datasets "
+        "(use raw pipeline output as-is).",
+    )
+    p.add_argument(
+        "--filter-threshold", type=float, default=7.0,
+        help="keep generated samples scoring >= this (0-10) against the task "
+        "scorer; lower scorers are dropped and regenerated. Default 7.0.",
+    )
+    p.add_argument(
+        "--overgen-factor", type=float, default=1.6,
+        help="over-generate by this factor before filtering, to absorb the "
+        "expected drop rate. Default 1.6.",
+    )
     p.add_argument("--max-new-tokens", type=int, default=512, help="eval generation cap")
     p.add_argument(
         "--sweep-timeout", type=float, default=48 * 3600,
@@ -355,10 +391,21 @@ async def _run_sweep(
 ) -> tuple[Path, dict]:
     """Launch a local sweep subprocess, wait for completion, return winner dir."""
     run_dir = workdir / "runs" / run_name
-    model_dir = run_dir / "model"
-    if resume and model_dir.exists() and _status_completed(run_dir):
+    # The sweep materializes its winner under the source dir name: ``model``
+    # for full/merged checkpoints, ``model-lora`` for adapter-only LoRA
+    # winners (see sweep.py:_materialize_best_model / _winner_model_dir).
+    # Accept either so adapter sweeps aren't misreported as failed.
+    def _winner_model_dir() -> Path | None:
+        for name in ("model", "model-lora"):
+            p = run_dir / name
+            if p.exists():
+                return p
+        return None
+
+    existing = _winner_model_dir()
+    if resume and existing is not None and _status_completed(run_dir):
         logger.info("sweep %s: reusing completed winner", run_name)
-        return model_dir, _sweep_timing(run_dir)
+        return existing, _sweep_timing(run_dir)
 
     launch = {
         "type": "sweep",
@@ -371,19 +418,103 @@ async def _run_sweep(
     }
     SubprocessManager().start(run_dir, launch, module="lqh.train.sweep", project_dir=workdir)
     await _await_run(SubprocessManager(), run_dir, timeout=timeout, label=f"sweep:{run_name}")
-    if not model_dir.exists():
+    model_dir = _winner_model_dir()
+    if model_dir is None:
         raise RuntimeError(
-            f"sweep:{run_name} completed but no winner model at {model_dir} "
+            f"sweep:{run_name} completed but no winner model at "
+            f"{run_dir}/(model|model-lora) "
             f"(all configs may have failed/collapsed; see {run_dir}/stderr.log)"
         )
     return model_dir, _sweep_timing(run_dir)
 
 
+async def _generate_filtered_split(
+    *, script_path: Path, scorer_path: Path, target: int, out_dir: Path,
+    client, concurrency: int, threshold: float, overgen_factor: float,
+    label: str, judge_size: str = "small", max_rounds: int = 4,
+) -> None:
+    """Generate a split, score every sample's gold against the task scorer, and
+    keep only samples at/above *threshold*, regenerating until *target* clear.
+
+    Writes ``out_dir/data.parquet`` with exactly *target* high-quality rows.
+    Over-generates by *overgen_factor* up front, then tops up using the
+    observed keep-rate. Raises if it cannot reach *target* within *max_rounds*.
+    """
+    tmp_root = out_dir.parent / f"_filt_tmp_{out_dir.name}"
+    shutil.rmtree(tmp_root, ignore_errors=True)
+    tmp_root.mkdir(parents=True, exist_ok=True)
+
+    kept_tables: list[pa.Table] = []
+    kept = 0
+    total_generated = 0
+    keep_rate = 1.0 / max(overgen_factor, 1.0)  # initial drop-rate estimate
+    for round_i in range(1, max_rounds + 1):
+        if kept >= target:
+            break
+        need = target - kept
+        gen_n = max(need, math.ceil(need / max(keep_rate, 0.05)))
+        # Cap per-round blow-up: if the keep-rate is pathologically low, prefer
+        # failing across rounds with a clear message over one giant round.
+        gen_n = min(gen_n, target * 4)
+        raw_dir = tmp_root / f"raw_{round_i}"
+        filt_dir = tmp_root / f"filt_{round_i}"
+        logger.info(
+            "datagen %s: round %d — generating %d (need %d more) ...",
+            label, round_i, gen_n, need,
+        )
+        gen = await run_pipeline(
+            script_path=script_path, num_samples=gen_n, output_dir=raw_dir,
+            client=client, concurrency=concurrency,
+        )
+        fr = await run_data_filter(
+            input_path=raw_dir / "data.parquet", scorer_path=scorer_path,
+            output_dataset_dir=filt_dir, client=client,
+            threshold=threshold, model_size=judge_size, concurrency=concurrency,
+        )
+        kept_tbl = pq.read_table(filt_dir / "data.parquet")
+        total_generated += gen.succeeded
+        if kept_tbl.num_rows:
+            kept_tables.append(kept_tbl)
+            kept += kept_tbl.num_rows
+        observed = (kept_tbl.num_rows / gen.succeeded) if gen.succeeded else 0.0
+        if observed > 0:
+            keep_rate = max(0.05, observed)
+        logger.info(
+            "datagen %s: round %d kept %d/%d (rate=%.2f, mean=%.2f); total %d/%d",
+            label, round_i, kept_tbl.num_rows, gen.succeeded, observed,
+            fr.mean_score, kept, target,
+        )
+
+    if kept < target:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        raise RuntimeError(
+            f"datagen {label}: only {kept}/{target} samples cleared the "
+            f"score>={threshold} filter after {max_rounds} rounds. Lower "
+            "--filter-threshold or raise --overgen-factor."
+        )
+
+    full = pa.concat_tables(kept_tables).slice(0, target)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(full, out_dir / "data.parquet")
+    shutil.rmtree(tmp_root, ignore_errors=True)
+    logger.info(
+        "datagen %s: wrote %d filtered rows (generated %d, kept %d, drop %d)",
+        label, target, total_generated, kept, total_generated - kept,
+    )
+
+
 async def _ensure_datasets(
     *, workdir: Path, task: Task, train_size: int, eval_size: int,
     client, concurrency: int, resume: bool,
+    filter_threshold: float | None, overgen_factor: float,
+    judge_size: str = "small",
 ) -> tuple[str, str, str]:
     """Generate train + eval datasets for a task (once, shared by all models).
+
+    When *filter_threshold* is not None, each split is over-generated and then
+    scorer-filtered (keep score >= threshold) down to the exact target count;
+    otherwise the raw pipeline output is used as-is.
+
     Returns (dataset_rel, eval_rel, scorer_rel) — paths relative to workdir."""
     scorer_rel = f"scorers/{task.name}.md"
     scorer_path = workdir / scorer_rel
@@ -400,24 +531,38 @@ async def _ensure_datasets(
         if resume and _dataset_ready(data_parquet, n):
             logger.info("datagen %s: reusing %d rows", rel, n)
             continue
-        logger.info("datagen %s: generating %d samples ...", rel, n)
-        res = await run_pipeline(
-            script_path=task.pipeline_path,
-            num_samples=n,
-            output_dir=out_dir,
-            client=client,
-            concurrency=concurrency,
-        )
+
+        if filter_threshold is None:
+            logger.info("datagen %s: generating %d samples (no filter) ...", rel, n)
+            res = await run_pipeline(
+                script_path=task.pipeline_path,
+                num_samples=n,
+                output_dir=out_dir,
+                client=client,
+                concurrency=concurrency,
+            )
+            logger.info(
+                "datagen %s: %d ok / %d failed", rel, res.succeeded, res.failed,
+            )
+        else:
+            await _generate_filtered_split(
+                script_path=task.pipeline_path,
+                scorer_path=scorer_path,
+                target=n,
+                out_dir=out_dir,
+                client=client,
+                concurrency=concurrency,
+                threshold=filter_threshold,
+                overgen_factor=overgen_factor,
+                judge_size=judge_size,
+                label=rel,
+            )
+
         rows = _dataset_rows(data_parquet) or 0
-        logger.info(
-            "datagen %s: %d ok / %d failed; parquet rows=%d/%d",
-            rel, res.succeeded, res.failed, rows, n,
-        )
         if rows < n:
             raise RuntimeError(
-                f"datagen produced only {rows}/{n} rows for {rel} "
-                f"({res.succeeded} ok / {res.failed} failed). Refusing to run "
-                "a benchmark on a partial dataset."
+                f"datagen produced only {rows}/{n} rows for {rel}. Refusing to "
+                "run a benchmark on a partial dataset."
             )
 
     return (
@@ -500,8 +645,14 @@ async def _run_model_on_task(
         dpo_dataset_rel = _ensure_dpo_dataset(workdir, task, dpo_size, resume=resume)
         dpo_model, dpo_timing = await _run_sweep(
             workdir=workdir, run_name=f"{tag}__dpo",
+            # Use the SFT winner's actual materialized path — it may be a
+            # merged ``model`` dir OR an adapter-only ``model-lora`` dir
+            # (SFT trains LoRA with merge=False). Hardcoding ``model`` here
+            # made every DPO config crash on load when the winner was an
+            # adapter. load_for_training(merge_before_attach=True) consumes
+            # either layout (dpo.py).
             base_config=_base_config(
-                run_type="on_policy_dpo", base_model=f"runs/{tag}__sft/model",
+                run_type="on_policy_dpo", base_model=str(sft_model.resolve()),
                 dataset_rel=dpo_dataset_rel, eval_rel=eval_rel, scorer_rel=scorer_rel,
                 train_size=dpo_size),
             grid_size=args.grid_size, timeout=args.sweep_timeout, resume=resume,
@@ -549,12 +700,37 @@ async def _main_async(args: argparse.Namespace) -> int:
     tasks = resolve_tasks([t for t in args.tasks.split(",") if t.strip()] or None)
     resume = not args.no_resume
 
+    # Transformers v4/v5 compatibility preflight. The benchmark mixes model
+    # generations (older LFM2 + newer LFM2.5) that may have been saved with
+    # different transformers versions; verify every id actually loads under the
+    # installed transformers (config + chat template, no weights) BEFORE
+    # spending datagen/GPU time, so an unsupported architecture surfaces here
+    # with an actionable message instead of crashing a sweep child hours in.
+    if not args.skip_preflight:
+        from .preflight import run_preflight
+
+        compat = run_preflight(models)
+        bad = [c for c in compat if not c.ok]
+        if bad:
+            detail = "\n".join(
+                f"  - {c.key} ({c.hf_id}): {'; '.join(c.notes) or c.error or 'incompatible'}"
+                for c in bad
+            )
+            raise SystemExit(
+                "model compatibility preflight failed for "
+                f"{len(bad)} model(s) under the installed transformers:\n{detail}\n"
+                "Upgrade transformers (target >=5,<6), drop the offending "
+                "model(s) from --models, or pass --skip-preflight to override."
+            )
+
     meta = {
         "run_name": run_name, "workdir": str(workdir),
         "train_size": args.train_size, "eval_size": args.eval_size,
         "grid_size": args.grid_size, "judge_size": args.judge_size,
         "skip_dpo": args.skip_dpo or args.dpo_train_size == 0, "compute": "local-gpu",
         "dpo_train_size": min(args.dpo_train_size, args.train_size),
+        "filter_threshold": (None if args.no_filter else args.filter_threshold),
+        "overgen_factor": args.overgen_factor,
         "models": [k for k, _ in models], "tasks": [t.name for t in tasks],
     }
     logger.info("workdir: %s", workdir)
@@ -580,6 +756,9 @@ async def _main_async(args: argparse.Namespace) -> int:
             workdir=workdir, task=task, train_size=args.train_size,
             eval_size=args.eval_size, client=client,
             concurrency=args.datagen_concurrency, resume=resume,
+            filter_threshold=(None if args.no_filter else args.filter_threshold),
+            overgen_factor=args.overgen_factor,
+            judge_size=args.judge_size,
         )
         for model_key, hf_id in models:
             logger.info("=== task=%s model=%s (%s) ===", task.name, model_key, hf_id)
