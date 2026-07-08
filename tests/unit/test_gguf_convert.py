@@ -8,7 +8,6 @@ discovery, and smoke-test gating are pure and must stay correct.
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
 
 import pytest
 

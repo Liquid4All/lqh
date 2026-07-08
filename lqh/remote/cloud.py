@@ -26,7 +26,6 @@ import asyncio
 import json
 import logging
 import os
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator

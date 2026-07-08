@@ -32,7 +32,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from lqh.config import LqhConfig, config_path, load_config, save_config
+from lqh.config import load_config, save_config
 
 __all__ = [
     "ComputeTarget",

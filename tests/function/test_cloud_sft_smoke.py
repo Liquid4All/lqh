@@ -242,9 +242,9 @@ class TestCloudSftSmoke(unittest.TestCase):
 
         # progress.jsonl: at least one progress row was received
         progress_lines = [
-            json.loads(l) for l in
+            json.loads(line) for line in
             (self._run_dir / "progress.jsonl").read_text().strip().splitlines()
-            if l.strip()
+            if line.strip()
         ]
         self.assertTrue(progress_lines, "progress.jsonl is empty — no events streamed back")
 

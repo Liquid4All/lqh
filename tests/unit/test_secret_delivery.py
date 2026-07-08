@@ -11,7 +11,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
 
 import lqh.agent as agentmod
 from lqh.agent import Agent, AgentCallbacks

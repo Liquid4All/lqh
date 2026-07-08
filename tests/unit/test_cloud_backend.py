@@ -198,7 +198,7 @@ def test_sync_progress_writes_progress_and_status(tmp_path, fake_cloud):
 
     # progress.jsonl has one row per progress event + one terminal status row.
     lines = (run_dir / "progress.jsonl").read_text().strip().splitlines()
-    parsed = [json.loads(l) for l in lines]
+    parsed = [json.loads(line) for line in lines]
     steps = [r.get("step") for r in parsed if "step" in r]
     assert steps == [1, 2]
     assert any(r.get("status") == "completed" for r in parsed)
@@ -273,7 +273,7 @@ def test_disconnect_then_resume_replays_missed_events(tmp_path, fake_cloud):
 
     # progress.jsonl has steps from both phases — no duplicates, in order.
     lines = (run_dir / "progress.jsonl").read_text().strip().splitlines()
-    parsed = [json.loads(l) for l in lines]
+    parsed = [json.loads(line) for line in lines]
     steps = [r.get("step") for r in parsed if "step" in r]
     assert steps == [1, 2, 3], "step rows must be contiguous across the gap"
 

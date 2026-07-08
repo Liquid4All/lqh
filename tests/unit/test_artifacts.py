@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from pathlib import Path
 
 import httpx
 import pytest

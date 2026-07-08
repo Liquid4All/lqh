@@ -18,7 +18,6 @@ from pathlib import Path
 
 import pytest
 
-import lqh.config as lqh_config
 import lqh.remote.compute as compute
 import lqh.remote.config as remote_config
 

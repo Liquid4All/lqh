@@ -16,6 +16,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from lqh.train.vlm_data import (
+    VLMCollator,
+    chatml_to_vlm_dataset,
+    conversation_has_images,
+    decode_image,
+    split_image_parts,
+    vlm_generate,
+)
+
 try:
     import torch  # noqa: F401
 
@@ -25,15 +34,6 @@ except ImportError:
 
 requires_torch = pytest.mark.skipif(
     not _HAS_TORCH, reason="requires torch (pip install lqh[train])"
-)
-
-from lqh.train.vlm_data import (
-    VLMCollator,
-    chatml_to_vlm_dataset,
-    conversation_has_images,
-    decode_image,
-    split_image_parts,
-    vlm_generate,
 )
 
 

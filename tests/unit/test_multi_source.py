@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Callable
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq

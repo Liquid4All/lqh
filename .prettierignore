@@ -1,1 +1,3 @@
-tests/e2e/reports/
+tests/harness/reports/
+tests/benchmarks/orchestration/results/
+tests/experiments/projects/*/runs/

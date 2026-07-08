@@ -22,7 +22,6 @@ from datasets import Dataset
 from peft import LoraConfig, PeftModel
 from transformers import (
     AutoModelForCausalLM,
-    AutoTokenizer,
     TrainerCallback,
     TrainerControl,
     TrainerState,

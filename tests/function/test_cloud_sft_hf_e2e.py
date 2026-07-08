@@ -435,9 +435,9 @@ class TestCloudSftHFE2E(unittest.TestCase):
 
         # ---- 3. progress + training step rows ----
         progress_lines = [
-            json.loads(l) for l in
+            json.loads(line) for line in
             (self._run_dir / "progress.jsonl").read_text().strip().splitlines()
-            if l.strip()
+            if line.strip()
         ]
         self.assertTrue(progress_lines, "progress.jsonl is empty")
         step_rows = [r for r in progress_lines if "step" in r and "status" not in r]

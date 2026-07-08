@@ -23,7 +23,6 @@ Each sample is a 3-message ChatML conversation:
 
 from __future__ import annotations
 
-import math
 import random
 import re
 

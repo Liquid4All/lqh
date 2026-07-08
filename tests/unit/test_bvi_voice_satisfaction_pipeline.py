@@ -10,7 +10,6 @@ pure compatibility decision so the model-mix guard can be trusted offline.
 
 from __future__ import annotations
 
-import json
 
 import pytest
 

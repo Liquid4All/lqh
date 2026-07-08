@@ -23,7 +23,6 @@ import json
 from contextlib import redirect_stdout
 from pathlib import Path
 
-import pytest
 
 from lqh.train import progress
 
@@ -121,7 +120,7 @@ def test_sentinel_wire_format_one_line(tmp_path: Path, monkeypatch):
         )
 
     sentinel_lines = [
-        l for l in buf.getvalue().splitlines() if l.startswith(SENTINEL_PREFIX)
+        line for line in buf.getvalue().splitlines() if line.startswith(SENTINEL_PREFIX)
     ]
     assert len(sentinel_lines) == 1, f"expected one sentinel line, got {sentinel_lines!r}"
     # The line itself must parse cleanly after the prefix.
