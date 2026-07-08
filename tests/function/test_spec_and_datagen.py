@@ -1,9 +1,9 @@
-"""E2E test: Data generation + evaluation — seeded translation spec
+"""E2E test: Spec capture + data generation — sentiment classification
 
 Usage:
-    python -m tests.e2e.test_datagen_and_eval
-    python -m tests.e2e.test_datagen_and_eval orchestration:12
-    python -m tests.e2e.test_datagen_and_eval orchestration:12 --timeout=600
+    python -m tests.function.test_spec_and_datagen
+    python -m tests.function.test_spec_and_datagen orchestration:12
+    python -m tests.function.test_spec_and_datagen orchestration:12 --timeout=600
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import unittest
 from tests.harness.harness import E2EHarness
 from tests.harness.judge import judge_artifacts
 from tests.harness.report import generate_report
-from tests.harness.scenarios import DATAGEN_AND_EVAL_TRANSLATION
+from tests.harness.scenarios import SPEC_AND_DATAGEN_SENTIMENT
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ def _has_api_access() -> bool:
 
 def _run_e2e(model: str, timeout: int) -> None:
     """Run the E2E test with report generation on any exit (success, failure, kill)."""
-    harness = E2EHarness(DATAGEN_AND_EVAL_TRANSLATION, orchestration_model=model)
+    harness = E2EHarness(SPEC_AND_DATAGEN_SENTIMENT, orchestration_model=model)
     result = None
     start = time.time()
 
@@ -88,27 +88,31 @@ def _run_e2e(model: str, timeout: int) -> None:
 
 
 @unittest.skipUnless(_has_api_access(), "No API access (set LQH_DEBUG_API_KEY or run /login)")
-class TestDatagenAndEvalE2E(unittest.TestCase):
-    """End-to-end test for data generation + evaluation — seeded translation spec."""
+class TestSpecAndDatagenE2E(unittest.TestCase):
+    """End-to-end test for spec capture + data generation — sentiment classification."""
 
-    def test_datagen_and_eval(self) -> None:
-        """Run data generation + evaluation for the seeded translation task."""
+    def test_spec_and_datagen(self) -> None:
+        """Run spec capture + data generation for the sentiment classification task."""
         result = _run_e2e(_ORCHESTRATION_MODEL, _TIMEOUT_SECONDS)
 
         # --- Heuristic checks ---
         tools = result.tools_called()
-        self.assertIn("run_data_gen_pipeline", tools, "Agent never ran a data gen pipeline")
+        self.assertIn("ask_user", tools, "Agent never asked the user anything")
+        self.assertIn("create_file", tools, "Agent never created any files")
 
         artifacts = result.artifacts
+        self.assertIn("SPEC.md", artifacts, "SPEC.md was not created")
+
+        spec = artifacts["SPEC.md"].lower()
+        self.assertTrue(
+            "sentiment" in spec or "positive" in spec or "negative" in spec,
+            f"SPEC.md doesn't mention sentiment/positive/negative: {spec[:200]}",
+        )
 
         pipeline_created = any(k.startswith("data_gen/") for k in artifacts)
         self.assertTrue(pipeline_created, "No data_gen/ pipeline was created")
 
-        dataset_created = any(k.startswith("datasets/") for k in artifacts)
-        self.assertTrue(dataset_created, "No datasets/ output was created")
-
-        eval_created = any(k.startswith("evals/") for k in artifacts)
-        self.assertTrue(eval_created, "No evals/ scorer or eval run was created")
+        self.assertIn("run_data_gen_pipeline", tools, "Agent never ran a data gen pipeline")
 
         critical_errors = [e for e in result.errors if "Internal error" in e]
         self.assertEqual(critical_errors, [], f"Critical errors: {critical_errors}")
@@ -124,7 +128,7 @@ class TestDatagenAndEvalE2E(unittest.TestCase):
             client = create_client(token, config.api_base_url)
 
             judge_results = await judge_artifacts(
-                client, DATAGEN_AND_EVAL_TRANSLATION, artifacts,
+                client, SPEC_AND_DATAGEN_SENTIMENT, artifacts,
             )
 
             for jr in judge_results:
@@ -136,10 +140,6 @@ class TestDatagenAndEvalE2E(unittest.TestCase):
                     spec_scores[0].score, 6,
                     f"SPEC.md judge score too low: {spec_scores[0].reasoning}",
                 )
-
-            scorer_scores = [jr for jr in judge_results if "evals/scorers/" in jr.artifact]
-            for sr in scorer_scores:
-                logger.info("Scorer judge %s: %d/10 — %s", sr.artifact, sr.score, sr.reasoning)
 
         asyncio.run(_judge())
 

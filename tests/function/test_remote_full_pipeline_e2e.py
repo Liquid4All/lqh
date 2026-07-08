@@ -1,7 +1,7 @@
-"""Full pipeline E2E for tool calling: data gen -> baseline eval -> remote train -> post-train eval.
+"""Full pipeline E2E: data gen → baseline eval → remote train → post-train eval.
 
-Exercises the complete lqh workflow with tool-calling data:
-1. Generate training + eval data with tool calls
+This test exercises the complete lqh workflow:
+1. Generate training + eval data using the pipeline engine
 2. Score baseline model via API (before training)
 3. Train on remote GPU (SFT with LoRA)
 4. Run inference with trained model on remote
@@ -15,7 +15,7 @@ Requires:
 
 Usage::
 
-    pytest tests/remote/test_tool_calling_e2e.py --remote-host=toka -v -s
+    pytest tests/function/test_remote_full_pipeline_e2e.py --remote-host=toka -v -s
 """
 
 from __future__ import annotations
@@ -37,97 +37,175 @@ from lqh.train.progress import read_latest_progress
 
 logger = logging.getLogger(__name__)
 
-# -- Tool calling pipeline + scorer --
+# -- Reuse the translation scenario assets from tests/harness/scenarios.py --
 
 _SPEC = """\
-# Specification: Tool Calling Agent
+# Specification: Multi-Language Translation
 
 ## Overview
-Build a tool-calling agent that correctly selects and invokes tools
-based on user queries.
+Translate input text into 5 languages: German, French, Spanish, English, and Chinese.
+Output as a JSON object with keys: de, fr, es, en, zh.
 
-## Available Tools
-- get_weather: Get current weather for a location
-- search_products: Search product catalog
-- check_order_status: Check order status by ID
-- schedule_appointment: Schedule an appointment
-- translate_text: Translate text to a target language
+## Input Format
+- **Type**: Plain text, 1-5 sentences
+- **Language**: Any language (auto-detected)
+
+## Output Format
+- **Type**: JSON object
+- **Keys**: de, fr, es, en, zh
 
 ## Requirements
-1. Correctly identify which tool to call based on user intent
-2. Provide accurate arguments to the tool
-3. Summarize tool results in a natural, friendly response
+1. All 5 target languages must be present
+2. Translations must be accurate and natural
+3. Preserve proper nouns, numbers
 """
 
-_PIPELINE_PATH = Path(__file__).parent / "tool_calling_e2e_pipeline.py"
+_PIPELINE = '''\
+from lqh.pipeline import Pipeline, ChatMLMessage, Conversation, GenerationError, step
+import json
+import random
+import liquidrandom
+
+class TranslationPipeline(Pipeline):
+    """Generate translation training samples."""
+
+    SAMPLE_TYPES = [
+        "casual message", "formal email", "technical sentence",
+        "idiomatic expression", "short phrase",
+    ]
+
+    async def generate(self, client, input=None) -> Conversation:
+        self.persona = liquidrandom.persona()
+        self.sample_type = random.choice(self.SAMPLE_TYPES)
+        self.seed = f"{self.persona.name}-{self.sample_type}"
+
+        await self._generate_source(client)
+        await self._generate_translations(client)
+
+        return [
+            ChatMLMessage("user", self.source_text),
+            ChatMLMessage("assistant", self.translations_json),
+        ]
+
+    @step(retries=3)
+    async def _generate_source(self, client):
+        resp = await client.chat.completions.create(
+            model=f"random:small:{self.seed}",
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Write a short {self.sample_type} (1-2 sentences) that "
+                    f"a {self.persona.brief()} would write. "
+                    f"Output ONLY the text, nothing else."
+                ),
+            }],
+        )
+        self.source_text = resp.choices[0].message.content.strip()
+        if len(self.source_text) < 5:
+            raise GenerationError("Source text too short")
+
+    @step(retries=3)
+    async def _generate_translations(self, client):
+        resp = await client.chat.completions.create(
+            model=f"random:medium:{self.seed}",
+            messages=[
+                {"role": "system", "content": "Translate into all 5 languages. Return ONLY JSON with keys: de, fr, es, en, zh."},
+                {"role": "user", "content": self.source_text},
+            ],
+            response_format={"type": "json_object"},
+        )
+        raw = resp.choices[0].message.content.strip()
+        if not raw:
+            raise GenerationError("Empty translation response")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise GenerationError(f"Expected dict, got {type(data).__name__}")
+        required = {"de", "fr", "es", "en", "zh"}
+        if not required.issubset(data.keys()):
+            raise GenerationError(f"Missing keys: {required - set(data.keys())}")
+        self.translations_json = json.dumps(data, ensure_ascii=False)
+'''
 
 _SCORER = """\
-# Scorer: Tool Calling Quality (Complex)
+# Scorer: Multi-Language Translation Quality
 
 ## Task Description
-The assistant has 6 tools available (search_flights, book_hotel, convert_currency,
-schedule_meeting, analyze_data, send_notification). Each tool has multiple required
-parameters with specific formats.
+The model translates input text into 5 languages (de, fr, es, en, zh) as JSON.
 
-## Scoring Criteria
-Evaluate both tool selection AND argument accuracy:
+## Conversation Format
+```
+[User]
+<the input text to translate>
 
-### Tool Selection (40%)
-- Did the assistant pick the correct tool for the user's request?
-- With 6 tools and overlapping domains, this requires understanding intent.
-
-### Argument Accuracy (40%)
-- Are ALL required parameters present?
-- Are dates in YYYY-MM-DD format (not natural language)?
-- Are times in HH:MM 24h format?
-- Are airport/currency codes correct (IATA codes like SFO not city names)?
-- Are numeric values extracted correctly from the query?
-- Are array parameters (participants, metrics) properly structured?
-
-### Response Quality (20%)
-- Does the final response correctly summarize the tool output?
-- Is it natural and helpful?
+[Assistant]
+<the model's translation response — this is what you score>
+```
 
 ## Scoring Scale
-- **9-10**: Correct tool, all arguments accurate with proper formats, great response
-- **7-8**: Correct tool, most arguments right but 1 minor format issue (e.g. date format)
-- **5-6**: Correct tool, but multiple argument issues or missing optional params that were mentioned
-- **3-4**: Wrong tool selected, OR correct tool but most arguments wrong
-- **1-2**: No tool call, completely wrong tool, or garbled arguments
+- **9-10**: All 5 translations present, accurate, natural, valid JSON
+- **7-8**: All translations present with minor quality issues
+- **5-6**: Valid JSON but some translations significantly inaccurate
+- **3-4**: Missing language keys, or multiple translations are wrong
+- **1-2**: Not valid JSON, or most translations are missing/wrong
 
 ## Critical Failures (automatic score <= 3)
-- Wrong tool selected
-- Missing more than 1 required parameter
-- Date still in natural language (not YYYY-MM-DD)
-- Airport codes replaced with city names
+- Output is not valid JSON
+- More than 1 language key missing
 """
 
 _SYSTEM_PROMPT = (
-    "You are a helpful assistant with access to tools. "
-    "When the user asks a question that requires a tool, call the appropriate tool "
-    "with the correct arguments. Pay careful attention to parameter formats: "
-    "dates as YYYY-MM-DD, times as HH:MM, airport IATA codes, currency codes, etc. "
-    "After receiving the result, explain it to the user."
+    "Translate the following text into German, French, Spanish, English, "
+    "and Chinese. Format your response as a JSON object with the keys "
+    '"de", "fr", "es", "en", and "zh". Output ONLY the JSON object, '
+    "nothing else."
 )
 
-TRAIN_SAMPLES = 500
-EVAL_SAMPLES = 30
+_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "translation",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "de": {"type": "string"},
+                "fr": {"type": "string"},
+                "es": {"type": "string"},
+                "en": {"type": "string"},
+                "zh": {"type": "string"},
+            },
+            "required": ["de", "fr", "es", "en", "zh"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+# Sizes kept small for speed
+TRAIN_SAMPLES = 80
+EVAL_SAMPLES = 15
 MODEL_ID = "LiquidAI/LFM2.5-1.2B-Instruct"
 INFERENCE_MODEL = "lfm2.5-1.2b-instruct"
 
 
 async def _setup_project(project_dir: Path) -> None:
+    """Create project structure with spec, pipeline, scorer, prompt."""
     (project_dir / "SPEC.md").write_text(_SPEC)
     (project_dir / ".lqh").mkdir(exist_ok=True)
 
     dg = project_dir / "data_gen"
     dg.mkdir(exist_ok=True)
-    import shutil
-    shutil.copy(_PIPELINE_PATH, dg / "tool_calling_v1.py")
+    (dg / "translation_v1.py").write_text(_PIPELINE)
 
     scorers = project_dir / "evals" / "scorers"
     scorers.mkdir(parents=True, exist_ok=True)
-    (scorers / "tool_calling_v1.md").write_text(_SCORER)
+    (scorers / "translation_v1.md").write_text(_SCORER)
+
+    prompts = project_dir / "prompts"
+    prompts.mkdir(exist_ok=True)
+    (prompts / "translation_v0.md").write_text(_SYSTEM_PROMPT)
+    (prompts / "translation.schema.json").write_text(
+        json.dumps(_RESPONSE_FORMAT, indent=2)
+    )
 
 
 async def _generate_data(
@@ -135,6 +213,7 @@ async def _generate_data(
     num_train: int,
     num_eval: int,
 ) -> tuple[Path, Path]:
+    """Generate training and eval datasets using the pipeline engine."""
     from lqh.auth import require_token
     from lqh.client import create_client
     from lqh.config import load_config
@@ -144,9 +223,10 @@ async def _generate_data(
     token = require_token()
     client = create_client(token, config.api_base_url)
 
-    pipeline_path = project_dir / "data_gen" / "tool_calling_v1.py"
+    pipeline_path = project_dir / "data_gen" / "translation_v1.py"
 
-    train_dir = project_dir / "datasets" / "tool_calling_train"
+    # Generate training data
+    train_dir = project_dir / "datasets" / "translation_train"
     print(f"  Generating {num_train} training samples...")
     result = await run_pipeline(
         script_path=pipeline_path,
@@ -158,7 +238,8 @@ async def _generate_data(
     )
     print(f"  Training: {result.succeeded}/{result.total} succeeded")
 
-    eval_dir = project_dir / "datasets" / "tool_calling_eval"
+    # Generate eval data
+    eval_dir = project_dir / "datasets" / "translation_eval"
     print(f"  Generating {num_eval} eval samples...")
     result = await run_pipeline(
         script_path=pipeline_path,
@@ -173,7 +254,10 @@ async def _generate_data(
     return train_dir / "data.parquet", eval_dir / "data.parquet"
 
 
-async def _run_baseline_eval(project_dir: Path) -> float:
+async def _run_baseline_eval(
+    project_dir: Path,
+) -> float:
+    """Score the base model via API inference. Returns mean score."""
     from lqh.auth import require_token
     from lqh.client import create_client
     from lqh.config import load_config
@@ -183,8 +267,8 @@ async def _run_baseline_eval(project_dir: Path) -> float:
     token = require_token()
     client = create_client(token, config.api_base_url)
 
-    eval_path = project_dir / "datasets" / "tool_calling_eval" / "data.parquet"
-    scorer_path = project_dir / "evals" / "scorers" / "tool_calling_v1.md"
+    eval_path = project_dir / "datasets" / "translation_eval" / "data.parquet"
+    scorer_path = project_dir / "evals" / "scorers" / "translation_v1.md"
     output_dir = project_dir / "evals" / "runs" / "baseline"
 
     result = await run_scoring(
@@ -195,6 +279,7 @@ async def _run_baseline_eval(project_dir: Path) -> float:
         run_inference=True,
         inference_model=INFERENCE_MODEL,
         inference_system_prompt=_SYSTEM_PROMPT,
+        inference_response_format=_RESPONSE_FORMAT,
     )
     return result.mean_score
 
@@ -207,6 +292,10 @@ async def _run_remote_eval(
     model_remote: str,
     eval_run_name: str,
 ) -> float:
+    """Run inference with a model on remote, pull predictions, score locally.
+
+    Returns mean score.
+    """
     from lqh.auth import require_token
     from lqh.client import create_client
     from lqh.config import load_config
@@ -216,10 +305,11 @@ async def _run_remote_eval(
     token = require_token()
     client = create_client(token, config.api_base_url)
 
+    # Submit inference job on remote
     eval_run_dir = project_dir / "runs" / eval_run_name
     eval_run_dir.mkdir(parents=True, exist_ok=True)
 
-    eval_parquet = project_dir / "datasets" / "tool_calling_eval" / "data.parquet"
+    eval_parquet = project_dir / "datasets" / "translation_eval" / "data.parquet"
 
     infer_config = {
         "type": "infer",
@@ -235,7 +325,8 @@ async def _run_remote_eval(
 
     remote_eval_run = f"{remote_root}/runs/{eval_run_name}"
 
-    deadline = time.monotonic() + 300
+    # Wait for inference to complete
+    deadline = time.monotonic() + 300  # 5 min timeout
     while time.monotonic() < deadline:
         try:
             await backend.sync_progress(remote_eval_run, str(eval_run_dir))
@@ -246,7 +337,8 @@ async def _run_remote_eval(
         if latest and latest.get("status") == "completed":
             break
         if latest and latest.get("status") == "failed":
-            raise RuntimeError(f"Inference failed: {latest.get('error', 'unknown')}")
+            err = latest.get("error", "unknown")
+            raise RuntimeError(f"Inference failed: {err}")
 
         alive = await backend.is_job_alive(job_id)
         if not alive:
@@ -266,6 +358,7 @@ async def _run_remote_eval(
 
     print("  Inference completed, pulling predictions...")
 
+    # Pull predictions.parquet from remote
     predictions_remote = f"{remote_eval_run}/predictions.parquet"
     predictions_local = eval_run_dir / "predictions.parquet"
     await backend.sync_file_from_remote(predictions_remote, str(predictions_local))
@@ -275,31 +368,37 @@ async def _run_remote_eval(
 
     print(f"  Predictions: {pq.read_metadata(str(predictions_local)).num_rows} samples")
 
-    scorer_path = project_dir / "evals" / "scorers" / "tool_calling_v1.md"
-    output_dir = project_dir / "evals" / "runs" / eval_run_name
+    # Score locally via API judge
+    scorer_path = project_dir / "evals" / "scorers" / "translation_v1.md"
+    output_dir = project_dir / "evals" / "runs" / "post_training"
 
     result = await run_scoring(
         dataset_path=predictions_local,
         scorer_path=scorer_path,
         output_dir=output_dir,
         client=client,
-        run_inference=False,
+        run_inference=False,  # already have predictions
     )
     return result.mean_score
 
 
 @pytest_asyncio.fixture
-async def pipeline_env(remote_host: str, tmp_path: Path):
+async def pipeline_env(
+    remote_host: str, tmp_path: Path,
+):
+    """Full pipeline environment: project + remote backend."""
     from uuid import uuid4
 
-    remote_root = f"/tmp/lqh-toolcall-e2e-{uuid4().hex[:8]}"
+    remote_root = f"/tmp/lqh-pipeline-e2e-{uuid4().hex[:8]}"
     project_dir = tmp_path / "project"
     project_dir.mkdir()
 
+    # Setup project
     await _setup_project(project_dir)
 
+    # Setup remote
     remote_config = RemoteConfig(
-        name="toolcall-test",
+        name="pipeline-test",
         type="ssh_direct",
         hostname=remote_host,
         remote_root=remote_root,
@@ -314,15 +413,16 @@ async def pipeline_env(remote_host: str, tmp_path: Path):
 
     yield project_dir, backend, remote_root
 
+    # Cleanup
     print(f"\n[teardown] Cleaning up {remote_root}...")
     await ssh_run(remote_host, f"rm -rf {remote_root}", timeout=60.0)
 
 
-class TestToolCallingPipelineE2E:
-    """Full pipeline: tool-calling data gen -> baseline eval -> remote train -> post-train eval."""
+class TestFullPipelineE2E:
+    """Full pipeline: data gen → baseline eval → remote train → post-train eval."""
 
     @pytest.mark.asyncio
-    async def test_tool_calling_datagen_train_eval(
+    async def test_datagen_train_eval(
         self,
         pipeline_env: tuple,
         remote_host: str,
@@ -330,7 +430,7 @@ class TestToolCallingPipelineE2E:
         project_dir, backend, remote_root = pipeline_env
 
         # ---- Step 1: Generate data ----
-        print("\n[1/7] Generating training + eval data...")
+        print("\n[1/7] Generating training + eval data via pipeline...")
         train_path, eval_path = await _generate_data(
             project_dir, TRAIN_SAMPLES, EVAL_SAMPLES,
         )
@@ -340,17 +440,13 @@ class TestToolCallingPipelineE2E:
         eval_rows = pq.read_metadata(str(eval_path)).num_rows
         print(f"  Train: {train_rows} rows, Eval: {eval_rows} rows")
 
-        # Verify tools column
-        train_table = pq.read_table(str(train_path))
-        assert "tools" in train_table.column_names, "Training data missing tools column"
-
         # ---- Step 2: Baseline eval via API ----
         print("\n[2/7] Baseline eval (API inference + scoring)...")
         baseline_api_score = await _run_baseline_eval(project_dir)
         print(f"  Baseline (API): {baseline_api_score:.2f}/10")
 
         # ---- Step 3: Baseline eval via local HF inference on remote ----
-        # This is the apples-to-apples comparison with post-training
+        # This gives us an apples-to-apples comparison with post-training eval
         print(f"\n[3/7] Baseline eval (local HF inference on {remote_host})...")
         baseline_local_score = await _run_remote_eval(
             project_dir, backend, remote_root, remote_host,
@@ -364,13 +460,13 @@ class TestToolCallingPipelineE2E:
         last_step, trained_model = await self._train_on_remote(
             project_dir, backend, remote_root, remote_host,
             train_path, eval_path,
-            run_name="sft_tool_calling",
+            run_name="sft_normal",
             learning_rate=2e-5,
         )
         print(f"  Training completed at step {last_step}")
 
         # ---- Step 5: Post-training eval (normal LR) ----
-        print("\n[5/7] Post-training eval (lr=2e-5)...")
+        print("\n[5/7] Post-training eval (normal lr=2e-5)...")
         post_normal_score = await _run_remote_eval(
             project_dir, backend, remote_root, remote_host,
             trained_model, "post_training_normal",
@@ -388,7 +484,7 @@ class TestToolCallingPipelineE2E:
         print(f"  Training completed at step {last_step_tiny}")
 
         # ---- Step 7: Post-training eval (tiny LR) ----
-        print("\n[7/7] Post-training eval (lr=1e-8, should match baseline)...")
+        print("\n[7/7] Post-training eval (tiny lr=1e-8, should match baseline)...")
         post_tiny_score = await _run_remote_eval(
             project_dir, backend, remote_root, remote_host,
             trained_model_tiny, "post_training_tiny_lr",
@@ -396,19 +492,20 @@ class TestToolCallingPipelineE2E:
         print(f"  Post-training (tiny lr): {post_tiny_score:.2f}/10")
 
         # ---- Summary ----
-        delta_normal = post_normal_score - baseline_local_score
-        delta_tiny = post_tiny_score - baseline_local_score
         print(f"\n{'='*60}")
-        print("Tool Calling E2E Results:")
+        print("Score comparison:")
         print(f"  Baseline (API):              {baseline_api_score:.2f}/10")
         print(f"  Baseline (local HF):         {baseline_local_score:.2f}/10")
         print(f"  Post-training (lr=2e-5):     {post_normal_score:.2f}/10")
         print(f"  Post-training (lr=1e-8):     {post_tiny_score:.2f}/10")
         print("")
+        delta_normal = post_normal_score - baseline_local_score
+        delta_tiny = post_tiny_score - baseline_local_score
         print(f"  Delta (normal lr):           {delta_normal:+.2f}")
         print(f"  Delta (tiny lr):             {delta_tiny:+.2f}")
         print(f"{'='*60}")
 
+        # Assertions
         assert 1.0 <= baseline_api_score <= 10.0
         assert 1.0 <= baseline_local_score <= 10.0
         assert 1.0 <= post_normal_score <= 10.0
@@ -420,6 +517,7 @@ class TestToolCallingPipelineE2E:
             f"baseline={baseline_local_score:.2f}, tiny_lr={post_tiny_score:.2f}"
         )
 
+        # Write summary
         summary = {
             "train_samples": train_rows,
             "eval_samples": eval_rows,
@@ -432,9 +530,10 @@ class TestToolCallingPipelineE2E:
             "model": MODEL_ID,
             "remote_host": remote_host,
         }
-        (project_dir / "tool_calling_e2e_summary.json").write_text(
+        (project_dir / "pipeline_e2e_summary.json").write_text(
             json.dumps(summary, indent=2) + "\n"
         )
+        print("\n  Summary saved to pipeline_e2e_summary.json")
 
     async def _train_on_remote(
         self,
@@ -448,6 +547,7 @@ class TestToolCallingPipelineE2E:
         run_name: str,
         learning_rate: float,
     ) -> tuple[int, str]:
+        """Train on remote, return (last_step, remote_model_path)."""
         run_dir = project_dir / "runs" / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -468,16 +568,16 @@ class TestToolCallingPipelineE2E:
                 ],
             },
             "training": {
-                "num_epochs": 3,
+                "num_epochs": 1,
                 "per_device_batch_size": 2,
                 "gradient_accumulation_steps": 2,
                 "learning_rate": learning_rate,
                 "warmup_ratio": 0.1,
-                "logging_steps": 10,
+                "logging_steps": 5,
                 "save_steps": 999,
                 "gradient_checkpointing": True,
                 "bf16": True,
-                "max_seq_length": 2048,
+                "max_seq_length": 512,
                 "dataloader_num_workers": 0,
             },
         }
@@ -525,7 +625,7 @@ class TestToolCallingPipelineE2E:
             )
             print(f"\n  --- stderr ---\n{stderr_out}\n  --- end ---")
 
-        assert final_state == "completed", f"Training failed (state={final_state})"
+        assert final_state == "completed", f"Training {run_name} failed (state={final_state})"
 
         trained_model_remote = f"{remote_run_dir}/model"
         stdout, _, rc = await ssh_run(
@@ -533,6 +633,6 @@ class TestToolCallingPipelineE2E:
             f"test -f {trained_model_remote}/config.json && echo yes",
             timeout=10.0,
         )
-        assert "yes" in stdout, "Model not found on remote"
+        assert "yes" in stdout, f"Model not found on remote for {run_name}"
 
         return last_step, trained_model_remote

@@ -5,8 +5,8 @@ These tests require a real SSH-accessible GPU host.  Skip when no
 
 Usage::
 
-    pytest tests/remote/test_remote_e2e.py --remote-host=lab-gpu-01
-    LQH_TEST_REMOTE_HOST=lab-gpu-01 pytest tests/remote/test_remote_e2e.py
+    pytest tests/function/test_remote_e2e.py --remote-host=lab-gpu-01
+    LQH_TEST_REMOTE_HOST=lab-gpu-01 pytest tests/function/test_remote_e2e.py
 """
 
 from __future__ import annotations

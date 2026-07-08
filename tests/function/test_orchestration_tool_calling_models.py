@@ -2,8 +2,8 @@
 
 This file can be used two ways:
 
-    pytest tests/e2e/test_orchestration_tool_calling_models.py -q
-    python -m tests.e2e.test_orchestration_tool_calling_models
+    pytest tests/function/test_orchestration_tool_calling_models.py -q
+    python -m tests.function.test_orchestration_tool_calling_models
 
 The pytest cases are marked ``integration`` and are skipped automatically when
 no API token is configured. The direct runner prints a table that is useful when

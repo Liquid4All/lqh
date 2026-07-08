@@ -30,7 +30,7 @@ Time + cost budget:
   - GPU cost: ~$0.50-$1.00 per run on an A100-40GB.
 
 Usage:
-    LQH_E2E=1 python -m pytest lqh_py/tests/e2e/test_cloud_sft_hf_e2e.py -v -s
+    LQH_E2E=1 python -m pytest lqh_py/tests/function/test_cloud_sft_hf_e2e.py -v -s
 """
 
 from __future__ import annotations

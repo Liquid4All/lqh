@@ -5,7 +5,7 @@ model directly from the remote to HuggingFace (no local download).
 
 Usage::
 
-    pytest tests/remote/test_sft_and_upload.py --remote-host=toka -v -s
+    pytest tests/function/test_sft_and_upload.py --remote-host=toka -v -s
 
 Requires:
     - SSH access to a GPU host (--remote-host or LQH_TEST_REMOTE_HOST)

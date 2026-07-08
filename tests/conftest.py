@@ -279,6 +279,14 @@ def mock_openai_client() -> Callable[..., MagicMock]:
 # ---------------------------------------------------------------------------
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--remote-host",
+        default=None,
+        help="SSH hostname for remote function tests (see tests/function/)",
+    )
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:

@@ -4,9 +4,9 @@ Starts with an existing translation project (spec, 50 eval samples, scorer)
 and tests model evaluation on lfm2.5-1.2b-instruct followed by prompt optimization.
 
 Usage:
-    python -m tests.e2e.test_eval_promptopt
-    python -m tests.e2e.test_eval_promptopt orchestration:3
-    python -m tests.e2e.test_eval_promptopt orchestration:3 --timeout=1200
+    python -m tests.function.test_eval_promptopt
+    python -m tests.function.test_eval_promptopt orchestration:3
+    python -m tests.function.test_eval_promptopt orchestration:3 --timeout=1200
 """
 
 from __future__ import annotations

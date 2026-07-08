@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from tests.e2e.test_cloud_finetune_agent_e2e import (
+from tests.function.test_cloud_finetune_agent_e2e import (
     _assert_common_training_contract,
     _run_agent_e2e,
 )

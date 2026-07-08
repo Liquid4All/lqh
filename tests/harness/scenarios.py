@@ -749,7 +749,9 @@ async def seed_full_pipeline_tools_async(project_dir: Path) -> None:
     (project_dir / "SPEC.md").write_text(_HELPDESK_SPEC, encoding="utf-8")
 
     # Copy the tool-calling pipeline
-    pipeline_src = Path(__file__).parent.parent.parent / "data_gen" / "tool_calling.py"
+    pipeline_src = (
+        Path(__file__).parent.parent / "function" / "tool_calling_e2e_pipeline.py"
+    )
     dg = project_dir / "data_gen"
     dg.mkdir(parents=True, exist_ok=True)
     shutil.copy(pipeline_src, dg / "tool_calling_v1.py")

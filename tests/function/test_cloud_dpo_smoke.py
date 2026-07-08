@@ -27,7 +27,7 @@ Time + cost budget:
   - GPU cost: ~$0.75-$1.50 on A100-80GB (DPO uses the bigger box).
 
 Usage:
-    LQH_E2E=1 python -m pytest lqh_py/tests/e2e/test_cloud_dpo_smoke.py -v -s
+    LQH_E2E=1 python -m pytest lqh_py/tests/function/test_cloud_dpo_smoke.py -v -s
 """
 
 from __future__ import annotations

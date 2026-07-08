@@ -19,7 +19,7 @@ Time + cost budget:
   - GPU cost: ~$0.15-$0.30 per run.
 
 Usage:
-    LQH_E2E=1 python -m pytest lqh_py/tests/e2e/test_cloud_eval_hf_smoke.py -v -s
+    LQH_E2E=1 python -m pytest lqh_py/tests/function/test_cloud_eval_hf_smoke.py -v -s
 """
 
 from __future__ import annotations

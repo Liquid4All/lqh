@@ -5,7 +5,7 @@ monitors progress, and verifies completion.
 
 Usage::
 
-    pytest tests/remote/test_remote_training_e2e.py --remote-host=toka -v -s
+    pytest tests/function/test_remote_training_e2e.py --remote-host=toka -v -s
 """
 
 from __future__ import annotations

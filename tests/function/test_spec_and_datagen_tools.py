@@ -1,9 +1,9 @@
 """E2E test: Spec + data generation for tool-calling — scheduling assistant
 
 Usage:
-    python -m tests.e2e.test_spec_and_datagen_tools
-    python -m tests.e2e.test_spec_and_datagen_tools orchestration:12
-    python -m tests.e2e.test_spec_and_datagen_tools orchestration:12 --timeout=600
+    python -m tests.function.test_spec_and_datagen_tools
+    python -m tests.function.test_spec_and_datagen_tools orchestration:12
+    python -m tests.function.test_spec_and_datagen_tools orchestration:12 --timeout=600
 """
 
 from __future__ import annotations

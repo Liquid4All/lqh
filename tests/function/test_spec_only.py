@@ -1,9 +1,9 @@
 """E2E test: Spec capture only — email summarization
 
 Usage:
-    python -m tests.e2e.test_spec_only
-    python -m tests.e2e.test_spec_only orchestration:12
-    python -m tests.e2e.test_spec_only orchestration:12 --timeout=600
+    python -m tests.function.test_spec_only
+    python -m tests.function.test_spec_only orchestration:12
+    python -m tests.function.test_spec_only orchestration:12 --timeout=600
 """
 
 from __future__ import annotations

@@ -39,7 +39,7 @@ Gating:
 
 Usage:
     LQH_E2E_BEFORE_AFTER=1 python -m pytest \
-        lqh_py/tests/e2e/test_cloud_sft_before_after.py -v -s
+        lqh_py/tests/function/test_cloud_sft_before_after.py -v -s
 """
 
 from __future__ import annotations
