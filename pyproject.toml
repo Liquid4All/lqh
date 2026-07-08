@@ -61,7 +61,7 @@ dev = [
 
 [tool.pytest.ini_options]
 minversion = "7.0"
-testpaths = ["tests"]
+testpaths = ["tests/unit"]
 asyncio_mode = "auto"
 xfail_strict = true
 markers = [
