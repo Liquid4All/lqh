@@ -16,6 +16,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
+try:
+    import torch  # noqa: F401
+
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+
+requires_torch = pytest.mark.skipif(
+    not _HAS_TORCH, reason="requires torch (pip install lqh[train])"
+)
+
 from lqh.train.vlm_data import (
     VLMCollator,
     chatml_to_vlm_dataset,
@@ -167,6 +178,7 @@ def _mock_processor(seq_len: int = 6, pad_id: int = 0):
     return processor
 
 
+@requires_torch
 class TestVLMCollator:
     def test_reinserts_pil_images_and_masks_labels(self) -> None:
         from PIL import Image
@@ -260,6 +272,7 @@ def test_decode_image_returns_rgb() -> None:
     assert img.size == (5, 5)
 
 
+@requires_torch
 def test_vlm_generate_moves_inputs_and_decodes() -> None:
     import torch
 
@@ -442,6 +455,7 @@ def test_vlm_base_rejects_dpo(training_project) -> None:
 # ---------------------------------------------------------------------------
 
 
+@requires_torch
 def test_merge_lora_vision_base_uses_vlm_class_and_processor(tmp_path, monkeypatch):
     from unittest.mock import patch
 
@@ -469,6 +483,7 @@ def test_merge_lora_vision_base_uses_vlm_class_and_processor(tmp_path, monkeypat
         auto_tok.from_pretrained.assert_not_called()
 
 
+@requires_torch
 def test_merge_lora_text_base_unchanged(tmp_path, monkeypatch):
     from unittest.mock import patch
 
@@ -489,6 +504,7 @@ def test_merge_lora_text_base_unchanged(tmp_path, monkeypatch):
         auto_proc.from_pretrained.assert_not_called()
 
 
+@requires_torch
 def test_vlm_generate_drops_rejected_model_kwargs() -> None:
     """generate() may reject processor-emitted keys its
     prepare_inputs_for_generation doesn't route (LFM2-VL:
@@ -540,6 +556,7 @@ def test_vlm_generate_drops_rejected_model_kwargs() -> None:
     assert "input_ids" in calls[1]
 
 
+@requires_torch
 def test_vlm_generate_reraises_unrelated_value_error() -> None:
     import torch
 

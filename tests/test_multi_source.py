@@ -635,7 +635,9 @@ class TestHandlerMultiSource:
 
 
 class TestLocalEvalMultiSource:
-    async def test_local_eval_accepts_list(self, ms_workspace: Path) -> None:
+    async def test_local_eval_accepts_list(
+        self, ms_workspace: Path, stub_torch,
+    ) -> None:
         """start_local_eval builds an infer config whose dataset is the
         multi-source list, scored per-source downstream."""
         from lqh.tools import handlers
@@ -704,7 +706,9 @@ class TestLocalEvalMultiSource:
             {"path": "datasets/type_b_eval/data.parquet", "source": "type_b_eval"},
         ]
 
-    async def test_local_eval_single_source_string(self, ms_workspace: Path) -> None:
+    async def test_local_eval_single_source_string(
+        self, ms_workspace: Path, stub_torch,
+    ) -> None:
         from lqh.tools import handlers
 
         captured: dict[str, Any] = {}
