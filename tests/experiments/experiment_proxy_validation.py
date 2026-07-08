@@ -20,7 +20,7 @@ Reuses helpers and patterns from ``experiment_e2e_pipeline.py``:
   on-policy ping-pong, no held-out scoring loop.
 
 Usage:
-  python -m tests.remote.experiment_proxy_validation \\
+  python -m tests.experiments.experiment_proxy_validation \\
       --mode dpo \\
       --task ar_to_de \\
       --base-model <path-to-sft-merged-model> \\
@@ -49,7 +49,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tests.remote.experiment_e2e_pipeline import (  # noqa: E402
+from tests.experiments.experiment_e2e_pipeline import (  # noqa: E402
     TaskConfig,
     _build_infer_config,
     _run_subprocess,
@@ -753,7 +753,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=("sft", "dpo"), required=True)
     p.add_argument("--task", required=True,
-                   help="Task name under tests/e2e_projects/ (provides scorer + system prompt + schema)")
+                   help="Task name under tests/experiments/projects/ (provides scorer + system prompt + schema)")
     p.add_argument("--base-model", required=True,
                    help="HF model id or local checkpoint path")
     p.add_argument("--preferences",

@@ -100,14 +100,14 @@ visibly below the API baseline. If both plateau, scale data per
 
 ```bash
 # SFT only (default)
-python -m tests.remote.experiment_e2e_pipeline --task spam_filter
+python -m tests.experiments.experiment_e2e_pipeline --task spam_filter
 
 # SFT + DPO 3 iter
-python -m tests.remote.experiment_e2e_pipeline --task spam_filter \
+python -m tests.experiments.experiment_e2e_pipeline --task spam_filter \
     --config-name with_dpo
 
 # DPO from baseline (no SFT)
-python -m tests.remote.experiment_e2e_pipeline --task spam_filter \
+python -m tests.experiments.experiment_e2e_pipeline --task spam_filter \
     --config-name dpo_only
 ```
 

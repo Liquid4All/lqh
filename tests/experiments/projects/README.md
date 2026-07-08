@@ -1,7 +1,7 @@
 # E2E task projects
 
 Each subdirectory here is a self-contained project that the
-`tests/remote/experiment_e2e_pipeline.py` harness can drive end-to-end:
+`tests/experiments/experiment_e2e_pipeline.py` harness can drive end-to-end:
 **datagen → LLM-judge filter → SFT → eval (→ DPO → eval, optionally)**.
 
 Each project mirrors the structure of `example_project/`:
@@ -62,19 +62,19 @@ open-ended tasks (Phase 3), drop `prompts/schema.json`.
 
 ```bash
 # Full run (toka, GPU required, hours).
-python -m tests.remote.experiment_e2e_pipeline --task translation
+python -m tests.experiments.experiment_e2e_pipeline --task translation
 
 # Quick shake-out — small sample sizes, all stages:
-python -m tests.remote.experiment_e2e_pipeline --task translation \
+python -m tests.experiments.experiment_e2e_pipeline --task translation \
     --train-samples 8 --eval-samples 4
 
 # Iterating on the SFT / eval stage with an existing dataset:
-python -m tests.remote.experiment_e2e_pipeline --task translation \
+python -m tests.experiments.experiment_e2e_pipeline --task translation \
     --skip-generate-train --skip-generate-eval \
     --skip-filter-train --skip-filter-eval
 
 # Run an alternate config (DPO-only on feedback_bot):
-python -m tests.remote.experiment_e2e_pipeline --task feedback_bot \
+python -m tests.experiments.experiment_e2e_pipeline --task feedback_bot \
     --config-name dpo_only
 ```
 
@@ -97,11 +97,11 @@ The harness writes `runs/<exp_name>/report.md` with a verdict
 
 ## Adding a new task
 
-1. `mkdir tests/e2e_projects/<task>/{data_gen,prompts,evals/scorers}`.
+1. `mkdir tests/experiments/projects/<task>/{data_gen,prompts,evals/scorers}`.
 2. Write `SPEC.md` describing input/output and any constraints.
 3. Write `data_gen/pipeline.py` — one `Pipeline` subclass with a
    `generate(self, client, input=None) -> Conversation` method.
-   See `tests/e2e_projects/translation/data_gen/pipeline.py` for a
+   See `tests/experiments/projects/translation/data_gen/pipeline.py` for a
    reference.
 4. Write `prompts/system.md` and (for JSON tasks) `prompts/schema.json`.
 5. Write `evals/scorers/scorer.md` — concise judging criteria; keep it
@@ -109,7 +109,7 @@ The harness writes `runs/<exp_name>/report.md` with a verdict
 6. Write `e2e_config.json` per the schema above.
 7. Smoke-test with small numbers:
    ```bash
-   python -m tests.remote.experiment_e2e_pipeline --task <new> \
+   python -m tests.experiments.experiment_e2e_pipeline --task <new> \
        --train-samples 8 --eval-samples 4
    ```
 8. If the smoke run is sane, do the full run on toka.

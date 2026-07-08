@@ -1,15 +1,17 @@
-"""Experiment: On-policy DPO training on remote GPU.
+"""Experiment: SFT then DPO (validate -> scale -> polish pipeline).
 
-Full ping-pong loop:
-  Remote subprocess generates predictions →
-  Local scores via API + assembles preferences →
-  Syncs preferences back to remote →
-  Remote runs DPO step →
-  Repeat
+Full workflow:
+  1. Generate data
+  2. Baseline eval
+  3. SFT training
+  4. Post-SFT eval
+  5. DPO on top of SFT model
+  6. Post-DPO eval
 
 Usage::
 
-    python -m tests.remote.experiment_dpo_training --remote-host=toka
+    python -m tests.experiments.experiment_sft_then_dpo --remote-host=toka
+    python -m tests.experiments.experiment_sft_then_dpo --remote-host=toka --train-samples=500 --eval-samples=200
 """
 
 from __future__ import annotations
@@ -23,12 +25,20 @@ from uuid import uuid4
 
 import pyarrow.parquet as pq
 
-MODEL_ID = "LiquidAI/LFM2.5-1.2B-Instruct"
+
+# ---- Config ----
 TRAIN_SAMPLES = 200
-EVAL_SAMPLES = 20
-NUM_ITERATIONS = 3
+EVAL_SAMPLES = 200
+MODEL_ID = "LiquidAI/LFM2.5-1.2B-Instruct"
+
+# SFT config
+SFT_EPOCHS = 3
+SFT_LEARNING_RATE = 2e-5
+
+# DPO config
+DPO_ITERATIONS = 3
 DPO_BETA = 0.1
-LEARNING_RATE = 5e-6
+DPO_LEARNING_RATE = 5e-6
 
 SYSTEM_PROMPT = (
     "Translate the following text into German, French, Spanish, English, "
@@ -73,7 +83,7 @@ import liquidrandom
 class TranslationPipeline(Pipeline):
     SAMPLE_TYPES = [
         "casual message", "formal email", "technical sentence",
-        "idiomatic expression", "short phrase",
+        "idiomatic expression", "short phrase", "multi-sentence paragraph",
     ]
 
     async def generate(self, client, input=None) -> Conversation:
@@ -134,28 +144,23 @@ class TranslationPipeline(Pipeline):
         self.translations_json = json.dumps(data, ensure_ascii=False)
 '''
 
-RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "translation",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "de": {"type": "string"},
-                "fr": {"type": "string"},
-                "es": {"type": "string"},
-                "en": {"type": "string"},
-                "zh": {"type": "string"},
-            },
-            "required": ["de", "fr", "es", "en", "zh"],
-            "additionalProperties": False,
-        },
-    },
+LORA_CONFIG = {
+    "enabled": True,
+    "r": 16,
+    "alpha": 32,
+    "dropout": 0.02,
+    "target_modules": [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "in_proj", "out_proj", "w1", "w2", "w3",
+    ],
 }
 
 
-async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_samples: int = EVAL_SAMPLES) -> None:
+async def main(
+    remote_host: str,
+    train_samples: int = TRAIN_SAMPLES,
+    eval_samples: int = EVAL_SAMPLES,
+) -> None:
     import tempfile
 
     from lqh.auth import require_token
@@ -169,8 +174,8 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
     from lqh.scoring import run_scoring
     from lqh.train.progress import read_latest_progress
 
-    remote_root = f"/tmp/lqh-dpo-exp-{uuid4().hex[:8]}"
-    tmpdir = Path(tempfile.mkdtemp(prefix="lqh_dpo_exp_"))
+    remote_root = f"/tmp/lqh-sft-dpo-exp-{uuid4().hex[:8]}"
+    tmpdir = Path(tempfile.mkdtemp(prefix="lqh_sft_dpo_exp_"))
     project_dir = tmpdir / "project"
     project_dir.mkdir()
     (project_dir / ".lqh").mkdir()
@@ -178,7 +183,9 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
 
     print(f"Project dir: {project_dir}")
     print(f"Remote root: {remote_root}")
-    print(f"Config: {train_samples} train, {eval_samples} eval, {NUM_ITERATIONS} DPO iters")
+    print(f"Config: {train_samples} train, {eval_samples} eval")
+    print(f"  SFT: {SFT_EPOCHS} epochs, lr={SFT_LEARNING_RATE}")
+    print(f"  DPO: {DPO_ITERATIONS} iterations, beta={DPO_BETA}, lr={DPO_LEARNING_RATE}")
     print()
 
     # Setup project files
@@ -197,20 +204,20 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
 
     # Bootstrap remote
     print("=" * 60)
-    print("[1/6] Bootstrapping remote...")
+    print("[1/8] Bootstrapping remote...")
     print("=" * 60)
     remote_config = RemoteConfig(
-        name="dpo-exp", type="ssh_direct", hostname=remote_host, remote_root=remote_root,
+        name="sft-dpo-exp", type="ssh_direct", hostname=remote_host, remote_root=remote_root,
     )
     backend = SSHDirectBackend(remote_config, project_dir)
     log = await backend.setup()
     print(log)
 
     try:
-        # Generate data
+        # ---- Generate data ----
         print()
         print("=" * 60)
-        print(f"[2/6] Generating {train_samples} train + {eval_samples} eval samples...")
+        print(f"[2/8] Generating {train_samples} train + {eval_samples} eval samples...")
         print("=" * 60)
         pipeline_path = dg / "translation_v1.py"
 
@@ -231,10 +238,10 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
         train_path = train_dir / "data.parquet"
         eval_path = eval_dir / "data.parquet"
 
-        # Baseline eval (local HF on remote)
+        # ---- Baseline eval ----
         print()
         print("=" * 60)
-        print("[3/6] Baseline eval (local HF on remote)...")
+        print("[3/8] Baseline eval (local HF on remote)...")
         print("=" * 60)
         baseline_score = await _remote_eval(
             project_dir, backend, remote_root, remote_host, client,
@@ -242,40 +249,95 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
         )
         print(f"  Baseline: {baseline_score:.2f}/10")
 
-        # DPO training with manual ping-pong
+        # ---- SFT training ----
         print()
         print("=" * 60)
-        print(f"[4/6] DPO training ({NUM_ITERATIONS} iterations)...")
+        print(f"[4/8] SFT training ({train_samples} samples, {SFT_EPOCHS} epochs)...")
         print("=" * 60)
 
-        run_name = "dpo_translation"
-        run_dir = project_dir / "runs" / run_name
-        run_dir.mkdir(parents=True)
+        sft_run_name = "sft_translation"
+        sft_run_dir = project_dir / "runs" / sft_run_name
+        sft_run_dir.mkdir(parents=True)
+
+        sft_config = {
+            "type": "sft",
+            "base_model": MODEL_ID,
+            "dataset": str(train_path),
+            "eval_dataset": str(eval_path),
+            "eval_on_checkpoints": False,
+            "lora": LORA_CONFIG,
+            "training": {
+                "num_epochs": SFT_EPOCHS,
+                "per_device_batch_size": 4,
+                "gradient_accumulation_steps": 4,
+                "learning_rate": SFT_LEARNING_RATE,
+                "warmup_ratio": 0.1,
+                "logging_steps": 10,
+                "save_steps": 999,
+                "gradient_checkpointing": True,
+                "bf16": True,
+                "max_seq_length": 512,
+                "dataloader_num_workers": 2,
+            },
+        }
+
+        t0_sft = time.monotonic()
+        job_id = await backend.submit_run(str(sft_run_dir), sft_config)
+        print(f"  Job PID: {job_id}")
+        remote_sft_dir = f"{remote_root}/runs/{sft_run_name}"
+
+        last_step, final_state = await _wait_for_training(
+            backend, remote_sft_dir, sft_run_dir, job_id, remote_host,
+        )
+        t_sft = time.monotonic() - t0_sft
+
+        if final_state != "completed":
+            stderr_out, _, _ = await ssh_run(
+                remote_host, f"tail -30 {remote_sft_dir}/stderr.log 2>/dev/null",
+                timeout=10.0,
+            )
+            print(f"\n  --- stderr ---\n{stderr_out}\n  --- end ---")
+            raise RuntimeError(f"SFT training failed: {final_state}")
+
+        print(f"  SFT completed in {t_sft:.0f}s ({last_step} steps)")
+
+        # ---- Post-SFT eval ----
+        print()
+        print("=" * 60)
+        print("[5/8] Post-SFT eval...")
+        print("=" * 60)
+        sft_model_remote = f"{remote_sft_dir}/model"
+        post_sft_score = await _remote_eval(
+            project_dir, backend, remote_root, remote_host, client,
+            sft_model_remote, "post_sft", eval_path, scorer_path,
+        )
+        print(f"  Post-SFT: {post_sft_score:.2f}/10")
+
+        # ---- DPO on top of SFT ----
+        print()
+        print("=" * 60)
+        print(f"[6/8] DPO training ({DPO_ITERATIONS} iterations on SFT model)...")
+        print("=" * 60)
+
+        dpo_run_name = "dpo_translation"
+        dpo_run_dir = project_dir / "runs" / dpo_run_name
+        dpo_run_dir.mkdir(parents=True)
 
         dpo_config = {
             "type": "on_policy_dpo",
-            "base_model": MODEL_ID,
+            "base_model": sft_model_remote,  # start from SFT model
             "dataset": str(train_path),
-            # DPO generates on-policy rollouts from `dataset` (training data)
+            # DPO generates on-policy rollouts from `dataset` (training data).
             "system_prompt": SYSTEM_PROMPT,
-            "num_iterations": NUM_ITERATIONS,
+            "num_iterations": DPO_ITERATIONS,
             "dpo_beta": DPO_BETA,
             "golden_source": "dataset",
             "rejection_threshold": 6.0,
             "scorer": str(scorer_path.relative_to(project_dir)),
-            "lora": {
-                "enabled": True,
-                "r": 16,
-                "alpha": 32,
-                "dropout": 0.02,
-                "target_modules": [
-                    "q_proj", "k_proj", "v_proj", "o_proj",
-                    "in_proj", "out_proj", "w1", "w2", "w3",
-                ],
-            },
+            "lora": LORA_CONFIG,
             "training": {
                 "per_device_batch_size": 2,
-                "learning_rate": LEARNING_RATE,
+                "learning_rate": DPO_LEARNING_RATE,
                 "gradient_checkpointing": True,
                 "bf16": True,
                 "max_seq_length": 512,
@@ -283,29 +345,28 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
             },
         }
 
-        t0 = time.monotonic()
-        job_id = await backend.submit_run(str(run_dir), dpo_config)
+        t0_dpo = time.monotonic()
+        job_id = await backend.submit_run(str(dpo_run_dir), dpo_config)
         print(f"  Job PID: {job_id}")
-        remote_run_dir = f"{remote_root}/runs/{run_name}"
+        remote_dpo_dir = f"{remote_root}/runs/{dpo_run_name}"
 
-        # Manual ping-pong: detect iter_request, score, supply preferences
+        # DPO ping-pong
         iteration_scores: list[float] = []
-
-        for iteration in range(NUM_ITERATIONS):
+        for iteration in range(DPO_ITERATIONS):
             iter_name = f"iter_{iteration:03d}"
-            local_iter_dir = run_dir / "iterations" / iter_name
+            local_iter_dir = dpo_run_dir / "iterations" / iter_name
             local_iter_dir.mkdir(parents=True, exist_ok=True)
-            remote_iter_dir = f"{remote_run_dir}/iterations/{iter_name}"
+            remote_iter_dir = f"{remote_dpo_dir}/iterations/{iter_name}"
 
-            print(f"\n  --- Iteration {iteration + 1}/{NUM_ITERATIONS} ---")
+            print(f"\n  --- Iteration {iteration + 1}/{DPO_ITERATIONS} ---")
 
-            # Wait for iter_request.json (subprocess generated predictions)
+            # Wait for predictions
             print("  Waiting for predictions...")
             last_step_seen = -1
             deadline = time.monotonic() + 600
             while time.monotonic() < deadline:
                 try:
-                    await backend.sync_progress(remote_run_dir, str(run_dir))
+                    await backend.sync_progress(remote_dpo_dir, str(dpo_run_dir))
                 except Exception:
                     pass
 
@@ -314,23 +375,21 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
                 if request_file.exists() and predictions_file.exists():
                     break
 
-                # Reset deadline on new progress
-                latest = read_latest_progress(run_dir)
+                latest = read_latest_progress(dpo_run_dir)
                 if latest:
                     step = latest.get("step", -1)
                     if step > last_step_seen:
                         last_step_seen = step
                         deadline = time.monotonic() + 600
 
-                # Check if process died
                 if not await backend.is_job_alive(job_id):
-                    await backend.sync_progress(remote_run_dir, str(run_dir))
+                    await backend.sync_progress(remote_dpo_dir, str(dpo_run_dir))
                     if request_file.exists() and predictions_file.exists():
                         break
-                    latest = read_latest_progress(run_dir)
+                    latest = read_latest_progress(dpo_run_dir)
                     err = latest.get("error", "unknown") if latest else "process died"
                     stderr_out, _, _ = await ssh_run(
-                        remote_host, f"tail -20 {remote_run_dir}/stderr.log 2>/dev/null",
+                        remote_host, f"tail -20 {remote_dpo_dir}/stderr.log 2>/dev/null",
                         timeout=10.0,
                     )
                     raise RuntimeError(
@@ -345,12 +404,11 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
             n_preds = pq.read_metadata(str(predictions_file)).num_rows
             print(f"  Got {n_preds} predictions, scoring...")
 
-            # Score predictions via API
-            score_output_dir = local_iter_dir
+            # Score predictions
             score_result = await run_scoring(
                 dataset_path=predictions_file,
                 scorer_path=scorer_path,
-                output_dir=score_output_dir,
+                output_dir=local_iter_dir,
                 client=client,
                 run_inference=False,
             )
@@ -381,86 +439,98 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
             await backend.sync_file_to_remote(str(prefs_path), remote_prefs)
             print("  Preferences synced to remote, DPO step running...")
 
-        # Wait for training to complete
+        # Wait for DPO to complete
         print("\n  Waiting for DPO to finish...")
         deadline = time.monotonic() + 600
         final_state = "unknown"
         while time.monotonic() < deadline:
             try:
-                await backend.sync_progress(remote_run_dir, str(run_dir))
+                await backend.sync_progress(remote_dpo_dir, str(dpo_run_dir))
             except Exception:
                 pass
-            latest = read_latest_progress(run_dir)
+            latest = read_latest_progress(dpo_run_dir)
             if latest:
                 status = latest.get("status")
-                if status in ("completed", "failed"):
+                if status in ("completed", "failed", "interrupted"):
                     final_state = status
                     break
             if not await backend.is_job_alive(job_id):
-                await backend.sync_progress(remote_run_dir, str(run_dir))
-                latest = read_latest_progress(run_dir)
+                await backend.sync_progress(remote_dpo_dir, str(dpo_run_dir))
+                latest = read_latest_progress(dpo_run_dir)
                 final_state = latest.get("status", "failed") if latest else "failed"
                 break
             await asyncio.sleep(3)
 
-        t_total = time.monotonic() - t0
+        t_dpo = time.monotonic() - t0_dpo
 
-        if final_state != "completed":
+        if final_state not in ("completed", "interrupted"):
             stderr_out, _, _ = await ssh_run(
-                remote_host, f"tail -30 {remote_run_dir}/stderr.log 2>/dev/null",
+                remote_host, f"tail -30 {remote_dpo_dir}/stderr.log 2>/dev/null",
                 timeout=10.0,
             )
             print(f"\n  --- stderr ---\n{stderr_out}\n  --- end ---")
             raise RuntimeError(f"DPO training failed: {final_state}")
 
-        print(f"  DPO completed in {t_total:.0f}s")
+        print(f"  DPO completed in {t_dpo:.0f}s")
 
-        # Post-training eval
+        # ---- Post-DPO eval ----
         print()
         print("=" * 60)
-        print("[5/6] Post-training eval...")
+        print("[7/8] Post-DPO eval...")
         print("=" * 60)
-        trained_model = f"{remote_run_dir}/model"
-        post_score = await _remote_eval(
+        dpo_model_remote = f"{remote_dpo_dir}/model"
+        post_dpo_score = await _remote_eval(
             project_dir, backend, remote_root, remote_host, client,
-            trained_model, "post_dpo", eval_path, scorer_path,
+            dpo_model_remote, "post_dpo", eval_path, scorer_path,
         )
-        print(f"  Post-DPO: {post_score:.2f}/10")
+        print(f"  Post-DPO: {post_dpo_score:.2f}/10")
 
-        # Results
+        # ---- Results ----
         print()
         print("=" * 60)
-        print("RESULTS")
+        print("[8/8] RESULTS")
         print("=" * 60)
-        delta = post_score - baseline_score
+        sft_delta = post_sft_score - baseline_score
+        dpo_delta = post_dpo_score - post_sft_score
+        total_delta = post_dpo_score - baseline_score
         print(f"  Train samples:       {train_samples}")
         print(f"  Eval samples:        {eval_samples}")
-        print(f"  DPO iterations:      {NUM_ITERATIONS}")
-        print(f"  Total time:          {t_total:.0f}s")
+        print(f"  SFT epochs:          {SFT_EPOCHS}")
+        print(f"  SFT time:            {t_sft:.0f}s")
+        print(f"  DPO iterations:      {DPO_ITERATIONS}")
+        print(f"  DPO time:            {t_dpo:.0f}s")
         print("")
         print(f"  Baseline (local HF): {baseline_score:.2f}/10")
+        print(f"  Post-SFT:            {post_sft_score:.2f}/10  (delta: {sft_delta:+.2f})")
         for i, s in enumerate(iteration_scores):
-            print(f"  Iteration {i} score:   {s:.2f}/10")
-        print(f"  Post-DPO:            {post_score:.2f}/10")
-        print(f"  Delta:               {delta:+.2f}")
-        print(f"  Improvement:         {'YES' if delta > 0.5 else 'marginal' if delta > 0 else 'NO'}")
+            print(f"    DPO iter {i} score:  {s:.2f}/10")
+        print(f"  Post-DPO:            {post_dpo_score:.2f}/10  (delta vs SFT: {dpo_delta:+.2f})")
+        print("")
+        print(f"  Total improvement:   {total_delta:+.2f}")
+        print(f"  Pipeline:            {'YES' if total_delta > 0 else 'NO'}")
         print("=" * 60)
 
         summary = {
             "train_samples": train_samples,
             "eval_samples": eval_samples,
-            "dpo_iterations": NUM_ITERATIONS,
+            "sft_epochs": SFT_EPOCHS,
+            "sft_learning_rate": SFT_LEARNING_RATE,
+            "sft_time_s": round(t_sft, 1),
+            "dpo_iterations": DPO_ITERATIONS,
             "dpo_beta": DPO_BETA,
-            "learning_rate": LEARNING_RATE,
-            "total_time_s": round(t_total, 1),
+            "dpo_learning_rate": DPO_LEARNING_RATE,
+            "dpo_time_s": round(t_dpo, 1),
             "baseline_score": round(baseline_score, 2),
+            "post_sft_score": round(post_sft_score, 2),
+            "sft_delta": round(sft_delta, 2),
             "iteration_scores": [round(s, 2) for s in iteration_scores],
-            "post_dpo_score": round(post_score, 2),
-            "delta": round(delta, 2),
+            "post_dpo_score": round(post_dpo_score, 2),
+            "dpo_delta": round(dpo_delta, 2),
+            "total_delta": round(total_delta, 2),
             "model": MODEL_ID,
             "remote_host": remote_host,
         }
-        out_path = project_dir / "dpo_experiment_results.json"
+        out_path = project_dir / "sft_dpo_experiment_results.json"
         out_path.write_text(json.dumps(summary, indent=2) + "\n")
         print(f"\nResults saved to {out_path}")
 
@@ -469,9 +539,70 @@ async def main(remote_host: str, train_samples: int = TRAIN_SAMPLES, eval_sample
         await ssh_run(remote_host, f"rm -rf {remote_root}", timeout=60.0)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _wait_for_training(
+    backend, remote_run_dir: str, local_run_dir: Path, job_id: str, remote_host: str,
+) -> tuple[int, str]:
+    """Poll for SFT training completion. Returns (last_step, final_state)."""
+    from lqh.train.progress import read_latest_progress
+
+    deadline = time.monotonic() + 3600
+    last_step = -1
+    final_state = "unknown"
+
+    while time.monotonic() < deadline:
+        try:
+            await backend.sync_progress(remote_run_dir, str(local_run_dir))
+        except Exception:
+            pass
+
+        latest = read_latest_progress(local_run_dir)
+        if latest:
+            step = latest.get("step")
+            if step is not None and step != last_step:
+                last_step = step
+                loss = latest.get("loss")
+                lr = latest.get("lr")
+                epoch = latest.get("epoch")
+                parts = [f"Step {step}"]
+                if loss is not None:
+                    parts.append(f"loss={loss:.4f}")
+                if lr is not None:
+                    parts.append(f"lr={lr:.2e}")
+                if epoch is not None:
+                    parts.append(f"epoch={epoch:.2f}")
+                print(f"  {' | '.join(parts)}")
+
+            status = latest.get("status")
+            if status in ("completed", "failed"):
+                final_state = status
+                break
+
+        if not await backend.is_job_alive(job_id) and last_step >= 0:
+            await backend.sync_progress(remote_run_dir, str(local_run_dir))
+            latest = read_latest_progress(local_run_dir)
+            final_state = latest.get("status", "failed") if latest else "failed"
+            break
+
+        await asyncio.sleep(5)
+
+    return last_step, final_state
+
+
 async def _remote_eval(
-    project_dir, backend, remote_root, remote_host, client,
-    model_remote, eval_run_name, eval_path, scorer_path,
+    project_dir: Path,
+    backend,
+    remote_root: str,
+    remote_host: str,
+    client,
+    model_remote: str,
+    eval_run_name: str,
+    eval_path: Path,
+    scorer_path: Path,
 ) -> float:
     """Run inference on remote, pull predictions, score locally."""
     from lqh.remote.ssh_helpers import ssh_run
@@ -560,6 +691,6 @@ if __name__ == "__main__":
         import os
         host = os.environ.get("LQH_TEST_REMOTE_HOST")
     if not host:
-        print("Usage: python -m tests.remote.experiment_dpo_training --remote-host=toka [--train-samples=200] [--eval-samples=200]")
+        print("Usage: python -m tests.experiments.experiment_sft_then_dpo --remote-host=toka [--train-samples=200] [--eval-samples=200]")
         sys.exit(1)
     asyncio.run(main(host, train_samples=n_train or TRAIN_SAMPLES, eval_samples=n_eval or EVAL_SAMPLES))

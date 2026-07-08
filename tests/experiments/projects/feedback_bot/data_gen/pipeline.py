@@ -2,7 +2,7 @@
 
 Produces 5-message ChatML conversations exercising one of 5 tools per
 sample. The conversation shape matches what
-``tests/remote/tool_calling_e2e_pipeline.py`` uses, so it flows
+``tests/function/tool_calling_e2e_pipeline.py`` uses, so it flows
 through ``lqh.infer`` and ``lqh.train`` unchanged. Tools are attached
 to the *system* message — the engine writes them into the parquet's
 ``tools`` column.

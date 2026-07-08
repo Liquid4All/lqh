@@ -24,7 +24,7 @@ comparable to what the agent reports.
 
 Usage::
 
-    python -m tests.remote.experiment_sft_no_regression \\
+    python -m tests.experiments.experiment_sft_no_regression \\
         --project-dir example_project \\
         --train-dataset datasets/business_chat_translation_v1_filtered/data.parquet \\
         --eval-dataset datasets/business_chat_translation_v1_eval/data.parquet \\

@@ -2,7 +2,7 @@
 
 Usage::
 
-    python -m tests.remote.experiment_larger_training --remote-host=toka
+    python -m tests.experiments.experiment_larger_training --remote-host=toka
 """
 
 from __future__ import annotations
@@ -524,6 +524,6 @@ if __name__ == "__main__":
         import os
         host = os.environ.get("LQH_TEST_REMOTE_HOST")
     if not host:
-        print("Usage: python -m tests.remote.experiment_larger_training --remote-host=toka [--train-samples=1000] [--eval-samples=200]")
+        print("Usage: python -m tests.experiments.experiment_larger_training --remote-host=toka [--train-samples=1000] [--eval-samples=200]")
         sys.exit(1)
     asyncio.run(main(host, train_samples=n_train or TRAIN_SAMPLES, eval_samples=n_eval or EVAL_SAMPLES))

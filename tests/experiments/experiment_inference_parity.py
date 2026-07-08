@@ -18,7 +18,7 @@ and (with --score) the mean judge-score gap.
 
 Usage::
 
-    python -m tests.remote.experiment_inference_parity \
+    python -m tests.experiments.experiment_inference_parity \
         --dataset example_project/datasets/business_chat_translation_v1_eval/data.parquet \
         --schema example_project/prompts/business_chat_translation.schema.json \
         --system-prompt example_project/prompts/business_chat_translation_v0.md \

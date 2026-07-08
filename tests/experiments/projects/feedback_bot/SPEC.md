@@ -45,7 +45,7 @@ tool     — JSON-string mock result
 assistant — final, customer-facing reply (2-4 sentences)
 ```
 
-This matches `tests/remote/tool_calling_e2e_pipeline.py`'s shape and
+This matches `tests/function/tool_calling_e2e_pipeline.py`'s shape and
 flows through `lqh.infer` and `lqh.train` unchanged.
 
 ## What the eval actually scores

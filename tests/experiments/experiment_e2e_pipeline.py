@@ -1,7 +1,7 @@
 """Generic e2e harness: spec → datagen → filter → SFT → eval (→ DPO).
 
 Driven by ``e2e_config.json`` in a per-task project under
-``tests/e2e_projects/<task>/``. The same script handles JSON-constrained
+``tests/experiments/projects/<task>/``. The same script handles JSON-constrained
 tasks, tool-calling tasks (Phase 4), and open-ended tasks (Phase 3
 adds DPO support); per-task differences are declared in the config.
 
@@ -19,12 +19,12 @@ Stage order (each skippable via ``--skip-<stage>``)::
 
 Final report: a single table with baseline / post-SFT (/ post-DPO)
 mean+median+deltas + PASS/WARN/FAIL verdict, written to
-``tests/e2e_projects/<task>/runs/e2e_<timestamp>/report.md``.
+``tests/experiments/projects/<task>/runs/e2e_<timestamp>/report.md``.
 
 Usage::
 
-    python -m tests.remote.experiment_e2e_pipeline --task translation
-    python -m tests.remote.experiment_e2e_pipeline --task translation \\
+    python -m tests.experiments.experiment_e2e_pipeline --task translation
+    python -m tests.experiments.experiment_e2e_pipeline --task translation \\
         --train-samples 8 --eval-samples 4 --skip-sft --skip-post-sft-eval
 
 Designed to run on a GPU host (toka). Needs an lqh API token (in
@@ -48,7 +48,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-PROJECTS_ROOT = REPO_ROOT / "tests" / "e2e_projects"
+PROJECTS_ROOT = REPO_ROOT / "tests" / "experiments" / "projects"
 
 
 # --------------------------------------------------------------------------
@@ -1000,7 +1000,7 @@ def _render_report(
 async def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--task", required=True,
-                   help="Task project name under tests/e2e_projects/")
+                   help="Task project name under tests/experiments/projects/")
     p.add_argument("--config-name", default="default",
                    help="Picks <project>/e2e_config_<NAME>.json. Default loads "
                         "<project>/e2e_config.json. Use this to run multiple "
