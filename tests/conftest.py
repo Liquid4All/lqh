@@ -16,7 +16,7 @@ integration tests:
 * a helper for assembling OpenAI ``ChatCompletion`` response shapes
 
 Tests should compose these fixtures rather than re-rolling local
-helpers — see ``tests/test_scoring.py`` and ``tests/test_training.py``
+helpers — see ``tests/unit/test_scoring.py`` and ``tests/unit/test_training.py``
 for canonical usage.
 """
 

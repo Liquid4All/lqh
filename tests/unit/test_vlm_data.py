@@ -336,7 +336,7 @@ def _make_dataset(project: Path, name: str) -> str:
 def isolated_home(tmp_path, monkeypatch):
     """Point HOME + the global remotes/compute paths at a tmp dir so tests
     can't leak state into the developer's real ~/.lqh (same shape as
-    tests/test_compute_resolve.py)."""
+    tests/unit/test_compute_resolve.py)."""
     import lqh.remote.config as remote_config
 
     home = tmp_path / "home"
