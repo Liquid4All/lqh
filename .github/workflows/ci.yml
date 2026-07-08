@@ -40,6 +40,9 @@ jobs:
       - run: uv python install ${{ matrix.python-version }}
       - run: uv sync --frozen --group dev --python ${{ matrix.python-version }}
       - run: uv run pytest tests/unit -v
+      # Import-check every suite (function/e2e/harness/benchmarks) without
+      # auth or cost — catches broken imports and stale module paths.
+      - run: uv run pytest tests --collect-only -q
 
   json-lint:
     name: json lint
