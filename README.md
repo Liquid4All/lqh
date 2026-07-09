@@ -15,7 +15,7 @@ Liquid Harness is a terminal agent that turns a plain-English description of you
 > ⚠️ **Closed beta** — visit [lqh.ai](https://lqh.ai) to request access.
 
 ```bash
-pip install lqh
+uv tool install lqh   # or: pip install lqh
 lqh
 ```
 
@@ -48,10 +48,17 @@ Point it at a folder of raw, unlabelled images and it can build a vision fine-tu
 ## 🚀 Quickstart
 
 ```bash
-pip install lqh
+# One-time: install uv (skip if you already have it)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv tool install lqh
 mkdir my-task && cd my-task
 lqh
 ```
+
+`uv tool install` puts the `lqh` command on your PATH in its own isolated environment — no virtualenv to create or activate, and uv downloads a compatible Python automatically if your system one is too old. Upgrade later with `uv tool upgrade lqh`. On Windows, install uv with `winget install astral-sh.uv`.
+
+If you already manage your own Python environments, `pipx install lqh` or `pip install lqh` work just as well.
 
 Inside the TUI:
 
@@ -174,7 +181,7 @@ Everything is plain files — specs are markdown, pipelines are Python, datasets
 
 ## 🔧 Requirements
 
-- Python 3.11+
+- Python 3.11+ (`uv tool install` fetches one automatically if needed)
 - A Liquid Harness account ([request access](https://lqh.ai))
 - Optional: `torch` + `transformers` for local fine-tuning
 - Optional: `HF_TOKEN` for HuggingFace dataset sync
