@@ -69,6 +69,9 @@ def _is_other_option(option: str) -> bool:
     """
     return option.strip().lower().startswith("other")
 
+# Maximum rows the input area grows to before it scrolls internally.
+INPUT_MAX_LINES = 8
+
 # Interval between background-job completion scans, in seconds.
 # Trades freshness against SSH/filesystem load when remote runs are active.
 JOB_POLL_INTERVAL_SEC = 60.0
@@ -177,7 +180,10 @@ class LqhApp:
                 buffer=self._input_buffer,
                 focusable=True,
             ),
-            height=Dimension(min=1, max=6, preferred=1),
+            # No explicit `preferred`: the window then sizes itself to the
+            # buffer's line count (wrap-aware), clamped to INPUT_MAX_LINES.
+            height=Dimension(min=1, max=INPUT_MAX_LINES),
+            wrap_lines=True,
             style="class:input-area",
         )
 
@@ -230,9 +236,10 @@ class LqhApp:
         is_dataset_mode = Condition(lambda: self._dataset_viewer is not None)
 
         @kb.add("escape", "enter")
+        @kb.add("c-j")
         def _newline(event):
-            """Insert newline on Alt+Enter."""
-            event.app.current_buffer.insert_text("\n")
+            """Insert newline on Alt+Enter (or Ctrl+J where Alt+Enter is swallowed)."""
+            event.app.current_buffer.newline()
 
         @kb.add("c-c", eager=True)
         def _interrupt(event):
@@ -349,6 +356,20 @@ class LqhApp:
         """Render the status bar, with mode hints when applicable."""
         self._status_bar.bg_tasks = self._tasks.snapshot()
         parts = list(self._status_bar.get_formatted_text())
+
+        composing_multiline = (
+            self._ask_user_options is None
+            and self._dataset_viewer is None
+            and self._input_buffer is not None
+            and "\n" in self._input_buffer.text
+        )
+        if composing_multiline:
+            parts.extend([
+                ("class:status.separator", " │ "),
+                ("class:status", "Enter send"),
+                ("class:status.separator", " │ "),
+                ("class:status", "Alt+Enter newline"),
+            ])
 
         if self._ask_user_options:
             if self._ask_user_multi_select:
@@ -666,6 +687,9 @@ class LqhApp:
             lines = ["**Available Commands:**\n"]
             for cmd in COMMANDS:
                 lines.append(f"  `{cmd.name}` - {cmd.description}")
+            lines.append(
+                "\nTip: Alt+Enter (or Ctrl+J) inserts a newline; Enter sends."
+            )
             await self._emit(render_system_message("\n".join(lines)))
             return True
 

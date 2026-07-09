@@ -9,7 +9,7 @@ import pytest
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from lqh.tui.app import LqhApp, OTHER_OPTION, _is_other_option
+from lqh.tui.app import INPUT_MAX_LINES, LqhApp, OTHER_OPTION, _is_other_option
 from lqh.tui.renderer import render_options, render_system_message
 
 
@@ -65,10 +65,42 @@ async def _drive_ask_user(
     return result["res"]
 
 
+async def _drive_main_input(app: LqhApp, keystrokes: str) -> str:
+    """Feed *keystrokes* to the main prompt and return the submitted message."""
+    application = app._create_application()
+    app._app = application
+    result: dict[str, str] = {}
+
+    with create_pipe_input() as pipe:
+        application.input = pipe
+        application.output = DummyOutput()
+
+        async def drive() -> None:
+            await asyncio.sleep(0.1)
+            pipe.send_text(keystrokes)
+            result["res"] = await asyncio.wait_for(app._input_queue.get(), timeout=2)
+            application.exit()
+
+        task = asyncio.create_task(drive())
+        await application.run_async()
+        await task
+
+    return result["res"]
+
+
+def _input_window(app: LqhApp):
+    """Return the input Window from a freshly built layout."""
+    application = app._create_application()
+    hidden_input_row = application.layout.container.children[2]
+    return hidden_input_row.content.children[1]
+
+
 # Key sequences sent through the pipe input.
 ENTER = "\r"
 SPACE = " "
 DOWN = "\x1b[B"
+ALT_ENTER = "\x1b\r"
+CTRL_J = "\n"
 
 
 class TestPromptSession:
@@ -242,6 +274,52 @@ class TestPromptSession:
         out = render_options(["alpha", "beta"], 0, allow_other=False)
         assert "Enter: select" in out
         assert "Other" not in out
+
+    async def test_alt_enter_composes_multiline_message(self, app: LqhApp) -> None:
+        """Alt+Enter inserts a newline; Enter submits the whole message."""
+        res = await _drive_main_input(app, "hello" + ALT_ENTER + "world" + ENTER)
+        assert res == "hello\nworld"
+
+    async def test_ctrl_j_composes_multiline_message(self, app: LqhApp) -> None:
+        """Ctrl+J is the newline fallback for terminals that eat Alt+Enter."""
+        res = await _drive_main_input(app, "hello" + CTRL_J + "world" + ENTER)
+        assert res == "hello\nworld"
+
+    async def test_input_window_grows_with_buffer_lines(self, app: LqhApp) -> None:
+        """The input area's preferred height tracks the buffer's line count."""
+        window = _input_window(app)
+        assert app._input_buffer is not None
+
+        assert window.preferred_height(80, 24).preferred == 1
+
+        app._input_buffer.text = "a\nb\nc"
+        assert window.preferred_height(80, 24).preferred == 3
+
+    async def test_input_window_height_clamps_at_max(self, app: LqhApp) -> None:
+        window = _input_window(app)
+        assert app._input_buffer is not None
+        app._input_buffer.text = "\n".join(str(i) for i in range(INPUT_MAX_LINES + 5))
+        dim = window.preferred_height(80, 40)
+        assert dim.preferred == INPUT_MAX_LINES
+        assert dim.max == INPUT_MAX_LINES
+
+    def test_status_bar_hints_only_while_composing_multiline(self, app: LqhApp) -> None:
+        app._create_application()
+        assert app._input_buffer is not None
+
+        app._input_buffer.text = "single line"
+        flat = "".join(text for _, text in app._get_status_text())
+        assert "Alt+Enter" not in flat
+
+        app._input_buffer.text = "line one\nline two"
+        flat = "".join(text for _, text in app._get_status_text())
+        assert "Enter send" in flat
+        assert "Alt+Enter newline" in flat
+
+        # Suppressed while an ask-user prompt owns the Enter key.
+        app._ask_user_options = ["alpha", "beta"]
+        flat = "".join(text for _, text in app._get_status_text())
+        assert "Alt+Enter newline" not in flat
 
     async def test_wait_for_app_task_ignores_cancellation(self) -> None:
         async def never_finishes() -> None:
