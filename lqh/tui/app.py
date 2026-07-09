@@ -56,7 +56,18 @@ TUI_STYLE = Style.from_dict({
     "input-area": "bg:#16202a #f5f7fa",
 })
 
-OTHER_OPTION = "Other (please specify)"
+OTHER_OPTION = "Other (type your own answer)"
+
+
+def _is_other_option(option: str) -> bool:
+    """True if *option* looks like a catch-all "Other" choice.
+
+    The TUI always appends its own ``OTHER_OPTION``, so any model-produced
+    variant ("Other", "Other (please specify)", "Other (please enter)", …)
+    must be stripped first — otherwise the list shows two "Other" rows.
+    Matching on the ``other`` prefix is deliberately liberal.
+    """
+    return option.strip().lower().startswith("other")
 
 # Interval between background-job completion scans, in seconds.
 # Trades freshness against SSH/filesystem load when remote runs are active.
@@ -399,6 +410,7 @@ class LqhApp:
                 self._ask_user_selected,
                 checked=self._ask_user_checked if self._ask_user_multi_select else None,
                 warn_empty=self._ask_user_confirm_none,
+                allow_other=self._ask_user_allow_other,
             )
         )
 
@@ -512,7 +524,10 @@ class LqhApp:
                     ] if hasattr(self, "_ask_user_options_snapshot") else []
                     self._ask_user_checked_prefix = checked_names
                     self._set_managed_text(
-                        render_system_message("Type additional items (comma-separated):", separated=False)
+                        render_system_message(
+                            "✎ Type additional items (comma-separated), then press Enter:",
+                            separated=False,
+                        )
                     )
                     self._invalidate()
                     return
@@ -539,7 +554,10 @@ class LqhApp:
                     self._ask_user_options = None
                     self._ask_user_allow_other = False
                     self._set_managed_text(
-                        render_system_message("Type your response:", separated=False)
+                        render_system_message(
+                            "✎ Type your own answer, then press Enter:",
+                            separated=False,
+                        )
                     )
                     self._invalidate()
                     return
@@ -1187,11 +1205,7 @@ class LqhApp:
         await self._emit(render_agent_message(f"❓ {question}"))
 
         if options:
-            filtered = [
-                option
-                for option in options
-                if "other" not in option.lower() or "please specify" not in option.lower()
-            ]
+            filtered = [option for option in options if not _is_other_option(option)]
             all_options = filtered + [OTHER_OPTION] if allow_other else filtered
             response = await self._wait_for_user_response(
                 options=all_options,

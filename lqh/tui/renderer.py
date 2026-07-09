@@ -265,6 +265,7 @@ def render_options(
     *,
     checked: set[int] | None = None,
     warn_empty: bool = False,
+    allow_other: bool = False,
 ) -> str:
     """Render a selectable options list.
 
@@ -312,6 +313,12 @@ def render_options(
                 console.print(Text(f"  ▶ {opt}", style="bold cyan"))
             else:
                 console.print(Text(f"    {opt}", style="dim"))
+        hint = "    ↑↓: navigate  Enter: select"
+        if allow_other:
+            # The auto-appended "Other" row needs Enter first, THEN typing — the
+            # single most common point of confusion. Spell out both paths.
+            hint += "  ·  pick Other (or just type) for your own answer"
+        console.print(Text(hint, style="dim italic"))
 
     console.print()
     return buf.getvalue()

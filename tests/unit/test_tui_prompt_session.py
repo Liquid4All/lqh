@@ -9,7 +9,7 @@ import pytest
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from lqh.tui.app import LqhApp, OTHER_OPTION
+from lqh.tui.app import LqhApp, OTHER_OPTION, _is_other_option
 from lqh.tui.renderer import render_options, render_system_message
 
 
@@ -198,6 +198,50 @@ class TestPromptSession:
             allow_other=True,
         )
         assert res == "alpha"
+
+    @pytest.mark.parametrize(
+        "model_option",
+        [
+            "Other",
+            "Other (please specify)",
+            "Other (please enter)",
+            "  other  ",
+            OTHER_OPTION,
+        ],
+    )
+    async def test_model_produced_other_is_not_duplicated(
+        self, app: LqhApp, model_option: str,
+    ) -> None:
+        """A model that includes its own 'Other' row must not yield two of them.
+
+        The TUI appends exactly one OTHER_OPTION; the model's variant is filtered.
+        """
+        captured: dict[str, list[str]] = {}
+
+        async def fake_wait(*, options, allow_other, multi_select, relock_after):
+            captured["options"] = options
+            return options[0]
+
+        app._wait_for_user_response = fake_wait  # type: ignore[assignment]
+        await app._on_ask_user("Pick one", ["alpha", model_option], allow_other=True)
+
+        rendered = captured["options"]
+        assert rendered.count(OTHER_OPTION) == 1
+        assert sum(_is_other_option(o) for o in rendered) == 1
+        assert rendered == ["alpha", OTHER_OPTION]
+
+    def test_single_select_render_shows_navigation_hint(self, app: LqhApp) -> None:
+        """Single-select mode must spell out how to answer (it had no hint before)."""
+        out = render_options(["alpha", "beta"], 0, allow_other=True)
+        assert "Enter: select" in out
+        assert "type" in out.lower()  # invites a custom free-text answer
+
+    def test_single_select_hint_omits_custom_answer_without_other(
+        self, app: LqhApp,
+    ) -> None:
+        out = render_options(["alpha", "beta"], 0, allow_other=False)
+        assert "Enter: select" in out
+        assert "Other" not in out
 
     async def test_wait_for_app_task_ignores_cancellation(self) -> None:
         async def never_finishes() -> None:
