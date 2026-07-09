@@ -33,6 +33,7 @@ project5/
 
 # Deployment / local scripts
 build_and_deploy.sh
+copy_to_*.sh
 
 # IDE / editor
 .idea/
