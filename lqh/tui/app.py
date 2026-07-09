@@ -97,6 +97,7 @@ class LqhApp:
         self._ask_user_selected = 0
         self._ask_user_multi_select = False
         self._ask_user_checked: set[int] = set()
+        self._ask_user_confirm_none = False
         self._dataset_viewer: DatasetViewer | None = None
         self._dataset_viewer_future: asyncio.Future[str] | None = None
         self._input_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -246,6 +247,8 @@ class LqhApp:
         def _ask_up(event):
             if self._ask_user_options:
                 self._ask_user_selected = max(0, self._ask_user_selected - 1)
+                # Moving off the guarded row cancels the pending "confirm none".
+                self._ask_user_confirm_none = False
                 self._render_ask_user_options()
                 event.app.invalidate()
 
@@ -256,6 +259,7 @@ class LqhApp:
                     len(self._ask_user_options) - 1,
                     self._ask_user_selected + 1,
                 )
+                self._ask_user_confirm_none = False
                 self._render_ask_user_options()
                 event.app.invalidate()
 
@@ -276,6 +280,8 @@ class LqhApp:
                 self._ask_user_checked.discard(idx)
             else:
                 self._ask_user_checked.add(idx)
+            # Any toggle clears a pending "confirm none" warning.
+            self._ask_user_confirm_none = False
             self._render_ask_user_options()
             event.app.invalidate()
 
@@ -392,6 +398,7 @@ class LqhApp:
                 self._ask_user_options,
                 self._ask_user_selected,
                 checked=self._ask_user_checked if self._ask_user_multi_select else None,
+                warn_empty=self._ask_user_confirm_none,
             )
         )
 
@@ -504,6 +511,14 @@ class LqhApp:
                     for i in sorted(self._ask_user_checked)
                     if i < len(self._ask_user_options) and self._ask_user_options[i] != OTHER_OPTION
                 ]
+                if not checked_names and not self._ask_user_confirm_none:
+                    # First Enter with nothing toggled: users routinely expect the
+                    # highlighted row to count. Guard once with a prominent hint
+                    # instead of silently answering "(none selected)".
+                    self._ask_user_confirm_none = True
+                    self._render_ask_user_options()
+                    self._invalidate()
+                    return
                 response = ", ".join(checked_names) if checked_names else "(none selected)"
             else:
                 # Single-select
@@ -536,6 +551,7 @@ class LqhApp:
         self._ask_user_selected = 0
         self._ask_user_multi_select = False
         self._ask_user_checked = set()
+        self._ask_user_confirm_none = False
         self._set_managed_text("")
         self._invalidate()
 
@@ -561,6 +577,7 @@ class LqhApp:
         self._ask_user_allow_other = allow_other
         self._ask_user_multi_select = multi_select
         self._ask_user_checked = set()
+        self._ask_user_confirm_none = False
         self._ask_user_selected = 0
         # Snapshot options for "Other" flow in multi-select
         if multi_select and options:
@@ -912,10 +929,11 @@ class LqhApp:
             return
 
         await self._emit(render_system_message(
-            "Your feedback and this session's full conversation — including "
-            "system and tool messages, not just your chat — will be sent to the "
-            "lqh team for review. By submitting, you agree to our privacy "
-            "policy: https://lqh.ai/privacy/"
+            "Your feedback, this session's full conversation — including "
+            "system and tool messages, not just your chat — and a snapshot of "
+            "your environment (OS, CPU/RAM/GPU, Python and package versions) "
+            "will be sent to the lqh team for review. By submitting, you agree "
+            "to our privacy policy: https://lqh.ai/privacy/"
         ))
 
         message = (args or "").strip()

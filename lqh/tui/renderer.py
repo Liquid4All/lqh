@@ -264,12 +264,17 @@ def render_options(
     width: int = 100,
     *,
     checked: set[int] | None = None,
+    warn_empty: bool = False,
 ) -> str:
     """Render a selectable options list.
 
     When *checked* is provided, options are rendered as checkboxes (multi-select
     mode) with Space-to-toggle hint.  Otherwise rendered as single-select radio
     with an arrow marker.
+
+    When *warn_empty* is set (multi-select confirm guard), a prominent banner
+    reminds the user that Space toggles options before they confirm an empty
+    selection.
     """
     buf = StringIO()
     console = Console(
@@ -284,7 +289,22 @@ def render_options(
                 console.print(Text(f"  ▶ [{mark}] {opt}", style="bold cyan"))
             else:
                 console.print(Text(f"    [{mark}] {opt}", style="dim"))
-        console.print(Text("    Space: toggle  Enter: confirm", style="dim italic"))
+        if warn_empty:
+            console.print(
+                Text(
+                    "  ⚠ Nothing selected. Press Space to toggle the highlighted "
+                    "option,",
+                    style="bold yellow",
+                )
+            )
+            console.print(
+                Text(
+                    "    or press Enter again to answer with none selected.",
+                    style="bold yellow",
+                )
+            )
+        else:
+            console.print(Text("    Space: toggle  Enter: confirm", style="dim italic"))
     else:
         # Single-select (radio) mode
         for i, opt in enumerate(options):
