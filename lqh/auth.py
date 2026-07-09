@@ -89,10 +89,14 @@ async def send_feedback(
     """Submit user feedback plus the current conversation context to the
     backend for super-admin review (FEEDBACK.md). Raises on a non-2xx
     response. The conversation is trimmed (oldest-first) to fit the backend's
-    size cap."""
+    size cap. A best-effort environment snapshot (OS/CPU/RAM/GPU/Python) is
+    attached as `metadata` — see lqh.sysinfo."""
+    from lqh.sysinfo import collect_environment
+
     payload = {
         "message": message,
         "context": _trim_feedback_context(context or []),
+        "metadata": collect_environment(),
         "session_id": session_id,
         "client_version": __version__,
     }
