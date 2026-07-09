@@ -470,6 +470,18 @@ class LqhApp:
         buff.reset()
 
         if self._ask_user_future is not None:
+            # Slash commands are dispatched only on the main input path
+            # (_handle_input). While an ask_user prompt is active, a leading
+            # "/" would otherwise be swallowed as the literal answer, so
+            # intercept it here and tell the user to answer the question first.
+            if is_command(text):
+                asyncio.get_event_loop().create_task(
+                    self._emit(render_system_message(
+                        "Commands aren't available while a question is pending. "
+                        "Please answer the question above first."
+                    ))
+                )
+                return False
             self._resolve_ask_user(text)
             return False
 
