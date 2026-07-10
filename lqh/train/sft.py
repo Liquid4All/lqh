@@ -581,6 +581,26 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         label="sft",
     )
 
+    # Always evaluate the final model once after training. Two reasons:
+    #   1. The in-training eval cadence (eval_steps, default 50) can
+    #      exceed the total number of optimizer steps entirely — small
+    #      dataset x large auto-tuned batch means a 2-epoch run may have
+    #      ~14 steps. Then HF Trainer never evaluates, eval_history.json
+    #      carries no eval_loss, and the sweep proxy is missing for
+    #      every config (sweep fails with "wrote no proxy metric").
+    #   2. Even when step evals did fire, this measures the model that
+    #      is actually saved (post load_best_model_at_end), which is
+    #      what the sweep is selecting between. Trainer.evaluate() logs
+    #      its metrics into state.log_history, so the dump below picks
+    #      it up as the LAST eval_loss entry — exactly the one
+    #      _read_sft_proxy in sweep.py uses.
+    if eval_dataset is not None:
+        try:
+            final_metrics = trainer.evaluate()
+            print(f"Final eval: eval_loss={final_metrics.get('eval_loss')}")
+        except Exception as exc:  # noqa: BLE001 — eval must not kill a finished train
+            print(f"  WARNING: final evaluation failed: {exc}")
+
     # Dump the full log history (one entry per logging step, including
     # eval rows) for downstream correlation analysis. Filter to
     # JSON-serialisable scalars only — log_history sometimes carries
