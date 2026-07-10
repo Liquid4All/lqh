@@ -28,6 +28,8 @@ dependencies = [
     "pyarrow",
     # Image preprocessing for VLM data-gen (resize/re-encode before base64).
     "pillow>=10.0",
+    # Direct dependency: used for PEP 440 comparisons in the update checker.
+    "packaging>=24.0",
 ]
 
 [project.optional-dependencies]

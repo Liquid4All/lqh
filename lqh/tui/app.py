@@ -39,6 +39,7 @@ from lqh.tui.renderer import (
 )
 from lqh.tui.background_tasks import BackgroundTask, BackgroundTaskRegistry
 from lqh.tui.status_bar import StatusBar
+from lqh.update_check import check_for_update
 
 if TYPE_CHECKING:
     from lqh.subprocess_manager import SubprocessManager
@@ -144,6 +145,7 @@ class LqhApp:
         # First-time observations are recorded silently; only running → terminal
         # transitions enqueue a notification.
         self._job_watcher_task: asyncio.Task | None = None
+        self._update_check_task: asyncio.Task[None] | None = None
         self._job_last_state: dict[str, str] = {}
         # Completion notices keyed by run_name, recorded by _watch_jobs on a
         # running -> terminal transition. Auto-mode _await_background pops the
@@ -2216,6 +2218,7 @@ class LqhApp:
         await asyncio.sleep(0)
 
         await self._emit(render_welcome())
+        self._update_check_task = asyncio.create_task(self._show_update_notice())
 
         token = get_token()
         self._status_bar.logged_in = bool(token)
@@ -2250,6 +2253,7 @@ class LqhApp:
             try:
                 await self._run_auto_mode()
             finally:
+                await self._stop_update_check()
                 self._exit_application()
                 await self._wait_for_app_task(app_task)
                 self._save_session()
@@ -2314,6 +2318,7 @@ class LqhApp:
                 for task in pending:
                     task.cancel()
         finally:
+            await self._stop_update_check()
             if self._job_watcher_task is not None:
                 self._job_watcher_task.cancel()
                 try:
@@ -2330,3 +2335,28 @@ class LqhApp:
             self._exit_application()
             await self._wait_for_app_task(app_task)
             self._save_session()
+
+    async def _show_update_notice(self) -> None:
+        """Emit a non-blocking update hint when PyPI has a newer release."""
+        update = await check_for_update()
+        if update is None:
+            return
+        await self._emit(
+            render_system_message(
+                f"⬆️ lqh {update.latest} is available "
+                f"(installed: {update.current}). Upgrade with: pip install -U lqh"
+            )
+        )
+
+    async def _stop_update_check(self) -> None:
+        """Finish or cancel the optional startup update task cleanly."""
+        task = self._update_check_task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._update_check_task = None

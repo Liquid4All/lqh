@@ -8,6 +8,8 @@ import logging
 import sys
 from pathlib import Path
 
+from lqh import __version__
+
 
 def _configure_logging(project_dir: Path) -> None:
     """Route library log output to ``.lqh/lqh.log``.
@@ -45,6 +47,12 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show the installed lqh version and exit.",
+    )
+    parser.add_argument(
         "--auto",
         metavar="SPEC_DIR",
         type=Path,
@@ -72,8 +80,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     """Main entry point for the lqh CLI."""
-    from lqh.tui.app import LqhApp
-
     args = _build_parser().parse_args()
 
     if args.auto is not None:
@@ -96,6 +102,10 @@ def main() -> None:
     else:
         project_dir = Path.cwd()
         auto_mode = False
+
+    # Keep lightweight commands such as --help and --version from importing
+    # the full TUI dependency graph.
+    from lqh.tui.app import LqhApp
 
     _configure_logging(project_dir)
     app = LqhApp(project_dir, auto_mode=auto_mode, extra_spec=args.spec)

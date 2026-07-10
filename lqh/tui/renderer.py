@@ -9,6 +9,8 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
+from lqh import __version__
+
 BLOCK_INDENT = 2
 MIN_RENDER_WIDTH = 20
 WELCOME_LOGO = (
@@ -393,7 +395,12 @@ def render_welcome(width: int = 100) -> str:
         )
 
     console.print()
-    console.print(Text("  Customize Liquid AI foundation models", style=accent))
+    console.print(
+        Text(
+            f"  Customize Liquid AI foundation models  •  v{__version__}",
+            style=accent,
+        )
+    )
     console.print()
     console.print(
         Text("  Type a message to get started, or use / for commands.", style="dim")

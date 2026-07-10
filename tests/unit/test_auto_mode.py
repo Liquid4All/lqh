@@ -642,6 +642,15 @@ class TestCliParser:
         assert args.auto is None
         assert args.spec is None
 
+    def test_version_flag(self, parser, capsys) -> None:
+        from lqh import __version__
+
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["--version"])
+
+        assert exc_info.value.code == 0
+        assert capsys.readouterr().out.strip() == f"lqh {__version__}"
+
     def test_auto_flag(self, parser) -> None:
         args = parser.parse_args(["--auto", "/tmp/myproj"])
         assert str(args.auto) == "/tmp/myproj"

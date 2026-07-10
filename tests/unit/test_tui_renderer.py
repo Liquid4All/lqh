@@ -6,7 +6,9 @@ from lqh.tui.renderer import (
     render_agent_message,
     render_system_message,
     render_user_message,
+    render_welcome,
 )
+from lqh import __version__
 
 
 class TestRenderer:
@@ -34,3 +36,6 @@ class TestRenderer:
         assert not rendered.startswith("\n")
         assert not rendered.startswith("  ")
         assert "Type your response:" in rendered
+
+    def test_welcome_includes_version(self) -> None:
+        assert f"v{__version__}" in render_welcome()
