@@ -37,12 +37,31 @@ COMMANDS: list[SlashCommand] = [
 
 
 class SlashCommandCompleter(Completer):
-    """Completer for slash commands."""
+    """Completer for slash commands.
+
+    Only completes while the buffer is a single line whose first word is
+    still being typed (``/spe``); as soon as the user is past the command
+    word (``/spec my task``) or composing a multiline message, it yields
+    nothing so the menu closes. ``enabled`` gates completion entirely —
+    the TUI uses it to suppress the menu while an ask_user prompt or the
+    dataset viewer owns the input buffer.
+    """
+
+    def __init__(self, enabled: Callable[[], bool] | None = None) -> None:
+        self._enabled = enabled
 
     def get_completions(self, document: Document, complete_event):
-        text = document.text_before_cursor.strip()
+        if self._enabled is not None and not self._enabled():
+            return
 
-        if not text.startswith("/"):
+        if "\n" in document.text:
+            return
+
+        text = document.text_before_cursor.lstrip()
+
+        # Past the command word (a space was typed) — the user is writing
+        # arguments or free text; keep the menu closed.
+        if not text.startswith("/") or any(ch.isspace() for ch in text):
             return
 
         for cmd in COMMANDS:

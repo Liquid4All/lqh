@@ -124,7 +124,8 @@ class TestPromptSession:
 
     def test_layout_keeps_status_below_input(self, app: LqhApp) -> None:
         application = app._create_application()
-        assert len(application.layout.container.children) == 5
+        # managed, pad, input, completion menu, pad, status
+        assert len(application.layout.container.children) == 6
 
     async def test_plain_ask_user_prompt_stays_in_managed_area(self, app: LqhApp) -> None:
         task = asyncio.create_task(

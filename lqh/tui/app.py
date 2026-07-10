@@ -54,6 +54,14 @@ TUI_STYLE = Style.from_dict({
     "input-border": "#444444",
     "input-prompt": "bold #888888",
     "input-area": "bg:#16202a #f5f7fa",
+    # NB: deliberately NOT named "completion-menu" — that class exists in
+    # prompt_toolkit's default UI style (bg:#bbbbbb) and would bleed a light
+    # background through any partial override.
+    "slash-menu": "#c0c8d0",
+    "slash-menu.selected": "bg:#16202a #00ff88 bold",
+    "slash-menu.meta": "#777777",
+    "slash-menu.meta.selected": "bg:#16202a #aaaaaa",
+    "slash-menu.hint": "#555555 italic",
 })
 
 OTHER_OPTION = "Other (type your own answer)"
@@ -71,6 +79,19 @@ def _is_other_option(option: str) -> bool:
 
 # Maximum rows the input area grows to before it scrolls internally.
 INPUT_MAX_LINES = 8
+
+# A second Ctrl+C within this window exits the app. Outside it, Ctrl+C is a
+# fresh press: interrupt the running agent turn, or clear the typed input.
+CTRL_C_EXIT_WINDOW_SEC = 2.0
+
+# Sentinel pushed into the input queue on shutdown so any consumer parked on
+# the queue (the auto-mode pause prompt, the main input loop) wakes up and
+# unwinds instead of waiting for input that will never come.
+_SHUTDOWN_SENTINEL = "\x00__lqh_shutdown__"
+
+
+class AgentInterrupted(Exception):
+    """The user cancelled the in-flight agent turn (Esc / Ctrl+C)."""
 
 # Interval between background-job completion scans, in seconds.
 # Trades freshness against SSH/filesystem load when remote runs are active.
@@ -142,6 +163,14 @@ class LqhApp:
         # but exposed via self._tasks for future producers).
         self._tasks = BackgroundTaskRegistry(on_change=self._invalidate)
         self._ctrl_c_pressed = False
+        self._ctrl_c_at = 0.0
+        # The in-flight agent turn, wrapped in a task so Esc / Ctrl+C can
+        # cancel it without waiting for the current LLM call to finish.
+        self._agent_task: asyncio.Task | None = None
+        self._interrupt_requested = False
+        # Auto mode: True while the run is paused waiting for a user
+        # instruction (single Ctrl+C). Unhides the input row.
+        self._auto_paused = False
         self._input_buffer: Buffer | None = None
         self._managed_ansi = ""
         self._shutdown_requested = False
@@ -171,7 +200,12 @@ class LqhApp:
 
         self._input_buffer = Buffer(
             name="input",
-            completer=SlashCommandCompleter(),
+            completer=SlashCommandCompleter(
+                enabled=lambda: (
+                    self._ask_user_future is None and self._dataset_viewer is None
+                ),
+            ),
+            complete_while_typing=True,
             multiline=False,
             accept_handler=self._on_accept,
         )
@@ -202,10 +236,19 @@ class LqhApp:
             ),
         )
 
+        completion_menu = ConditionalContainer(
+            content=Window(
+                content=FormattedTextControl(self._get_completion_menu_text),
+                dont_extend_height=True,
+            ),
+            filter=Condition(self._completion_menu_active),
+        )
+
         # In auto mode the input field is hidden — the agent runs without
         # user input and the managed window is the only visible surface
-        # besides the status bar.
-        not_auto = Condition(lambda: not self.auto_mode)
+        # besides the status bar. Exception: while the run is paused by a
+        # user interrupt, the input row appears to collect the instruction.
+        not_auto = Condition(lambda: not self.auto_mode or self._auto_paused)
         hidden_input_pad_top = ConditionalContainer(content=input_pad_top, filter=not_auto)
         hidden_input_row = ConditionalContainer(content=input_row, filter=not_auto)
         hidden_input_pad_bottom = ConditionalContainer(content=input_pad_bottom, filter=not_auto)
@@ -220,6 +263,7 @@ class LqhApp:
                 managed_window,
                 hidden_input_pad_top,
                 hidden_input_row,
+                completion_menu,
                 hidden_input_pad_bottom,
                 status_window,
             ]),
@@ -243,13 +287,22 @@ class LqhApp:
 
         @kb.add("c-c", eager=True)
         def _interrupt(event):
-            """Ctrl+C once warns, twice exits."""
-            if self._ctrl_c_pressed:
+            """Ctrl+C once interrupts the agent (or warns); twice in a row exits."""
+            now = time.monotonic()
+            if self._ctrl_c_pressed and now - self._ctrl_c_at <= CTRL_C_EXIT_WINDOW_SEC:
                 self._save_session()
                 self._request_shutdown()
                 return
 
             self._ctrl_c_pressed = True
+            self._ctrl_c_at = now
+
+            # Agent busy: a single Ctrl+C cancels the in-flight turn and
+            # returns control to the user (feedback is emitted by the
+            # interrupt path). The typed buffer is preserved.
+            if self._request_agent_interrupt():
+                return
+
             event.app.current_buffer.reset()
             asyncio.get_event_loop().create_task(
                 self._emit(render_system_message("Press Ctrl+C again to exit, or continue typing."))
@@ -280,6 +333,60 @@ class LqhApp:
                 self._ask_user_confirm_none = False
                 self._render_ask_user_options()
                 event.app.invalidate()
+
+        # Slash-command autocomplete. The completer only fires on a
+        # single-line "/word" prefix (and never in ask/dataset mode), so
+        # these bindings cannot collide with the ask-mode arrows above.
+        has_completion_menu = Condition(self._completion_menu_active)
+        completion_selected = Condition(
+            lambda: bool(
+                self._input_buffer
+                and self._input_buffer.complete_state
+                and self._input_buffer.complete_state.current_completion
+            )
+        )
+
+        @kb.add("up", filter=has_completion_menu, eager=True)
+        def _completion_up(event):
+            event.app.current_buffer.complete_previous()
+
+        @kb.add("down", filter=has_completion_menu, eager=True)
+        def _completion_down(event):
+            event.app.current_buffer.complete_next()
+
+        @kb.add("c-i", filter=has_completion_menu, eager=True)  # Tab
+        def _completion_tab(event):
+            """Tab fills the buffer with the highlighted (or first) command."""
+            buff = event.app.current_buffer
+            state = buff.complete_state
+            completion = state.current_completion or state.completions[0]
+            buff.apply_completion(completion)
+
+        @kb.add("enter", filter=completion_selected, eager=True)
+        def _completion_enter(event):
+            """Enter on a highlighted row runs that command immediately."""
+            buff = event.app.current_buffer
+            buff.apply_completion(buff.complete_state.current_completion)
+            buff.validate_and_handle()
+
+        @kb.add("escape", filter=has_completion_menu, eager=True)
+        def _completion_escape(event):
+            event.app.current_buffer.cancel_completion()
+
+        # Esc interrupts the in-flight agent turn, like a single Ctrl+C.
+        # Excluded while another overlay owns Esc (completion menu, dataset
+        # viewer). `eager` means Esc no longer waits to disambiguate from
+        # Alt+Enter while the agent is busy — acceptable, since composing a
+        # multiline message mid-turn is far rarer than wanting to interrupt.
+        is_agent_busy = Condition(self._agent_busy)
+
+        @kb.add(
+            "escape",
+            filter=is_agent_busy & ~has_completion_menu & ~is_dataset_mode,
+            eager=True,
+        )
+        def _esc_interrupt(event):
+            self._request_agent_interrupt()
 
         is_multi_select = Condition(
             lambda: self._ask_user_multi_select and self._ask_user_options is not None
@@ -352,6 +459,37 @@ class LqhApp:
             label = " > "
         return FormattedText([("class:input-prompt", label)])
 
+    def _completion_menu_active(self) -> bool:
+        """True while the slash-command menu has rows to show."""
+        buf = self._input_buffer
+        return bool(buf and buf.complete_state and buf.complete_state.completions)
+
+    def _get_completion_menu_text(self) -> FormattedText:
+        """Render the slash-command menu below the input row."""
+        buf = self._input_buffer
+        state = buf.complete_state if buf else None
+        if not state or not state.completions:
+            return FormattedText([])
+
+        width = max(len(c.text) for c in state.completions)
+        fragments: list[tuple[str, str]] = []
+        for i, completion in enumerate(state.completions):
+            selected = i == state.complete_index
+            name_style = "class:slash-menu.selected" if selected else "class:slash-menu"
+            meta_style = (
+                "class:slash-menu.meta.selected" if selected
+                else "class:slash-menu.meta"
+            )
+            marker = "❯ " if selected else "  "
+            fragments.append((name_style, f"   {marker}{completion.text:<{width}}"))
+            fragments.append((meta_style, f"  {completion.display_meta_text}"))
+            fragments.append(("", "\n"))
+        fragments.append(
+            ("class:slash-menu.hint",
+             "   ↑/↓ choose · Enter run · Tab complete · Esc dismiss")
+        )
+        return FormattedText(fragments)
+
     def _get_status_text(self) -> FormattedText:
         """Render the status bar, with mode hints when applicable."""
         self._status_bar.bg_tasks = self._tasks.snapshot()
@@ -393,6 +531,24 @@ class LqhApp:
             parts.extend([
                 ("class:status.separator", " │ "),
                 ("class:status.spinner", "n/p/r/q dataset"),
+            ])
+
+        if self._auto_paused:
+            parts.extend([
+                ("class:status.separator", " │ "),
+                ("class:status.spinner", "⏸ paused"),
+                ("class:status.separator", " │ "),
+                ("class:status", "Enter continue"),
+            ])
+        elif (
+            self._agent_busy()
+            and self._ask_user_future is None
+            and self._dataset_viewer is None
+        ):
+            hint = "Ctrl+C interrupt" if self.auto_mode else "Esc interrupt"
+            parts.extend([
+                ("class:status.separator", " │ "),
+                ("class:status", hint),
             ])
 
         return FormattedText(parts)
@@ -469,7 +625,58 @@ class LqhApp:
     def _request_shutdown(self) -> None:
         """Mark the session for shutdown and stop the live application."""
         self._shutdown_requested = True
+        # Cancel any in-flight agent turn so callers awaiting it unwind
+        # instead of blocking shutdown until the turn completes.
+        self._request_agent_interrupt()
+        # Wake any consumer parked on the input queue (auto-mode pause,
+        # main loop) so it sees the shutdown instead of waiting forever.
+        self._input_queue.put_nowait(_SHUTDOWN_SENTINEL)
         self._exit_application()
+
+    def _agent_busy(self) -> bool:
+        """True while an agent turn is in flight (and thus interruptible)."""
+        return self._agent_task is not None and not self._agent_task.done()
+
+    def _request_agent_interrupt(self) -> bool:
+        """Cancel the in-flight agent turn. Returns True if one was running."""
+        task = self._agent_task
+        if task is None or task.done():
+            return False
+        self._interrupt_requested = True
+        task.cancel()
+        return True
+
+    async def _run_interruptible(self, action: Callable[[], Awaitable[Any]]) -> Any:
+        """Run an agent action as a task so Esc / Ctrl+C can cancel it mid-flight.
+
+        Cancellation does NOT wait for the current LLM call or tool to finish.
+        On a user interrupt the session is repaired (unanswered tool calls get
+        synthetic results so the API accepts the history), transient status UI
+        is cleared, and ``AgentInterrupted`` is raised for the caller to
+        resume its own flow.
+        """
+        task = asyncio.create_task(action())
+        self._agent_task = task
+        try:
+            return await task
+        except asyncio.CancelledError:
+            if not self._interrupt_requested:
+                # We were cancelled from outside — propagate, but don't leave
+                # the agent turn running detached.
+                task.cancel()
+                raise
+            self._interrupt_requested = False
+            if self._agent:
+                self._agent.abort_turn()
+            # The cancel can land while the spinner / pipeline status is live.
+            self._on_spinner_stop()
+            self._on_pipeline_done()
+            self._save_session()
+            if not self._shutdown_requested:
+                await self._emit(render_system_message("⏹ Interrupted."))
+            raise AgentInterrupted() from None
+        finally:
+            self._agent_task = None
 
     def _start_application_task(self) -> asyncio.Task:
         """Create and start a fresh bottom-docked application instance."""
@@ -496,7 +703,10 @@ class LqhApp:
 
         if self._processing and self._ask_user_future is None:
             asyncio.get_event_loop().create_task(
-                self._emit(render_system_message("⏳ Please wait for the current operation to finish."))
+                self._emit(render_system_message(
+                    "⏳ Please wait for the current operation to finish "
+                    "(or press Esc / Ctrl+C to interrupt it)."
+                ))
             )
             return False
 
@@ -649,6 +859,17 @@ class LqhApp:
         finally:
             if relock_after:
                 self._lock_input()
+            if self._ask_user_future is future:
+                # The wait was cancelled (user interrupt) before the prompt
+                # was answered — clear the ask state so the input row returns
+                # to normal instead of swallowing the next message as an answer.
+                self._ask_user_future = None
+                self._ask_user_options = None
+                self._ask_user_allow_other = False
+                self._ask_user_multi_select = False
+                self._ask_user_checked = set()
+                self._ask_user_confirm_none = False
+                self._ask_user_selected = 0
             if self._ask_user_future is None:
                 self._set_managed_text("")
 
@@ -689,6 +910,10 @@ class LqhApp:
                 lines.append(f"  `{cmd.name}` - {cmd.description}")
             lines.append(
                 "\nTip: Alt+Enter (or Ctrl+J) inserts a newline; Enter sends."
+            )
+            lines.append(
+                "Tip: Esc or Ctrl+C interrupts the agent while it's working; "
+                "Ctrl+C twice exits."
             )
             await self._emit(render_system_message("\n".join(lines)))
             return True
@@ -751,13 +976,17 @@ class LqhApp:
             if self._agent:
                 self._lock_input()
                 try:
-                    await self._run_agent_with_reconnect(
-                        lambda: self._agent.process_user_input(
-                            f"[System: The {skill_name} skill is now active. "
-                            f"Begin the workflow described in the skill instructions.]"
-                        ),
-                        lambda: self._agent.continue_after_interruption(),
+                    await self._run_interruptible(
+                        lambda: self._run_agent_with_reconnect(
+                            lambda: self._agent.process_user_input(
+                                f"[System: The {skill_name} skill is now active. "
+                                f"Begin the workflow described in the skill instructions.]"
+                            ),
+                            lambda: self._agent.continue_after_interruption(),
+                        )
                     )
+                except AgentInterrupted:
+                    pass
                 except Exception as e:
                     await self._emit(render_error(f"{type(e).__name__}: {e}"))
                 finally:
@@ -778,10 +1007,14 @@ class LqhApp:
 
         try:
             if self._agent:
-                await self._run_agent_with_reconnect(
-                    lambda: self._agent.process_user_input(text),
-                    lambda: self._agent.continue_after_interruption(),
+                await self._run_interruptible(
+                    lambda: self._run_agent_with_reconnect(
+                        lambda: self._agent.process_user_input(text),
+                        lambda: self._agent.continue_after_interruption(),
+                    )
                 )
+        except AgentInterrupted:
+            pass
         except Exception as e:
             await self._emit(render_error(f"{type(e).__name__}: {e}"))
         finally:
@@ -857,7 +1090,11 @@ class LqhApp:
             self._lock_input()
         try:
             if self._agent:
-                await self._run_agent_with_reconnect(action, action)
+                await self._run_interruptible(
+                    lambda: self._run_agent_with_reconnect(action, action)
+                )
+        except AgentInterrupted:
+            pass
         finally:
             if not was_processing:
                 self._unlock_input()
@@ -1441,14 +1678,40 @@ class LqhApp:
         )
 
         try:
-            ok = await self._run_agent_with_reconnect(
-                lambda: self._agent.process_user_input(kickoff),
-                lambda: self._agent.continue_after_interruption(),
-            )
-            if not ok:
-                self._auto_done = True
-                self._invalidate()
-                return
+            # The pipeline is one long agent turn; a single Ctrl+C pauses it
+            # (AgentInterrupted), collects a user instruction, and resumes the
+            # run with that instruction injected. Auto mode itself is never
+            # left — only interrupted.
+            next_input = kickoff
+            while True:
+                try:
+                    ok = await self._run_interruptible(
+                        lambda msg=next_input: self._run_agent_with_reconnect(
+                            lambda: self._agent.process_user_input(msg),
+                            lambda: self._agent.continue_after_interruption(),
+                        )
+                    )
+                except AgentInterrupted:
+                    instruction = await self._pause_auto_mode()
+                    if instruction is None:
+                        # Shutdown requested while paused.
+                        self._auto_done = True
+                        self._invalidate()
+                        return
+                    await self._emit(render_user_message(instruction))
+                    next_input = (
+                        "[User interruption] The user paused the auto run to say:\n\n"
+                        f"{instruction}\n\n"
+                        "Acknowledge and incorporate this, then continue the "
+                        "auto-mode pipeline. Only call exit_auto_mode if the "
+                        "user asked you to stop."
+                    )
+                    continue
+                if not ok:
+                    self._auto_done = True
+                    self._invalidate()
+                    return
+                break
         except Exception as e:
             await self._emit(render_error(
                 f"Auto mode crashed: {type(e).__name__}: {e}"
@@ -1491,6 +1754,48 @@ class LqhApp:
             "See the conversation log above for the full results table; "
             "checkpoints are under runs/, datasets under datasets/."
         ))
+
+    async def _pause_auto_mode(self) -> str | None:
+        """Collect a user instruction while an auto run is paused.
+
+        Entered after a user interrupt (single Ctrl+C) cancelled the auto-mode
+        agent turn. Unhides the input row, waits for a typed instruction, and
+        returns it so the caller resumes the pipeline with it injected.
+        Returns ``None`` when the app is shutting down instead.
+        """
+        self._auto_paused = True
+        self._unlock_input()
+        self._invalidate()
+        await self._emit(render_system_message(
+            "⏸ Auto mode paused. Type an instruction and press Enter to "
+            "continue the run; /quit (or Ctrl+C twice) exits."
+        ))
+        try:
+            while True:
+                text = await self._input_queue.get()
+                if text == _SHUTDOWN_SENTINEL or self._shutdown_requested:
+                    return None
+                if text.startswith("[System:"):
+                    # Background completion notice, not user input. Dropping
+                    # it is safe: the notice stays in _pending_completions and
+                    # is re-delivered when the agent next parks on that run.
+                    continue
+                if is_command(text):
+                    command, _ = parse_command(text)
+                    if command == "/quit":
+                        self._save_session()
+                        self._request_shutdown()
+                        return None
+                    await self._emit(render_system_message(
+                        "Slash commands aren't available during an auto run. "
+                        "Type an instruction to continue, or /quit to exit."
+                    ))
+                    continue
+                return text
+        finally:
+            self._auto_paused = False
+            self._lock_input()
+            self._invalidate()
 
     async def _await_background(
         self, run_names: list[str] | None, timeout: float,
@@ -2000,6 +2305,8 @@ class LqhApp:
                         continue
 
                 text = input_task.result()
+                if text == _SHUTDOWN_SENTINEL:
+                    break
                 should_continue = await self._handle_input(text)
                 if not should_continue:
                     break

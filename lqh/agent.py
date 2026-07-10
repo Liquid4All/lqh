@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -280,6 +281,27 @@ MAX_CONTEXT_TOKENS = 200_000
 # returned to the model (no heartbeat).
 AUTO_PARK_HEARTBEAT_SEC = 600.0
 
+# Tools whose execution submits external work (cloud/remote jobs, deployments,
+# one-time API keys). A user interrupt must never sever the await mid-submission
+# — that would orphan server-side state (or lose a just-minted secret) that the
+# transcript knows nothing about. For these, cancellation is deferred: the
+# submission is allowed to finish (bounded by the grace below), its result is
+# recorded in the session, and the interrupt is re-delivered right after.
+# In-process tools (file ops, pipelines, scoring) are NOT listed — cancelling
+# them stops the work itself, which is exactly what the user asked for.
+PROTECTED_SUBMISSION_TOOLS = frozenset({
+    "start_training",
+    "start_local_eval",
+    "eval_hf_model",
+    "push_to_production",
+    "create_inference_key",
+})
+
+# Upper bound on how long a deferred interrupt waits for an in-flight
+# submission to finish before force-cancelling it anyway. Submissions are
+# normally seconds; the bound covers slow dataset rsyncs to a remote.
+SUBMISSION_INTERRUPT_GRACE_SEC = 60.0
+
 # When True, strip reasoning/thinking content from previous assistant turns
 # before sending them in follow-up API calls.  Reduces context usage at the
 # cost of losing the model's chain-of-thought in subsequent turns.
@@ -385,6 +407,10 @@ class Agent:
         # right now. Read by the harness on CancelledError so the benchmark
         # can report exactly where a scenario was stuck when it timed out.
         self._current_operation: str | None = None
+        # Set when a user interrupt landed during a protected submission tool
+        # and was deferred; the loop re-raises the cancellation after the
+        # tool's result has been recorded in the session.
+        self._deferred_interrupt = False
 
         # Auto mode: sticky system messages live outside session.messages so
         # they survive compaction; _build_messages() prepends them on every
@@ -506,6 +532,47 @@ class Agent:
         through ``process_user_input`` would duplicate it.
         """
         await self._run_inner_loop(is_first_turn=True)
+
+    def abort_turn(self) -> None:
+        """Restore session consistency after the user cancelled the turn.
+
+        A user interrupt (Esc / Ctrl+C in the TUI) cancels the agent loop at
+        an arbitrary await point — possibly between an assistant message that
+        carries ``tool_calls`` and the tool results answering it. The API
+        rejects a history with unanswered tool calls, so fill each gap with a
+        synthetic "interrupted" result. Safe to call regardless of where the
+        cancel landed.
+        """
+        self._current_operation = None
+        self._deferred_interrupt = False
+        messages = self.session.messages
+        for i in range(len(messages) - 1, -1, -1):
+            role = messages[i].get("role")
+            if role in ("tool", "system"):
+                # Tool results and mid-turn system injections (e.g. a skill
+                # loaded by an earlier tool call in this same turn) can sit
+                # between the assistant's tool_calls message and the cancel
+                # point — skip over them, don't stop the scan.
+                continue
+            if role == "assistant":
+                answered = {
+                    m.get("tool_call_id")
+                    for m in messages[i + 1:]
+                    if m.get("role") == "tool"
+                }
+                for tc in messages[i].get("tool_calls") or []:
+                    if tc.get("id") not in answered:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id"),
+                            "content": (
+                                "[Interrupted by user — this tool call was "
+                                "cancelled and may have partially executed. "
+                                "Verify the current project state before "
+                                "assuming it did or didn't happen.]"
+                            ),
+                        })
+            break
 
     async def _run_inner_loop(self, is_first_turn: bool = False) -> None:
         """Inner loop: call agent, execute tools, repeat until no tools."""
@@ -785,6 +852,13 @@ class Agent:
                         self.session.add_message(skill_msg)
                         if self.callbacks.on_skill_loaded:
                             await self.callbacks.on_skill_loaded(skill_name)
+
+                    # A user interrupt was deferred so a protected submission
+                    # could finish and have its result recorded above —
+                    # re-deliver it now, before any further tool or LLM call.
+                    if self._deferred_interrupt:
+                        self._deferred_interrupt = False
+                        raise asyncio.CancelledError()
             else:
                 if self.auto_mode and self._auto_exit is None:
                     # Auto mode: a turn with no tool call would otherwise return
@@ -912,7 +986,10 @@ class Agent:
             # registers here — without it, auto-mode parking would see no
             # running task and fall through to busy-polling that run.
             extra["on_background_task_started"] = self.callbacks.on_background_task_started
-        result = await execute_tool(tool_name, arguments, self.project_dir, **extra)
+        if tool_name in PROTECTED_SUBMISSION_TOOLS:
+            result = await self._execute_shielded(tool_name, arguments, extra)
+        else:
+            result = await execute_tool(tool_name, arguments, self.project_dir, **extra)
 
         # Handle ask_user tool
         if result.requires_user_input and tool_name == "ask_user":
@@ -1027,6 +1104,43 @@ class Agent:
                 return ToolResult(content=viewer_summary)
 
         return result
+
+    async def _execute_shielded(
+        self, tool_name: str, arguments: dict, extra: dict[str, Any],
+    ) -> ToolResult:
+        """Run a submission-type tool so a user interrupt can't sever it mid-flight.
+
+        A cancel that lands while e.g. ``start_training`` is submitting a
+        remote job (or ``create_inference_key`` is minting a one-time secret)
+        would orphan external state the transcript never learns about. The
+        tool runs in its own task behind ``asyncio.shield``: on interrupt the
+        submission is allowed to finish (bounded), its result flows back to
+        the loop to be recorded, and the cancellation is re-delivered
+        afterwards via ``_deferred_interrupt``.
+        """
+        inner = asyncio.ensure_future(
+            execute_tool(tool_name, arguments, self.project_dir, **extra)
+        )
+        try:
+            return await asyncio.shield(inner)
+        except asyncio.CancelledError:
+            if inner.cancelled():
+                raise
+            self._deferred_interrupt = True
+            if self.callbacks.on_agent_message:
+                await self.callbacks.on_agent_message(
+                    f"⏳ Finishing the in-flight `{tool_name}` submission "
+                    "before interrupting…"
+                )
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(inner), SUBMISSION_INTERRUPT_GRACE_SEC,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                # Grace expired, or the user interrupted again / the app is
+                # shutting down — stop protecting the submission.
+                inner.cancel()
+                raise asyncio.CancelledError() from None
 
     async def _reinvoke_tool(self, tool_name: str, tool_args: dict) -> ToolResult:
         """Re-run the original tool after the compute target is persisted.
