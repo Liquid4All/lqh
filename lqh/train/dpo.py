@@ -13,6 +13,7 @@ ping-pong repeats for ``num_iterations``.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,7 @@ from lqh.train.data_utils import (
 )
 from lqh.train.progress import (
     wait_for_file,
+    write_eval_request,
     write_iter_request,
     write_progress,
     write_status,
@@ -61,9 +63,25 @@ class _DPOProgressCallback(TrainerCallback):
         "eval_runtime",
     )
 
-    def __init__(self, run_dir: Path, iteration: int) -> None:
+    def __init__(
+        self,
+        run_dir: Path,
+        iteration: int,
+        num_iterations: int,
+        *,
+        has_held_out_eval: bool = False,
+        training_end: float = 1.0,
+    ) -> None:
+        from lqh.progress import ProgressReporter
+
         self.run_dir = run_dir
         self.iteration = iteration
+        self.num_iterations = num_iterations
+        self.has_held_out_eval = has_held_out_eval
+        self.training_end = training_end
+        self.reporter = ProgressReporter(
+            task_kind="dpo", label=run_dir.name, run_dir=run_dir,
+        )
 
     def on_log(
         self,
@@ -76,6 +94,9 @@ class _DPOProgressCallback(TrainerCallback):
         if logs is None:
             return
         extra: dict[str, Any] = {"iteration": self.iteration, "phase": "dpo_train"}
+        max_steps = getattr(state, "max_steps", None)
+        if isinstance(max_steps, int) and max_steps > 0:
+            extra["max_steps"] = max_steps
         for key in self._EVAL_KEYS:
             if key in logs:
                 extra[key] = logs[key]
@@ -86,7 +107,49 @@ class _DPOProgressCallback(TrainerCallback):
             lr=logs.get("learning_rate"),
             epoch=state.epoch,
             extra=extra,
+            emit_cloud=not (isinstance(max_steps, int) and max_steps > 0),
         )
+        if isinstance(max_steps, int) and max_steps > 0:
+            from lqh.progress import (
+                DPO_PREFERENCE_SHARE,
+                DPO_ROLLOUT_SHARE,
+                dpo_optimizer_share,
+                dpo_overall_fraction,
+            )
+
+            within_iteration = (
+                DPO_ROLLOUT_SHARE
+                + DPO_PREFERENCE_SHARE
+                + dpo_optimizer_share(self.has_held_out_eval)
+                * state.global_step / max_steps
+            )
+            self.reporter.update(
+                phase="training",
+                phase_label=f"DPO iteration {self.iteration + 1}/{self.num_iterations}",
+                completed=state.global_step,
+                total=max_steps,
+                unit="steps",
+                overall_fraction=dpo_overall_fraction(
+                    self.iteration, self.num_iterations, within_iteration,
+                    self.training_end,
+                ),
+                step=state.global_step,
+                loss=(
+                    float(logs["loss"])
+                    if isinstance(logs.get("loss"), (int, float)) else None
+                ),
+                lr=(
+                    float(logs["learning_rate"])
+                    if isinstance(logs.get("learning_rate"), (int, float))
+                    else None
+                ),
+                epoch=(
+                    float(state.epoch)
+                    if isinstance(state.epoch, (int, float)) else None
+                ),
+                detail=(f"loss {logs['loss']:.4f}" if isinstance(logs.get('loss'), (int, float)) else None),
+                force=state.global_step >= max_steps,
+            )
 
 
 def _per_example_ce(
@@ -375,7 +438,33 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
     skip_generation_if_preferences_exist = bool(
         config.get("skip_generation_if_preferences_exist", False)
     )
-    num_iterations = config.get("num_iterations", 5)
+    from lqh.progress import (
+        DEFAULT_DPO_ITERATIONS,
+        DPO_HELD_OUT_SHARE,
+        DPO_PREFERENCE_SHARE,
+        DPO_ROLLOUT_SHARE,
+        FINAL_INFERENCE_END,
+        ProgressReporter,
+        dpo_optimizer_share,
+        dpo_overall_fraction,
+        has_final_inference,
+        has_final_scoring,
+        training_end_for,
+        nonnegative_int,
+    )
+
+    num_iterations = nonnegative_int(
+        config.get("num_iterations"), DEFAULT_DPO_ITERATIONS,
+    )
+    training_end = training_end_for(config)
+
+    progress_reporter = ProgressReporter(
+        task_kind="dpo", label=run_dir.name, run_dir=run_dir,
+    )
+    progress_reporter.update(
+        phase="setup", phase_label="loading DPO models",
+        overall_fraction=0, force=True,
+    )
     dpo_beta = config.get("dpo_beta", 0.1)
     training_cfg = config.get("training", {})
     lora_cfg = config.get("lora", {})
@@ -498,7 +587,9 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                 start_iteration = last_completed + 1
 
     interrupted = False
+    interruption_error: str | None = None
 
+    completed_iterations = start_iteration
     for iteration in range(start_iteration, num_iterations):
         iter_name = f"iter_{iteration:03d}"
         iter_dir = iterations_dir / iter_name
@@ -507,6 +598,17 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         print(f"\n{'='*60}")
         print(f"Iteration {iteration + 1}/{num_iterations}")
         print(f"{'='*60}")
+        iteration_base = dpo_overall_fraction(
+            iteration, num_iterations, 0, training_end,
+        )
+        rollout_end = dpo_overall_fraction(
+            iteration, num_iterations, DPO_ROLLOUT_SHARE, training_end,
+        )
+        progress_reporter.update(
+            phase="rollout", phase_label=f"DPO rollout {iteration + 1}/{num_iterations}",
+            completed=0, total=len(preference_convos) or None, unit="samples",
+            overall_fraction=iteration_base, force=True,
+        )
 
         # Step 1: Generate predictions — unless caller pre-seeded
         # preferences.parquet and asked us to skip generation (used by
@@ -526,15 +628,29 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         else:
             print("Generating predictions...")
             predictions = _generate_predictions(
-                model, tokenizer, preference_convos, max_new_tokens, system_prompt, run_dir
+                model, tokenizer, preference_convos, max_new_tokens, system_prompt, run_dir,
+                progress_reporter=progress_reporter,
+                progress_start=iteration_base,
+                progress_end=rollout_end,
             )
             _write_predictions(predictions, iter_dir)
             write_iter_request(iter_dir)
+
+        progress_reporter.update(
+            # The trainer is only waiting here; the observer process owns the
+            # preference_scoring phase and its local clock/rate samples.
+            phase="preference_wait",
+            phase_label=f"judging preferences {iteration + 1}/{num_iterations}",
+            completed=0, total=len(preference_convos) or None, unit="samples",
+            overall_fraction=rollout_end,
+            force=True,
+        )
 
         write_progress(
             run_dir,
             step=iteration,
             extra={"phase": "waiting_for_preferences", "iteration": iteration},
+            emit_cloud=False,
         )
 
         # Cloud sandbox path: when LQH_API_TOKEN + LQH_BASE_URL are
@@ -547,22 +663,32 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
 
             score_dpo_iter_inline(iter_dir, config, Path.cwd())
         except Exception as exc:  # noqa: BLE001
-            # Don't crash the trainer on a scoring failure — surface
-            # the error and let the existing wait_for_file timeout
-            # path handle it. The harness can read partial state on
-            # the next reconnect.
+            # Surface the terminal handoff error to wait_for_file. Its
+            # RuntimeError is handled like a timeout below so the partial
+            # adapter is still saved before the run exits.
             print(f"WARNING: inline scoring failed: {exc}")
+            from lqh.progress import write_error_marker
+
+            write_error_marker(
+                iter_dir / "preference_error.json",
+                f"inline preference scoring failed: {exc}",
+            )
 
         # Step 2: Wait for preferences from main process
         print("Waiting for preferences from main process...")
         try:
             preferences_path = wait_for_file(
                 iter_dir / "preferences.parquet",
+                error_path=iter_dir / "preference_error.json",
                 poll_interval=3.0,
                 timeout=7200.0,  # 2 hours max
             )
-        except TimeoutError:
-            print("Timeout waiting for preferences. Saving progress and exiting.")
+        except (TimeoutError, RuntimeError) as exc:
+            interruption_error = str(exc)
+            print(
+                f"Preference handoff failed ({exc}). "
+                "Saving progress and exiting."
+            )
             interrupted = True
             break
 
@@ -576,6 +702,19 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                 extra={"phase": "converged", "iteration": iteration},
             )
             break
+
+        progress_reporter.update(
+            phase="training",
+            phase_label=f"DPO training {iteration + 1}/{num_iterations}",
+            completed=0, total=len(preferences), unit="pairs",
+            overall_fraction=dpo_overall_fraction(
+                iteration,
+                num_iterations,
+                DPO_ROLLOUT_SHARE + DPO_PREFERENCE_SHARE,
+                training_end,
+            ),
+            force=True,
+        )
 
         print(f"Running DPO step with {len(preferences)} preference pairs...")
 
@@ -706,7 +845,15 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             )
         dpo_config = DPOConfig(**dpo_kwargs)
 
-        callbacks: list[TrainerCallback] = [_DPOProgressCallback(run_dir, iteration)]
+        callbacks: list[TrainerCallback] = [
+            _DPOProgressCallback(
+                run_dir,
+                iteration,
+                num_iterations,
+                has_held_out_eval=bool(held_out_convos),
+                training_end=training_end,
+            )
+        ]
 
         # If we have an eval split, precompute reference-model CE on
         # both chosen and rejected once — this is the absolute baseline
@@ -921,6 +1068,7 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             step=iteration,
             loss=dpo_metrics.get("train_loss"),
             extra={"phase": "dpo_complete", "iteration": iteration},
+            emit_cloud=False,
         )
 
         # DPOTrainer wraps the model with PEFT internally when peft_config
@@ -941,6 +1089,7 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }) + "\n"
         )
+        completed_iterations = iteration + 1
 
         print(f"DPO step complete. Loss: {dpo_metrics.get('train_loss')}")
 
@@ -951,9 +1100,37 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         if held_out_convos:
             print(f"Running held-out eval ({len(held_out_convos)} samples)...")
             try:
+                from lqh.train.cloud_score import is_cloud_mode
+
+                inline_held_out_scoring = is_cloud_mode()
+                held_out_start = dpo_overall_fraction(
+                    iteration,
+                    num_iterations,
+                    DPO_ROLLOUT_SHARE
+                    + DPO_PREFERENCE_SHARE
+                    + dpo_optimizer_share(True),
+                    training_end,
+                )
+                held_out_inference_end = dpo_overall_fraction(
+                    iteration,
+                    num_iterations,
+                    (
+                        1.0 - DPO_HELD_OUT_SHARE / 2
+                        if inline_held_out_scoring
+                        else 1.0
+                    ),
+                    training_end,
+                )
                 eval_preds = _generate_predictions(
                     model, tokenizer, held_out_convos,
                     max_new_tokens, system_prompt, run_dir,
+                    progress_reporter=progress_reporter,
+                    progress_start=held_out_start,
+                    progress_end=held_out_inference_end,
+                    progress_phase="held_out_inference",
+                    progress_label=(
+                        f"held-out inference {iteration + 1}/{num_iterations}"
+                    ),
                 )
                 _write_predictions(
                     eval_preds, iter_dir,
@@ -976,7 +1153,13 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                     from lqh.train.cloud_score import score_held_out_eval_inline
 
                     summary = score_held_out_eval_inline(
-                        iter_dir, config, Path.cwd(),
+                        iter_dir,
+                        config,
+                        Path.cwd(),
+                        progress_start=held_out_inference_end,
+                        progress_end=dpo_overall_fraction(
+                            iteration, num_iterations, 1.0, training_end,
+                        ),
                     )
                     if summary is not None:
                         (iter_dir / "eval_result.json").write_text(
@@ -1070,12 +1253,81 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
 
     tokenizer.save_pretrained(str(final_model_dir))
 
+    final_eval_expected = has_final_inference(config) and not interrupted
+    final_scoring_expected = has_final_scoring(config) and not interrupted
+    final_eval_failed = False
+    if final_eval_expected:
+        try:
+            final_eval_convos = load_chatml_datasets(config["eval_dataset"])
+            eval_predictions = _generate_predictions(
+                model,
+                tokenizer,
+                final_eval_convos,
+                max_new_tokens,
+                system_prompt,
+                run_dir,
+                progress_reporter=progress_reporter,
+                progress_start=training_end,
+                progress_end=(
+                    FINAL_INFERENCE_END if final_scoring_expected else 1.0
+                ),
+                progress_phase="final_inference",
+                progress_label="evaluating final DPO model",
+            )
+            _write_predictions(eval_predictions, run_dir)
+            write_eval_request(run_dir)
+
+            # Cloud jobs have no host watcher, so finish the promised judge
+            # stage inline. Local/SSH watchers consume the request above.
+            from lqh.train.cloud_score import score_run_eval_inline
+
+            score_run_eval_inline(run_dir, config)
+        except Exception as exc:  # noqa: BLE001
+            final_eval_failed = True
+            from lqh.progress import write_error_marker
+
+            write_error_marker(
+                run_dir / "eval_error.json",
+                f"final DPO evaluation failed: {exc}",
+            )
+            print(f"WARNING: final DPO evaluation failed: {exc}")
+
     if interrupted:
-        write_status(run_dir, "interrupted", error="Timeout waiting for preferences")
+        write_status(
+            run_dir,
+            "interrupted",
+            error=(
+                f"{interruption_error or 'Preference handoff interrupted'}; "
+                "partial model saved to model/"
+            ),
+        )
         print(f"DPO training interrupted. Partial model saved to {final_model_dir}")
-    else:
+    elif final_eval_failed:
+        write_status(run_dir, "completed")
+        print(
+            "DPO training completed, but final evaluation failed. "
+            f"Model saved to {final_model_dir}"
+        )
+    elif not final_scoring_expected:
+        from lqh.progress import ProgressEvent, write_progress_event
+
+        write_progress_event(
+            run_dir,
+            ProgressEvent(
+                task_kind="dpo", label=run_dir.name,
+                phase="completed", phase_label="DPO complete",
+                completed=completed_iterations, total=num_iterations, unit="iterations",
+                overall_fraction=1.0, result_ready=True,
+            ),
+        )
         write_status(run_dir, "completed")
         print(f"DPO training completed. Model saved to {final_model_dir}")
+    else:
+        write_status(run_dir, "completed")
+        print(
+            "DPO training completed; final evaluation is ready for scoring. "
+            f"Model saved to {final_model_dir}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1142,6 +1394,12 @@ def _generate_predictions(
     max_new_tokens: int,
     system_prompt: str | None = None,
     run_dir: Path | None = None,
+    *,
+    progress_reporter: Any | None = None,
+    progress_start: float = 0.0,
+    progress_end: float = 0.0,
+    progress_phase: str = "rollout",
+    progress_label: str = "generating DPO rollouts",
 ) -> list[dict[str, Any]]:
     """Generate model responses for each conversation prompt."""
     model.eval()
@@ -1187,13 +1445,28 @@ def _generate_predictions(
             }
         )
 
-        if (i + 1) % 10 == 0:
+        if (i + 1) % 10 == 0 or i == len(conversations) - 1:
             print(f"  Generated {i + 1}/{len(conversations)}")
             if run_dir is not None:
                 write_progress(
                     run_dir,
                     step=i + 1,
                     extra={"phase": "generating_predictions", "total": len(conversations)},
+                    emit_cloud=progress_reporter is None,
+                )
+            if progress_reporter is not None:
+                completed = i + 1
+                progress_reporter.update(
+                    phase=progress_phase, phase_label=progress_label,
+                    completed=completed, total=len(conversations), unit="samples",
+                    overall_fraction=(
+                        progress_start
+                        + (progress_end - progress_start)
+                        * completed / max(len(conversations), 1)
+                    ),
+                    # Keep sparse local updates exact, but preserve the cloud
+                    # reporter's one-event-per-second backend volume cap.
+                    force=not bool(os.environ.get("LQH_JOB_ID")),
                 )
 
     return predictions

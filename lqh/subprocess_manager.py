@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from lqh.train.progress import read_latest_progress, read_progress
+from lqh.train.progress import read_progress
 
 __all__ = [
     "SubprocessManager",
@@ -124,28 +124,40 @@ class SubprocessManager:
 
     def get_status(self, run_dir: Path) -> RunStatus:
         """Build a composite status from the PID file and progress log."""
-        latest = read_latest_progress(run_dir)
+        entries = read_progress(run_dir, last_n=4096)
+        latest = entries[-1] if entries else None
+        terminal = next(
+            (row for row in reversed(entries) if "status" in row), None,
+        )
+        metric_keys = ("step", "loss", "lr", "epoch")
+        metrics = next(
+            (
+                row for row in reversed(entries)
+                if any(key in row for key in metric_keys)
+            ),
+            None,
+        )
 
         # Terminal states from progress.jsonl
-        if latest and latest.get("status") == "completed":
-            return RunStatus(state="completed", **self._extract_metrics(latest))
-        if latest and latest.get("status") == "failed":
+        if terminal and terminal.get("status") == "completed":
+            return RunStatus(state="completed", **self._extract_metrics(metrics))
+        if terminal and terminal.get("status") in {"failed", "interrupted"}:
             return RunStatus(
                 state="failed",
-                error=latest.get("error"),
-                **self._extract_metrics(latest),
+                error=terminal.get("error"),
+                **self._extract_metrics(metrics),
             )
 
         # Process-level check
         if self.is_alive(run_dir):
-            return RunStatus(state="running", **self._extract_metrics(latest))
+            return RunStatus(state="running", **self._extract_metrics(metrics))
 
         # Process is gone but no terminal status in progress.jsonl
         if latest:
             return RunStatus(
                 state="failed",
                 error="Process exited without writing final status",
-                **self._extract_metrics(latest),
+                **self._extract_metrics(metrics),
             )
 
         return RunStatus(state="unknown")

@@ -105,6 +105,7 @@ class _ChildProgressContext:
     config_id: str
     config_index: int
     n_configs: int
+    training_end: float = 1.0
     offset: int = 0
     last_step: int | None = None
     emitted_eval_keys: set[tuple[int, str]] = field(default_factory=set)
@@ -383,6 +384,39 @@ def _forward_child_progress_row(
     ctx: _ChildProgressContext,
     row: dict[str, Any],
 ) -> None:
+    child_overall = row.get("overall_fraction")
+    if isinstance(child_overall, (int, float)):
+        from lqh.progress import ProgressEvent, write_progress_event
+
+        child_fraction = min(1.0, max(0.0, float(child_overall)))
+        write_progress_event(
+            ctx.parent_run_dir,
+            ProgressEvent(
+                task_kind="training_sweep",
+                label=ctx.parent_run_dir.name,
+                # A phase is a rate-estimation window. Keep configurations
+                # separate because their hyperparameters can have very
+                # different throughput.
+                phase=(
+                    f"config_{ctx.config_index + 1}_"
+                    f"{row.get('phase', 'training')}"
+                ),
+                phase_label=(
+                    f"configuration {ctx.config_index + 1}/{ctx.n_configs} · "
+                    f"{row.get('phase_label', 'training')}"
+                ),
+                completed=float(row.get("completed", 0) or 0),
+                total=(float(row["total"]) if isinstance(row.get("total"), (int, float)) else None),
+                unit=str(row.get("unit", "steps")),
+                overall_fraction=(
+                    ctx.training_end * (ctx.config_index + child_fraction)
+                    / max(ctx.n_configs, 1)
+                ),
+                detail=row.get("detail") if isinstance(row.get("detail"), str) else None,
+            ),
+        )
+        return
+
     step = row.get("step")
     if not isinstance(step, int):
         return
@@ -460,12 +494,22 @@ def _build_eval_of_best_config(base: dict[str, Any], run_dir: Path) -> dict[str,
     # Build a minimal lqh.infer config that matches what the rest of
     # the stack expects (matches the shape produced by
     # handle_start_local_eval).
+    from lqh.progress import FINAL_INFERENCE_END, TRAINING_END
+
+    progress_start = TRAINING_END if base.get("scorer") else FINAL_INFERENCE_END
+    progress_end = FINAL_INFERENCE_END if base.get("scorer") else 1.0
     cfg: dict[str, Any] = {
         "type": "infer",
         "base_model": str(model_path.resolve()),
         "dataset": eval_dataset,
         "max_new_tokens": int(base.get("max_new_tokens", 4096)),
         "manifest": ["base_model", "dataset"],
+        # Report final inference into the parent sweep's whole-job lifecycle.
+        "progress_run_dir": str(run_dir),
+        "progress_start": progress_start,
+        "progress_end": progress_end,
+        "progress_label": f"{base.get('type', 'training').upper()} evaluation",
+        "progress_task_kind": "training_sweep",
     }
     if scorer := base.get("scorer"):
         cfg["scorer"] = scorer
@@ -510,13 +554,36 @@ def _run_eval_of_best(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
     log_path = eval_dir / "infer.log"
     with log_path.open("w") as log:
         try:
-            proc = subprocess.run(
-                [sys.executable, "-m", "lqh.infer", str(cfg_path)],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-            rc = proc.returncode
+            command = [sys.executable, "-m", "lqh.infer", str(cfg_path)]
+            if os.environ.get("LQH_JOB_ID"):
+                # The cloud runner only sees this parent process's stdout.
+                # Tee child sentinels back to it while keeping ordinary infer
+                # logs in eval_of_best/infer.log.
+                from lqh.progress import relay_cloud_sentinel
+
+                proc = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+                if proc.stdout is not None:
+                    for line in proc.stdout:
+                        if not relay_cloud_sentinel(line):
+                            log.write(line)
+                            log.flush()
+                rc = proc.wait()
+            else:
+                proc = subprocess.run(
+                    command,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+                rc = proc.returncode
         except FileNotFoundError as exc:
             # Python missing — practically impossible since we're
             # running under it, but defend against PATH oddities in
@@ -561,11 +628,35 @@ def _run_eval_of_best(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
     try:
         from lqh.train.cloud_score import score_run_eval_inline
 
-        score_summary = score_run_eval_inline(run_dir, base)
+        scoring_config = dict(base)
+        scoring_config["progress_task_kind"] = "training_sweep"
+        score_summary = score_run_eval_inline(run_dir, scoring_config)
         if score_summary is not None:
             summary["score_summary"] = score_summary
+        elif os.environ.get("LQH_JOB_ID") and base.get("scorer"):
+            from lqh.progress import write_error_marker
+
+            error_path = run_dir / "eval_error.json"
+            message = "inline eval-of-best scoring produced no result"
+            if error_path.exists():
+                try:
+                    message = str(json.loads(error_path.read_text()).get(
+                        "error", message,
+                    ))
+                except (OSError, json.JSONDecodeError):
+                    pass
+            else:
+                write_error_marker(error_path, message)
+            summary["scoring_error"] = message
     except Exception as exc:  # noqa: BLE001
         print(f"sweep: inline eval-of-best scoring failed: {exc}", flush=True)
+        from lqh.progress import write_error_marker
+
+        write_error_marker(
+            run_dir / "eval_error.json",
+            f"inline eval-of-best scoring failed: {exc}",
+        )
+        summary["scoring_error"] = str(exc)
 
     return summary
 
@@ -810,6 +901,33 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
             "proxy_key": proxy_key,
         },
     )
+    from lqh.progress import (
+        FINAL_INFERENCE_END,
+        ProgressEvent,
+        TRAINING_END,
+        write_progress_event,
+    )
+
+    will_eval_best = bool(
+        sweep_config.get("eval_best", True)
+        and base.get("eval_dataset")
+    )
+    will_score_best = bool(will_eval_best and base.get("scorer"))
+    training_end = (
+        TRAINING_END
+        if will_score_best
+        else FINAL_INFERENCE_END if will_eval_best else 1.0
+    )
+
+    write_progress_event(
+        run_dir,
+        ProgressEvent(
+            task_kind="training_sweep", label=run_dir.name,
+            phase="setup", phase_label="preparing training sweep",
+            completed=0, total=len(grid), unit="configurations",
+            overall_fraction=0,
+        ),
+    )
 
     rows: list[dict[str, Any]] = []
     sweep_summary_path = run_dir / "sweep_summary.json"
@@ -827,6 +945,10 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
         sub_config = _deep_merge(base, point.overrides)
         # Child runs MUST not recurse into another sweep.
         sub_config.pop("enable_sweep", None)
+        # Sweep configs use the trainer's cheap eval-loss/CE proxy for model
+        # selection. Generative inference + paid judge scoring runs once on
+        # the winner below, not once per grid point/checkpoint.
+        sub_config["eval_on_checkpoints"] = False
 
         if point.id in completed_rows:
             row = dict(completed_rows[point.id])
@@ -847,6 +969,18 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
                     "n_configs": len(grid),
                     "resumed": True,
                 },
+            )
+            write_progress_event(
+                run_dir,
+                ProgressEvent(
+                    task_kind="training_sweep", label=run_dir.name,
+                    phase=f"config_{i + 1}_completed",
+                    phase_label=f"configuration {i + 1}/{len(grid)}",
+                    completed=i + 1, total=len(grid), unit="configurations",
+                    overall_fraction=(
+                        training_end * (i + 1) / max(len(grid), 1)
+                    ),
+                ),
             )
             running_summary = _write_sweep_summary(
                 sweep_summary_path,
@@ -881,6 +1015,7 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
             config_id=point.id,
             config_index=i,
             n_configs=len(grid),
+            training_end=training_end,
         )
         token = _CHILD_PROGRESS_CONTEXT.set(progress_ctx)
         try:
@@ -936,6 +1071,18 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
                 "n_configs": len(grid),
             },
         )
+        write_progress_event(
+            run_dir,
+            ProgressEvent(
+                task_kind="training_sweep", label=run_dir.name,
+                phase=f"config_{i + 1}_completed",
+                phase_label=f"configuration {i + 1}/{len(grid)}",
+                completed=i + 1, total=len(grid), unit="configurations",
+                overall_fraction=(
+                    training_end * (i + 1) / max(len(grid), 1)
+                ),
+            ),
+        )
 
         sweep_summary = _write_sweep_summary(
             sweep_summary_path,
@@ -979,6 +1126,47 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
         eval_summary = _run_eval_of_best(run_dir, base)
         print(f"sweep: eval-of-best summary: {eval_summary}", flush=True)
 
+    expects_eval_result = bool(
+        sweep_config.get("eval_best", True)
+        and base.get("eval_dataset")
+    )
+    expects_scored_result = bool(
+        expects_eval_result
+        and base.get("scorer")
+    )
+    if expects_eval_result and eval_summary.get("skipped"):
+        from lqh.progress import write_error_marker
+
+        write_error_marker(
+            run_dir / "eval_error.json",
+            f"eval-of-best failed: {eval_summary['skipped']}",
+        )
+    result_still_pending = bool(
+        expects_scored_result
+        and (run_dir / "eval_request.json").exists()
+        and (run_dir / "predictions.parquet").exists()
+        and not (run_dir / "eval_result.json").exists()
+        and not (run_dir / "eval_error.json").exists()
+    )
+    result_failed = expects_eval_result and (run_dir / "eval_error.json").exists()
+    # The scoring producer owns the terminal event for judged results. For a
+    # no-scorer eval, the infer child writes directly to the parent run's
+    # progress_run_dir on every backend, so the parent must not duplicate it.
+    if (
+        not expects_eval_result
+        and not result_still_pending
+        and not result_failed
+    ):
+        write_progress_event(
+            run_dir,
+            ProgressEvent(
+                task_kind="training_sweep", label=run_dir.name,
+                phase="completed", phase_label="sweep complete",
+                completed=len(rows), total=len(grid), unit="configurations",
+                overall_fraction=1.0, result_ready=True,
+            ),
+        )
+
     write_status(
         run_dir, "completed",
         extra={
@@ -1006,6 +1194,9 @@ def main() -> None:
     cfg = json.loads(cfg_path.read_text())
     run_dir = cfg_path.parent
     (run_dir / "pid").write_text(str(os.getpid()))
+    from lqh.train.progress import begin_run_attempt
+
+    begin_run_attempt(run_dir)
     try:
         sweep_loop(run_dir, cfg)
     except Exception as exc:

@@ -121,6 +121,7 @@ class LqhApp:
         self.extra_spec = extra_spec
         self._status_bar = StatusBar(project_dir=project_dir)
         self._status_bar.auto_mode = auto_mode
+        self._foreground_progress_history: list[Any] = []
         # Auto-mode progress state, rendered into the managed area.
         self._auto_stage: str | None = None
         self._auto_stage_note: str | None = None
@@ -145,6 +146,7 @@ class LqhApp:
         # First-time observations are recorded silently; only running → terminal
         # transitions enqueue a notification.
         self._job_watcher_task: asyncio.Task | None = None
+        self._progress_refresh_task: asyncio.Task | None = None
         self._update_check_task: asyncio.Task[None] | None = None
         self._job_last_state: dict[str, str] = {}
         # Completion notices keyed by run_name, recorded by _watch_jobs on a
@@ -154,7 +156,7 @@ class LqhApp:
         self._pending_completions: dict[str, str] = {}
         # Live progress tracking for the status bar: the last step seen per run
         # and the wall time it last advanced (drives the "↑8s ago" freshness).
-        self._job_last_step: dict[str, int] = {}
+        self._job_last_step: dict[str, tuple[str, float]] = {}
         self._job_progress_at: dict[str, float] = {}
         # Per-run scoring/sync watchers (RunWatcher / RemoteRunWatcher),
         # keyed by run_name. Spawned lazily by _watch_jobs when a run is
@@ -1347,6 +1349,7 @@ class LqhApp:
             on_token_update=self._on_token_update,
             on_skill_loaded=self._on_skill_loaded,
             on_pipeline_progress=self._on_pipeline_progress,
+            legacy_pipeline_progress_callback=False,
             on_pipeline_done=self._on_pipeline_done,
             on_background_task_started=self._on_background_task_started,
             on_await_background=self._await_background,
@@ -1385,7 +1388,7 @@ class LqhApp:
             try:
                 import json
                 run_type = json.loads(config_path.read_text()).get("type", "")
-                kind = "eval" if run_type == "infer" else "train"
+                kind = "eval" if run_type in {"infer", "eval_hf"} else "train"
             except Exception:
                 pass
         self._tasks.register(BackgroundTask(
@@ -1404,20 +1407,83 @@ class LqhApp:
         ``updated_at`` timestamp only advances when the step itself advances,
         so a stalled run shows a growing "↑Xm ago" age in the status bar.
         """
-        from lqh.train.progress import format_progress_oneline, read_latest_progress
+        import math
+
+        from lqh.progress import (
+            format_event_oneline,
+            read_progress_events,
+            select_display_event,
+        )
+        from lqh.train.progress import format_progress_oneline, read_current_attempt_id
 
         run_dir = self.project_dir / "runs" / run_name
         try:
-            latest = read_latest_progress(run_dir)
+            history = read_progress_events(run_dir, last_n=256)
         except Exception:
             return
-        line, _pct = format_progress_oneline(latest)
+        current_attempt = read_current_attempt_id(run_dir)
+        if isinstance(current_attempt, str) and current_attempt:
+            # A known new attempt with no v1 rows must show setup/legacy state,
+            # never the previous attempt's high-water mark.
+            history = [
+                row for row in history
+                if row.get("attempt_id") == current_attempt
+            ]
+            if not history:
+                self._job_last_step.pop(run_name, None)
+                self._job_progress_at.pop(run_name, None)
+                self._tasks.update(run_name, progress=None, updated_at=None)
+                return
+        v1_rows = [
+            row for row in history
+            if isinstance(row.get("overall_fraction"), (int, float))
+            and math.isfinite(float(row["overall_fraction"]))
+        ]
+        # Fractions are the cross-machine ordering key. Raw ISO timestamps may
+        # come from skewed producer and observer clocks.
+        v1_rows.sort(key=lambda row: float(row["overall_fraction"]))
+        if v1_rows:
+            # Whole-job progress is authoritative once a v1 producer appears.
+            # Pick the furthest monotonic event so another process cannot make
+            # the display regress by appending an older/legacy observation.
+            latest = select_display_event(v1_rows)
+            if latest is None:
+                return
+            step = latest.get("overall_fraction")
+        else:
+            latest = next(
+                (row for row in reversed(history) if "step" in row), None,
+            )
+            step = (
+                latest.get("child_step", latest.get("step"))
+                if latest else None
+            )
+        if latest is None:
+            if isinstance(current_attempt, str) and current_attempt:
+                self._job_last_step.pop(run_name, None)
+                self._job_progress_at.pop(run_name, None)
+                self._tasks.update(run_name, progress=None, updated_at=None)
+            return
+        progress_key = (
+            ("fraction" if v1_rows else "step"), float(step),
+        ) if isinstance(step, (int, float)) else None
+        if progress_key is not None and self._job_last_step.get(run_name) != progress_key:
+            self._job_last_step[run_name] = progress_key
+            self._job_progress_at[run_name] = time.time()
+        if v1_rows:
+            latest_phase = latest.get("phase")
+            display_history = [
+                row for row in v1_rows if row.get("phase") == latest_phase
+            ]
+            line, _pct = format_event_oneline(
+                latest,
+                history=display_history,
+                observed_at=self._job_progress_at.get(run_name),
+            )
+        else:
+            line, _pct = format_progress_oneline(latest, history=history)
         if not line:
             return
-        step = latest.get("child_step", latest.get("step")) if latest else None
-        if isinstance(step, int) and self._job_last_step.get(run_name) != step:
-            self._job_last_step[run_name] = step
-            self._job_progress_at[run_name] = time.time()
         self._tasks.update(
             run_name,
             progress=line,
@@ -1442,6 +1508,39 @@ class LqhApp:
         # over from an earlier run that reused this name.
         self._job_last_state[task_id] = "running"
         self._pending_completions.pop(task_id, None)
+        self._ensure_progress_refresh_task()
+
+    def _ensure_progress_refresh_task(self) -> None:
+        """Refresh progress from local run mirrors without polling job state."""
+        if self._progress_refresh_task and not self._progress_refresh_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Some embedders/unit tests register display state before mounting
+            # the async application. The normal run startup will retry.
+            return
+
+        async def refresh() -> None:
+            try:
+                while len(self._tasks):
+                    for task in self._tasks.snapshot():
+                        try:
+                            self._update_task_progress(task.task_id)
+                        except Exception:
+                            # One malformed/deleted run must not kill refresh
+                            # for every other active task.
+                            continue
+                    await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                # The lifecycle poll will recreate the refresh task; consume
+                # unexpected failures so asyncio does not report an orphaned
+                # task exception.
+                return
+
+        self._progress_refresh_task = loop.create_task(refresh())
 
     async def _on_agent_message(self, text: str) -> None:
         await self._emit(render_agent_message(text))
@@ -1580,10 +1679,23 @@ class LqhApp:
 
         async def spin() -> None:
             try:
-                while self._status_bar.spinning or self._status_bar.pipeline_status:
-                    self._status_bar.advance_spinner()
+                while (
+                    self._status_bar.spinning
+                    or self._status_bar.pipeline_status
+                    or (
+                        self._status_bar.recent_completion is not None
+                        and self._status_bar.recent_completion[1] > time.time()
+                    )
+                ):
+                    animated = bool(
+                        self._status_bar.spinning
+                        or self._status_bar.pipeline_status
+                    )
+                    if animated:
+                        self._status_bar.advance_spinner()
                     self._invalidate()
-                    await asyncio.sleep(0.08)
+                    await asyncio.sleep(0.08 if animated else 1.0)
+                self._invalidate()
             except asyncio.CancelledError:
                 return
 
@@ -1619,11 +1731,19 @@ class LqhApp:
         self._status_bar.active_skill = skill_name
         self._invalidate()
 
-    def _on_pipeline_progress(self, completed: int, total: int, concurrency: int) -> None:
-        """Update pipeline progress in the status bar."""
-        self._status_bar.pipeline_status = (
-            f"🚀 {completed}/{total} samples (concurrency {concurrency})"
+    def _on_pipeline_progress(self, event: Any) -> None:
+        """Update foreground progress using the shared event renderer."""
+        from lqh.progress import ProgressEvent, format_event_oneline
+
+        if not isinstance(event, ProgressEvent):
+            return
+        self._foreground_progress_history.append(event)
+        self._foreground_progress_history = self._foreground_progress_history[-256:]
+        line, _ = format_event_oneline(
+            event, history=self._foreground_progress_history,
         )
+        label = event.label or event.task_kind.replace("_", " ").title()
+        self._status_bar.pipeline_status = f"{label} · {line}"
         if not self._status_bar.spinning:
             self._status_bar.start_spinning()
         self._ensure_spinner_task()
@@ -1632,6 +1752,7 @@ class LqhApp:
     def _on_pipeline_done(self) -> None:
         """Clear pipeline progress from the status bar."""
         self._status_bar.pipeline_status = ""
+        self._foreground_progress_history.clear()
         self._status_bar.stop_spinning()
         self._cancel_spinner_task()
         self._invalidate()
@@ -1722,6 +1843,9 @@ class LqhApp:
             self._invalidate()
             return
         finally:
+            if self._progress_refresh_task is not None:
+                self._progress_refresh_task.cancel()
+                self._progress_refresh_task = None
             if self._job_watcher_task is not None:
                 self._job_watcher_task.cancel()
                 try:
@@ -1959,11 +2083,14 @@ class LqhApp:
         terminal_states = {"completed", "failed"}
         last_wall_time = time.time()
 
+        first_scan = True
         while True:
-            try:
-                await asyncio.sleep(JOB_POLL_INTERVAL_SEC)
-            except asyncio.CancelledError:
-                return
+            if not first_scan:
+                try:
+                    await asyncio.sleep(JOB_POLL_INTERVAL_SEC)
+                except asyncio.CancelledError:
+                    return
+            first_scan = False
 
             now = time.time()
             if now - last_wall_time > JOB_POLL_INTERVAL_SEC * SLEEP_GAP_FACTOR:
@@ -1987,6 +2114,10 @@ class LqhApp:
                 if state == "unknown":
                     # Transient SSH/FS hiccup — don't update last_state, retry next tick.
                     continue
+                if state == "completed" and self._results_pending(run_name):
+                    # The process has exited, but the user-facing job has not:
+                    # inference/judging still owes its final result artifact.
+                    state = "running"
                 prev = self._job_last_state.get(run_name)
                 if prev == "running" and state in terminal_states:
                     text = self._format_completion_message(
@@ -1999,12 +2130,16 @@ class LqhApp:
                     self._pending_completions[run_name] = text
                     self._input_queue.put_nowait(text)
                     self._record_completion_event(run_name, state, error, remote)
+                    if state == "completed":
+                        self._status_bar.recent_completion = (run_name, time.time() + 10.0)
+                        self._ensure_spinner_task()
                     self._tasks.unregister(run_name)
                 # Keep the registry in sync with live state. The handler
                 # eagerly registers on submission; this branch is the
                 # fallback for jobs discovered after a TUI restart.
                 if state == "running":
                     self._ensure_task_registered(run_name, remote)
+                    self._ensure_progress_refresh_task()
                     self._update_task_progress(run_name)
                 elif state in terminal_states:
                     self._tasks.unregister(run_name)
@@ -2028,6 +2163,20 @@ class LqhApp:
                     await self._spawn_run_watcher(run_name, remote)
                 except Exception:
                     pass
+
+    def _results_pending(self, run_name: str) -> bool:
+        """Whether a successful process still owes its useful eval result."""
+        import json
+
+        from lqh.progress import has_pending_final_result
+
+        run_dir = self.project_dir / "runs" / run_name
+        config_path = run_dir / "config.json"
+        try:
+            config = json.loads(config_path.read_text())
+        except Exception:
+            return False
+        return has_pending_final_result(run_dir, config)
 
     async def _scan_jobs(
         self, manager: "SubprocessManager",
@@ -2172,6 +2321,31 @@ class LqhApp:
         # call never needs a remote argument.
         status_call = f"training_status(run_name='{run_name}')"
         if state == "completed":
+            run_dir = self.project_dir / "runs" / run_name
+            scoring_failed = any(path.exists() for path in (
+                run_dir / "eval_error.json",
+                run_dir / "checkpoints" / "final" / "eval_error.json",
+            ))
+            if scoring_failed:
+                error_message = "final evaluation failed"
+                for marker in (
+                    run_dir / "eval_error.json",
+                    run_dir / "checkpoints" / "final" / "eval_error.json",
+                ):
+                    if marker.exists():
+                        try:
+                            import json
+
+                            payload = json.loads(marker.read_text())
+                            error_message = str(payload.get("error", error_message))
+                        except (OSError, json.JSONDecodeError):
+                            pass
+                        break
+                return (
+                    f"[System: run {run_name} finished{location}, but its final "
+                    f"evaluation failed: {error_message}. Call {status_call} to inspect "
+                    "the completed model and scoring error, then decide whether to retry.]"
+                )
             return (
                 f"[System: training run {run_name} completed successfully{location}. "
                 f"Call {status_call} now to read final details, then continue with "
@@ -2319,6 +2493,9 @@ class LqhApp:
                     task.cancel()
         finally:
             await self._stop_update_check()
+            if self._progress_refresh_task is not None:
+                self._progress_refresh_task.cancel()
+                self._progress_refresh_task = None
             if self._job_watcher_task is not None:
                 self._job_watcher_task.cancel()
                 try:

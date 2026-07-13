@@ -323,7 +323,10 @@ class AgentCallbacks:
     on_spinner_stop: Callable[[], None] | None = None
     on_token_update: Callable[[int, int], None] | None = None
     on_skill_loaded: Callable[[str], Awaitable[None]] | None = None
-    on_pipeline_progress: Callable[[int, int, int], None] | None = None  # (completed, total, concurrency)
+    # Progress callbacks used the legacy (completed, total, concurrency)
+    # signature before the common ProgressEvent protocol. Keep that public
+    # default compatible; new consumers opt into events explicitly.
+    on_pipeline_progress: Callable[..., None] | None = None
     on_pipeline_done: Callable[[], None] | None = None
     # Fires when a tool submits a long-running job whose completion will
     # later notify the agent (e.g. start_local_eval, start_training).
@@ -341,6 +344,9 @@ class AgentCallbacks:
     on_auto_stage: Callable[[str, str | None], None] | None = None
     # Auto-mode: fires when the agent calls exit_auto_mode (status, reason).
     on_auto_exit: Callable[[str, str], Awaitable[None]] | None = None
+    # Appended to preserve positional compatibility for existing callback
+    # bundles while offering an explicit, inspection-free protocol switch.
+    legacy_pipeline_progress_callback: bool = True
 
 
 def _strip_thinking(msg: dict[str, Any]) -> dict[str, Any]:
@@ -933,6 +939,9 @@ class Agent:
         return {
             "on_pipeline_progress": self.callbacks.on_pipeline_progress,
             "on_pipeline_done": self.callbacks.on_pipeline_done,
+            "legacy_progress_callback": (
+                self.callbacks.legacy_pipeline_progress_callback
+            ),
         }
 
     async def _handle_tool_call(self, tool_name: str, arguments: dict) -> ToolResult:
@@ -1265,6 +1274,9 @@ class Agent:
             tool_args.get("validation_instructions"),
             on_pipeline_progress=self.callbacks.on_pipeline_progress,
             on_pipeline_done=self.callbacks.on_pipeline_done,
+            legacy_progress_callback=(
+                self.callbacks.legacy_pipeline_progress_callback
+            ),
         )
 
     async def _handle_hf_push_permission(

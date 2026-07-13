@@ -160,8 +160,19 @@ def main() -> None:
     _validate(config)
     run_dir = config_path.parent
     (run_dir / "pid").write_text(str(os.getpid()))
+    from lqh.train.progress import begin_run_attempt, write_status
+    begin_run_attempt(run_dir)
 
     try:
+        from lqh.progress import ProgressReporter
+
+        ProgressReporter(
+            task_kind="evaluation", label="HF model evaluation",
+            run_dir=run_dir,
+        ).update(
+            phase="setup", phase_label="downloading checkpoint",
+            overall_fraction=0, force=True,
+        )
         # 1. Download HF checkpoint to a sandbox-local dir.
         dl_root = run_dir / "hf_checkpoints"
         local_dir = _download_checkpoint(
@@ -174,6 +185,7 @@ def main() -> None:
             "base_model": str(local_dir),
             "dataset": config["eval_dataset"],
             "max_new_tokens": int(config.get("max_new_tokens", 4096)),
+            "progress_label": "HF model evaluation",
         }
         if config["training_method"] == "lora":
             # _run_inference forwards `base_override` to
@@ -300,8 +312,6 @@ def main() -> None:
             )
             traceback.print_exc()
     except Exception as exc:
-        from lqh.train.progress import write_status
-
         write_status(run_dir, "failed", error=str(exc))
         raise
 

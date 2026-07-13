@@ -520,6 +520,11 @@ class TestSweepOrchestration:
             and row.get("config_id") == "done"
         ]
         assert resumed and resumed[-1].get("resumed") is True
+        common_rows = [
+            row for row in progress_rows if "overall_fraction" in row
+        ]
+        assert common_rows[-1]["overall_fraction"] == 1.0
+        assert common_rows[-1]["result_ready"] is True
 
     def test_forwards_child_progress_with_sweep_context(
         self, tmp_path: Path,

@@ -27,6 +27,8 @@ def main() -> None:
 
     # Write PID file so the main process can track us.
     (run_dir / "pid").write_text(str(__import__("os").getpid()))
+    from lqh.train.progress import begin_run_attempt, write_status
+    begin_run_attempt(run_dir)
 
     run_type = config.get("type", "sft")
 
@@ -45,16 +47,12 @@ def main() -> None:
     except TimeoutError:
         # DPO timeout waiting for preferences — handled inside dpo_loop
         # which writes "interrupted" status. This is a safety net.
-        from lqh.train.progress import write_status
-
         write_status(run_dir, "interrupted", error="Timeout waiting for preferences")
     except Exception as exc:
         # Write failure to progress so the watcher can detect it. A CUDA
         # OOM is flagged explicitly (oom=True) so the backend classifies
         # the lease as `oom` rather than `preempted` and batch auto-tuning
         # can self-heal — see lqh.train.progress.write_status.
-        from lqh.train.progress import write_status
-
         is_oom = _looks_like_oom(exc)
         if is_oom:
             # Self-heal: write back a smaller batch profile so the next

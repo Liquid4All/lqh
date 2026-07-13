@@ -73,13 +73,13 @@ class TestBgSummary:
             updated_at=time.time() - 8,
         )]
         summary = bar._format_bg_summary()
-        assert summary.startswith("watching train:dpo_v1@toka · 6/6 · step 1640/2000 (82%)")
+        assert summary.startswith("train:dpo_v1@toka · 6/6 · step 1640/2000 (82%)")
         assert "↑" in summary  # freshness shown
 
     def test_no_progress_keeps_plain_label(self) -> None:
         bar = self._bar()
         bar.bg_tasks = [BackgroundTask("dpo_v1", "train", "dpo_v1", "running", "toka")]
-        assert bar._format_bg_summary() == "watching train:dpo_v1@toka"
+        assert bar._format_bg_summary() == "train:dpo_v1@toka"
 
     def test_progress_without_timestamp_has_no_freshness(self) -> None:
         bar = self._bar()
@@ -87,15 +87,15 @@ class TestBgSummary:
             "r", "train", "r", "running", None, progress="step 5", updated_at=None,
         )]
         summary = bar._format_bg_summary()
-        assert summary == "watching train:r · step 5"
+        assert summary == "train:r · step 5"
 
-    def test_multi_task_summary_unchanged(self) -> None:
+    def test_multi_task_shows_most_recent_advance(self) -> None:
         bar = self._bar()
         bar.bg_tasks = [
-            BackgroundTask("a", "train", "a", "running"),
-            BackgroundTask("b", "eval", "b", "running"),
+            BackgroundTask("a", "train", "a", "running", updated_at=10),
+            BackgroundTask("b", "eval", "b", "running", progress="40%", updated_at=20),
         ]
-        assert bar._format_bg_summary() == "watching 2 tasks (1 eval, 1 train)"
+        assert bar._format_bg_summary().startswith("2 active · eval:b · 40%")
 
     def test_format_age(self) -> None:
         assert StatusBar._format_age(8) == "8s"

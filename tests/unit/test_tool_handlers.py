@@ -410,6 +410,7 @@ class TestFullEvalWorkflowIntegration:
             inference_model="small",
             inference_system_prompt="Answer factual questions accurately and concisely.",
             on_pipeline_progress=on_progress,
+            legacy_progress_callback=True,
         )
 
         assert "Model evaluation complete" in result.content

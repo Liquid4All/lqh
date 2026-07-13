@@ -34,6 +34,7 @@ class StatusBar:
         self.active_skill: str = ""
         self.auto_mode: bool = False
         self.bg_tasks: list[BackgroundTask] = []
+        self.recent_completion: tuple[str, float] | None = None
         self._spinner_frame: int = 0
         self._spin_start: float = 0.0
         self._hf_token: bool = bool(os.environ.get("HF_TOKEN"))
@@ -102,24 +103,21 @@ class StatusBar:
     def _format_bg_summary(self) -> str:
         """One-line summary of pending background tasks."""
         n = len(self.bg_tasks)
-        if n == 1:
-            t = self.bg_tasks[0]
-            label = t.label if len(t.label) <= 32 else t.label[:31] + "…"
-            remote = f"@{t.remote}" if t.remote else ""
-            base = f"watching {t.kind}:{label}{remote}"
-            if not t.progress:
-                return base
-            # Freshness = how long since the step last advanced. A growing age
-            # while the run is alive is the "it's stalled" signal.
-            fresh = ""
-            if t.updated_at is not None:
-                fresh = f" · ↑{self._format_age(time.time() - t.updated_at)}"
-            return f"{base} · {t.progress}{fresh}"
-        kinds = sorted({t.kind for t in self.bg_tasks})
-        breakdown = ", ".join(
-            f"{sum(1 for t in self.bg_tasks if t.kind == k)} {k}" for k in kinds
-        )
-        return f"watching {n} tasks ({breakdown})"
+        if not n:
+            return ""
+        # The most recently *advancing* task is the useful headline. Polling a
+        # stale job must not steal the slot from a job doing visible work.
+        t = max(self.bg_tasks, key=lambda item: item.updated_at or 0.0)
+        label = t.label if len(t.label) <= 32 else t.label[:31] + "…"
+        remote = f"@{t.remote}" if t.remote else ""
+        prefix = f"{n} active · " if n > 1 else ""
+        base = f"{prefix}{t.kind}:{label}{remote}"
+        if not t.progress:
+            return base
+        fresh = ""
+        if t.updated_at is not None:
+            fresh = f" · ↑{self._format_age(time.time() - t.updated_at)}"
+        return f"{base} · {t.progress}{fresh}"
 
     def advance_spinner(self) -> None:
         """Advance the spinner animation frame."""
@@ -148,6 +146,8 @@ class StatusBar:
                 "class:status.spinner",
                 f" {frame} thinking...{timer}{bg_suffix} ",
             ))
+        elif self.recent_completion is not None and self.recent_completion[1] > time.time():
+            parts.append(("class:status.spinner", f" ✅ {self.recent_completion[0]} completed "))
         elif bg_count:
             parts.append(("class:status.spinner", f" 🟡 {self._format_bg_summary()} "))
         else:

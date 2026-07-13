@@ -101,6 +101,24 @@ class TestRemoteRunWatcher:
         assert watcher._job_id == "1234"
 
     @pytest.mark.asyncio
+    async def test_pushes_preference_error_to_wake_remote_trainer(self, tmp_path: Path):
+        run_dir = tmp_path / "runs" / "test_run"
+        iter_dir = run_dir / "iterations" / "iter_000"
+        iter_dir.mkdir(parents=True)
+        error = iter_dir / "preference_error.json"
+        error.write_text('{"error":"judge failed"}\n')
+        backend = MockBackend()
+        callbacks = MockCallbacks()
+        watcher = self._make_watcher(run_dir, backend, callbacks)
+
+        await watcher._push_preference_errors()
+
+        assert backend.pushed_files == [(
+            str(error),
+            "/remote/runs/test_run/iterations/iter_000/preference_error.json",
+        )]
+
+    @pytest.mark.asyncio
     async def test_detects_completion_from_progress(self, tmp_path: Path):
         """Watcher should detect completed state from progress.jsonl."""
         run_dir = tmp_path / "runs" / "test_run"

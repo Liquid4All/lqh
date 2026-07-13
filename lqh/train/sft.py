@@ -23,6 +23,17 @@ from transformers import (
 )
 from trl import SFTConfig, SFTTrainer
 
+from lqh.progress import (
+    FINAL_INFERENCE_END,
+    ProgressEvent,
+    ProgressReporter,
+    TRAINING_END,
+    has_final_inference,
+    has_final_scoring,
+    training_end_for,
+    write_progress_event,
+)
+
 from lqh.train.data_utils import (
     chatml_to_sft_dataset,
     load_chatml_datasets,
@@ -88,6 +99,10 @@ class ProgressCallback(TrainerCallback):
         self.run_dir = run_dir
         self.config = config
         self.tokenizer = tokenizer
+        self.training_end = training_end_for(config)
+        self.reporter = ProgressReporter(
+            task_kind="sft", label=run_dir.name, run_dir=run_dir,
+        )
 
     def on_log(
         self,
@@ -117,7 +132,37 @@ class ProgressCallback(TrainerCallback):
             lr=logs.get("learning_rate"),
             epoch=state.epoch,
             extra=extra or None,
+            # The v1 reporter immediately below is the cloud headline event;
+            # keep this metric row local instead of doubling backend events.
+            emit_cloud=not (isinstance(max_steps, int) and max_steps > 0),
         )
+        if isinstance(max_steps, int) and max_steps > 0:
+            self.reporter.update(
+                phase="training",
+                phase_label="training SFT",
+                completed=state.global_step,
+                total=max_steps,
+                unit="steps",
+                overall_fraction=(
+                    self.training_end * state.global_step / max_steps
+                ),
+                step=state.global_step,
+                loss=(
+                    float(logs["loss"])
+                    if isinstance(logs.get("loss"), (int, float)) else None
+                ),
+                lr=(
+                    float(logs["learning_rate"])
+                    if isinstance(logs.get("learning_rate"), (int, float))
+                    else None
+                ),
+                epoch=(
+                    float(state.epoch)
+                    if isinstance(state.epoch, (int, float)) else None
+                ),
+                detail=(f"loss {logs['loss']:.4f}" if isinstance(logs.get('loss'), (int, float)) else None),
+                force=state.global_step >= max_steps,
+            )
 
     def on_save(
         self,
@@ -173,6 +218,23 @@ def _run_checkpoint_eval(
     predictions: list[dict[str, Any]] = []
     model.eval()
 
+    final_reporter = None
+    total_eval = sum(len(convos) for _, convos in eval_srcs)
+    if checkpoint_dir.name == "final" and has_final_inference(config):
+        inference_start = training_end_for(config)
+        inference_end = (
+            FINAL_INFERENCE_END if has_final_scoring(config) else 1.0
+        )
+        final_reporter = ProgressReporter(
+            task_kind="sft", label=checkpoint_dir.parent.parent.name,
+            run_dir=checkpoint_dir.parent.parent,
+        )
+        final_reporter.update(
+            phase="inference", phase_label="evaluating final model",
+            completed=0, total=total_eval, unit="samples",
+            overall_fraction=inference_start, force=True,
+        )
+
     idx = 0
     for source_label, eval_convos in eval_srcs:
         for conv in eval_convos:
@@ -227,6 +289,17 @@ def _run_checkpoint_eval(
                 }
             )
             idx += 1
+            if final_reporter is not None:
+                final_reporter.update(
+                    phase="inference", phase_label="evaluating final model",
+                    completed=idx, total=total_eval, unit="samples",
+                    overall_fraction=(
+                        inference_start
+                        + (inference_end - inference_start)
+                        * idx / max(total_eval, 1)
+                    ),
+                    force=idx == total_eval,
+                )
 
     # Write predictions as parquet (single combined file, source-tagged)
     import pyarrow as pa
@@ -676,5 +749,15 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         del eval_model
         torch.cuda.empty_cache()
 
+    if not has_final_scoring(config):
+        write_progress_event(
+            run_dir,
+            ProgressEvent(
+                task_kind="sft", label=run_dir.name,
+                phase="completed", phase_label="training complete",
+                completed=1, total=1, unit="run", overall_fraction=1.0,
+                result_ready=True,
+            ),
+        )
     write_status(run_dir, "completed")
     print("Training completed.")

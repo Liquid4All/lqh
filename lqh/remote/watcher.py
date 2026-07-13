@@ -13,7 +13,7 @@ from typing import Any
 
 from lqh.config import default_api_base_url
 from lqh.remote.backend import RemoteBackend
-from lqh.train.progress import read_latest_progress
+from lqh.train.progress import read_latest_progress, read_latest_status
 from lqh.watcher import RunWatcher, WatcherCallbacks
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,7 @@ class RemoteRunWatcher(RunWatcher):
         # Track which result files we've already pushed to the remote
         self._pushed_eval_results: set[str] = set()
         self._pushed_preferences: set[str] = set()
+        self._pushed_preference_errors: set[str] = set()
 
     # ------------------------------------------------------------------
     # Override the main loop
@@ -152,6 +153,7 @@ class RemoteRunWatcher(RunWatcher):
         """
         await self._push_eval_results()
         await self._push_preferences()
+        await self._push_preference_errors()
 
     async def _push_eval_results(self) -> None:
         """Push new eval_result.json files for SFT checkpoint scoring."""
@@ -223,6 +225,32 @@ class RemoteRunWatcher(RunWatcher):
                     )
                     self._pushed_preferences.discard(key)
 
+    async def _push_preference_errors(self) -> None:
+        """Wake an SSH DPO trainer after terminal preference-scoring failure."""
+        iterations_dir = self.run_dir / "iterations"
+        if not iterations_dir.is_dir():
+            return
+        for iter_dir in sorted(iterations_dir.iterdir()):
+            error_file = iter_dir / "preference_error.json"
+            key = str(error_file)
+            if not error_file.exists() or key in self._pushed_preference_errors:
+                continue
+            self._pushed_preference_errors.add(key)
+            remote_path = (
+                f"{self._remote_run_dir}/iterations/"
+                f"{iter_dir.name}/preference_error.json"
+            )
+            try:
+                await self._backend.sync_file_to_remote(
+                    str(error_file), remote_path,
+                )
+            except Exception:
+                self._pushed_preference_errors.discard(key)
+                logger.warning(
+                    "Failed to push preference_error.json for %s/%s",
+                    self.run_name, iter_dir.name, exc_info=True,
+                )
+
     # ------------------------------------------------------------------
     # Remote-aware completion check
     # ------------------------------------------------------------------
@@ -235,13 +263,18 @@ class RemoteRunWatcher(RunWatcher):
         at the end: we resync once more before declaring "no terminal
         status" so late-arriving progress + predictions don't get stranded.
         """
-        latest = read_latest_progress(self.run_dir)
+        latest = read_latest_status(self.run_dir)
         if latest:
             if latest.get("status") == "completed":
+                if (
+                    not bool(getattr(self._backend, "inline_scoring", False))
+                    and self._has_pending_scoring_requests()
+                ):
+                    return
                 self.callbacks.on_training_completed(self.run_name)
                 self._stop.set()
                 return
-            if latest.get("status") == "failed":
+            if latest.get("status") in {"failed", "interrupted"}:
                 self.callbacks.on_training_failed(
                     self.run_name, latest.get("error"),
                 )
@@ -276,12 +309,17 @@ class RemoteRunWatcher(RunWatcher):
                 "Final resync failed for %s", self.run_name, exc_info=True,
             )
 
-        latest = read_latest_progress(self.run_dir)
+        latest = read_latest_status(self.run_dir)
         if latest and latest.get("status") == "completed":
+            if (
+                not bool(getattr(self._backend, "inline_scoring", False))
+                and self._has_pending_scoring_requests()
+            ):
+                return
             self.callbacks.on_training_completed(self.run_name)
             self._stop.set()
             return
-        if latest and latest.get("status") == "failed":
+        if latest and latest.get("status") in {"failed", "interrupted"}:
             self.callbacks.on_training_failed(
                 self.run_name, latest.get("error"),
             )

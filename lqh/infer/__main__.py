@@ -27,12 +27,12 @@ def main() -> None:
 
     # Write PID file
     (run_dir / "pid").write_text(str(__import__("os").getpid()))
+    from lqh.train.progress import begin_run_attempt, write_status
+    begin_run_attempt(run_dir)
 
     try:
         _run_inference(run_dir, config)
     except Exception as exc:
-        from lqh.train.progress import write_status
-
         write_status(run_dir, "failed", error=str(exc))
         raise
 
@@ -40,6 +40,7 @@ def main() -> None:
 def _run_inference(run_dir: Path, config: dict) -> None:
     import torch
 
+    from lqh.progress import ProgressReporter
     from lqh.train.data_utils import load_eval_sources_with_tools
     from lqh.train.load_model import load_for_inference
     from lqh.train.progress import write_eval_request, write_progress, write_status
@@ -54,6 +55,20 @@ def _run_inference(run_dir: Path, config: dict) -> None:
     # declares. Forwarded to load_for_inference; ignored for non-
     # adapter `base_model` values.
     base_override = config.get("base_override")
+    progress_dir = Path(config.get("progress_run_dir", run_dir))
+    progress_start = float(config.get("progress_start", 0.0))
+    progress_end = float(config.get(
+        "progress_end", 0.5 if config.get("scorer") else 1.0,
+    ))
+    reporter = ProgressReporter(
+        task_kind=str(config.get("progress_task_kind", "evaluation")),
+        label=str(config.get("progress_label", "Model evaluation")),
+        run_dir=progress_dir,
+    )
+    reporter.update(
+        phase="setup", phase_label="loading model",
+        overall_fraction=progress_start, unit="samples", force=True,
+    )
 
     print(f"Loading model: {base_model}")
     # load_for_inference transparently handles hub ids, merged dirs,
@@ -76,6 +91,11 @@ def _run_inference(run_dir: Path, config: dict) -> None:
     # the judge can score sources separately and macro-average them.
     conversations, tools_per_sample, sources_per_sample = (
         load_eval_sources_with_tools(dataset_path)
+    )
+    reporter.update(
+        phase="inference", phase_label="running inference", completed=0,
+        total=len(conversations), unit="samples", overall_fraction=progress_start,
+        force=True,
     )
 
     max_new_tokens = config.get("max_new_tokens", 4096)
@@ -239,6 +259,18 @@ def _run_inference(run_dir: Path, config: dict) -> None:
                 run_dir,
                 step=i + 1,
                 extra={"phase": "inference", "total": len(conversations)},
+                emit_cloud=False,
+            )
+            completed = i + 1
+            reporter.update(
+                phase="inference", phase_label="running inference",
+                completed=completed, total=len(conversations), unit="samples",
+                overall_fraction=(
+                    progress_start
+                    + (progress_end - progress_start)
+                    * completed / max(len(conversations), 1)
+                ),
+                force=completed == len(conversations),
             )
 
     # Write predictions
@@ -265,6 +297,12 @@ def _run_inference(run_dir: Path, config: dict) -> None:
 
     # Signal for scoring
     write_eval_request(run_dir)
+    if progress_end >= 1.0:
+        reporter.update(
+            phase="completed", phase_label="predictions ready",
+            completed=len(predictions), total=len(predictions), unit="samples",
+            overall_fraction=1.0, result_ready=True, force=True,
+        )
     write_status(run_dir, "completed")
     print(f"Inference complete: {len(predictions)} predictions written")
 

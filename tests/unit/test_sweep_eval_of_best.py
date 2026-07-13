@@ -52,6 +52,8 @@ def test_build_eval_config_carries_required_fields(tmp_path: Path):
     assert cfg["dataset"] == "datasets/heldout"
     assert cfg["scorer"] == "evals/scorers/translate.md"
     assert cfg["max_new_tokens"] == 2048
+    assert cfg["progress_start"] == 0.90
+    assert cfg["progress_end"] == 0.95
     # base_model must point at the winner model, NOT the original
     # pre-fine-tune model — eval-of-best evaluates the WINNER.
     assert cfg["base_model"].endswith("/model")
@@ -69,6 +71,8 @@ def test_build_eval_config_accepts_lora_winner_dir(tmp_path: Path):
 
     assert cfg is not None
     assert cfg["base_model"].endswith("/model-lora")
+    assert cfg["progress_start"] == 0.95
+    assert cfg["progress_end"] == 1.0
 
 
 def test_build_eval_config_skips_when_no_eval_dataset(tmp_path: Path):
@@ -120,6 +124,39 @@ def _fake_infer_success(predictions_bytes: bytes):
             returncode = 0
         return _Result()
     return runner
+
+
+def test_cloud_eval_relays_child_progress_sentinel(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    run_dir = tmp_path / "run"
+    (run_dir / "model").mkdir(parents=True)
+
+    class FakePopen:
+        def __init__(self, argv, **_kwargs):
+            cfg_path = Path(argv[-1])
+            eval_dir = cfg_path.parent
+            (eval_dir / "predictions.parquet").write_bytes(b"PRED")
+            (eval_dir / "eval_request.json").write_text("{}")
+            self.stdout = iter([
+                'LQH_EVENT_JSON: {"kind":"progress","payload":{"overall_fraction":0.92}}\n',
+                "ordinary infer log\n",
+            ])
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setenv("LQH_JOB_ID", "cloud-job")
+    monkeypatch.setattr(sweep.subprocess, "Popen", FakePopen)
+
+    result = sweep._run_eval_of_best(
+        run_dir,
+        {"type": "sft", "eval_dataset": "datasets/eval"},
+    )
+
+    assert result["ok"] is True
+    assert "LQH_EVENT_JSON:" in capsys.readouterr().out
+    assert "ordinary infer log" in (run_dir / "eval_of_best" / "infer.log").read_text()
 
 
 def _fake_infer_failure(rc: int = 7):

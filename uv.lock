@@ -752,7 +752,7 @@ wheels = [
 
 [[package]]
 name = "lqh"
-version = "0.4.12"
+version = "0.4.14"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
@@ -760,6 +760,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "liquidrandom" },
     { name = "openai" },
+    { name = "packaging" },
     { name = "pillow" },
     { name = "prompt-toolkit" },
     { name = "pyarrow" },
@@ -790,6 +791,7 @@ requires-dist = [
     { name = "liquidrandom" },
     { name = "lm-format-enforcer", marker = "extra == 'train'", specifier = ">=0.11" },
     { name = "openai", specifier = ">=1.0" },
+    { name = "packaging", specifier = ">=24.0" },
     { name = "peft", marker = "extra == 'train'", specifier = ">=0.15" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "prompt-toolkit", specifier = ">=3.0" },

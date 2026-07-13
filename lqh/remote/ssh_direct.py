@@ -295,35 +295,56 @@ class SSHDirectBackend(RemoteBackend):
         if run_dir:
             stdout, _, rc = await ssh_run(
                 self._hostname,
-                f"tail -1 {run_dir}/progress.jsonl 2>/dev/null",
+                f"tail -n 512 {run_dir}/progress.jsonl 2>/dev/null",
                 timeout=10.0,
             )
             if rc == 0 and stdout.strip():
                 try:
-                    entry = json.loads(stdout.strip())
-                    if entry.get("status") == "completed":
+                    entries = []
+                    for line in stdout.splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(row, dict):
+                            entries.append(row)
+                    if not entries:
+                        raise ValueError("no valid progress rows")
+                    latest = entries[-1]
+                    terminal = next(
+                        (row for row in reversed(entries) if "status" in row),
+                        None,
+                    )
+                    metrics = next(
+                        (row for row in reversed(entries) if "step" in row),
+                        None,
+                    )
+                    current_step = metrics.get("step") if metrics else None
+                    if terminal and terminal.get("status") == "completed":
                         return JobStatus(
                             state="completed",
                             pid=int(job_id),
-                            current_step=entry.get("step"),
-                            last_update=entry.get("timestamp"),
+                            current_step=current_step,
+                            last_update=latest.get("timestamp"),
                         )
-                    if entry.get("status") == "failed":
+                    if terminal and terminal.get("status") in {"failed", "interrupted"}:
                         return JobStatus(
                             state="failed",
                             pid=int(job_id),
-                            error=entry.get("error"),
-                            current_step=entry.get("step"),
-                            last_update=entry.get("timestamp"),
+                            error=terminal.get("error"),
+                            current_step=current_step,
+                            last_update=latest.get("timestamp"),
                         )
                     # Running — extract metrics
                     return JobStatus(
                         state="running" if await self.is_job_alive(job_id) else "failed",
                         pid=int(job_id),
-                        current_step=entry.get("step"),
-                        last_update=entry.get("timestamp"),
+                        current_step=current_step,
+                        last_update=latest.get("timestamp"),
                     )
-                except json.JSONDecodeError:
+                except (TypeError, IndexError, ValueError):
                     pass
 
         # Fallback: just check if PID is alive

@@ -115,17 +115,61 @@ async def _score_iter_async(
         return
 
     from lqh.golden import generate_golden
+    from lqh.progress import (
+        DEFAULT_DPO_ITERATIONS,
+        ProgressReporter,
+        dpo_judging_fraction,
+        dpo_preferences_ready_fraction,
+        nonnegative_int,
+        training_end_for,
+    )
     from lqh.scoring import run_scoring
+
+    try:
+        iteration = int(iter_dir.name.rsplit("_", 1)[-1])
+    except (TypeError, ValueError):
+        iteration = 0
+    n_iterations = nonnegative_int(
+        config.get("num_iterations"), DEFAULT_DPO_ITERATIONS,
+    )
+    training_end = training_end_for(config)
+    reporter = ProgressReporter(
+        task_kind="dpo", label=iter_dir.parent.parent.name,
+        run_dir=iter_dir.parent.parent,
+    )
+
+    def on_progress(completed: int, total: int) -> None:
+        reporter.update(
+            phase="preference_scoring",
+            phase_label=f"judging preferences {iteration + 1}/{n_iterations}",
+            completed=completed, total=total, unit="samples",
+            overall_fraction=dpo_judging_fraction(
+                iteration, n_iterations, completed, total, training_end,
+            ),
+            force=completed == total,
+        )
 
     client = _make_client()
     try:
         # Step 1: judge-score predictions
-        await run_scoring(
+        score_result = await run_scoring(
             dataset_path=predictions_path,
             scorer_path=scorer_path,
             output_dir=iter_dir,
             client=client,
             run_inference=False,
+            on_progress=on_progress,
+        )
+        if score_result.scored == 0:
+            raise RuntimeError("all preference judge calls failed")
+        reporter.update(
+            phase="preference_assembly",
+            phase_label=f"assembling preferences {iteration + 1}/{n_iterations}",
+            completed=0, total=1, unit="stage",
+            overall_fraction=dpo_judging_fraction(
+                iteration, n_iterations, 1, 1, training_end,
+            ),
+            force=True,
         )
         # Step 2: assemble preferences. generate_golden writes
         # preferences.parquet into iter_dir, which is what the
@@ -137,6 +181,15 @@ async def _score_iter_async(
             config=config,
             client=client,
             output_dir=iter_dir,
+        )
+        reporter.update(
+            phase="preference_ready",
+            phase_label=f"preferences ready {iteration + 1}/{n_iterations}",
+            completed=1, total=1, unit="stage",
+            overall_fraction=dpo_preferences_ready_fraction(
+                iteration, n_iterations, training_end,
+            ),
+            force=True,
         )
     finally:
         # AsyncOpenAI's underlying httpx client holds open connections
@@ -161,10 +214,9 @@ def score_dpo_iter_inline(
     when we're not in cloud mode — the laptop watcher path remains
     authoritative, and the trainer should block on the file as usual.
 
-    Failures are logged and re-raised so the trainer can decide what
-    to do (today: it'll be caught by the trainer's existing
-    wait_for_file timeout path, which surfaces as "no preferences
-    received this iter — converged or upstream failure").
+    Failures are logged and re-raised. The trainer writes a terminal handoff
+    marker, catches it while waiting, and saves its partial adapter before
+    exiting with an interrupted status.
     """
     if not is_cloud_mode():
         return False
@@ -177,6 +229,9 @@ async def _score_held_out_async(
     iter_dir: Path,
     config: dict[str, Any],
     project_dir: Path,
+    *,
+    progress_start: float | None = None,
+    progress_end: float | None = None,
 ) -> dict[str, Any] | None:
     """Score the per-iter held-out eval predictions. Returns the
     summary dict (mean/median/std) or None when nothing was scored.
@@ -189,6 +244,33 @@ async def _score_held_out_async(
         return None
 
     from lqh.scoring import run_scoring
+
+    reporter = None
+    if progress_start is not None and progress_end is not None:
+        from lqh.progress import ProgressReporter
+
+        reporter = ProgressReporter(
+            task_kind="dpo",
+            label=iter_dir.parent.parent.name,
+            run_dir=iter_dir.parent.parent,
+        )
+
+    def on_progress(completed: int, total: int) -> None:
+        if reporter is None or progress_start is None or progress_end is None:
+            return
+        reporter.update(
+            phase="held_out_scoring",
+            phase_label="judging held-out evaluation",
+            completed=completed,
+            total=total,
+            unit="samples",
+            overall_fraction=(
+                progress_start
+                + (progress_end - progress_start)
+                * completed / max(total, 1)
+            ),
+            force=completed == total,
+        )
 
     client = _make_client()
     try:
@@ -203,6 +285,7 @@ async def _score_held_out_async(
             output_dir=eval_out_dir,
             client=client,
             run_inference=False,
+            on_progress=on_progress,
         )
         summary_path = eval_out_dir / "summary.json"
         if summary_path.exists():
@@ -236,6 +319,37 @@ async def _score_run_eval_async(
         return None
 
     from lqh.scoring import score_predictions_by_source
+    from lqh.progress import (
+        ProgressReporter,
+        final_scoring_context,
+        write_error_marker,
+    )
+
+    scoring_context = final_scoring_context(run_dir, config)
+    reporter = None
+    if scoring_context is not None:
+        reporter = ProgressReporter(
+            task_kind=scoring_context.task_kind,
+            label=scoring_context.progress_dir.name,
+            run_dir=scoring_context.progress_dir,
+        )
+        reporter.update(
+            phase="scoring", phase_label="judging results", completed=0,
+            unit="samples", overall_fraction=scoring_context.start, force=True,
+        )
+
+    def on_progress(completed: int, total: int) -> None:
+        if reporter is not None and scoring_context is not None:
+            reporter.update(
+                phase="scoring", phase_label="judging results",
+                completed=completed, total=total, unit="samples",
+                overall_fraction=(
+                    scoring_context.start
+                    + (1.0 - scoring_context.start)
+                    * completed / max(total, 1)
+                ),
+                force=completed == total,
+            )
 
     client = _make_client()
     try:
@@ -249,7 +363,24 @@ async def _score_run_eval_async(
             scorer_path=scorer_path,
             output_dir=run_dir,
             client=client,
+            on_progress=on_progress,
         )
+        num_scored = int(payload.get("num_scored", 0))
+        total_attempted = num_scored + int(payload.get("num_failed", 0))
+        if reporter is not None and num_scored > 0:
+            reporter.update(
+                phase="completed", phase_label="results ready",
+                completed=total_attempted, total=total_attempted,
+                unit="samples", overall_fraction=1.0,
+                result_ready=True, force=True,
+            )
+        elif num_scored == 0:
+            (run_dir / "eval_result.json").unlink(missing_ok=True)
+            write_error_marker(
+                run_dir / "eval_error.json",
+                "all judge scoring attempts failed",
+            )
+            return None
         return payload or None
     finally:
         try:
@@ -281,6 +412,9 @@ def score_held_out_eval_inline(
     iter_dir: Path,
     config: dict[str, Any],
     project_dir: Path,
+    *,
+    progress_start: float | None = None,
+    progress_end: float | None = None,
 ) -> dict[str, Any] | None:
     """Score the per-iteration held-out eval (eval_predictions.parquet).
 
@@ -292,4 +426,10 @@ def score_held_out_eval_inline(
     if not is_cloud_mode():
         return None
     logger.info("inline scoring held-out eval at %s (cloud mode)", iter_dir)
-    return asyncio.run(_score_held_out_async(iter_dir, config, project_dir))
+    return asyncio.run(_score_held_out_async(
+        iter_dir,
+        config,
+        project_dir,
+        progress_start=progress_start,
+        progress_end=progress_end,
+    ))

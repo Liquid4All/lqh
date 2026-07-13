@@ -20,9 +20,26 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from lqh.progress import (
+    RUN_ATTEMPT_ENV,
+    append_jsonl as _append_jsonl,
+    emit_sentinel as _emit_sentinel,
+    format_event_oneline,
+    read_jsonl_tail,
+)
+
+
+def begin_run_attempt(run_dir: Path) -> str:
+    """Start (or inherit) one append-only progress attempt."""
+    attempt_id = os.environ.get(RUN_ATTEMPT_ENV) or uuid.uuid4().hex
+    os.environ[RUN_ATTEMPT_ENV] = attempt_id
+    write_status(run_dir, "running", extra={"attempt_id": attempt_id})
+    return attempt_id
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +55,7 @@ def write_progress(
     lr: float | None = None,
     epoch: float | None = None,
     extra: dict[str, Any] | None = None,
+    emit_cloud: bool = True,
 ) -> None:
     """Append a progress line to ``progress.jsonl`` (and mirror to stdout
     as an LQH_EVENT_JSON sentinel when running in a cloud sandbox)."""
@@ -45,6 +63,8 @@ def write_progress(
         "step": step,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if attempt_id := os.environ.get(RUN_ATTEMPT_ENV):
+        entry["attempt_id"] = attempt_id
     if loss is not None:
         entry["loss"] = loss
     if lr is not None:
@@ -57,7 +77,8 @@ def write_progress(
     # Emit sentinel first so the cloud SSE path is robust even if
     # the local file write later fails (disk full, permissions, etc).
     # Local + SSH runs treat this as a no-op.
-    _emit_sentinel("progress", entry)
+    if emit_cloud:
+        _emit_sentinel("progress", entry)
     _append_jsonl(run_dir / "progress.jsonl", entry)
 
 
@@ -83,6 +104,8 @@ def write_status(
         "status": status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if attempt_id := os.environ.get(RUN_ATTEMPT_ENV):
+        entry["attempt_id"] = attempt_id
     if error is not None:
         entry["error"] = error
     if oom:
@@ -126,6 +149,7 @@ def write_iter_request(iter_dir: Path) -> None:
 def wait_for_file(
     path: Path,
     *,
+    error_path: Path | None = None,
     poll_interval: float = 2.0,
     timeout: float = 3600.0,
 ) -> Path:
@@ -138,6 +162,13 @@ def wait_for_file(
     while time.monotonic() < deadline:
         if path.exists() and path.stat().st_size > 0:
             return path
+        if error_path is not None and error_path.exists():
+            try:
+                payload = json.loads(error_path.read_text())
+                message = payload.get("error", "upstream work failed")
+            except Exception:
+                message = "upstream work failed"
+            raise RuntimeError(str(message))
         time.sleep(poll_interval)
     raise TimeoutError(f"Timed out waiting for {path} after {timeout}s")
 
@@ -152,29 +183,7 @@ def read_progress(run_dir: Path, last_n: int = 10) -> list[dict[str, Any]]:
 
     Returns an empty list if the file does not exist yet.
     """
-    progress_file = run_dir / "progress.jsonl"
-    if not progress_file.exists():
-        return []
-
-    lines: list[str] = []
-    try:
-        with open(progress_file) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    lines.append(line)
-    except OSError:
-        return []
-
-    # Keep only last N
-    lines = lines[-last_n:]
-    result: list[dict[str, Any]] = []
-    for line in lines:
-        try:
-            result.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return result
+    return read_jsonl_tail(run_dir / "progress.jsonl", last_n=last_n)
 
 
 def read_latest_progress(run_dir: Path) -> dict[str, Any] | None:
@@ -183,7 +192,47 @@ def read_latest_progress(run_dir: Path) -> dict[str, Any] | None:
     return entries[0] if entries else None
 
 
-def format_progress_oneline(latest: dict[str, Any] | None) -> tuple[str, int | None]:
+def read_latest_status(run_dir: Path) -> dict[str, Any] | None:
+    """Return the newest status row even if later telemetry was appended."""
+    for row in reversed(read_progress(run_dir, last_n=4096)):
+        if "status" in row:
+            return row
+    return None
+
+
+def read_current_attempt_id(run_dir: Path) -> str | None:
+    """Return the active attempt tag from recent status or v1 rows.
+
+    Unlike the startup status row, every current v1 event carries this tag, so
+    discovery does not degrade after a fixed number of progress updates.
+    """
+    for row in reversed(read_progress(run_dir, last_n=64)):
+        value = row.get("attempt_id")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def read_latest_metrics(run_dir: Path) -> dict[str, Any] | None:
+    """Return the newest row carrying trainer metrics.
+
+    Trainer v1 and legacy rows may both carry these fields. Searching by
+    content keeps callers independent of which transport produced the newest
+    metric-bearing observation.
+    """
+    metric_keys = ("step", "loss", "lr", "epoch")
+    for row in reversed(read_progress(run_dir, last_n=4096)):
+        if any(key in row for key in metric_keys):
+            return row
+    return None
+
+
+def format_progress_oneline(
+    latest: dict[str, Any] | None,
+    *,
+    history: list[dict[str, Any]] | None = None,
+    observed_at: float | None = None,
+) -> tuple[str, int | None]:
     """Compact one-line progress for the status bar, plus a percent (or None).
 
     Distinct from the verbose tool-output renderer
@@ -195,6 +244,16 @@ def format_progress_oneline(latest: dict[str, Any] | None) -> tuple[str, int | N
     """
     if not latest:
         return ("", None)
+
+    # The common v1 event already carries an authoritative whole-job fraction.
+    # Keep all legacy branches below so runs created by older clients remain
+    # readable during upgrades and reconnects.
+    if "overall_fraction" in latest:
+        return format_event_oneline(
+            latest,
+            history=history or (),
+            observed_at=observed_at,
+        )
 
     def _pct(step: object, total: object) -> int | None:
         if isinstance(step, int) and isinstance(total, int) and total > 0:
@@ -230,75 +289,3 @@ def format_progress_oneline(latest: dict[str, Any] | None) -> tuple[str, int | N
             return (f"step {step} · epoch {epoch:.2f}", None)
         return (f"step {step}", None)
     return ("", None)
-
-
-# ---------------------------------------------------------------------------
-# Internal
-# ---------------------------------------------------------------------------
-
-
-def _append_jsonl(path: Path, entry: dict[str, Any]) -> None:
-    """Append one JSON line. Uses ``_json_default`` to coerce non-JSON
-    types (numpy/torch scalars, custom objects in trainer hooks) so
-    a stray value in ``extra`` never crashes a training run."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a") as f:
-        f.write(json.dumps(entry, default=_json_default) + "\n")
-
-
-# The env var the cloud runner injects to mark "you are inside a
-# cloud sandbox". Other backends (local, SSH-direct) leave it unset.
-_CLOUD_ENV_MARKER = "LQH_JOB_ID"
-
-# stdout sentinel prefix recognized by the backend's cloud runner
-# (parseSentinel). Any line starting with this prefix is parsed as a
-# structured event; everything else is treated as a log line.
-_SENTINEL_PREFIX = "LQH_EVENT_JSON:"
-
-
-def _emit_sentinel(kind: str, payload: dict[str, Any]) -> None:
-    """If running in a cloud sandbox, echo one structured event to
-    stdout for the cloud runner to pick up.
-
-    Silent in every other context (local training, SSH-direct, tests).
-    Designed to be a strict superset of the file-based protocol — the
-    file is always written; the sentinel is the additional cloud-path
-    signal.
-
-    Failures are swallowed: a broken stdout (closed during shutdown,
-    encoding error on a quirky payload) must NEVER take down a
-    training run. The host-side parser tolerates malformed sentinels
-    by logging them and moving on.
-    """
-    if not os.environ.get(_CLOUD_ENV_MARKER):
-        return
-    try:
-        line = _SENTINEL_PREFIX + " " + json.dumps(
-            {"kind": kind, "payload": payload},
-            default=_json_default,
-        )
-        # Use print rather than sys.stdout.write so we get auto-flush
-        # behavior on line buffering. flush=True forces it even on
-        # block-buffered stdout (which is what the sandbox stdout pipe
-        # typically is).
-        print(line, flush=True)
-    except Exception:
-        # Don't let telemetry break the run.
-        return
-
-
-def _json_default(obj: Any) -> Any:
-    """Fallback for objects json.dumps can't serialize natively.
-
-    Mostly catches numpy / torch scalars that creep into the
-    `extra` dict in DPO/SFT trainer hooks. Returns str(obj) as a
-    last resort so the sentinel still parses on the host side.
-    """
-    # The most common offenders have .item() (numpy/torch 0-d arrays).
-    item = getattr(obj, "item", None)
-    if callable(item):
-        try:
-            return item()
-        except Exception:
-            pass
-    return str(obj)

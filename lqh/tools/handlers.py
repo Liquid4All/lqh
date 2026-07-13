@@ -634,6 +634,7 @@ async def handle_run_data_gen_pipeline(
         samples_per_item=samples_per_item,
         on_pipeline_progress=kwargs.get("on_pipeline_progress"),
         on_pipeline_done=kwargs.get("on_pipeline_done"),
+        legacy_progress_callback=bool(kwargs.get("legacy_progress_callback", True)),
     )
 
 
@@ -647,18 +648,28 @@ async def _execute_pipeline(
     samples_per_item: int = 1,
     on_pipeline_progress: Callable | None = None,
     on_pipeline_done: Callable | None = None,
+    legacy_progress_callback: bool = True,
 ) -> ToolResult:
     """Actually execute the pipeline after permission is granted."""
     from lqh.auth import require_token
     from lqh.client import create_client
     from lqh.config import load_config
     from lqh.engine import run_pipeline
+    from lqh.progress import ProgressReporter
 
     concurrency = min(100, num_samples)
 
-    # Signal start immediately
-    if on_pipeline_progress:
-        on_pipeline_progress(0, num_samples, concurrency)
+    reporter = ProgressReporter(
+        task_kind="data_gen",
+        label="Data generation",
+        callback=on_pipeline_progress,
+        legacy_callback=legacy_progress_callback,
+    )
+    reporter.update(
+        phase="generation", phase_label="generating", completed=0,
+        total=num_samples, unit="samples", overall_fraction=0,
+        concurrency=concurrency, force=True,
+    )
 
     try:
         config = load_config()
@@ -674,8 +685,12 @@ async def _execute_pipeline(
             val_text = val_path.read_text(encoding="utf-8")
 
         def on_progress(completed: int, total: int) -> None:
-            if on_pipeline_progress:
-                on_pipeline_progress(completed, total, concurrency)
+            reporter.update(
+                phase="generation", phase_label="generating",
+                completed=completed, total=total, unit="samples",
+                overall_fraction=completed / max(total, 1),
+                concurrency=concurrency,
+            )
 
         result = await run_pipeline(
             script_path=target,
@@ -700,6 +715,11 @@ async def _execute_pipeline(
             num_samples=num_samples,
             succeeded=result.succeeded,
             failed=result.failed,
+        )
+        reporter.update(
+            phase="completed", phase_label="dataset ready",
+            completed=result.total, total=result.total, unit="samples",
+            overall_fraction=1.0, result_ready=True, force=True,
         )
 
         return ToolResult(
@@ -1050,11 +1070,29 @@ async def handle_run_scoring(
     except Exception as e:
         return ToolResult(content=f"Error: {e}")
 
+    from lqh.progress import ProgressReporter
+
     on_progress = kwargs.get("on_pipeline_progress")
+    progress_kind = "zero_shot_eval" if mode == "model_eval" else "evaluation"
+    progress_label = "Zero-shot evaluation" if mode == "model_eval" else "Data scoring"
+    reporter = ProgressReporter(
+        task_kind=progress_kind,
+        label=progress_label,
+        callback=on_progress,
+        legacy_callback=bool(kwargs.get("legacy_progress_callback", True)),
+    )
+    reporter.update(
+        phase="setup", phase_label="preparing evaluation",
+        overall_fraction=0, unit="samples", force=True,
+    )
 
     def _progress(completed: int, total: int) -> None:
-        if on_progress:
-            on_progress(completed, total, min(100, total))
+        reporter.update(
+            phase="evaluation", phase_label="evaluating",
+            completed=completed, total=total, unit="samples",
+            overall_fraction=completed / max(total, 1),
+            concurrency=min(100, total), force=completed == total,
+        )
 
     try:
         if mode == "data_quality":
@@ -1079,6 +1117,15 @@ async def handle_run_scoring(
                 mode="data_quality",
                 mean_score=round(result.mean_score, 2),
                 median_score=round(result.median_score, 2),
+            )
+            reporter.update(
+                phase="completed",
+                phase_label=(
+                    "scores ready" if result.scored > 0 else "no valid scores"
+                ),
+                completed=result.total, total=result.total, unit="samples",
+                overall_fraction=1.0,
+                result_ready=result.scored > 0, force=True,
             )
 
             distribution = _format_score_distribution(data_path.parent / "scores.parquet")
@@ -1179,6 +1226,15 @@ async def handle_run_scoring(
                 run_name=run_name,
                 mean_score=round(result.mean_score, 2),
                 median_score=round(result.median_score, 2),
+            )
+            reporter.update(
+                phase="completed",
+                phase_label=(
+                    "evaluation ready" if result.scored > 0 else "evaluation failed"
+                ),
+                completed=result.total, total=result.total, unit="samples",
+                overall_fraction=1.0,
+                result_ready=result.scored > 0, force=True,
             )
 
             distribution = _format_score_distribution(output_dir / "results.parquet")
@@ -3319,8 +3375,8 @@ async def _training_status_remote(
         lines.append(f"  Error: {status.error}")
 
     # Also show local mirror progress if available
-    from lqh.train.progress import read_latest_progress
-    latest = read_latest_progress(run_dir)
+    from lqh.train.progress import read_latest_metrics
+    latest = read_latest_metrics(run_dir)
     latest_sweep_lines = _format_latest_sweep_progress(latest)
     if latest_sweep_lines:
         lines.extend(latest_sweep_lines)
@@ -3329,6 +3385,8 @@ async def _training_status_remote(
             lines.append(f"  Loss: {latest['loss']:.4f}")
         if latest.get("lr") is not None:
             lines.append(f"  LR:   {latest['lr']:.2e}")
+    if progress_line := _unified_progress_line(run_dir):
+        lines.append(f"  Progress: {progress_line}")
 
     chosen_summary = run_dir / "chosen_pool_summary.json"
     if chosen_summary.exists():
@@ -3401,8 +3459,8 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
     emoji = state_emoji.get(status.state, "❓")
     lines = [f"{emoji} **{run_name}** — {status.state}"]
 
-    from lqh.train.progress import read_latest_progress
-    latest = read_latest_progress(run_dir)
+    from lqh.train.progress import read_latest_metrics
+    latest = read_latest_metrics(run_dir)
     latest_sweep_lines = _format_latest_sweep_progress(latest)
     if latest_sweep_lines:
         lines.extend(latest_sweep_lines)
@@ -3417,6 +3475,8 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
             lines.append(f"  Epoch: {status.epoch:.2f}")
     if status.error:
         lines.append(f"  Error: {status.error}")
+    if progress_line := _unified_progress_line(run_dir):
+        lines.append(f"  Progress: {progress_line}")
 
     # SFT/checkpoint eval results
     checkpoints_dir = run_dir / "checkpoints"
@@ -3502,6 +3562,41 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
         lines.extend(sweep_lines)
 
     return "\n".join(lines)
+
+
+def _unified_progress_line(run_dir: Path) -> str:
+    """Render the latest current-attempt v1 percentage/ETA for tool output."""
+    from lqh.progress import (
+        format_event_oneline,
+        read_progress_events,
+        select_display_event,
+    )
+    from lqh.train.progress import read_current_attempt_id
+
+    rows = [
+        row for row in read_progress_events(run_dir, last_n=256)
+        if isinstance(row.get("overall_fraction"), (int, float))
+    ]
+    attempt_id = read_current_attempt_id(run_dir)
+    if isinstance(attempt_id, str) and attempt_id:
+        rows = [row for row in rows if row.get("attempt_id") == attempt_id]
+    if not rows:
+        return ""
+    latest = select_display_event(rows)
+    if latest is None:
+        return ""
+    phase_rows = [row for row in rows if row.get("phase") == latest.get("phase")]
+    observed_candidates: list[float] = []
+    for name in ("progress.jsonl", "observer_progress.jsonl"):
+        try:
+            observed_candidates.append((run_dir / name).stat().st_ctime)
+        except OSError:
+            pass
+    observed_at = max(observed_candidates) if observed_candidates else None
+    line, _ = format_event_oneline(
+        latest, history=phase_rows, observed_at=observed_at,
+    )
+    return line
 
 
 def _format_latest_sweep_progress(latest: dict[str, Any] | None) -> list[str]:
@@ -4717,11 +4812,28 @@ async def handle_run_data_filter(
 
     output_dir = project_dir / "datasets" / output_dataset
 
-    def on_progress(completed: int, total: int) -> None:
-        cb = kwargs.get("on_pipeline_progress")
-        if cb:
-            cb(completed, total, min(100, total))
+    from lqh.progress import ProgressReporter
 
+    reporter = ProgressReporter(
+        task_kind="data_filter",
+        label="Data filtering",
+        callback=kwargs.get("on_pipeline_progress"),
+        legacy_callback=bool(kwargs.get("legacy_progress_callback", True)),
+    )
+    reporter.update(
+        phase="setup", phase_label="preparing filter",
+        overall_fraction=0, unit="samples", force=True,
+    )
+
+    def on_progress(completed: int, total: int) -> None:
+        reporter.update(
+            phase="filtering", phase_label="filtering",
+            completed=completed, total=total, unit="samples",
+            overall_fraction=completed / max(total, 1),
+            concurrency=min(100, total), force=completed == total,
+        )
+
+    succeeded = False
     try:
         result = await run_data_filter(
             input_path=input_abs,
@@ -4732,9 +4844,16 @@ async def handle_run_data_filter(
             model_size=model_size,
             on_progress=on_progress,
         )
+        succeeded = True
     except Exception as exc:
         return ToolResult(content=f"❌ run_data_filter failed: {type(exc).__name__}: {exc}")
     finally:
+        if succeeded:
+            reporter.update(
+                phase="completed", phase_label="filtered dataset ready",
+                completed=result.total, total=result.total, unit="samples",
+                overall_fraction=1.0, result_ready=True, force=True,
+            )
         on_done = kwargs.get("on_pipeline_done")
         if on_done:
             on_done()
