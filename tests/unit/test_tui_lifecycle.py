@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -34,6 +36,8 @@ class _FakeAgent:
 
 @pytest.fixture
 def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LqhApp:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("lqh.auth.get_token", lambda: "test-token")
     instance = LqhApp(tmp_path)
     instance._reconnect_backoffs = (0.0,)
     emitted: list[str] = []
@@ -51,7 +55,7 @@ async def test_transient_agent_failure_retries_without_duplicate_message(app: Lq
     agent = _FakeAgent()
     app._agent = agent  # type: ignore[assignment]
 
-    await app._handle_message("train the model")
+    await asyncio.wait_for(app._handle_message("train the model"), timeout=2)
 
     assert agent.process_calls == ["train the model"]
     assert agent.continue_calls == 1
@@ -82,6 +86,42 @@ async def test_reconnect_command_no_pending_operation(app: LqhApp) -> None:
 
     emitted = getattr(app, "_emitted")
     assert any("No reconnect is pending" in text for text in emitted)
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["/spec", "/datagen"],
+)
+async def test_workflow_slash_command_sets_activity_boundary_before_start(
+    app: LqhApp, command: str,
+) -> None:
+    telemetry = MagicMock()
+    async def run_deferred(callback, *args):
+        return callback(*args)
+    telemetry.run_deferred = AsyncMock(side_effect=run_deferred)
+    app._telemetry = telemetry
+    app._agent = None
+
+    await app._handle_command(command)
+
+    tracked = command.removeprefix("/")
+    telemetry.record_workflow_command.assert_called_once_with(tracked)
+
+
+async def test_fire_and_forget_telemetry_flush_is_retained(app: LqhApp) -> None:
+    release = asyncio.Event()
+
+    async def flush() -> None:
+        await release.wait()
+
+    app._telemetry.flush = flush  # type: ignore[method-assign]
+    app._start_telemetry_flush()
+    assert len(app._telemetry_flush_tasks) == 1
+
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not app._telemetry_flush_tasks
 
 
 async def test_scan_jobs_syncs_cloud_remote_before_polling(tmp_path: Path) -> None:
@@ -167,6 +207,37 @@ def _simulate_watch_completion(app: LqhApp, name: str, notice: str) -> None:
     app._pending_completions[name] = notice
     app._input_queue.put_nowait(notice)
     app._tasks.unregister(name)
+
+
+def test_local_workflow_telemetry_survives_cli_restart(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "run_1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "config.json").write_text(json.dumps({"type": "sft"}))
+
+    first = LqhApp(tmp_path)
+    first._telemetry.enabled = True
+    first._telemetry.account_key = "account-a"
+    first._telemetry.event = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    first._on_background_task_started("run_1", "train", "Training", None)
+    first._telemetry._work_queue.join()
+    state_path = run_dir / ".telemetry_workflow.json"
+    assert state_path.exists()
+    if os.name == "posix":
+        assert state_path.stat().st_mode & 0o777 == 0o600
+
+    emitted: list[tuple[str, dict, str | None]] = []
+    reopened = LqhApp(tmp_path)
+    reopened._telemetry.enabled = True
+    reopened._telemetry.account_key = "account-a"
+    reopened._telemetry.event = lambda name, metadata, workflow_id=None: emitted.append((name, metadata, workflow_id))  # type: ignore[method-assign]
+    reopened._record_completion_event("run_1", "completed", None, None)
+    reopened._telemetry._work_queue.join()
+
+    assert emitted and emitted[0][0] == "fine_tuning_completed"
+    assert emitted[0][1]["outcome"] == "succeeded"
+    assert emitted[0][1]["active_duration_ms"] == 0
+    assert emitted[0][1]["active_duration_ms"] <= emitted[0][1]["wall_duration_ms"]
+    assert not state_path.exists()
 
 
 async def test_await_background_wakes_on_completion_message(tmp_path: Path) -> None:

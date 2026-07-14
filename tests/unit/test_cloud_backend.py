@@ -28,6 +28,7 @@ import pytest
 
 from lqh.remote.backend import RemoteConfig
 from lqh.remote.cloud import CloudBackend, CloudError, _CloudState
+from lqh.telemetry import set_active_telemetry
 
 
 # ---------------------------------------------------------------------
@@ -166,6 +167,32 @@ def test_submit_writes_state_and_run_metadata(tmp_path, fake_cloud):
     assert state is not None
     assert state.job_id == job_id
     assert state.last_seq == 0
+
+
+def test_submit_failure_closes_client_workflow(tmp_path, monkeypatch):
+    project = tmp_path / "proj"; project.mkdir()
+    backend = _make_backend(project)
+
+    class Recorder:
+        def __init__(self):
+            self.events = []
+        def correlation_project_id(self):
+            return "00000000-0000-0000-0000-000000000001"
+        def event(self, name, metadata, workflow_id=None):
+            self.events.append((name, metadata, workflow_id))
+        async def run_deferred(self, callback, *args, **_kwargs):
+            return callback(*args)
+
+    recorder = Recorder()
+    set_active_telemetry(recorder)  # type: ignore[arg-type]
+    monkeypatch.setattr("lqh.remote.cloud.build_bundle", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad bundle")))
+    try:
+        with pytest.raises(ValueError, match="bad bundle"):
+            asyncio.run(backend.submit_run(str(project / "run"), {"type": "sft"}, module="lqh.train"))
+    finally:
+        set_active_telemetry(None)
+    assert [event[0] for event in recorder.events] == ["fine_tuning_started", "fine_tuning_failed"]
+    assert recorder.events[-1][1]["outcome"] == "failed"
 
 
 def test_sync_progress_writes_progress_and_status(tmp_path, fake_cloud):

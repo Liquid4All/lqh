@@ -238,6 +238,15 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         ),
                         "default": 1,
                     },
+                    "purpose": {
+                        "type": "string",
+                        "enum": ["smoke", "inspection", "validation", "training", "unspecified"],
+                        "default": "unspecified",
+                        "description": (
+                            "Semantic purpose of this run. Declare it explicitly; do not infer it "
+                            "from the requested sample count."
+                        ),
+                    },
                 },
                 "required": ["script_path", "num_samples", "output_dataset"],
             },

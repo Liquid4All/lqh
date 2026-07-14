@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -40,6 +42,7 @@ from lqh.tui.renderer import (
 from lqh.tui.background_tasks import BackgroundTask, BackgroundTaskRegistry
 from lqh.tui.status_bar import StatusBar
 from lqh.update_check import check_for_update
+from lqh.telemetry import TelemetryClient, notice_needed, set_active_telemetry
 
 if TYPE_CHECKING:
     from lqh.subprocess_manager import SubprocessManager
@@ -97,6 +100,8 @@ class AgentInterrupted(Exception):
 # Interval between background-job completion scans, in seconds.
 # Trades freshness against SSH/filesystem load when remote runs are active.
 JOB_POLL_INTERVAL_SEC = 60.0
+TELEMETRY_FLUSH_INTERVAL_SEC = 60.0
+TELEMETRY_HEARTBEAT_INTERVAL_SEC = 300.0
 RECONNECT_BACKOFF_SEC = (3.0, 20.0, 60.0)
 SLEEP_GAP_FACTOR = 2.0
 # After an eval/infer run goes terminal, the scoring watcher still needs to
@@ -143,8 +148,9 @@ class LqhApp:
         self._spinner_task: asyncio.Task | None = None
         self._app: Application | None = None
         # Background job watcher state: maps run_name → last observed state.
-        # First-time observations are recorded silently; only running → terminal
-        # transitions enqueue a notification.
+        # First-time observations are normally silent. A terminal run with a
+        # persisted telemetry workflow is the exception: it completed while
+        # this TUI was closed and must be reconciled exactly once.
         self._job_watcher_task: asyncio.Task | None = None
         self._progress_refresh_task: asyncio.Task | None = None
         self._update_check_task: asyncio.Task[None] | None = None
@@ -178,6 +184,12 @@ class LqhApp:
         self._input_buffer: Buffer | None = None
         self._managed_ansi = ""
         self._shutdown_requested = False
+        self._telemetry = TelemetryClient(project_dir, auto_mode=auto_mode)
+        self._telemetry_heartbeat_task: asyncio.Task[None] | None = None
+        self._telemetry_flush_tasks: set[asyncio.Task[None]] = set()
+        # workflow id, monotonic start, wall start, prior active seconds,
+        # current-session active baseline, kind, target
+        self._telemetry_jobs: dict[str, tuple[str, float | None, float, float, float, str, str, int]] = {}
         self._pending_reconnect: Callable[[], Awaitable[None]] | None = None
         self._pending_reconnect_error: str | None = None
         self._reconnect_backoffs = RECONNECT_BACKOFF_SEC
@@ -903,6 +915,45 @@ class LqhApp:
         """Handle a slash command."""
         command, _args = parse_command(text)
 
+        tracked_command = command.removeprefix("/")
+        if tracked_command in {"spec", "datagen", "validate", "train", "eval", "prompt", "clear", "resume", "feedback"}:
+            # File locks may contend with another CLI in the same project;
+            # keep that synchronous disk work off the UI event loop.
+            await self._telemetry.run_deferred(self._telemetry.record_workflow_command, tracked_command)
+
+        if command == "/telemetry":
+            from lqh.config import load_config, telemetry_enabled, update_config
+            action = _args.strip().lower() or "status"
+            if action not in {"on", "off", "status"}:
+                await self._emit(render_error("Usage: /telemetry on|off|status"))
+                return True
+            if action != "status":
+                def update_telemetry_consent(config):
+                    config.telemetry_enabled = action == "on"
+                    config.telemetry_consent_epoch += 1
+
+                config = update_config(update_telemetry_consent)
+                # Opt-out is a hard boundary and may wait for an in-flight
+                # sender's cross-process lock. Keep the UI responsive while
+                # that privacy barrier completes.
+                await self._telemetry.run_deferred(
+                    self._telemetry.set_enabled,
+                    telemetry_enabled(config),
+                    timeout=None if action == "off" else 0.25,
+                )
+                if action == "off":
+                    self._clear_persisted_telemetry_jobs()
+            else:
+                config = load_config()
+            env_override = os.environ.get("LQH_TELEMETRY")
+            suffix = " (overridden by LQH_TELEMETRY)" if env_override is not None else ""
+            enabled = await self._telemetry.run_deferred(self._telemetry.is_enabled)
+            if enabled is None:
+                enabled = self._telemetry.state_snapshot()[0]
+            state = "on" if enabled else "off"
+            await self._emit(render_system_message(f"Telemetry is {state}{suffix}."))
+            return True
+
         if command == "/quit":
             self._save_session()
             self._request_shutdown()
@@ -1005,6 +1056,8 @@ class LqhApp:
         if not get_token():
             await self._emit(render_error("Not logged in. Please run /login first."))
             return
+
+        await self._telemetry.run_deferred(self._telemetry.record_user_turn, "message")
 
         self._lock_input()
         await self._emit(render_user_message(text))
@@ -1175,6 +1228,12 @@ class LqhApp:
             self._invalidate()
             email = user.get("email", "?") if isinstance(user, dict) else "?"
             await self._emit(render_system_message(f"✅ Logged in as {email}"))
+            # The app may have started before a bearer existed. Record the
+            # original CLI open now, preserving its new/pre-existing project
+            # classification, and begin draining the account-bound queue.
+            await self._telemetry.run_deferred(self._telemetry.refresh_account_binding)
+            await self._telemetry.run_deferred(self._telemetry.start_session)
+            self._start_telemetry_flush()
         except LoginExpired:
             await self._emit(render_error("Device code expired. Run /login again."))
         except Exception as e:
@@ -1509,6 +1568,94 @@ class LqhApp:
         self._job_last_state[task_id] = "running"
         self._pending_completions.pop(task_id, None)
         self._ensure_progress_refresh_task()
+        enabled, consent_epoch, active_baseline, _account_key = self._telemetry.state_snapshot()
+        if remote != "cloud" and enabled:
+            workflow_id = str(uuid.uuid4())
+            workflow_kind = "zero_shot_evaluation" if kind == "eval" else "fine_tuning"
+            target = "ssh" if remote else "local"
+            metadata = {"workflow_kind": workflow_kind, "execution_target": target}
+            if kind == "eval":
+                metadata["subtype"] = "zero_shot"
+            event_name = "zero_shot_evaluation_started" if kind == "eval" else "fine_tuning_started"
+            self._telemetry.defer(self._telemetry.event, event_name, metadata, workflow_id)
+            started_mono, started_wall = time.monotonic(), time.time()
+            self._telemetry_jobs[task_id] = (
+                workflow_id, started_mono, started_wall, 0.0, active_baseline,
+                workflow_kind, target, consent_epoch,
+            )
+            self._persist_telemetry_job(
+                task_id, workflow_id, started_mono, started_wall, 0.0,
+                workflow_kind, target, consent_epoch,
+            )
+
+    def _telemetry_job_path(self, run_name: str) -> Path:
+        return self.project_dir / "runs" / run_name / ".telemetry_workflow.json"
+
+    def _persist_telemetry_job(
+        self, run_name: str, workflow_id: str, started_mono: float | None,
+        started_wall: float, active_seconds: float, workflow_kind: str,
+        target: str, consent_epoch: int,
+    ) -> None:
+        path = self._telemetry_job_path(run_name)
+        try:
+            account_key = self._telemetry.state_snapshot()[3]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "workflow_id": workflow_id, "started_mono": started_mono, "started_wall": started_wall,
+                "workflow_kind": workflow_kind, "target": target,
+                "account_key": account_key,
+                "consent_epoch": consent_epoch,
+                "active_seconds": active_seconds,
+            }, separators=(",", ":")) + "\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except OSError:
+            return
+
+    def _load_telemetry_job(self, run_name: str) -> tuple[str, float | None, float, float, float, str, str, int] | None:
+        try:
+            path = self._telemetry_job_path(run_name)
+            os.chmod(path, 0o600)
+            value = json.loads(path.read_text())
+            _enabled, consent_epoch, active_seconds, account_key = self._telemetry.state_snapshot()
+            if (value.get("account_key") != account_key
+                    or value.get("consent_epoch", 0) != consent_epoch):
+                return None
+            started_mono = float(value.get("started_mono", 0))
+            if started_mono <= 0 or started_mono > time.monotonic():
+                started_mono = None
+            return (
+                str(uuid.UUID(value["workflow_id"])), started_mono,
+                float(value["started_wall"]), float(value.get("active_seconds", 0)),
+                active_seconds, str(value["workflow_kind"]),
+                str(value["target"]), int(value.get("consent_epoch", 0)),
+            )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None
+
+    def _clear_persisted_telemetry_jobs(self) -> None:
+        self._telemetry_jobs.clear()
+        try:
+            for path in (self.project_dir / "runs").glob("*/.telemetry_workflow.json"):
+                path.unlink(missing_ok=True)
+        except OSError:
+            return
+
+    def _checkpoint_telemetry_jobs(self) -> None:
+        """Persist interaction-active time for local/SSH jobs across restarts."""
+        active_seconds = self._telemetry.state_snapshot()[2]
+        for run_name, job in list(self._telemetry_jobs.items()):
+            workflow_id, started_mono, started_wall, prior, baseline, kind, target, consent_epoch = job
+            active = prior + max(active_seconds - baseline, 0)
+            self._telemetry_jobs[run_name] = (
+                workflow_id, started_mono, started_wall, active,
+                active_seconds, kind, target, consent_epoch,
+            )
+            self._persist_telemetry_job(
+                run_name, workflow_id, started_mono, started_wall, active,
+                kind, target, consent_epoch,
+            )
 
     def _ensure_progress_refresh_task(self) -> None:
         """Refresh progress from local run mirrors without polling job state."""
@@ -1575,12 +1722,15 @@ class LqhApp:
                 multi_select=multi_select,
                 relock_after=True,
             )
+            await self._telemetry.run_deferred(self._telemetry.record_user_turn, "ask_user_answer")
             return response
 
-        return await self._wait_for_user_response(
+        response = await self._wait_for_user_response(
             managed_text=render_system_message("Type your response:", separated=False),
             relock_after=True,
         )
+        await self._telemetry.run_deferred(self._telemetry.record_user_turn, "ask_user_answer")
+        return response
 
     async def _on_show_secret(self, text: str) -> None:
         """Display a one-time secret in a distinct panel (out-of-band).
@@ -2119,7 +2269,11 @@ class LqhApp:
                     # inference/judging still owes its final result artifact.
                     state = "running"
                 prev = self._job_last_state.get(run_name)
-                if prev == "running" and state in terminal_states:
+                pending_telemetry = (
+                    run_name in self._telemetry_jobs
+                    or (prev is None and self._load_telemetry_job(run_name) is not None)
+                )
+                if state in terminal_states and (prev == "running" or pending_telemetry):
                     text = self._format_completion_message(
                         run_name, state, error, remote,
                     )
@@ -2138,6 +2292,10 @@ class LqhApp:
                 # eagerly registers on submission; this branch is the
                 # fallback for jobs discovered after a TUI restart.
                 if state == "running":
+                    if run_name not in self._telemetry_jobs:
+                        persisted_job = self._load_telemetry_job(run_name)
+                        if persisted_job is not None:
+                            self._telemetry_jobs[run_name] = persisted_job
                     self._ensure_task_registered(run_name, remote)
                     self._ensure_progress_refresh_task()
                     self._update_task_progress(run_name)
@@ -2364,6 +2522,40 @@ class LqhApp:
         """Mirror the transition in the project log so summary/restart see it."""
         from lqh.project_log import append_event
 
+        telemetry_job = self._telemetry_jobs.pop(run_name, None) or self._load_telemetry_job(run_name)
+        if telemetry_job is not None:
+            workflow_id, started_mono, started_wall, prior_active, active_baseline, workflow_kind, target, consent_epoch = telemetry_job
+            elapsed_seconds = time.monotonic() - started_mono if started_mono is not None else time.time() - started_wall
+            elapsed_ms = int(max(elapsed_seconds, 0) * 1000)
+            active_seconds = self._telemetry.state_snapshot()[2]
+            active_ms = int((prior_active + max(active_seconds-active_baseline, 0)) * 1000)
+            outcome = "succeeded" if state == "completed" else "failed"
+            metadata: dict[str, Any] = {
+                "workflow_kind": workflow_kind, "execution_target": target,
+                "outcome": outcome, "wall_duration_ms": elapsed_ms,
+                "active_duration_ms": active_ms,
+            }
+            config_path = self.project_dir / "runs" / run_name / "config.json"
+            try:
+                config = __import__("json").loads(config_path.read_text())
+                config_type = str(config.get("type", ""))
+                base_type = str((config.get("base_config") or {}).get("type", "")) if isinstance(config.get("base_config"), dict) else ""
+                if workflow_kind == "zero_shot_evaluation":
+                    metadata["subtype"] = "zero_shot"
+                    metadata["sample_count"] = int(config.get("num_samples", 0) or 0)
+                elif config_type == "sweep":
+                    metadata["subtype"] = "dpo_sweep" if base_type in {"dpo", "on_policy_dpo"} else "sft_sweep"
+                else:
+                    metadata["subtype"] = "direct_dpo" if config_type in {"dpo", "on_policy_dpo"} else "direct_sft"
+            except (OSError, ValueError, TypeError):
+                if workflow_kind == "zero_shot_evaluation": metadata["subtype"] = "zero_shot"
+            event_name = ("zero_shot_evaluation_" if workflow_kind == "zero_shot_evaluation" else "fine_tuning_") + ("completed" if state == "completed" else "failed")
+            self._telemetry.defer(
+                self._finalize_telemetry_job,
+                event_name, metadata, workflow_id, consent_epoch,
+                self._telemetry_job_path(run_name),
+            )
+
         event = "training_completed" if state == "completed" else "training_failed"
         if state == "completed":
             desc = f"Run {run_name} completed"
@@ -2382,16 +2574,40 @@ class LqhApp:
             kwargs["error"] = error
         append_event(self.project_dir, event, desc, **kwargs)
 
+    def _finalize_telemetry_job(
+        self, event_name: str, metadata: dict[str, Any], workflow_id: str,
+        consent_epoch: int, checkpoint_path: Path,
+    ) -> None:
+        """Emit and clear a job checkpoint on the ordered telemetry worker."""
+        if self._telemetry.consent_active(consent_epoch):
+            self._telemetry.event(event_name, metadata, workflow_id)
+        try:
+            checkpoint_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     async def run(self) -> None:
         """Run the persistent bottom application."""
         self._shutdown_requested = False
         self._session = Session.create(self.project_dir)
+        # Telemetry sessions are intentionally independent from conversation
+        # sessions (/clear creates another conversation, not another CLI open).
+        set_active_telemetry(self._telemetry)
+        await self._telemetry.run_deferred(self._telemetry.start_session)
+        self._telemetry_heartbeat_task = asyncio.create_task(self._telemetry_heartbeat())
         self._status_bar.session_id = self._session.id
         self._agent = self._create_agent()
         app_task = self._start_application_task()
         await asyncio.sleep(0)
 
         await self._emit(render_welcome())
+        if notice_needed():
+            await self._emit(render_system_message(
+                "LQH collects limited usage and workflow timing telemetry to improve the product. "
+                "No prompts, responses, file names, paths, or file contents are collected. "
+                "Use /telemetry off to opt out."
+            ))
+        self._start_telemetry_flush()
         self._update_check_task = asyncio.create_task(self._show_update_notice())
 
         token = get_token()
@@ -2431,6 +2647,7 @@ class LqhApp:
                 self._exit_application()
                 await self._wait_for_app_task(app_task)
                 self._save_session()
+                await self._finish_telemetry()
             return
 
         if self._agent:
@@ -2512,6 +2729,53 @@ class LqhApp:
             self._exit_application()
             await self._wait_for_app_task(app_task)
             self._save_session()
+            await self._finish_telemetry()
+
+    async def _telemetry_heartbeat(self) -> None:
+        next_heartbeat = time.monotonic() + TELEMETRY_HEARTBEAT_INTERVAL_SEC
+        try:
+            while True:
+                await asyncio.sleep(TELEMETRY_FLUSH_INTERVAL_SEC)
+                # Heartbeats carry the cumulative capped interaction time. The
+                # backend converts cumulative snapshots into exactly-once
+                # deltas, preserving activity if the process disappears before
+                # a final session_ended event.
+                now = time.monotonic()
+                if now >= next_heartbeat:
+                    await self._telemetry.run_deferred(self._telemetry.heartbeat)
+                    # A timed-out waiter leaves the heartbeat queued. Persist
+                    # the latest completed state either way; a later heartbeat
+                    # or shutdown checkpoint captures any still-pending delta.
+                    self._checkpoint_telemetry_jobs()
+                    next_heartbeat = now + TELEMETRY_HEARTBEAT_INTERVAL_SEC
+                # Drain queued telemetry even during an idle open session; a
+                # heartbeat is intentionally omitted when activity is unchanged.
+                await self._telemetry.flush()
+        except asyncio.CancelledError:
+            return
+
+    def _start_telemetry_flush(self) -> None:
+        """Retain fire-and-forget flushes until they finish."""
+        task = asyncio.create_task(self._telemetry.flush())
+        self._telemetry_flush_tasks.add(task)
+        task.add_done_callback(self._telemetry_flush_tasks.discard)
+
+    async def _finish_telemetry(self) -> None:
+        task = self._telemetry_heartbeat_task
+        if task is None:
+            return
+        self._telemetry_heartbeat_task = None
+        task.cancel()
+        pending = list(self._telemetry_flush_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._checkpoint_telemetry_jobs()
+        await self._telemetry.run_deferred(
+            self._telemetry.end_session,
+            "cancelled" if self._interrupt_requested else "succeeded",
+        )
+        await self._telemetry.flush()
+        set_active_telemetry(None)
 
     async def _show_update_notice(self) -> None:
         """Emit a non-blocking update hint when PyPI has a newer release."""

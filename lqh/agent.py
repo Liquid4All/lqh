@@ -622,6 +622,9 @@ class Agent:
                 )
                 _api_call_duration = time.monotonic() - _api_call_start
                 self._current_operation = None
+                from lqh.telemetry import active_telemetry
+                if telemetry := active_telemetry():
+                    await telemetry.run_deferred(telemetry.record_agent_turn)
             except Exception as e:
                 if self.callbacks.on_spinner_stop:
                     self.callbacks.on_spinner_stop()
@@ -999,6 +1002,20 @@ class Agent:
             result = await self._execute_shielded(tool_name, arguments, extra)
         else:
             result = await execute_tool(tool_name, arguments, self.project_dir, **extra)
+
+        if tool_name in {"create_file", "write_file", "edit_file"}:
+            from lqh.telemetry import active_telemetry
+            if telemetry := active_telemetry():
+                await telemetry.run_deferred(
+                    telemetry.maybe_spec_completed,
+                    str(arguments.get("path", "")),
+                    not result.content.lower().startswith("error"),
+                )
+
+        if result.workflow_launched:
+            from lqh.telemetry import active_telemetry
+            if telemetry := active_telemetry():
+                await telemetry.run_deferred(telemetry.complete_readiness, arguments)
 
         # Handle ask_user tool
         if result.requires_user_input and tool_name == "ask_user":

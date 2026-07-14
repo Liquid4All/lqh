@@ -32,7 +32,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from lqh.config import load_config, save_config
+from lqh.config import load_config, update_config
 
 __all__ = [
     "ComputeTarget",
@@ -95,9 +95,7 @@ def save_global_default(value: ComputeTarget | None) -> None:
 
     Idempotent on identical writes; reads-modify-writes so we don't
     clobber unrelated config fields (e.g. api_key)."""
-    cfg = load_config()
-    cfg.default_compute = value
-    save_config(cfg)
+    update_config(lambda config: setattr(config, "default_compute", value))
 
 
 def resolve_compute(

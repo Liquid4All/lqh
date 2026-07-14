@@ -163,9 +163,10 @@ async def login_device_code(
             rr = await http.post(DEVICE_TOKEN_PATH, json={"device_code": device_code})
             if rr.status_code == 200:
                 payload = rr.json()
-                save_credentials(payload["token"])
                 user = payload.get("user")
-                return user if isinstance(user, dict) else {}
+                user = user if isinstance(user, dict) else {}
+                save_credentials(payload["token"], str(user.get("id") or "") or None)
+                return user
 
             try:
                 body = rr.json()

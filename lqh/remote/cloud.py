@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -178,43 +179,101 @@ class CloudBackend(RemoteBackend):
 
         # Infer kind from module if the config doesn't say.
         kind = _infer_kind(config, module)
-
-        # Build bundle in-memory.
-        bundle = build_bundle(config, self.project_dir)
-
-        meta = {
-            "kind": kind,
-            "project_id": self.project_dir.name,
-            "module": module,
-            "config": config,
-        }
-        # Project metadata: display name, spec hash, base/reward model.
-        # The backend upserts the projects row on submit; missing
-        # fields don't overwrite previously-recorded values.
-        meta.update(gather_project_meta(self.project_dir, config).to_meta_dict())
-        # HF token donate path: if the project binding asked us to
-        # donate the local env var, attach it to meta.hf_token. The
-        # backend forwards it as an ephemeral cloud secret and never
-        # persists it.
-        if getattr(self.config, "hf_token_configured", False):
-            hf = os.environ.get("HF_TOKEN")
-            if hf:
-                meta["hf_token"] = hf
-
-        # httpx multipart: meta is a string field, bundle is a file.
-        files = [
-            ("meta", (None, json.dumps(meta), "application/json")),
-            ("bundle", ("bundle.tar.gz", bundle, "application/gzip")),
-        ]
-        async with httpx.AsyncClient(base_url=self._api_base, timeout=120.0) as client:
-            resp = await client.post(
-                "/v1/cloud/jobs",
-                files=files,
-                headers=self._auth_headers(),
+        from lqh.telemetry import active_telemetry
+        telemetry = active_telemetry()
+        telemetry_project_id = (
+            # This identifier leaves the process in the cloud-job request, so
+            # unlike best-effort event writes it must wait for persisted
+            # consent to be checked instead of treating a detached waiter as
+            # a negative result while the callback remains queued.
+            await telemetry.run_deferred(
+                telemetry.correlation_project_id, timeout=None,
             )
-            _raise_for_cloud_error(resp)
-            data = resp.json()
-            job_id = data["job_id"]
+            if telemetry else None
+        )
+        telemetry_workflow_id = str(uuid.uuid4()) if telemetry_project_id else None
+        if telemetry and telemetry_workflow_id:
+            if kind == "eval_hf":
+                await telemetry.run_deferred(telemetry.event, "zero_shot_evaluation_started", {
+                    "workflow_kind":"zero_shot_evaluation", "subtype":"zero_shot",
+                    "execution_target":"cloud", "sample_count":int(config.get("num_samples", 0) or 0),
+                }, telemetry_workflow_id)
+            elif kind.startswith("train_"):
+                subtype = {
+                    "train_sft":"direct_sft", "train_dpo":"direct_dpo",
+                    "train_sft_sweep":"sft_sweep", "train_dpo_sweep":"dpo_sweep",
+                }.get(kind, "direct_sft")
+                await telemetry.run_deferred(telemetry.event, "fine_tuning_started", {
+                    "workflow_kind":"fine_tuning", "subtype":subtype,
+                    "execution_target":"cloud",
+                }, telemetry_workflow_id)
+
+        async def emit_submit_terminal(outcome: str) -> None:
+            if not telemetry or not telemetry_workflow_id:
+                return
+            if kind == "eval_hf":
+                event_name = "zero_shot_evaluation_failed"
+                workflow_kind = "zero_shot_evaluation"
+                subtype = "zero_shot"
+            elif kind.startswith("train_"):
+                event_name = "fine_tuning_failed"
+                workflow_kind = "fine_tuning"
+                subtype = {
+                    "train_sft":"direct_sft", "train_dpo":"direct_dpo",
+                    "train_sft_sweep":"sft_sweep", "train_dpo_sweep":"dpo_sweep",
+                }.get(kind, "direct_sft")
+            else:
+                return
+            await telemetry.run_deferred(telemetry.event, event_name, {
+                "workflow_kind":workflow_kind, "subtype":subtype,
+                "execution_target":"cloud", "outcome":outcome,
+            }, telemetry_workflow_id)
+
+        # Bundle construction and submission can fail before a cloud job
+        # exists. Always close the client-side workflow in those paths.
+        try:
+            bundle = build_bundle(config, self.project_dir)
+            meta = {
+                "kind": kind,
+                "project_id": self.project_dir.name,
+                "module": module,
+                "config": config,
+            }
+            if telemetry_project_id and telemetry_workflow_id:
+                meta["telemetry_project_id"] = telemetry_project_id
+                meta["telemetry_workflow_id"] = telemetry_workflow_id
+            # Project metadata: display name, spec hash, base/reward model.
+            # The backend upserts the projects row on submit; missing
+            # fields don't overwrite previously-recorded values.
+            meta.update(gather_project_meta(self.project_dir, config).to_meta_dict())
+            # HF token donate path: if the project binding asked us to
+            # donate the local env var, attach it to meta.hf_token. The
+            # backend forwards it as an ephemeral cloud secret and never
+            # persists it.
+            if getattr(self.config, "hf_token_configured", False):
+                hf = os.environ.get("HF_TOKEN")
+                if hf:
+                    meta["hf_token"] = hf
+
+            files = [
+                ("meta", (None, json.dumps(meta), "application/json")),
+                ("bundle", ("bundle.tar.gz", bundle, "application/gzip")),
+            ]
+            async with httpx.AsyncClient(base_url=self._api_base, timeout=120.0) as client:
+                resp = await client.post(
+                    "/v1/cloud/jobs",
+                    files=files,
+                    headers=self._auth_headers(),
+                )
+                _raise_for_cloud_error(resp)
+                data = resp.json()
+                job_id = data["job_id"]
+        except asyncio.CancelledError:
+            await emit_submit_terminal("cancelled")
+            raise
+        except Exception:
+            await emit_submit_terminal("failed")
+            raise
 
         # Persist enough to reconnect after a client restart. We write
         # both remote_job.json (for parity with SSHDirect) and

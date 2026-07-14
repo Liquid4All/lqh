@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Callable
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -561,6 +561,46 @@ class TestAutoModeParking:
             await agent._handle_tool_call(tool_name, {})
 
         assert captured.get("on_background_task_started") is sentinel
+
+    @pytest.mark.parametrize("sentinel", ["PERMISSION_REQUIRED", "COMPUTE_PICK_REQUIRED"])
+    async def test_readiness_does_not_complete_for_submission_prompt(
+        self, make_agent: Callable[..., Agent], sentinel: str,
+    ) -> None:
+        from lqh.tools.handlers import ToolResult
+
+        telemetry = MagicMock()
+        async def run_deferred(callback, *args):
+            return callback(*args)
+        telemetry.run_deferred = AsyncMock(side_effect=run_deferred)
+        agent = make_agent(auto_mode=False)
+        deferred = ToolResult(content=sentinel, requires_user_input=True)
+        with (
+            patch("lqh.agent.execute_tool", return_value=deferred),
+            patch("lqh.telemetry.active_telemetry", return_value=telemetry),
+        ):
+            await agent._handle_tool_call("start_training", {})
+
+        telemetry.complete_readiness.assert_not_called()
+
+    async def test_readiness_completes_only_after_accepted_launch(
+        self, make_agent: Callable[..., Agent],
+    ) -> None:
+        from lqh.tools.handlers import ToolResult
+
+        telemetry = MagicMock()
+        async def run_deferred(callback, *args):
+            return callback(*args)
+        telemetry.run_deferred = AsyncMock(side_effect=run_deferred)
+        agent = make_agent(auto_mode=False)
+        arguments = {"dataset": "datasets/generated"}
+        launched = ToolResult(content="training started", workflow_launched=True)
+        with (
+            patch("lqh.agent.execute_tool", return_value=launched),
+            patch("lqh.telemetry.active_telemetry", return_value=telemetry),
+        ):
+            await agent._handle_tool_call("start_training", arguments)
+
+        telemetry.complete_readiness.assert_called_once_with(arguments)
 
 
 class TestTrainingPermissionScope:

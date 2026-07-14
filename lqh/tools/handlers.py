@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +65,10 @@ class ToolResult:
     auto_reason: str | None = None
     auto_stage: str | None = None
     auto_stage_note: str | None = None
+    # True only after a downstream evaluation/training launch has actually
+    # been accepted. Permission and compute-picker sentinels deliberately
+    # leave this false so pipeline readiness cannot complete prematurely.
+    workflow_launched: bool = False
 
 
 def _validate_path(project_dir: Path, rel_path: str) -> Path:
@@ -577,6 +582,7 @@ async def handle_run_data_gen_pipeline(
     output_dataset: str,
     validation_instructions: str | None = None,
     samples_per_item: int = 1,
+    purpose: str = "unspecified",
     **kwargs: Any,
 ) -> ToolResult:
     """Execute a data generation pipeline. Requires user permission."""
@@ -632,6 +638,7 @@ async def handle_run_data_gen_pipeline(
     return await _execute_pipeline(
         project_dir, script_path, num_samples, output_dataset, validation_instructions,
         samples_per_item=samples_per_item,
+        purpose=purpose,
         on_pipeline_progress=kwargs.get("on_pipeline_progress"),
         on_pipeline_done=kwargs.get("on_pipeline_done"),
         legacy_progress_callback=bool(kwargs.get("legacy_progress_callback", True)),
@@ -646,6 +653,7 @@ async def _execute_pipeline(
     validation_instructions: str | None,
     *,
     samples_per_item: int = 1,
+    purpose: str = "unspecified",
     on_pipeline_progress: Callable | None = None,
     on_pipeline_done: Callable | None = None,
     legacy_progress_callback: bool = True,
@@ -658,6 +666,29 @@ async def _execute_pipeline(
     from lqh.progress import ProgressReporter
 
     concurrency = min(100, num_samples)
+    from lqh.telemetry import active_telemetry
+    telemetry = active_telemetry()
+    workflow_id = str(__import__("uuid").uuid4())
+    started_mono = time.monotonic()
+    if telemetry:
+        _enabled, consent_epoch, started_active, _account_key = telemetry.state_snapshot()
+    else:
+        started_active, consent_epoch = 0.0, -1
+    # This is only a cheap scheduling gate. Each queued telemetry mutation
+    # re-validates durable consent on the ordered worker before writing, so a
+    # slow in-flight flush cannot make a timed-out result suppress the entire
+    # workflow's telemetry.
+    telemetry_started = bool(
+        telemetry and telemetry.cached_consent_active(consent_epoch)
+    )
+    if purpose not in {"smoke", "inspection", "validation", "training", "unspecified"}:
+        purpose = "unspecified"
+    if telemetry_started and telemetry:
+        await telemetry.run_deferred(telemetry.record_generation_attempt)
+        await telemetry.run_deferred(telemetry.event, "data_generation_started", {
+            "workflow_kind":"data_generation", "purpose":purpose,
+            "requested_count":num_samples, "execution_target":"local",
+        }, workflow_id)
 
     reporter = ProgressReporter(
         task_kind="data_gen",
@@ -703,6 +734,51 @@ async def _execute_pipeline(
             on_progress=on_progress,
         )
 
+        if result.succeeded <= 0:
+            if telemetry_started and telemetry and telemetry.cached_consent_active(consent_epoch):
+                await telemetry.run_deferred(telemetry.event, "data_generation_failed", {
+                    "workflow_kind":"data_generation", "purpose":purpose,
+                    "execution_target":"local", "outcome":"failed",
+                    "wall_duration_ms":int((time.monotonic()-started_mono)*1000),
+                    "active_duration_ms":int(max(telemetry.state_snapshot()[2]-started_active, 0)*1000),
+                    "requested_count":num_samples, "succeeded_count":0,
+                    "failed_count":result.failed, "sample_count":result.total,
+                }, workflow_id)
+
+            from lqh.project_log import append_event, file_hash_prefix
+
+            append_event(
+                project_dir,
+                "data_gen_failed",
+                f"Pipeline {script_path} produced no successful samples",
+                script_path=script_path,
+                script_hash=file_hash_prefix(project_dir / script_path),
+                output_dataset=output_dataset,
+                num_samples=num_samples,
+                error="no successful samples",
+            )
+            reporter.update(
+                phase="failed", phase_label="no samples generated",
+                completed=result.total, total=result.total, unit="samples",
+                overall_fraction=1.0, force=True,
+            )
+            return ToolResult(content=(
+                "❌ Pipeline failed: no samples were generated successfully\n"
+                f"  Samples: 0/{result.total} succeeded, {result.failed} failed"
+            ))
+
+        if telemetry_started and telemetry and telemetry.cached_consent_active(consent_epoch):
+            if result.succeeded > 0:
+                await telemetry.run_deferred(telemetry.record_generation_succeeded, output_dir)
+            await telemetry.run_deferred(telemetry.event, "data_generation_completed", {
+                "workflow_kind":"data_generation", "purpose":purpose,
+                "execution_target":"local", "outcome":"succeeded",
+                "wall_duration_ms":int((time.monotonic()-started_mono)*1000),
+                "active_duration_ms":int(max(telemetry.state_snapshot()[2]-started_active, 0)*1000),
+                "requested_count":num_samples,"succeeded_count":result.succeeded,
+                "failed_count":result.failed,"sample_count":result.total,
+            }, workflow_id)
+
         from lqh.project_log import append_event, file_hash_prefix
 
         append_event(
@@ -728,10 +804,29 @@ async def _execute_pipeline(
                 f"  Samples: {result.succeeded}/{result.total} succeeded"
                 + (f", {result.failed} failed" if result.failed else "")
                 + f"\n  Output:  {result.output_path}"
-            )
+            ),
         )
+    except asyncio.CancelledError:
+        if telemetry_started and telemetry and telemetry.cached_consent_active(consent_epoch):
+            await telemetry.run_deferred(telemetry.event, "data_generation_failed", {
+                "workflow_kind":"data_generation", "purpose":purpose,
+                "execution_target":"local", "outcome":"cancelled",
+                "wall_duration_ms":int((time.monotonic()-started_mono)*1000),
+                "active_duration_ms":int(max(telemetry.state_snapshot()[2]-started_active, 0)*1000),
+                "requested_count":num_samples,
+            }, workflow_id)
+        raise
     except Exception as e:
         import traceback
+
+        if telemetry_started and telemetry and telemetry.cached_consent_active(consent_epoch):
+            await telemetry.run_deferred(telemetry.event, "data_generation_failed", {
+                "workflow_kind":"data_generation", "purpose":purpose,
+                "execution_target":"local", "outcome":"failed",
+                "wall_duration_ms":int((time.monotonic()-started_mono)*1000),
+                "active_duration_ms":int(max(telemetry.state_snapshot()[2]-started_active, 0)*1000),
+                "requested_count":num_samples,
+            }, workflow_id)
 
         from lqh.project_log import append_event, file_hash_prefix
 
@@ -1436,7 +1531,7 @@ async def handle_pull(
             f"Error: pull source must be 'hf:owner/repo' or 'lqh:<artifact_id>'; "
             f"got a local path {source!r}. Local files are already on disk — use "
             "read_file / list_files instead."
-        )
+        ),
     )
 
 
@@ -1462,7 +1557,7 @@ async def _pull_lqh_artifact(project_dir: Path, artifact_id: str, dest: str | No
         content=(
             f"✅ Downloaded lqh:{artifact_id} -> {rel} ({size:,} bytes). "
             "Checkpoints arrive as a .tar.gz; extract before use."
-        )
+        ),
     )
 
 
@@ -1498,7 +1593,7 @@ async def handle_push(
         content=(
             f"Error: push source must be a local path or 'lqh:<artifact_id>'; "
             f"got {source!r}"
-        )
+        ),
     )
 
 
@@ -1523,7 +1618,7 @@ async def _push_lqh_to_hf(
             f"(job {job_id}). The checkpoint is uploaded from R2 directly; check "
             "training_status or the artifact's hf_repo once it completes. Requires a "
             "stored HF token (run /hf_login) since the upload happens in the cloud."
-        )
+        ),
     )
 
 
@@ -1569,7 +1664,7 @@ async def handle_gguf_convert(
             "the produced .gguf files register as new artifacts (kind 'gguf'). Check "
             "training_status for progress, then 'artifacts' (action=list) to download them."
             + (" HF push requires a stored token (run /hf_login)." if target_hf_repo else "")
-        )
+        ),
     )
 
 
@@ -3137,7 +3232,8 @@ async def _execute_start_training_remote(
                 f"  Type:    {config.get('type', 'unknown')}\n"
                 f"  Job ID:  {job_id}\n\n"
                 f"Backend: LQH Cloud (api.lqh.ai). Use training_status to monitor progress."
-            )
+            ),
+            workflow_launched=True,
         )
 
     # --- SSH path (existing behavior) ---
@@ -3191,7 +3287,8 @@ async def _execute_start_training_remote(
             f"  Host:     {remote_config.hostname}\n"
             f"  Dir:      {remote_run_dir}\n\n"
             f"Use training_status(run_name='{run_name}') to monitor progress."
-        )
+        ),
+        workflow_launched=True,
     )
 
 
@@ -3241,7 +3338,8 @@ async def _execute_start_training(
             f"  PID:    {pid}\n"
             f"  Dir:    runs/{run_name}/\n\n"
             f"Use training_status to monitor progress."
-        )
+        ),
+        workflow_launched=True,
     )
 
 
@@ -4005,7 +4103,7 @@ async def handle_start_local_eval(
     # Eval dataset(s) — one path or a list of held-out sources. Multiple
     # sources are scored separately and combined into a macro-average (each
     # source weighted equally), same as the training eval-of-best.
-    eval_sources, _eval_resolved, ds_err = _resolve_training_sources(
+    eval_sources, eval_resolved, ds_err = _resolve_training_sources(
         project_dir, dataset, kind="dataset", allow_repeat=False
     )
     if ds_err:
@@ -4036,6 +4134,7 @@ async def handle_start_local_eval(
         "base_model": str(model_dir),
         "dataset": _sources_to_config(eval_sources),
         "scorer": scorer,
+        "num_samples": sum((_parquet_metadata(path)[0] or 0) for path in eval_resolved),
         "max_new_tokens": max_new_tokens,
         "manifest": ["base_model", "dataset", "scorer"],
     }
@@ -4060,7 +4159,8 @@ async def handle_start_local_eval(
             f"  PID:     {pid}\n"
             f"  Dir:     runs/{run_name}/\n\n"
             f"Predictions will be scored automatically when ready."
-        )
+        ),
+        workflow_launched=True,
     )
 
 
@@ -4108,7 +4208,7 @@ async def handle_eval_hf_model(
 
     # Eval dataset(s) — one path or a list of held-out sources, scored
     # separately and macro-averaged sandbox-side.
-    eval_sources, _eval_resolved, ds_err = _resolve_training_sources(
+    eval_sources, eval_resolved, ds_err = _resolve_training_sources(
         project_dir, eval_dataset, kind="eval_dataset", allow_repeat=False
     )
     if ds_err:
@@ -4147,6 +4247,7 @@ async def handle_eval_hf_model(
         "scorer": scorer,
         "judge_size": judge_size,
         "max_new_tokens": max_new_tokens,
+        "num_samples": sum((_parquet_metadata(path)[0] or 0) for path in eval_resolved),
         # manifest tells lqh.remote.bundle.resolve_manifest which keys
         # in this config name files to include in the bundle. The hf
         # repo itself is downloaded sandbox-side via snapshot_download
@@ -4211,7 +4312,8 @@ async def handle_eval_hf_model(
             f"  Job ID:  {job_id}\n\n"
             f"Use training_status to monitor; eval_result.json lands "
             f"under runs/{run_name}/ when done."
-        )
+        ),
+        workflow_launched=True,
     )
 
 
@@ -4246,7 +4348,7 @@ async def _start_local_eval_remote(
 
     # Validate eval dataset source(s) — one path or a list of held-out
     # sources, scored separately and macro-averaged (same as the local path).
-    eval_sources, _eval_resolved, ds_err = _resolve_training_sources(
+    eval_sources, eval_resolved, ds_err = _resolve_training_sources(
         project_dir, dataset, kind="dataset", allow_repeat=False
     )
     if ds_err:
@@ -4275,6 +4377,7 @@ async def _start_local_eval_remote(
         "dataset": _sources_to_config(eval_sources),
         "scorer": scorer,
         "max_new_tokens": max_new_tokens,
+        "num_samples": sum((_parquet_metadata(path)[0] or 0) for path in eval_resolved),
         "manifest": ["base_model", "dataset", "scorer"],
     }
     if system_prompt is not None:
@@ -4299,7 +4402,8 @@ async def _start_local_eval_remote(
             f"  Job ID:  {job_id}\n"
             f"  Host:    {remote_config.hostname}\n\n"
             f"Predictions will be scored automatically when ready."
-        )
+        ),
+        workflow_launched=True,
     )
 
 
