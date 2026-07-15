@@ -407,7 +407,7 @@ class TestSweepOrchestration:
         assert "crashed" in err
         assert "stderr.log" in err
 
-    def test_dpo_no_proxy_error_explains_low_preference_yield(
+    def test_dpo_no_proxy_error_explains_missing_heldout_score(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from lqh.train import sweep
@@ -453,9 +453,9 @@ class TestSweepOrchestration:
             for line in (run_dir / "progress.jsonl").read_text().splitlines()
         ]
         assert rows[-1]["status"] == "failed"
-        assert "too few usable preference pairs" in rows[-1]["error"]
-        assert "already too close to the chosen/gold answers" in rows[-1]["error"]
-        assert "0 held-out preference pairs" in rows[-1]["error"]
+        assert "no fixed held-out judge score" in rows[-1]["error"]
+        assert "35 preference pairs" in rows[-1]["error"]
+        assert "Check held_out_eval_dataset" in rows[-1]["error"]
 
     def test_continuation_skips_completed_sweep_configs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

@@ -144,7 +144,11 @@ def _apply(training_cfg: dict[str, Any], micro: int, target_effective: int) -> i
     """Set per_device_batch_size to ``micro`` and adjust grad accumulation
     to preserve at least the configured effective batch size. Returns
     grad_accum."""
-    micro = max(1, micro)
+    # A micro-batch larger than the requested effective batch silently raises
+    # the true optimizer batch because accumulation cannot be below one. This
+    # mattered for DPO's target of 16 when a cached/probed GPU profile said
+    # 128 or 256 was memory-safe.
+    micro = min(max(1, micro), max(1, target_effective))
     accum = max(1, math.ceil(target_effective / micro))
     training_cfg["per_device_batch_size"] = micro
     training_cfg["gradient_accumulation_steps"] = accum
@@ -396,6 +400,7 @@ def maybe_autotune_batch_size(
             if admin_cap:
                 micro = min(micro, admin_cap)
             accum = _apply(training_cfg, micro, target_effective)
+            micro = int(training_cfg["per_device_batch_size"])
             print(
                 f"calibrate: cached micro_batch={micro} grad_accum={accum} "
                 f"(effective {target_effective}, gpu={gpu_type})",
@@ -403,12 +408,10 @@ def maybe_autotune_batch_size(
             )
             return
 
-        # Probe the full candidate range, not just up to the configured
-        # micro-batch: old run configs carry per_device_batch_size=4 and
-        # capping at cur_micro froze discovery there (GPU_TYPE_2.md). When
-        # auto_batch is on, the probe owns the decision; the only ceiling
-        # is the admin override.
-        probe_cap = admin_cap or max(_PROBE_BATCHES)
+        # Probe beyond the configured micro-batch up to the requested
+        # effective-batch target. The target is a hard ceiling: a micro-batch
+        # above it would silently increase the true optimizer batch.
+        probe_cap = min(admin_cap or max(_PROBE_BATCHES), target_effective)
         headroom = float(training_cfg.get("batch_headroom", _DEFAULT_HEADROOM))
         safe, peak = _probe_micro_batch(
             model,
@@ -422,6 +425,7 @@ def maybe_autotune_batch_size(
         if not safe:
             print("calibrate: probe found no safe batch; keeping configured default", flush=True)
             return
+        safe = min(int(safe), probe_cap, target_effective)
         accum = _apply(training_cfg, safe, target_effective)
         if grad_ckpt:
             _post_profile(

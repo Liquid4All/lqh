@@ -68,6 +68,13 @@ def test_ensure_batch_defaults_honors_explicit_batch_shape():
     assert cfg["effective_batch_size"] == 32
 
 
+def test_apply_never_exceeds_effective_batch_target():
+    cfg = {}
+    accum = calibrate._apply(cfg, micro=128, target_effective=16)
+    assert cfg["per_device_batch_size"] == 16
+    assert accum == 1
+
+
 def test_get_cached_profile_noop_without_env(monkeypatch):
     monkeypatch.delenv("LQH_BASE_URL", raising=False)
     monkeypatch.delenv("LQH_API_TOKEN", raising=False)
@@ -163,13 +170,11 @@ def test_autotune_cached_value_respects_admin_cap(monkeypatch):
     calibrate.maybe_autotune_batch_size(
         cfg, model=object(), tokenizer=object(), base_model="m", method="lora", lora_rank=32
     )
-    assert cfg["per_device_batch_size"] == 32
+    assert cfg["per_device_batch_size"] == 16
 
 
-def test_autotune_probes_full_range_despite_small_config(monkeypatch):
-    """Old run configs carry per_device_batch_size=4; the probe must
-    still search the full candidate range, not cap at the configured
-    value (the bug that froze discovery at 4, GPU_TYPE_2.md)."""
+def test_autotune_probes_up_to_effective_target_despite_small_micro(monkeypatch):
+    """The probe can exceed configured micro, but not effective batch."""
     _patch_torch(monkeypatch)
     monkeypatch.setattr(calibrate, "_get_cached_profile", lambda key: None)
     seen = {}
@@ -195,11 +200,11 @@ def test_autotune_probes_full_range_despite_small_config(monkeypatch):
     calibrate.maybe_autotune_batch_size(
         cfg, model=object(), tokenizer=object(), base_model="m", method="lora", lora_rank=32
     )
-    assert seen["max_micro_batch"] == max(calibrate._PROBE_BATCHES)
+    assert seen["max_micro_batch"] == 64
     assert seen["pair_batch"] is False
-    assert cfg["per_device_batch_size"] == 96
-    assert cfg["gradient_accumulation_steps"] == 1  # ceil(64/96)
-    assert posted["micro_batch"] == 96
+    assert cfg["per_device_batch_size"] == 64
+    assert cfg["gradient_accumulation_steps"] == 1
+    assert posted["micro_batch"] == 64
     assert posted["source"] == "probe"
 
 

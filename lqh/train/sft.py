@@ -576,6 +576,10 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         dataloader_num_workers=training_cfg.get("dataloader_num_workers", 4),
         dataloader_pin_memory=True,
         ddp_find_unused_parameters=False,
+        seed=training_cfg.get("seed", 42),
+        data_seed=training_cfg.get(
+            "data_seed", training_cfg.get("seed", 42)
+        ),
     )
     if is_vision:
         # The VLMCollator owns tokenization; TRL must not try to prepare

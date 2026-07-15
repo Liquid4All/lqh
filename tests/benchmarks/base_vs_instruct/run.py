@@ -117,10 +117,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--skip-dpo", action="store_true", help="run SFT only, no DPO stage")
     p.add_argument(
         "--dpo-train-size", type=int, default=1000,
-        help="prompt count for the DPO stage (a slice of the train set). DPO "
+        help="fresh prompt count for the DPO stage. DPO "
         "regenerates rollouts on ALL its prompts every iteration, so this is "
         "kept small and decoupled from --train-size (SFT uses the full set). "
-        "Capped at --train-size. Set to 0 to skip DPO and run the SFT "
+        "Set to 0 to skip DPO and run the SFT "
         "comparison only.",
     )
     p.add_argument(
@@ -251,42 +251,86 @@ def _sweep_timing(run_dir: Path) -> dict:
     }
 
 
-def _ensure_dpo_dataset(workdir: Path, task: Task, n: int, *, resume: bool) -> str:
-    """Materialize the DPO prompt set as the first *n* rows of the train set.
-
-    On-policy DPO regenerates rollouts on every prompt each iteration, so it
-    must run on a bounded slice — not the full (possibly 20k) SFT train set.
-    Slicing the existing train parquet avoids any extra generation. Returns the
-    workdir-relative path to the sliced data.parquet."""
-    import pyarrow.parquet as _pq
-
-    src = workdir / f"datasets/{task.name}_train/data.parquet"
+async def _ensure_dpo_dataset(
+    workdir: Path,
+    task: Task,
+    n: int,
+    *,
+    resume: bool,
+    client,
+    concurrency: int,
+    filter_threshold: float | None,
+    overgen_factor: float,
+    judge_size: str,
+) -> str:
+    """Generate a bounded DPO pool independently from SFT training data."""
     dst_dir = workdir / f"datasets/{task.name}_dpo"
     dst = dst_dir / "data.parquet"
+    provenance = dst_dir / "split_provenance.json"
     rel = f"datasets/{task.name}_dpo/data.parquet"
-    if resume and _dataset_ready(dst, n):
-        return rel
-    table = _pq.read_table(src)
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    _pq.write_table(table.slice(0, min(n, table.num_rows)), dst)
-    logger.info("dpo dataset %s: sliced %d rows from train", rel, min(n, table.num_rows))
+    if resume and _dataset_ready(dst, n) and provenance.exists():
+        try:
+            if json.loads(provenance.read_text()).get("source") == "independent_datagen":
+                return rel
+        except (OSError, json.JSONDecodeError):
+            pass
+    if filter_threshold is None:
+        result = await run_pipeline(
+            script_path=task.pipeline_path,
+            num_samples=n,
+            output_dir=dst_dir,
+            client=client,
+            concurrency=concurrency,
+        )
+        if result.succeeded < n:
+            raise RuntimeError(f"fresh DPO datagen produced only {result.succeeded}/{n}")
+    else:
+        await _generate_filtered_split(
+            script_path=task.pipeline_path,
+            scorer_path=workdir / f"scorers/{task.name}.md",
+            target=n,
+            out_dir=dst_dir,
+            client=client,
+            concurrency=concurrency,
+            threshold=filter_threshold,
+            overgen_factor=overgen_factor,
+            label=f"{task.name}_dpo",
+            judge_size=judge_size,
+        )
+    sft_path = workdir / f"datasets/{task.name}_train/data.parquet"
+    overlap = _dataset_prompt_keys(sft_path) & _dataset_prompt_keys(dst)
+    if overlap:
+        raise RuntimeError(
+            f"fresh DPO split overlaps SFT train on {len(overlap)} exact prompt(s)"
+        )
+    provenance.write_text(json.dumps({
+        "source": "independent_datagen",
+        "rows": n,
+        "sft_train_overlap_by_construction": False,
+    }, indent=2) + "\n")
+    logger.info("dpo dataset %s: generated %d fresh rows", rel, n)
     return rel
 
 
-# SFT/DPO batch shape. Start from a large real micro-batch so each optimizer
-# step does substantial GPU work; ``training.auto_batch`` probes down to the
-# largest safe value if 256 does not fit.
+def _dataset_prompt_keys(path: Path) -> set[str]:
+    table = pq.read_table(path, columns=["messages"])
+    result: set[str] = set()
+    for value in table["messages"].to_pylist():
+        messages = json.loads(value) if isinstance(value, str) else value
+        if messages and messages[-1].get("role") == "assistant":
+            messages = messages[:-1]
+        result.add(json.dumps(messages, sort_keys=True))
+    return result
+
+
+# SFT keeps its throughput-oriented batch. DPO uses a separate effective batch
+# of 16 so a few hundred verified pairs produce meaningful optimizer updates.
 _SFT_PER_DEVICE_BATCH = 256
 _SFT_GRAD_ACCUM = 1
-_DPO_PER_DEVICE_BATCH = 256
+_DPO_PER_DEVICE_BATCH = 16
 _DPO_GRAD_ACCUM = 1
 
-# Smallest train set for which on-policy DPO can compute its sweep proxy.
-# Measured pair-yield is ~0.13 for a strong SFT model; the proxy needs ≥10
-# held-out preference pairs in iter_000 (split_train_eval min_eval=10) while
-# leaving enough to train on. Below this we auto-skip DPO (see
-# _run_model_on_task) rather than fail. DPO's real value is at much larger
-# train sizes anyway.
+# Smallest fresh prompt pool likely to yield enough verified pairs to train.
 _DPO_MIN_TRAIN_SIZE = 400
 # Conservative on-policy preference-pair yield per train prompt per iter,
 # observed across model strengths (strong models yield the least). Used to size
@@ -358,6 +402,13 @@ def _base_config(
         cfg["num_iterations"] = 5
         cfg["dpo_beta"] = 0.1
         cfg["golden_source"] = "dataset"
+        cfg["held_out_eval_dataset"] = eval_rel
+        cfg["manifest"].append("held_out_eval_dataset")
+        cfg["selection"] = {
+            "top_quantile": 1.0,
+            "min_gap": 1.0,
+            "min_pairs_per_iter": 10,
+        }
         training.update({
             "per_device_batch_size": _DPO_PER_DEVICE_BATCH,
             "gradient_accumulation_steps": _DPO_GRAD_ACCUM,
@@ -622,27 +673,32 @@ async def _run_model_on_task(
         return result
 
     # 3) DPO sweep (on best SFT) + eval of winner.
-    # Auto-skip below _DPO_MIN_TRAIN_SIZE: on-policy DPO yields only ~0.13
-    # preference pairs per train prompt for a well-trained model (a near-perfect
-    # rollout rarely disagrees with the gold), so a small train set can't
-    # produce the ≥10 held-out pairs the sweep proxy (eval_ce_chosen_mean)
-    # needs in iter_000. Running it anyway just wastes GPU and fails. DPO is
-    # meaningful at scale, where pairs are plentiful.
+    # Auto-skip pools unlikely to produce enough verified preference pairs.
     if args.skip_dpo:
         return result
     if args.dpo_train_size == 0:
         result.notes.append("dpo skipped: dpo_train_size=0 (SFT-only comparison requested)")
         return result
-    dpo_size = min(args.dpo_train_size, args.train_size)
+    dpo_size = args.dpo_train_size
     if dpo_size < _DPO_MIN_TRAIN_SIZE:
         result.notes.append(
             f"dpo skipped: dpo_train_size={dpo_size} < {_DPO_MIN_TRAIN_SIZE} "
-            f"(on-policy preference yield too low to compute the sweep proxy; "
-            f"raise --dpo-train-size/--train-size or pass --skip-dpo)"
+            f"(verified on-policy preference yield is too low; "
+            f"raise --dpo-train-size or pass --skip-dpo)"
         )
         return result
     try:
-        dpo_dataset_rel = _ensure_dpo_dataset(workdir, task, dpo_size, resume=resume)
+        dpo_dataset_rel = await _ensure_dpo_dataset(
+            workdir,
+            task,
+            dpo_size,
+            resume=resume,
+            client=client,
+            concurrency=args.datagen_concurrency,
+            filter_threshold=(None if args.no_filter else args.filter_threshold),
+            overgen_factor=args.overgen_factor,
+            judge_size=args.judge_size,
+        )
         dpo_model, dpo_timing = await _run_sweep(
             workdir=workdir, run_name=f"{tag}__dpo",
             # Use the SFT winner's actual materialized path — it may be a
@@ -728,7 +784,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         "train_size": args.train_size, "eval_size": args.eval_size,
         "grid_size": args.grid_size, "judge_size": args.judge_size,
         "skip_dpo": args.skip_dpo or args.dpo_train_size == 0, "compute": "local-gpu",
-        "dpo_train_size": min(args.dpo_train_size, args.train_size),
+        "dpo_train_size": args.dpo_train_size,
         "filter_threshold": (None if args.no_filter else args.filter_threshold),
         "overgen_factor": args.overgen_factor,
         "models": [k for k, _ in models], "tasks": [t.name for t in tasks],
@@ -736,7 +792,7 @@ async def _main_async(args: argparse.Namespace) -> int:
     logger.info("workdir: %s", workdir)
     logger.info("models: %s", ", ".join(k for k, _ in models))
     logger.info("tasks:  %s", ", ".join(t.name for t in tasks))
-    dpo_size = min(args.dpo_train_size, args.train_size)
+    dpo_size = args.dpo_train_size
     if not args.skip_dpo and args.dpo_train_size > 0 and dpo_size < _DPO_MIN_TRAIN_SIZE:
         logger.warning(
             "DPO will be SKIPPED: dpo_train_size=%d < %d. On-policy preference "

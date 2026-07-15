@@ -6,6 +6,7 @@ when a DPO iteration's predictions have been scored.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -17,7 +18,110 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["generate_golden"]
+__all__ = ["generate_golden", "load_or_score_chosen_scores"]
+
+
+async def load_or_score_chosen_scores(
+    *,
+    dataset_spec: str | list[Any],
+    scorer_path: Path,
+    project_dir: Path,
+    client: AsyncOpenAI,
+    cache_path: Path,
+    model_size: str = "small",
+) -> list[float | None]:
+    """Return same-judge scores for the dataset's chosen assistant turns.
+
+    DPO reuses these scores for every iteration and sweep configuration.  The
+    cache is fingerprinted by dataset file metadata, repeat factors, scorer
+    contents, and judge size so a stale score vector is never silently paired
+    with a different chosen pool.
+    """
+    from lqh.scoring import is_scoring_error, run_scoring
+    from lqh.train.data_utils import normalize_sources
+
+    sources = normalize_sources(dataset_spec, allow_repeat=True)
+    resolved: list[tuple[Path, int, str]] = []
+    fingerprint_sources: list[dict[str, Any]] = []
+    for entry in sources:
+        path = Path(entry["path"])
+        if not path.is_absolute():
+            path = project_dir / path
+        path = path.resolve()
+        stat = path.stat()
+        repeat = int(entry.get("repeat", 1))
+        resolved.append((path, repeat, str(entry.get("source", path.parent.name))))
+        fingerprint_sources.append({
+            "path": str(path),
+            "repeat": repeat,
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        })
+
+    fingerprint_payload = {
+        "sources": fingerprint_sources,
+        "scorer_sha256": hashlib.sha256(scorer_path.read_bytes()).hexdigest(),
+        "model_size": model_size,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    meta_path = cache_path.with_suffix(cache_path.suffix + ".meta.json")
+    if cache_path.exists() and meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            if meta.get("fingerprint") == fingerprint:
+                table = pq.read_table(cache_path)
+                scores = [table["score"][i].as_py() for i in range(len(table))]
+                expected = sum(
+                    pq.read_metadata(path).num_rows * repeat
+                    for path, repeat, _ in resolved
+                )
+                if len(scores) == expected:
+                    return scores
+        except (OSError, KeyError, json.JSONDecodeError):
+            pass
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    scoring_root = cache_path.parent / f".{cache_path.stem}_scoring"
+    chosen_scores: list[float | None] = []
+    for source_i, (path, repeat, source_name) in enumerate(resolved):
+        out_dir = scoring_root / f"{source_i:03d}_{source_name}"
+        result = await run_scoring(
+            dataset_path=path,
+            scorer_path=scorer_path,
+            output_dir=out_dir,
+            client=client,
+            model_size=model_size,
+            run_inference=False,
+        )
+        if result.scored == 0:
+            raise RuntimeError(f"chosen-response scoring failed for {path}")
+        table = pq.read_table(out_dir / "results.parquet")
+        source_scores: list[float | None] = [None] * pq.read_metadata(path).num_rows
+        for i in range(len(table)):
+            sample_index = int(table["sample_index"][i].as_py())
+            if sample_index < 0 or sample_index >= len(source_scores):
+                continue
+            reasoning = table["reasoning"][i].as_py()
+            source_scores[sample_index] = (
+                None if is_scoring_error(reasoning) else table["score"][i].as_py()
+            )
+        for _ in range(repeat):
+            chosen_scores.extend(source_scores)
+
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    pq.write_table(
+        pa.table({"score": pa.array(chosen_scores, type=pa.float64())}),
+        tmp_path,
+    )
+    tmp_path.replace(cache_path)
+    meta_path.write_text(json.dumps({
+        "fingerprint": fingerprint,
+        **fingerprint_payload,
+        "count": len(chosen_scores),
+    }, indent=2) + "\n")
+    return chosen_scores
 
 
 async def generate_golden(
@@ -84,24 +188,47 @@ async def generate_golden(
 
     # Load predictions
     pred_table = pq.read_table(str(predictions_path))
-    pred_messages = [
-        json.loads(pred_table.column("messages")[i].as_py())
+    pred_indices = (
+        pred_table.column("sample_index").to_pylist()
+        if "sample_index" in pred_table.column_names
+        else list(range(len(pred_table)))
+    )
+    pred_messages = {
+        int(pred_indices[i]): json.loads(pred_table.column("messages")[i].as_py())
         for i in range(len(pred_table))
-    ]
+    }
 
     # Load scores
     score_table = pq.read_table(str(scores_path))
-    scores = [
-        score_table.column("score")[i].as_py()
-        for i in range(len(score_table))
-    ]
+    from lqh.scoring import is_scoring_error
+
+    score_indices = (
+        score_table.column("sample_index").to_pylist()
+        if "sample_index" in score_table.column_names
+        else list(range(len(score_table)))
+    )
+    has_reasoning = "reasoning" in score_table.column_names
+    scores: dict[int, float | None] = {}
+    for row_i, sample_index in enumerate(score_indices):
+        sample_index = int(sample_index)
+        if sample_index not in pred_messages:
+            continue
+        reasoning = (
+            score_table.column("reasoning")[row_i].as_py()
+            if has_reasoning else ""
+        )
+        score = score_table.column("score")[row_i].as_py()
+        scores[sample_index] = (
+            None if score is None or is_scoring_error(reasoning or "")
+            else float(score)
+        )
 
     # ---- Selection ----
     # Output diagnostic stats so we can see exactly how the funnel
     # narrowed at every iter.
     stats: dict[str, Any] = {
-        "rejected_scored": sum(1 for s in scores if s is not None),
-        "total_predictions": len(scores),
+        "rejected_scored": sum(1 for s in scores.values() if s is not None),
+        "total_predictions": len(pred_messages),
         "selector": "gap_quantile" if chosen_scores is not None else "threshold",
     }
 
@@ -115,7 +242,9 @@ async def generate_golden(
         # dataset), we keep what we have rather than artificially
         # narrowing further.
         pairs: list[tuple[int, float]] = []  # (idx, gap)
-        for i, rejected_score in enumerate(scores):
+        paired_chosen_scores: list[float] = []
+        paired_rejected_scores: list[float] = []
+        for i, rejected_score in scores.items():
             if rejected_score is None:
                 continue
             if i >= len(chosen_scores):
@@ -125,8 +254,19 @@ async def generate_golden(
                 continue
             gap = cs - rejected_score
             pairs.append((i, gap))
+            paired_chosen_scores.append(float(cs))
+            paired_rejected_scores.append(float(rejected_score))
 
         stats["pairs_with_both_scored"] = len(pairs)
+        stats["inverted_pairs"] = sum(1 for _, gap in pairs if gap < 0)
+        stats["tied_pairs"] = sum(1 for _, gap in pairs if gap == 0)
+        if paired_chosen_scores:
+            stats["chosen_score_mean"] = sum(paired_chosen_scores) / len(
+                paired_chosen_scores
+            )
+            stats["rejected_score_mean"] = sum(paired_rejected_scores) / len(
+                paired_rejected_scores
+            )
         # Distribution over ALL pairs (informative for diagnosing whether
         # the chosen pool actually beats the rejected pool).
         if pairs:
@@ -199,7 +339,7 @@ async def generate_golden(
     else:
         # Legacy threshold selector.
         low_indices = [
-            i for i, s in enumerate(scores)
+            i for i, s in scores.items()
             if s is not None and s < rejection_threshold
         ]
         stats["rejection_threshold"] = rejection_threshold
@@ -221,7 +361,7 @@ async def generate_golden(
 
     if golden_source == "dataset":
         golden_responses = _golden_from_dataset(
-            low_indices, pred_messages, dataset_path
+            low_indices, dataset_path
         )
     elif golden_source == "api":
         golden_responses = await _golden_from_api(
@@ -230,7 +370,7 @@ async def generate_golden(
     else:
         logger.warning("Unknown golden_source: %s, falling back to dataset", golden_source)
         golden_responses = _golden_from_dataset(
-            low_indices, pred_messages, dataset_path
+            low_indices, dataset_path
         )
 
     # Write golden.parquet
@@ -257,15 +397,33 @@ async def generate_golden(
 
     # Assemble preference pairs
     pref_entries = []
+    seen_preferences: set[tuple[str, str, str]] = set()
+    identical_pairs = 0
+    duplicate_pairs = 0
     for idx in low_indices:
         if idx not in golden_responses:
             continue
 
-        prompt = _get_prompt(pred_messages[idx])
-        rejected = _get_last_assistant(pred_messages[idx])
+        messages = pred_messages.get(idx, [])
+        prompt = _get_prompt(messages)
+        rejected = _get_last_assistant(messages)
         chosen = golden_responses[idx]
 
         if rejected and chosen:
+            normalized_chosen = chosen.strip()
+            normalized_rejected = rejected.strip()
+            if normalized_chosen == normalized_rejected:
+                identical_pairs += 1
+                continue
+            key = (
+                json.dumps(prompt, sort_keys=True),
+                normalized_chosen,
+                normalized_rejected,
+            )
+            if key in seen_preferences:
+                duplicate_pairs += 1
+                continue
+            seen_preferences.add(key)
             pref_entries.append(
                 {
                     "prompt": json.dumps(prompt),
@@ -274,6 +432,8 @@ async def generate_golden(
                 }
             )
 
+    stats["identical_pairs_excluded"] = identical_pairs
+    stats["duplicate_pairs_excluded"] = duplicate_pairs
     stats["pairs_written"] = len(pref_entries)
     (output_dir / "preference_stats.json").write_text(
         json.dumps(stats, indent=2) + "\n"
@@ -301,7 +461,6 @@ async def generate_golden(
 
 def _golden_from_dataset(
     low_indices: list[int],
-    pred_messages: list[list[dict[str, str]]],
     dataset_path: "str | list",
 ) -> dict[int, str]:
     """Pull golden responses from the original training dataset.
@@ -330,7 +489,7 @@ def _golden_from_dataset(
 
 async def _golden_from_api(
     low_indices: list[int],
-    pred_messages: list[list[dict[str, str]]],
+    pred_messages: dict[int, list[dict[str, str]]],
     client: AsyncOpenAI,
     model: str,
 ) -> dict[int, str]:
@@ -341,7 +500,7 @@ async def _golden_from_api(
     result: dict[int, str] = {}
 
     async def _generate_one(idx: int) -> None:
-        prompt = _get_prompt(pred_messages[idx])
+        prompt = _get_prompt(pred_messages.get(idx, []))
         if not prompt:
             return
 

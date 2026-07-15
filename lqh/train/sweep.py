@@ -32,10 +32,8 @@ SFT  →  ``eval_loss`` from HF Trainer.
         probability the policy assigns to the gold response — there
         is no hackable ratio.
 
-DPO  →  ``eval_ce_chosen_mean`` (written by ``_ChosenCECallback`` in
-        ``lqh/train/dpo.py`` to ``iter_000/chosen_ce_summary.json``).
-        Spearman ρ = −1.000 with judge_mean. Top-1 picked correctly,
-        top-3 3/3.
+DPO  →  held-out judge score on one fixed validation dataset, maximized across
+        iterations. ``eval_ce_chosen_delta_ref`` remains a hard collapse veto.
 
         DPO ``eval_loss`` is intentionally NOT used for selection.
         It correlates with judge in the WRONG direction (r = +0.92).
@@ -46,8 +44,10 @@ DPO  →  ``eval_ce_chosen_mean`` (written by ``_ChosenCECallback`` in
         is classic DPO reward-hacking (cf. Pal et al. *Smaug / DPO-Positive*).
         ``eval_rewards/margins`` has the same failure mode.
 
-        Chosen-CE is safe because the reference is FROZEN: only a true
-        increase in P_policy(chosen) lowers it.
+        Chosen CE is still recorded because the frozen-reference delta is a
+        useful catastrophic-collapse detector. It is not used to rank healthy
+        configs: teacher-forced CE is not task quality, and per-config
+        on-policy preference splits are not comparable.
 
 The selection function is hard-wired in this module. The agent never
 sees DPO eval_loss in ``training_status`` (filtered out by
@@ -80,6 +80,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from lqh.train.dpo_metrics import read_held_out_mean
 from lqh.train.progress import write_progress, write_status
 from lqh.train.resume import is_continuation
 
@@ -190,7 +191,7 @@ def resolve_grid(run_type: str, size: str) -> list[SweepPoint]:
 # direction is "min" for both — lower is better.
 PROXY_SPEC: dict[str, tuple[str, str, str]] = {
     "sft": ("eval_loss", "eval_history.json", "min"),
-    "dpo": ("eval_ce_chosen_mean", "iterations/iter_000/chosen_ce_summary.json", "min"),
+    "dpo": ("neg_held_out_judge_mean", "iterations/*/held_out_eval", "min"),
 }
 
 
@@ -227,28 +228,80 @@ def _read_sft_proxy(sub_run_dir: Path) -> dict[str, Any]:
 
 
 def _read_dpo_proxy(sub_run_dir: Path) -> dict[str, Any]:
-    _, fname, _ = PROXY_SPEC["dpo"]
-    path = sub_run_dir / fname
-    if not path.exists():
+    """Read DPO quality and safety metrics across every iteration.
+
+    Quality is the best fixed held-out judge mean.  CE is aggregated only for
+    collapse detection.  The iteration-0 chosen-CE fallback preserves old
+    direct configs that do not yet provide ``held_out_eval_dataset``; new
+    production and benchmark configs always provide it.
+    """
+    iter_root = sub_run_dir / "iterations"
+    if not iter_root.exists():
         return {}
-    try:
-        payload = json.loads(path.read_text())
-    except Exception:
-        return {}
+
     out: dict[str, Any] = {}
-    primary = payload.get("eval_ce_chosen_mean")
-    if primary is not None:
-        out["primary"] = primary
-    for k in (
-        "eval_ce_chosen_p90",
-        "eval_ce_chosen_p95",
-        "eval_ce_chosen_max",
-        "eval_ce_chosen_delta_ref",
-        "eval_ce_rejected_mean",
-        "ref_ce_chosen_mean",
-    ):
-        if k in payload:
-            out[k] = payload[k]
+    ce_rows: list[dict[str, Any]] = []
+    held_out: list[tuple[int, float]] = []
+    for iter_dir in sorted(iter_root.glob("iter_*")):
+        try:
+            iteration = int(iter_dir.name.rsplit("_", 1)[-1])
+        except ValueError:
+            continue
+        ce_path = iter_dir / "chosen_ce_summary.json"
+        if ce_path.exists():
+            try:
+                ce_rows.append(json.loads(ce_path.read_text()))
+            except (OSError, json.JSONDecodeError):
+                pass
+        mean = read_held_out_mean(iter_dir)
+        if mean is not None:
+            held_out.append((iteration, mean))
+
+    if ce_rows:
+        deltas = [
+            float(row["eval_ce_chosen_delta_ref"])
+            for row in ce_rows
+            if isinstance(row.get("eval_ce_chosen_delta_ref"), (int, float))
+        ]
+        if deltas:
+            out["max_eval_ce_chosen_delta_ref"] = max(deltas)
+            out["eval_ce_chosen_delta_ref"] = deltas[-1]
+        final_ce = ce_rows[-1]
+        for key in (
+            "eval_ce_chosen_mean",
+            "eval_ce_chosen_p90",
+            "eval_ce_chosen_p95",
+            "eval_ce_chosen_max",
+            "eval_ce_rejected_mean",
+            "ref_ce_chosen_mean",
+        ):
+            if key in final_ce:
+                out[key] = final_ce[key]
+
+    if held_out:
+        best_iteration, best_mean = max(held_out, key=lambda item: item[1])
+        out.update({
+            "primary": -best_mean,
+            "selection_source": "held_out_judge",
+            "held_out_judge_mean": best_mean,
+            "best_iteration": best_iteration,
+            "held_out_history": [
+                {"iteration": iteration, "mean": mean}
+                for iteration, mean in held_out
+            ],
+        })
+    else:
+        # Backward-compatible fallback only. Raw CE is comparable only when
+        # every config uses the same frozen preference validation examples.
+        iter0_path = iter_root / "iter_000" / "chosen_ce_summary.json"
+        if iter0_path.exists():
+            try:
+                iter0 = json.loads(iter0_path.read_text())
+                if isinstance(iter0.get("eval_ce_chosen_mean"), (int, float)):
+                    out["primary"] = float(iter0["eval_ce_chosen_mean"])
+                    out["selection_source"] = "legacy_iter0_chosen_ce"
+            except (OSError, json.JSONDecodeError):
+                pass
     return out
 
 
@@ -256,7 +309,10 @@ def _is_collapsed(proxy: dict[str, Any], run_type: str) -> bool:
     """DPO-only collapse detector. SFT never collapses in this sense."""
     if run_type == "sft":
         return False
-    dref = proxy.get("eval_ce_chosen_delta_ref")
+    dref = proxy.get(
+        "max_eval_ce_chosen_delta_ref",
+        proxy.get("eval_ce_chosen_delta_ref"),
+    )
     return dref is not None and dref > COLLAPSE_DELTA_REF_THRESHOLD
 
 
@@ -763,8 +819,7 @@ def _write_sweep_summary(
 
 
 def _dpo_no_proxy_message(run_dir: Path, rows: list[dict[str, Any]]) -> str | None:
-    """Explain the common DPO no-winner case: completed configs with no
-    held-out preference pairs, so the chosen-CE proxy was never written."""
+    """Explain completed DPO configs that produced no quality metric."""
     if not rows:
         return None
 
@@ -776,7 +831,6 @@ def _dpo_no_proxy_message(run_dir: Path, rows: list[dict[str, Any]]) -> str | No
         return None
 
     prefs: list[int] = []
-    eval_pairs: list[int] = []
     n_iters = 0
     for row in completed_without_proxy:
         sub_dir = row.get("sub_dir")
@@ -793,10 +847,7 @@ def _dpo_no_proxy_message(run_dir: Path, rows: list[dict[str, Any]]) -> str | No
             n_iters += 1
             if isinstance(payload.get("num_preferences"), int):
                 prefs.append(payload["num_preferences"])
-            if isinstance(payload.get("eval_pairs"), int):
-                eval_pairs.append(payload["eval_pairs"])
-
-    if not n_iters or not eval_pairs or any(n > 0 for n in eval_pairs):
+    if not n_iters:
         return None
 
     pref_range = (
@@ -805,15 +856,12 @@ def _dpo_no_proxy_message(run_dir: Path, rows: list[dict[str, Any]]) -> str | No
         else "too few"
     )
     return (
-        "DPO generated too few usable preference pairs to compute the sweep "
-        "proxy. All completed configs had 0 held-out preference pairs, so "
-        "iterations/iter_000/chosen_ce_summary.json was not written and "
-        "eval_ce_chosen_mean is unavailable. This usually means the policy "
-        "rollouts are already too close to the chosen/gold answers for this "
-        f"DPO prompt count: observed only {pref_range} preference pairs per "
-        "iteration. DPO cannot be selected/applied reliably at this size; "
-        "increase the DPO prompt count substantially, use prompts with more "
-        "headroom, or skip DPO for this benchmark point."
+        "DPO configs completed but produced no fixed held-out judge score, so "
+        "the sweep has no quality metric and will not select a model. Check "
+        "held_out_eval_dataset, scorer configuration, and held-out scoring "
+        f"errors. The runs observed {pref_range} preference pairs per iteration; "
+        "chosen CE cannot substitute for the missing task-quality score except "
+        "for legacy frozen-preference experiments."
     )
 
 
@@ -945,10 +993,17 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
         sub_config = _deep_merge(base, point.overrides)
         # Child runs MUST not recurse into another sweep.
         sub_config.pop("enable_sweep", None)
-        # Sweep configs use the trainer's cheap eval-loss/CE proxy for model
-        # selection. Generative inference + paid judge scoring runs once on
-        # the winner below, not once per grid point/checkpoint.
+        # Disable ordinary checkpoint eval. DPO still runs its explicit fixed
+        # held-out judge evaluation at every iteration; SFT selects on eval CE.
         sub_config["eval_on_checkpoints"] = False
+        if run_type in ("dpo", "on_policy_dpo"):
+            # Every sequential sweep child shares the expensive same-judge
+            # chosen-score cache.  This also guarantees consistent pair-gap
+            # verification across configurations.
+            sub_config.setdefault(
+                "chosen_scores_cache_path",
+                str((run_dir / "chosen_scores.parquet").resolve()),
+            )
 
         if point.id in completed_rows:
             row = dict(completed_rows[point.id])

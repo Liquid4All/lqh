@@ -98,6 +98,7 @@ class RunWatcher:
       - Scores predictions, generates golden trajectories,
         assembles preference pairs
       - Writes ``preferences.parquet``
+      - Scores ``eval_predictions.parquet`` on the fixed held-out set
 
     Parameters
     ----------
@@ -143,6 +144,7 @@ class RunWatcher:
         # Track which requests we've already processed
         self._processed_eval_requests: set[str] = set()
         self._processed_iter_requests: set[str] = set()
+        self._processed_held_out_requests: set[str] = set()
         self._scoring_attempts: dict[str, int] = {}
         self._iteration_attempts: dict[str, int] = {}
         self._retry_not_before: dict[str, float] = {}
@@ -504,13 +506,7 @@ class RunWatcher:
         if effective_config.get("type") not in ("on_policy_dpo", "dpo"):
             return
 
-        iterations_dir = self.run_dir / "iterations"
-        if not iterations_dir.exists():
-            return
-
-        for iter_dir in sorted(iterations_dir.iterdir()):
-            if not iter_dir.is_dir():
-                continue
+        for iter_dir in self._iteration_dirs():
             request_file = iter_dir / "iter_request.json"
             preferences_file = iter_dir / "preferences.parquet"
             error_file = iter_dir / "preference_error.json"
@@ -528,6 +524,83 @@ class RunWatcher:
                 self._handle_scoring_outcome(
                     key, iter_dir, outcome, preference=True,
                 )
+
+            held_out_ready = iter_dir / "eval_predictions_ready.json"
+            held_out_summary = iter_dir / "held_out_eval" / "summary.json"
+            held_out_error = iter_dir / "held_out_eval" / "eval_error.json"
+            held_out_key = f"{iter_dir}:held_out"
+            if (
+                held_out_ready.exists()
+                and not held_out_summary.exists()
+                and not held_out_error.exists()
+                and held_out_key not in self._processed_held_out_requests
+                and self._retry_due(held_out_key)
+            ):
+                self._processed_held_out_requests.add(held_out_key)
+                outcome = await self._score_dpo_held_out(iter_dir)
+                if outcome == _SCORE_SUCCESS:
+                    self._processed_held_out_requests.discard(held_out_key)
+                    self._retry_not_before.pop(held_out_key, None)
+                else:
+                    # Reuse the ordinary eval retry machinery, but keep its
+                    # bookkeeping set in sync with this request class.
+                    self._processed_eval_requests.add(held_out_key)
+                    self._handle_scoring_outcome(
+                        held_out_key,
+                        iter_dir / "held_out_eval",
+                        outcome,
+                        preference=False,
+                    )
+                    self._processed_held_out_requests.discard(held_out_key)
+
+    def _iteration_dirs(self) -> list[Path]:
+        """Return standalone and sweep-child DPO iteration directories."""
+        roots = [self.run_dir / "iterations"]
+        if self.config.get("type") == "sweep":
+            roots.extend(sorted(self.run_dir.glob("sweep_*/iterations")))
+        result: list[Path] = []
+        for root in roots:
+            if root.is_dir():
+                result.extend(
+                    directory
+                    for directory in sorted(root.iterdir())
+                    if directory.is_dir()
+                )
+        return result
+
+    async def _score_dpo_held_out(self, iter_dir: Path) -> str:
+        """Judge a DPO iteration on its fixed held-out prompt set."""
+        predictions = iter_dir / "eval_predictions.parquet"
+        if not predictions.exists():
+            return _SCORE_NOT_READY
+        effective_config = (
+            self.config.get("base_config", {})
+            if self.config.get("type") == "sweep"
+            else self.config
+        )
+        scorer = effective_config.get("scorer")
+        if not scorer:
+            return _SCORE_FAILED
+        try:
+            from lqh.client import create_client
+            from lqh.scoring import run_scoring
+
+            output = iter_dir / "held_out_eval"
+            output.mkdir(parents=True, exist_ok=True)
+            result = await run_scoring(
+                dataset_path=predictions,
+                scorer_path=self.project_dir / scorer,
+                output_dir=output,
+                client=create_client(self.api_key, self.api_base_url),
+                model_size=str(
+                    effective_config.get("preference_judge_size", "small")
+                ),
+                run_inference=False,
+            )
+            return _SCORE_SUCCESS if result.scored else _SCORE_FAILED
+        except Exception:
+            logger.exception("Failed to score held-out DPO iteration %s", iter_dir)
+            return _SCORE_FAILED
 
     async def _process_iteration(self, iter_dir: Path) -> str:
         """Score predictions, generate golden trajectories, assemble preferences."""
@@ -593,11 +666,13 @@ class RunWatcher:
                 )
 
             # Step 1: Score predictions
+            judge_size = str(effective_config.get("preference_judge_size", "small"))
             score_result = await run_scoring(
                 dataset_path=predictions_path,
                 scorer_path=self.project_dir / scorer_path,
                 output_dir=iter_dir,
                 client=client,
+                model_size=judge_size,
                 run_inference=False,
                 on_progress=on_progress,
             )
@@ -623,6 +698,30 @@ class RunWatcher:
             )
 
             # Step 2: Generate golden trajectories + assemble preferences
+            chosen_scores = None
+            if (
+                effective_config.get("selection")
+                and effective_config.get("golden_source", "dataset") == "dataset"
+            ):
+                from lqh.golden import load_or_score_chosen_scores
+
+                cache_value = effective_config.get("chosen_scores_cache_path")
+                cache_path = (
+                    Path(cache_value)
+                    if isinstance(cache_value, str) and cache_value
+                    else self.run_dir / "chosen_scores.parquet"
+                )
+                if not cache_path.is_absolute():
+                    cache_path = self.project_dir / cache_path
+                chosen_scores = await load_or_score_chosen_scores(
+                    dataset_spec=effective_config.get("dataset", ""),
+                    scorer_path=self.project_dir / scorer_path,
+                    project_dir=self.project_dir,
+                    client=client,
+                    cache_path=cache_path,
+                    model_size=judge_size,
+                )
+
             await generate_golden(
                 predictions_path=predictions_path,
                 scores_path=iter_dir / "results.parquet",
@@ -630,6 +729,7 @@ class RunWatcher:
                 config=effective_config,
                 client=client,
                 output_dir=iter_dir,
+                chosen_scores=chosen_scores,
             )
             reporter.update(
                 phase="preference_ready",

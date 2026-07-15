@@ -2814,14 +2814,13 @@ async def handle_start_training(
     the best config by a cheap, validated in-training proxy:
 
     - SFT: ``eval_loss`` (Pearson r = −0.90 with judge_mean on ar_to_de).
-    - DPO: ``eval_ce_chosen_mean`` (Spearman ρ = −1.0). DPO's own
-      ``eval_loss`` is NOT used — it's broken as a selector (correlates
-      with judge in the wrong direction because driving DPO loss down
-      can mean policy collapse).
+    - DPO: fixed held-out judge score, with chosen-response CE retained as a
+      catastrophic-collapse veto. DPO's own ``eval_loss`` is NOT used — it
+      can improve by suppressing rejected likelihood while task quality falls.
 
-    Rationale: training itself is cheap, data generation and judge eval
-    are expensive. Sweeping ~6 configs costs ~2-3× single-config wall
-    time and reliably finds a better config than zero-shot defaults.
+    DPO sweeps are deliberately judge-backed and therefore more expensive than
+    SFT sweeps. This avoids ranking configurations on incomparable on-policy
+    preference subsets.
 
     Pass ``enable_sweep=false`` to fall back to single-config behaviour
     only when the user explicitly asks for it (e.g. "just train one
@@ -2840,10 +2839,10 @@ async def handle_start_training(
     ``eval_dataset`` is mandatory and must resolve to a DIFFERENT path than
     ``dataset`` (the call is rejected otherwise). For SFT it is the sweep's
     selection signal (held-out val_loss) and the judge eval-of-best set.
-    For DPO the sweep selects on a held-out split of the *preferences*
-    (``eval_ce_chosen_mean``), not on ``eval_dataset`` — there
-    ``eval_dataset`` is purely the judge eval-of-best set (scored on unseen
-    prompts). The call is rejected without it.
+    For DPO it is the fixed judge-scored validation set shared by all configs
+    and iterations. Preference-pair chosen CE is still measured at every
+    iteration, but is used only to veto clear collapse. The focused benchmark
+    keeps an additional untouched final-test split outside this tool call.
 
     ``scorer`` must be an explicit decision: pass the project's
     default/current scorer, or set ``disable_scoring=True`` (only when the
@@ -3021,6 +3020,14 @@ async def handle_start_training(
         # OOM self-heal (report_oom_downgrade) shrink further if needed.
         default_micro_batch = 2
         default_effective_batch = 16
+    elif lora and type in ("on_policy_dpo", "dpo"):
+        # DPO preference batches are normally only a few hundred rows.  The
+        # old LoRA-wide default of 256 reduced those batches to one or two
+        # optimizer updates per on-policy iteration.  Keep enough updates to
+        # learn from the pairs; the GPU calibrator may still reduce the micro
+        # batch for memory safety without increasing this effective target.
+        default_micro_batch = 16
+        default_effective_batch = 16
     elif lora:
         default_micro_batch = 256
         default_effective_batch = 256
@@ -3083,6 +3090,12 @@ async def handle_start_training(
         config["eval_dataset"] = _sources_to_config(eval_sources)
         config["eval_on_checkpoints"] = True
         config["manifest"].append("eval_dataset")
+        if type in ("on_policy_dpo", "dpo"):
+            # DPO quality selection must use a fixed prompt set shared across
+            # configs and iterations. Projects with a dedicated DPO validation
+            # split may override this config field; the public tool's safe
+            # default is its required held-out eval dataset.
+            config["held_out_eval_dataset"] = _sources_to_config(eval_sources)
     if scorer_path:
         config["scorer"] = scorer_path
         config["manifest"].append("scorer")
@@ -3093,6 +3106,14 @@ async def handle_start_training(
         config["num_iterations"] = num_iterations
         config["dpo_beta"] = dpo_beta
         config["golden_source"] = golden_source
+        # Dataset gold is useful only when it is verified to beat the policy
+        # rollout under the same judge.  The scoring paths cache chosen scores
+        # once and activate the gap selector when this block is present.
+        config["selection"] = {
+            "top_quantile": 1.0,
+            "min_gap": 1.0,
+            "min_pairs_per_iter": 50,
+        }
 
     # Human-readable summary of the (possibly multiple) training sources,
     # e.g. "datasets/type_a + datasets/type_b (×3)".

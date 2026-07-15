@@ -152,11 +152,13 @@ async def _score_iter_async(
     client = _make_client()
     try:
         # Step 1: judge-score predictions
+        judge_size = str(config.get("preference_judge_size", "small"))
         score_result = await run_scoring(
             dataset_path=predictions_path,
             scorer_path=scorer_path,
             output_dir=iter_dir,
             client=client,
+            model_size=judge_size,
             run_inference=False,
             on_progress=on_progress,
         )
@@ -174,6 +176,27 @@ async def _score_iter_async(
         # Step 2: assemble preferences. generate_golden writes
         # preferences.parquet into iter_dir, which is what the
         # trainer's wait_for_file() call is watching for.
+        chosen_scores = None
+        if config.get("selection") and config.get("golden_source", "dataset") == "dataset":
+            from lqh.golden import load_or_score_chosen_scores
+
+            cache_value = config.get("chosen_scores_cache_path")
+            cache_path = (
+                Path(cache_value)
+                if isinstance(cache_value, str) and cache_value
+                else iter_dir.parent.parent / "chosen_scores.parquet"
+            )
+            if not cache_path.is_absolute():
+                cache_path = project_dir / cache_path
+            chosen_scores = await load_or_score_chosen_scores(
+                dataset_spec=config.get("dataset", ""),
+                scorer_path=scorer_path,
+                project_dir=project_dir,
+                client=client,
+                cache_path=cache_path,
+                model_size=judge_size,
+            )
+
         await generate_golden(
             predictions_path=predictions_path,
             scores_path=iter_dir / "results.parquet",
@@ -181,6 +204,7 @@ async def _score_iter_async(
             config=config,
             client=client,
             output_dir=iter_dir,
+            chosen_scores=chosen_scores,
         )
         reporter.update(
             phase="preference_ready",
@@ -284,6 +308,7 @@ async def _score_held_out_async(
             scorer_path=scorer_path,
             output_dir=eval_out_dir,
             client=client,
+            model_size=str(config.get("preference_judge_size", "small")),
             run_inference=False,
             on_progress=on_progress,
         )

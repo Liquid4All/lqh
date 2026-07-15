@@ -13,6 +13,7 @@ ping-pong repeats for ``num_iterations``.
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,6 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig, PeftModel
 from transformers import (
-    AutoModelForCausalLM,
     TrainerCallback,
     TrainerControl,
     TrainerState,
@@ -35,6 +35,7 @@ from lqh.train.data_utils import (
     load_preferences_parquet,
     split_train_eval,
 )
+from lqh.train.dpo_metrics import find_best_held_out_iter
 from lqh.train.progress import (
     wait_for_file,
     write_eval_request,
@@ -590,6 +591,14 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
     interruption_error: str | None = None
 
     completed_iterations = start_iteration
+    cumulative_optimizer_steps = 0
+    # Preserve the cumulative count on resume so diagnostics remain truthful.
+    for prior_result in sorted(iterations_dir.glob("iter_*/dpo_result.json")):
+        try:
+            prior = json.loads(prior_result.read_text())
+            cumulative_optimizer_steps += int(prior.get("optimizer_steps", 0) or 0)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
     for iteration in range(start_iteration, num_iterations):
         iter_name = f"iter_{iteration:03d}"
         iter_dir = iterations_dir / iter_name
@@ -782,8 +791,8 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         _dpo_lora_enabled = lora_cfg.get("enabled", True)
         ensure_batch_defaults(
             training_cfg,
-            default_micro_batch=256 if _dpo_lora_enabled else 1,
-            default_effective_batch=256 if _dpo_lora_enabled else 2,
+            default_micro_batch=16 if _dpo_lora_enabled else 1,
+            default_effective_batch=16 if _dpo_lora_enabled else 2,
         )
         _probe_model = model
         if peft_config is not None and not model_has_peft:
@@ -814,6 +823,10 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             max_length=training_cfg.get("max_seq_length", 2048),
             logging_steps=10,
             remove_unused_columns=False,
+            seed=training_cfg.get("seed", 42),
+            data_seed=training_cfg.get(
+                "data_seed", training_cfg.get("seed", 42)
+            ),
         )
         if has_eval:
             # Run eval at each eval_steps step (gives us per-step CE
@@ -827,10 +840,9 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             # rejected log-prob down faster than the chosen log-prob).
             # The proxy-validation experiment on ar_to_de (2026-05-11)
             # showed eval_loss correlates with judge_mean in the WRONG
-            # direction (Pearson r = +0.92). Cross-config selection by
-            # the validated proxy (eval_ce_chosen_mean) happens at the
-            # sweep level in lqh/train/sweep.py. Within a single iter we
-            # keep the final-step weights.
+            # direction (Pearson r = +0.92). Cross-config and cross-iteration
+            # selection uses the fixed held-out judge set in sweep.py. Within
+            # one optimizer call we keep the final-step weights.
             dpo_kwargs.update(
                 eval_strategy="steps",
                 eval_steps=eval_steps,
@@ -844,6 +856,28 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                 # load_best_model_at_end=False (default) — see comment above.
             )
         dpo_config = DPOConfig(**dpo_kwargs)
+
+        effective_batch = max(
+            1,
+            int(dpo_kwargs["per_device_train_batch_size"])
+            * int(dpo_kwargs["gradient_accumulation_steps"]),
+        )
+        planned_optimizer_steps = max(
+            1,
+            int(math.ceil(len(train_raw) / effective_batch))
+            * int(dpo_kwargs["num_train_epochs"]),
+        )
+        min_recommended_steps = int(training_cfg.get("dpo_min_optimizer_steps", 50))
+        projected_run_steps = planned_optimizer_steps * num_iterations
+        if projected_run_steps < min_recommended_steps:
+            print(
+                "  WARNING: DPO run is update-starved: "
+                f"about {projected_run_steps} projected optimizer steps "
+                f"({planned_optimizer_steps} this iteration) from "
+                f"{len(train_raw)} pairs at effective_batch={effective_batch}. "
+                f"Target at least {min_recommended_steps} cumulatively; reduce the DPO "
+                "effective batch or increase pairs/epochs."
+            )
 
         callbacks: list[TrainerCallback] = [
             _DPOProgressCallback(
@@ -1012,11 +1046,23 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             )
 
         # Record DPO step metrics
+        optimizer_steps = int(getattr(trainer.state, "global_step", 0) or 0)
+        cumulative_optimizer_steps += optimizer_steps
         dpo_metrics = {
             "iteration": iteration,
             "num_preferences": len(preferences),
             "train_pairs": len(train_raw),
             "eval_pairs": len(eval_raw),
+            "micro_batch_size": int(dpo_kwargs["per_device_train_batch_size"]),
+            "gradient_accumulation_steps": int(
+                dpo_kwargs["gradient_accumulation_steps"]
+            ),
+            "effective_batch_size": effective_batch,
+            "num_train_epochs": dpo_kwargs["num_train_epochs"],
+            "planned_optimizer_steps": planned_optimizer_steps,
+            "projected_run_optimizer_steps": projected_run_steps,
+            "optimizer_steps": optimizer_steps,
+            "cumulative_optimizer_steps": cumulative_optimizer_steps,
             "train_loss": train_result.training_loss if hasattr(train_result, "training_loss") else None,
             "final_eval": final_eval,
             "final_chosen_ce": final_chosen_ce,
@@ -1161,6 +1207,20 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                             iteration, num_iterations, 1.0, training_end,
                         ),
                     )
+                    if summary is None and not inline_held_out_scoring:
+                        # Local/SSH runs hand the held-out predictions to the
+                        # host watcher. Wait so checkpoint selection cannot
+                        # race ahead of the validation score, especially on
+                        # the final iteration.
+                        summary_path = wait_for_file(
+                            iter_dir / "held_out_eval" / "summary.json",
+                            error_path=(
+                                iter_dir / "held_out_eval" / "eval_error.json"
+                            ),
+                            poll_interval=3.0,
+                            timeout=float(config.get("held_out_eval_timeout", 7200.0)),
+                        )
+                        summary = json.loads(summary_path.read_text())
                     if summary is not None:
                         (iter_dir / "eval_result.json").write_text(
                             json.dumps({
@@ -1203,7 +1263,7 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # trend-abort fired — but the saved model was iter 1's). We
     # restore the best LoRA before the final merge-and-save so the
     # checkpoint we ship matches the peak we observed.
-    best_iter, best_mean = _find_best_held_out_iter(iterations_dir)
+    best_iter, best_mean = find_best_held_out_iter(iterations_dir)
     if best_iter is not None:
         completed_iters = [
             int(d.name.split("_")[1])
@@ -1223,8 +1283,15 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                 )
                 del model
                 torch.cuda.empty_cache()
-                model = AutoModelForCausalLM.from_pretrained(
-                    base_model, dtype=dtype, device_map=device_map,
+                # Reconstruct the exact SFT starting policy before applying
+                # the selected DPO adapter. ``base_model`` may itself be an
+                # adapter-only SFT result; loading it with AutoModel directly
+                # either fails or silently drops the SFT adapter.
+                model, _, _ = load_for_training(
+                    base_model,
+                    dtype=dtype,
+                    device_map=device_map,
+                    merge_before_attach=True,
                 )
                 model = PeftModel.from_pretrained(model, str(best_ckpt))
                 model_has_peft = True
@@ -1350,41 +1417,6 @@ def _find_last_completed_iteration(iterations_dir: Path) -> int | None:
             except (json.JSONDecodeError, KeyError):
                 continue
     return last
-
-
-def _find_best_held_out_iter(
-    iterations_dir: Path,
-) -> tuple[int | None, float | None]:
-    """Find the iter with the highest held-out mean.
-
-    Reads ``iter_NNN/held_out_eval.json`` files (written by the harness
-    after the per-iter eval) and returns ``(iter_number, mean)`` for
-    the iter with the highest mean, or ``(None, None)`` if no held-out
-    evals exist (e.g. eval was disabled, or run aborted before any
-    iter scored). Ties resolve to the earliest iter — preferring less
-    drift when the held-out scores are equal.
-    """
-    if not iterations_dir.exists():
-        return None, None
-    best_iter: int | None = None
-    best_mean: float | None = None
-    for d in sorted(iterations_dir.iterdir()):
-        if not d.is_dir() or not d.name.startswith("iter_"):
-            continue
-        held_path = d / "held_out_eval.json"
-        if not held_path.exists():
-            continue
-        try:
-            mean = json.loads(held_path.read_text()).get("mean")
-            iter_num = int(d.name.split("_")[1])
-        except (json.JSONDecodeError, OSError, IndexError, ValueError):
-            continue
-        if mean is None:
-            continue
-        if best_mean is None or mean > best_mean:
-            best_mean = float(mean)
-            best_iter = iter_num
-    return best_iter, best_mean
 
 
 def _generate_predictions(

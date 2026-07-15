@@ -72,6 +72,7 @@ class RemoteRunWatcher(RunWatcher):
         self._pushed_eval_results: set[str] = set()
         self._pushed_preferences: set[str] = set()
         self._pushed_preference_errors: set[str] = set()
+        self._pushed_held_out_results: set[str] = set()
 
     # ------------------------------------------------------------------
     # Override the main loop
@@ -154,6 +155,7 @@ class RemoteRunWatcher(RunWatcher):
         await self._push_eval_results()
         await self._push_preferences()
         await self._push_preference_errors()
+        await self._push_held_out_results()
 
     async def _push_eval_results(self) -> None:
         """Push new eval_result.json files for SFT checkpoint scoring."""
@@ -191,24 +193,20 @@ class RemoteRunWatcher(RunWatcher):
 
     async def _push_preferences(self) -> None:
         """Push new preferences.parquet files for DPO iterations."""
-        if self.config.get("type") not in ("on_policy_dpo", "dpo"):
+        effective = (
+            self.config.get("base_config", {})
+            if self.config.get("type") == "sweep"
+            else self.config
+        )
+        if effective.get("type") not in ("on_policy_dpo", "dpo"):
             return
-
-        iterations_dir = self.run_dir / "iterations"
-        if not iterations_dir.exists():
-            return
-
-        for iter_dir in sorted(iterations_dir.iterdir()):
-            if not iter_dir.is_dir():
-                continue
+        for iter_dir in self._iteration_dirs():
             prefs_file = iter_dir / "preferences.parquet"
             key = str(prefs_file)
             if prefs_file.exists() and key not in self._pushed_preferences:
                 self._pushed_preferences.add(key)
-                remote_path = (
-                    f"{self._remote_run_dir}/iterations/"
-                    f"{iter_dir.name}/preferences.parquet"
-                )
+                relative = prefs_file.relative_to(self.run_dir).as_posix()
+                remote_path = f"{self._remote_run_dir}/{relative}"
                 try:
                     await self._backend.sync_file_to_remote(
                         str(prefs_file), remote_path,
@@ -227,19 +225,14 @@ class RemoteRunWatcher(RunWatcher):
 
     async def _push_preference_errors(self) -> None:
         """Wake an SSH DPO trainer after terminal preference-scoring failure."""
-        iterations_dir = self.run_dir / "iterations"
-        if not iterations_dir.is_dir():
-            return
-        for iter_dir in sorted(iterations_dir.iterdir()):
+        for iter_dir in self._iteration_dirs():
             error_file = iter_dir / "preference_error.json"
             key = str(error_file)
             if not error_file.exists() or key in self._pushed_preference_errors:
                 continue
             self._pushed_preference_errors.add(key)
-            remote_path = (
-                f"{self._remote_run_dir}/iterations/"
-                f"{iter_dir.name}/preference_error.json"
-            )
+            relative = error_file.relative_to(self.run_dir).as_posix()
+            remote_path = f"{self._remote_run_dir}/{relative}"
             try:
                 await self._backend.sync_file_to_remote(
                     str(error_file), remote_path,
@@ -249,6 +242,27 @@ class RemoteRunWatcher(RunWatcher):
                 logger.warning(
                     "Failed to push preference_error.json for %s/%s",
                     self.run_name, iter_dir.name, exc_info=True,
+                )
+
+    async def _push_held_out_results(self) -> None:
+        """Push fixed-validation judge summaries back to an SSH trainer."""
+        for iter_dir in self._iteration_dirs():
+            summary = iter_dir / "held_out_eval" / "summary.json"
+            key = str(summary)
+            if not summary.exists() or key in self._pushed_held_out_results:
+                continue
+            self._pushed_held_out_results.add(key)
+            relative = summary.relative_to(self.run_dir).as_posix()
+            remote_path = f"{self._remote_run_dir}/{relative}"
+            try:
+                await self._backend.sync_file_to_remote(str(summary), remote_path)
+            except Exception:
+                self._pushed_held_out_results.discard(key)
+                logger.warning(
+                    "Failed to push held-out summary for %s/%s",
+                    self.run_name,
+                    iter_dir.name,
+                    exc_info=True,
                 )
 
     # ------------------------------------------------------------------

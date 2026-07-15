@@ -403,6 +403,15 @@ class SSHDirectBackend(RemoteBackend):
                 "iterations/*/",
                 "iterations/*/iter_request.json",
                 "iterations/*/predictions.parquet",
+                "iterations/*/eval_predictions_ready.json",
+                "iterations/*/eval_predictions.parquet",
+                "sweep_*/",
+                "sweep_*/iterations/",
+                "sweep_*/iterations/*/",
+                "sweep_*/iterations/*/iter_request.json",
+                "sweep_*/iterations/*/predictions.parquet",
+                "sweep_*/iterations/*/eval_predictions_ready.json",
+                "sweep_*/iterations/*/eval_predictions.parquet",
             ],
         )
 

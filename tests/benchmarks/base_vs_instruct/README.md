@@ -88,10 +88,10 @@ and `report/{results.json,report.md}`. The report is rewritten after every
 - `--train-size` / `--eval-size` — dataset sizes (default 200 / 40 smoke).
 - `--grid-size {tiny,small}` — sweep grid (3 vs 6 configs).
 - `--skip-dpo` — SFT only.
-- `--dpo-train-size` — prompt count for the DPO stage (default 1000, capped at
-  `--train-size`). DPO regenerates rollouts on **all** its prompts every
-  iteration, so it must stay bounded and decoupled from the (possibly 20k) SFT
-  train set — SFT uses the full set; DPO uses a slice. Set to `0` for an
+- `--dpo-train-size` — independently generated prompt count for the DPO stage
+  (default 1000). DPO regenerates rollouts on **all** its prompts every
+  iteration, so it stays bounded and decoupled from the (possibly 20k) SFT
+  train set. Exact prompt overlap with SFT is rejected. Set to `0` for an
   SFT-only comparison. Positive values must be ≥ 400 or DPO auto-skips.
 - `--judge-size {small,medium,large}` — scoring judge (use `large` for the
   final reported run).
@@ -154,17 +154,17 @@ to gauge wall-time before committing to 20k.
   - SFT evals/saves on a *step* schedule (default 50). `run.py` sizes
     `eval_steps`/`save_steps` to the dataset so the sweep's `eval_loss` proxy
     actually gets logged (otherwise every config is marked "failed").
-  - The DPO sweep proxy (`eval_ce_chosen_mean`) is read from **iter_000**'s
-    held-out split of the per-iteration preference pairs, and `split_train_eval`
-    has a hard floor of 10 eval examples. On-policy preference yield is only
+  - DPO selects on a fixed judge-scored validation set, while preference-pair
+    chosen CE is retained only as a collapse veto. Verified-gap selection still
+    needs enough pairs to train. On-policy preference yield can be only
     ~0.13–0.37 pairs per train prompt per iter — and the **stronger the SFT
     model, the fewer pairs** it produces (a near-perfect greedy rollout rarely
     disagrees with the gold; the 1.2B-Instruct SFT yielded only ~13 pairs from
-    100 prompts). So a small train set cannot produce 10 held-out pairs at any
-    split ratio. `run.py` therefore **auto-skips DPO when `--train-size < 400`**
-    (`_DPO_MIN_TRAIN_SIZE`), logging a warning and noting it in the report, and
-    sizes `eval_split_ratio` off a conservative 0.13 yield when it does run.
-    **For a DPO smoke use `--train-size 400`+**; the fastest SFT-only smoke is
+    100 prompts). A small pool therefore has too little verified training
+    signal. `run.py` **auto-skips DPO when `--dpo-train-size < 400`**
+    (`_DPO_MIN_TRAIN_SIZE`), logs the reason, and sizes the internal preference
+    split from a conservative 0.13 yield so the CE collapse diagnostic has data.
+    **For a DPO smoke use `--dpo-train-size 400`+**; the fastest SFT-only smoke is
     `--train-size 100 --dpo-train-size 0` (or `--skip-dpo`, or just let it
-    auto-skip). DPO's real signal needs `--train-size` in the thousands, where
+    auto-skip). DPO's real signal needs `--dpo-train-size` in the thousands, where
     pairs are plentiful.
