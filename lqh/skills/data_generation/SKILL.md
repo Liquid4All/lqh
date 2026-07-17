@@ -578,6 +578,13 @@ class AnnotateFromHF(Pipeline):
         ...  # same shape as bring-your-prompts
 ```
 
+Private repositories use `HF_TOKEN`. In cloud execution the donated or
+account-stored token is intentionally available to the approved pipeline's
+Python process as a Modal secret; this matches the local trusted-code model and
+allows `streaming=True` without copying the dataset through R2. Prefer a
+fine-grained, read-only token and pin `revision=<commit SHA>` for reproducible
+long-running jobs and continuations.
+
 #### Map vs iterate
 
 The engine takes `num_samples` and `samples_per_item`:
@@ -585,6 +592,59 @@ The engine takes `num_samples` and `samples_per_item`:
 - **map 1x**: `num_samples=len(source)`, `samples_per_item=1` (default) — one output per input item.
 - **iterate N×**: `samples_per_item=N` — generate N outputs per input, using fresh `self` each time (good for small seed lists + `liquidrandom` diversity).
 - **partial**: `num_samples=N` smaller than the source size — iterate through the source until N items have been enqueued, then stop.
+
+### Cloud execution for large runs
+
+`run_data_gen_pipeline` takes `execution: "local" | "cloud"` (default local).
+Use `execution="cloud"` for the **big final runs** (num_samples ≳ 500, or
+anything that would tie up the session for a long time): it submits a
+background CPU cloud job, the tool returns immediately, and the finished
+dataset downloads into `datasets/<output_dataset>/` automatically — you get a
+system notification when it lands, so never poll for it.
+
+Rules:
+
+- **Validate locally first — this is enforced, not advisory.** Cloud
+  submission is refused (`VALIDATION_REQUIRED`) until a local run of the
+  *exact current pipeline file and recorded local input contents* has succeeded. The normal draft workflow
+  (n=1–3 smoke, then the ~20-sample inspection batch) satisfies this. Any
+  edit to the pipeline file re-arms the gate: re-run a small local batch
+  before resubmitting to cloud.
+- **Inputs must go through `lqh.sources` helpers.** The seed data a pipeline
+  read during its validated local run (image folders, prompt files, seed_data)
+  is uploaded with the job automatically. Hand-rolled `open()`/`glob` reads
+  are NOT captured and will fail in the cloud with FileNotFoundError —
+  another reason the `lqh.sources`-only rule is mandatory.
+  `lqh.sources.hf_dataset` needs no upload; it streams in the sandbox.
+- **File access must be deterministic.** Only files the validation run
+  *actually read* ride the bundle — a pipeline that reads different files
+  depending on randomness or branches can validate locally and still hit
+  FileNotFoundError at cloud scale. Read every input the pipeline may need
+  on every run (loading a whole seed list and sampling from it in memory is
+  fine; conditionally opening different files is not).
+- **Pipelines must be self-contained single files.** Importing sibling
+  modules from `data_gen/` is not supported — it fails locally too (the
+  engine loads the pipeline by file path, and `from data_gen.…` imports are
+  rejected). Everything the pipeline needs comes from `lqh.*` imports plus
+  code in the pipeline file itself. Only the pipeline file ships to the
+  cloud, and only its content arms the validation gate.
+- **Avoid symlinked input paths.** Bundling records the resolved target,
+  so a pipeline reading through an in-project symlink alias will not find
+  the alias in the sandbox.
+- The user approves each cloud submit (sample count + cost shown) unless
+  they've granted "don't ask again". Compute bills by wall-clock at ≈ $1/hr
+  (an 8-hour overnight run ≈ $8; hard-capped ≈ $12 at the 12-hour timeout),
+  so don't leave huge margins on num_samples — the job ends when generation
+  finishes, not at the timeout. LLM tokens bill as usual. The backend also
+  enforces a job-wide ceiling of 10 LLM requests per requested output; this
+  survives worker continuations and prevents a pipeline bug from consuming an
+  unbounded number of requests inside one approved job.
+- While the cloud job runs, continue with other useful work (e.g. drafting
+  the scorer). When your next step needs the dataset, call
+  `training_status(run_name=...)` with the run name from the submit result —
+  in auto mode this parks until the job completes (never busy-poll, and never
+  assume the dataset exists before that call returns). Scoring/filtering of
+  the downloaded dataset then proceeds exactly as after a local run.
 
 ## Workflow
 
@@ -817,6 +877,11 @@ run_data_gen_pipeline(
     output_dataset="{task}_eval"
 )
 ```
+
+For large counts (≳ 500) prefer `execution="cloud"` — see "Cloud execution
+for large runs" above. The pipeline is already validated by the draft phase,
+so the gate is satisfied; the dataset lands in `datasets/{task}_eval/` when
+the background job completes.
 
 #### Step 3.3: Auto-Score the Validation Set
 

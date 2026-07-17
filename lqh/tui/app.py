@@ -160,6 +160,10 @@ class LqhApp:
         # entry for the run it is waiting on, so a stale notice for an unrelated
         # run can never be mis-delivered as another run's completion.
         self._pending_completions: dict[str, str] = {}
+        # Data-gen runs whose dataset download exhausted its retries in
+        # THIS session. The finalization marker stays on disk, so a TUI
+        # restart clears this set and retries automatically.
+        self._data_gen_gave_up: set[str] = set()
         # Live progress tracking for the status bar: the last step seen per run
         # and the wall time it last advanced (drives the "↑8s ago" freshness).
         self._job_last_step: dict[str, tuple[str, float]] = {}
@@ -1265,7 +1269,9 @@ class LqhApp:
         await self._refresh_hf_status()
         await self._emit(render_system_message(
             "✅ Hugging Face token stored (encrypted on the backend). Cloud jobs will "
-            "use it for private models/datasets and pushes — the laptop env is not needed."
+            "use it for private models/datasets and pushes — the laptop env is not needed. "
+            "For cloud data generation, the token is available directly to the trusted "
+            "pipeline Python process; use a fine-grained, read-only token when possible."
         ))
         self._invalidate()
 
@@ -2230,7 +2236,10 @@ class LqhApp:
         from lqh.subprocess_manager import SubprocessManager
 
         manager = SubprocessManager()
-        terminal_states = {"completed", "failed"}
+        # CloudBackend maps backend "cancelled" → "failed" already;
+        # "cancelled" is listed defensively so a path that surfaces the
+        # raw status still finalizes (marker consumption, notification).
+        terminal_states = {"completed", "failed", "cancelled"}
         last_wall_time = time.time()
 
         first_scan = True
@@ -2273,21 +2282,48 @@ class LqhApp:
                     run_name in self._telemetry_jobs
                     or (prev is None and self._load_telemetry_job(run_name) is not None)
                 )
-                if state in terminal_states and (prev == "running" or pending_telemetry):
-                    text = self._format_completion_message(
-                        run_name, state, error, remote,
-                    )
-                    # Record the notice keyed by run so auto-mode parking
-                    # delivers it only to the run actually being waited on; the
-                    # queue put is the wake signal (and the interactive loop's
-                    # notification source).
-                    self._pending_completions[run_name] = text
-                    self._input_queue.put_nowait(text)
-                    self._record_completion_event(run_name, state, error, remote)
-                    if state == "completed":
-                        self._status_bar.recent_completion = (run_name, time.time() + 10.0)
-                        self._ensure_spinner_task()
-                    self._tasks.unregister(run_name)
+                # Cloud data-gen runs leave a durable marker at submit; it
+                # survives TUI restarts, so a job first observed already
+                # terminal still gets finalized (download + notification).
+                # Runs whose download gave up this session are excluded
+                # until a restart clears the set.
+                needs_finalize = (
+                    self._data_gen_pending(run_name)
+                    and run_name not in self._data_gen_gave_up
+                )
+                if state in terminal_states and (
+                    prev == "running" or pending_telemetry or needs_finalize
+                ):
+                    text: str | None
+                    if self._run_type(run_name) == "data_gen":
+                        # Cloud data-gen: pull the dataset artifact into
+                        # datasets/<name>/ before telling the agent, so
+                        # the follow-up (scoring) finds the file locally.
+                        # None = transient download failure; the marker is
+                        # kept and the next scan retries silently.
+                        text = await self._finalize_data_gen_run(
+                            run_name, state, error,
+                        )
+                    else:
+                        text = self._format_completion_message(
+                            run_name, state, error, remote,
+                        )
+                    if text is not None:
+                        # Record the notice keyed by run so auto-mode parking
+                        # delivers it only to the run actually being waited on;
+                        # the queue put is the wake signal (and the interactive
+                        # loop's notification source).
+                        self._pending_completions[run_name] = text
+                        self._input_queue.put_nowait(text)
+                        if self._run_type(run_name) != "data_gen":
+                            # data_gen writes its own project-log event +
+                            # telemetry in _finalize_data_gen_run; the generic
+                            # recorder would mislabel it training_completed.
+                            self._record_completion_event(run_name, state, error, remote)
+                        if state == "completed":
+                            self._status_bar.recent_completion = (run_name, time.time() + 10.0)
+                            self._ensure_spinner_task()
+                        self._tasks.unregister(run_name)
                 # Keep the registry in sync with live state. The handler
                 # eagerly registers on submission; this branch is the
                 # fallback for jobs discovered after a TUI restart.
@@ -2312,7 +2348,12 @@ class LqhApp:
                 # and completed-but-unscored runs after a TUI restart).
                 if run_name in self._run_watchers:
                     continue
-                if state == "failed":
+                if state in ("failed", "cancelled"):
+                    continue
+                if self._run_type(run_name) == "data_gen":
+                    # Data-gen runs have no predictions to score mid-run;
+                    # their only follow-up is the dataset download handled
+                    # in _finalize_data_gen_run above.
                     continue
                 run_dir = self.project_dir / "runs" / run_name
                 if state == "completed" and (run_dir / "eval_result.json").exists():
@@ -2321,6 +2362,319 @@ class LqhApp:
                     await self._spawn_run_watcher(run_name, remote)
                 except Exception:
                     pass
+
+    def _run_type(self, run_name: str) -> str:
+        """The run's config ``type`` ("sft", "data_gen", ...), "" if unknown."""
+        import json
+
+        try:
+            config = json.loads(
+                (self.project_dir / "runs" / run_name / "config.json").read_text()
+            )
+            return str(config.get("type", ""))
+        except Exception:
+            return ""
+
+    def _data_gen_pending(self, run_name: str) -> bool:
+        """Whether a cloud data-gen run still owes finalization.
+
+        The marker is written by the submit handler and removed by
+        ``_finalize_data_gen_run`` — durable across TUI restarts.
+        """
+        return (
+            self.project_dir / "runs" / run_name / ".lqh_data_gen.json"
+        ).exists()
+
+    async def _finalize_data_gen_run(
+        self, run_name: str, state: str, error: str | None,
+    ) -> str | None:
+        """Terminal handling for a cloud data-gen run.
+
+        On success, download the run's ``dataset`` artifact into
+        ``datasets/<output_dataset>/data.parquet`` so local flows
+        (scoring, training bundles) proceed exactly as after a local
+        run, then return the completion notice for the agent. The
+        submit-time marker is consumed on every outcome EXCEPT a
+        transient download failure — there it survives (with a retry
+        counter) so the next watcher scan retries automatically, and
+        ``None`` is returned to suppress a premature notification.
+        """
+        import json
+
+        run_dir = self.project_dir / "runs" / run_name
+        try:
+            config = json.loads((run_dir / "config.json").read_text())
+        except Exception:
+            config = {}
+
+        marker_path = run_dir / ".lqh_data_gen.json"
+        marker: dict[str, Any] = {}
+        try:
+            marker = json.loads(marker_path.read_text())
+        except Exception:
+            pass
+        workflow_id = str(marker.get("workflow_id") or uuid.uuid4())
+
+        def _consume_marker() -> None:
+            marker_path.unlink(missing_ok=True)
+
+        output_dataset = str(config.get("output_dataset") or run_name)
+        # The submit handler validates this, but the config file on disk
+        # is not trusted for path construction — a separator or ".."
+        # would escape datasets/.
+        if Path(output_dataset).name != output_dataset or output_dataset in (".", ".."):
+            output_dataset = run_name
+
+        def _emit_terminal(outcome: str) -> None:
+            # A give-up already closed the workflow; a post-restart retry
+            # must not close it a second time.
+            if marker.get("workflow_closed"):
+                return
+            enabled, _epoch, _baseline, _key = self._telemetry.state_snapshot()
+            if not enabled:
+                return
+            event_name = (
+                "data_generation_completed" if outcome == "succeeded"
+                else "data_generation_failed"
+            )
+            self._telemetry.defer(self._telemetry.event, event_name, {
+                "workflow_kind": "data_generation",
+                "execution_target": "cloud",
+                "outcome": outcome,
+            }, workflow_id)
+
+        recovered_note = ""
+        recovered_artifact_id: str | None = None
+        if state != "completed":
+            # A backend restart mid-job loses the event pump; the orphan
+            # reconciler used to label such jobs failed even when they
+            # finished and published. The backend now checks for the
+            # dataset before deciding, but stay defensive here too: if
+            # the dataset artifact exists, recover it instead of
+            # reporting a bogus failure.
+            try:
+                from lqh.artifacts import BackendArtifactStore as _Store
+
+                job_id = str(marker.get("job_id") or "")
+                if job_id:
+                    # Server-side job_id filter: a newest-N scan would
+                    # miss the artifact once the project accumulates
+                    # more datasets than one page.
+                    for handle in await _Store().list_for_project(
+                        self.project_dir.name, kind="dataset", job_id=job_id,
+                    ):
+                        recovered_artifact_id = handle.id
+                        break
+            except Exception:
+                recovered_artifact_id = None
+            if recovered_artifact_id is None:
+                _consume_marker()
+                _emit_terminal("failed")
+                verb = "was cancelled" if state == "cancelled" else "failed"
+                err_part = f": {error}" if error else "."
+                return (
+                    f"[System: cloud data-gen run {run_name} {verb}{err_part} "
+                    f"Check runs/{run_name}/stderr.log (or the job's log artifacts) "
+                    "for the pipeline error, fix it, validate locally, and resubmit.]"
+                )
+            recovered_note = (
+                " (the job was reported failed — likely a backend restart — "
+                "but its dataset was published, so it was recovered)"
+            )
+
+        # A prior transient download failure schedules the next attempt;
+        # until then stay silent (no network work, no notification).
+        retry_after = marker.get("retry_after")
+        if isinstance(retry_after, (int, float)) and time.time() < float(retry_after):
+            return None
+
+        counts = ""
+        try:
+            status = json.loads((run_dir / "status.json").read_text())
+            if "succeeded" in status:
+                counts = f" ({status['succeeded']}/{status.get('total', '?')} samples ok)"
+        except Exception:
+            pass
+        if not counts:
+            # The SSE status mirror overwrites status.json with state-only
+            # payloads; the sandbox's summary progress row carries the
+            # real sample counts.
+            try:
+                lines = (run_dir / "progress.jsonl").read_text().splitlines()
+                for line in reversed(lines[-100:]):
+                    row = json.loads(line)
+                    if "succeeded" in row:
+                        counts = f" ({row['succeeded']}/{row.get('total', '?')} samples ok)"
+                        break
+            except Exception:
+                pass
+
+        # Preferred source: the artifact SSE event mirrored into
+        # artifacts.json by sync_progress. Fallback: list the project's
+        # dataset artifacts and match on this run's job id (covers a
+        # missed event after a long disconnect).
+        artifact_id: str | None = recovered_artifact_id
+        if artifact_id is None:
+            try:
+                manifest = json.loads((run_dir / "artifacts.json").read_text())
+                for entry in manifest.get("artifacts", []):
+                    if entry.get("kind") == "dataset" and entry.get("artifact_id"):
+                        artifact_id = str(entry["artifact_id"])
+                        break
+            except Exception:
+                pass
+
+        dest = self.project_dir / "datasets" / output_dataset / "data.parquet"
+        sidecar_path = dest.parent / ".lqh_source.json"
+        replaced = dest.exists()
+
+        # Overwrite policy: the NEWEST SUBMISSION wins among cloud jobs
+        # (a sidecar written on every download records which submission
+        # produced the local file), and anything the user generated
+        # locally after this submit is never clobbered (mtime check —
+        # applies only when no sidecar attributes the file to a job).
+        submitted_at = marker.get("submitted_at")
+        if replaced and isinstance(submitted_at, (int, float)):
+            sidecar: dict[str, Any] = {}
+            try:
+                loaded = json.loads(sidecar_path.read_text())
+                if isinstance(loaded, dict):
+                    sidecar = loaded
+            except Exception:
+                pass
+            prior_submitted = sidecar.get("submitted_at")
+            downloaded_at = sidecar.get("downloaded_at")
+            local_kept_msg = (
+                f"[System: cloud data-gen run {run_name} completed{counts}, but "
+                f"datasets/{output_dataset}/data.parquet was regenerated locally "
+                "after the job was submitted, so the local file was kept. The "
+                "cloud dataset remains available via the artifacts tool if you "
+                "want it instead.]"
+            )
+            if isinstance(prior_submitted, (int, float)):
+                if float(prior_submitted) > float(submitted_at):
+                    _consume_marker()
+                    _emit_terminal("succeeded")
+                    return (
+                        f"[System: cloud data-gen run {run_name} completed{counts}, "
+                        f"but datasets/{output_dataset}/data.parquet already holds "
+                        "the result of a NEWER submission, so it was kept. This "
+                        "run's dataset remains available via the artifacts tool.]"
+                    )
+                # We are the newer submission — but the file may have been
+                # modified/regenerated locally SINCE its cloud download
+                # (local runs also delete the sidecar, this is the belt for
+                # in-place edits): local work wins over any cloud job.
+                if (
+                    isinstance(downloaded_at, (int, float))
+                    and dest.stat().st_mtime > float(downloaded_at) + 2.0
+                ):
+                    _consume_marker()
+                    _emit_terminal("succeeded")
+                    return local_kept_msg
+                # else: overwrite below.
+            elif dest.stat().st_mtime > float(submitted_at):
+                _consume_marker()
+                _emit_terminal("succeeded")
+                return local_kept_msg
+
+        try:
+            from lqh.artifacts import BackendArtifactStore
+
+            store = BackendArtifactStore()
+            if artifact_id is None:
+                job_id = str(marker.get("job_id") or "")
+                if not job_id:
+                    meta_path = run_dir / "remote_job.json"
+                    if meta_path.exists():
+                        job_id = str(json.loads(meta_path.read_text()).get("job_id") or "")
+                if job_id:
+                    # Server-side job_id filter (see comment on the
+                    # recovery path above).
+                    for handle in await store.list_for_project(
+                        self.project_dir.name, kind="dataset", job_id=job_id,
+                    ):
+                        artifact_id = handle.id
+                        break
+            if artifact_id is None:
+                raise RuntimeError("no dataset artifact registered for this job")
+            await store.download(artifact_id, dest)
+        except Exception as exc:
+            attempts = int(marker.get("download_attempts", 0) or 0) + 1
+            if attempts < 8 and marker_path.exists():
+                # Transient (network blip, brief API/R2 outage, listing
+                # lag): keep the marker with a bumped counter and an
+                # exponential backoff, and stay silent — a later watcher
+                # scan retries the whole finalization. Eight attempts
+                # with growing gaps ride out multi-minute outages that
+                # three back-to-back scans could not.
+                marker["download_attempts"] = attempts
+                marker["retry_after"] = time.time() + min(900.0, 60.0 * (2 ** min(attempts, 4)))
+                try:
+                    marker_path.write_text(json.dumps(marker, indent=2) + "\n")
+                except OSError:
+                    pass
+                return None
+            # Give up FOR THIS SESSION: notify once with the manual
+            # recovery path, park the run in _data_gen_gave_up, and keep
+            # the marker (attempts reset) so a TUI restart retries the
+            # download automatically. Generation itself succeeded — the
+            # workflow closes as such.
+            self._data_gen_gave_up.add(run_name)
+            _emit_terminal("succeeded")
+            if marker_path.exists():
+                marker["download_attempts"] = 0
+                marker.pop("retry_after", None)
+                marker["workflow_closed"] = True
+                try:
+                    marker_path.write_text(json.dumps(marker, indent=2) + "\n")
+                except OSError:
+                    pass
+            return (
+                f"[System: cloud data-gen run {run_name} completed{counts}, but "
+                f"downloading the dataset failed after {attempts} attempts: {exc}. "
+                f"Use the artifacts tool to locate the run's dataset artifact and "
+                f"download it to datasets/{output_dataset}/data.parquet, then "
+                "continue (a TUI restart will also retry the download).]"
+            )
+
+        # Attribute the local file to this submission so a concurrent
+        # job targeting the same dataset can apply newest-submission-wins.
+        try:
+            sidecar_path.write_text(json.dumps({
+                "job_id": marker.get("job_id"),
+                "run_name": run_name,
+                "submitted_at": submitted_at,
+                # Lets a later cloud completion detect that the file was
+                # modified locally AFTER this download (mtime check) and
+                # keep the local version.
+                "downloaded_at": time.time(),
+            }, indent=2) + "\n")
+        except OSError:
+            pass
+
+        try:
+            from lqh.project_log import append_event
+
+            append_event(
+                self.project_dir,
+                "data_gen_completed",
+                f"Cloud data gen {run_name} completed; dataset at datasets/{output_dataset}/",
+                run_name=run_name,
+                output_dataset=output_dataset,
+            )
+        except Exception:
+            pass
+        _consume_marker()
+        _emit_terminal("succeeded")
+
+        replaced_note = " (replaced the existing local file)" if replaced else ""
+        return (
+            f"[System: cloud data-gen run {run_name} completed{counts}{recovered_note}. "
+            f"The dataset was downloaded to datasets/{output_dataset}/data.parquet"
+            f"{replaced_note} — continue with the natural next step "
+            "(e.g. scoring or training).]"
+        )
 
     def _results_pending(self, run_name: str) -> bool:
         """Whether a successful process still owes its useful eval result."""

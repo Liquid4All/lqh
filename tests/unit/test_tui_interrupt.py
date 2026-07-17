@@ -22,8 +22,14 @@ ESC = "\x1b"
 
 
 @pytest.fixture
-def app() -> LqhApp:
-    return LqhApp(Path("."))
+def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LqhApp:
+    # Isolated project dir + HOME: LqhApp(Path(".")) used to run against
+    # the repo root's real .lqh/ and the developer's real ~/.lqh
+    # (telemetry queues + file locks that other tests also touch without
+    # HOME redirection) — shared mutable state that made the Ctrl+C
+    # tests fail depending on which files ran earlier in the suite.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return LqhApp(tmp_path)
 
 
 def _make_agent(tmp_path: Path) -> Agent:
@@ -279,6 +285,18 @@ async def _drive_keys(app: LqhApp, steps: list[tuple[str, float]]) -> None:
     ``steps`` is a list of ``(text, wait_seconds)`` pairs; the wait after each
     chunk lets the input parser flush (a lone ESC needs the escape timeout).
     """
+    # Finalize garbage from earlier tests BEFORE the application runs:
+    # an unclosed httpx client left on a closed loop raises
+    # "Event loop is closed" when the GC finalizes it, and if that lands
+    # mid-run, prompt_toolkit's exception handler suspends the app on a
+    # "Press ENTER to continue" prompt that eats our test keys (the
+    # historical cause of this file's wedged Ctrl+C tests). Collected
+    # here, the finalizer error is just a logged warning.
+    import gc
+
+    gc.collect()
+    await asyncio.sleep(0)
+
     application = app._create_application()
     app._app = application
 
@@ -287,7 +305,15 @@ async def _drive_keys(app: LqhApp, steps: list[tuple[str, float]]) -> None:
         application.output = DummyOutput()
 
         async def drive() -> None:
-            await asyncio.sleep(0.1)
+            # Wait until the application is actually reading input — a
+            # blind 0.1s sleep raced app startup under full-suite load,
+            # and a key sent before the reader attaches is silently lost
+            # (the historical source of this file's flakiness).
+            for _ in range(500):
+                if application.is_running:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
             for text, wait in steps:
                 pipe.send_text(text)
                 await asyncio.sleep(wait)
@@ -311,16 +337,29 @@ class TestCtrlCAndEsc:
                 raise
 
         run = asyncio.create_task(app._run_interruptible(hang))
-        await asyncio.sleep(0.05)
+        # Wait for the busy state, not a fixed sleep: the Ctrl+C binding
+        # is filtered on _agent_busy(), so a keypress delivered before
+        # _run_interruptible sets _agent_task takes the idle-warn path
+        # and never cancels — the historical intermittent failure of
+        # this test under full-suite load.
+        for _ in range(500):
+            if app._agent_busy():
+                break
+            await asyncio.sleep(0.01)
+        assert app._agent_busy()
 
-        await _drive_keys(app, [(CTRL_C, 0.1)])
+        # Generous post-key wait: _drive_keys exits the application after
+        # the step wait, and under full-suite load the pipe→reader→key-
+        # processor hop can exceed 0.1s — the exit then discards the
+        # unprocessed keypress and the interrupt never fires.
+        await _drive_keys(app, [(CTRL_C, 1.0)])
 
         # Cancellation delivery is asynchronous — wait for it rather than
-        # asserting on a fixed sleep (flaky under full-suite load).
-        await asyncio.wait_for(interrupted.wait(), timeout=2)
+        # asserting on a fixed sleep.
+        await asyncio.wait_for(interrupted.wait(), timeout=15)
         assert not app._shutdown_requested
         with pytest.raises(AgentInterrupted):
-            await asyncio.wait_for(run, timeout=2)
+            await asyncio.wait_for(run, timeout=15)
 
     async def test_double_ctrl_c_exits(self, app: LqhApp) -> None:
         await _drive_keys(app, [(CTRL_C, 0.1), (CTRL_C, 0.1)])

@@ -82,6 +82,27 @@ def _validate_path(project_dir: Path, rel_path: str) -> Path:
     return resolved
 
 
+def _validate_writable_path(project_dir: Path, rel_path: str) -> Path:
+    """_validate_path plus a deny on the CLI's own state directory.
+
+    ``.lqh/`` holds security-relevant state the agent must not author:
+    permissions.json (user consent grants, including cloud spend) and
+    data_gen_validation.json (the handler-enforced cloud-validation
+    gate, whose source_paths/needs_hf feed bundle contents and HF-token
+    injection). Letting the model write there would turn every
+    "handler-enforced, not prompt-trusted" gate into a prompt-trusted
+    one.
+    """
+    resolved = _validate_path(project_dir, rel_path)
+    rel = resolved.relative_to(project_dir.resolve())
+    if rel.parts and rel.parts[0] == ".lqh":
+        raise ValueError(
+            f"Path '{rel_path}' is inside .lqh/ — CLI-internal state is not "
+            "writable through file tools"
+        )
+    return resolved
+
+
 def _resolve_training_sources(
     project_dir: Path,
     spec: "str | list[Any]",
@@ -521,7 +542,7 @@ async def _read_parquet(path: Path) -> ToolResult:
 
 async def handle_create_file(project_dir: Path, *, path: str, content: str, **kwargs: Any) -> ToolResult:
     """Create a new file. Fails if it already exists."""
-    target = _validate_path(project_dir, path)
+    target = _validate_writable_path(project_dir, path)
     if target.exists():
         return ToolResult(content=f"Error: file '{path}' already exists. Use write_file to overwrite.")
 
@@ -533,7 +554,7 @@ async def handle_create_file(project_dir: Path, *, path: str, content: str, **kw
 
 async def handle_write_file(project_dir: Path, *, path: str, content: str, **kwargs: Any) -> ToolResult:
     """Write/overwrite a file."""
-    target = _validate_path(project_dir, path)
+    target = _validate_writable_path(project_dir, path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     lines = content.count("\n") + 1
@@ -550,7 +571,7 @@ async def handle_edit_file(
     **kwargs: Any,
 ) -> ToolResult:
     """Edit a file by string replacement."""
-    target = _validate_path(project_dir, path)
+    target = _validate_writable_path(project_dir, path)
     if not target.exists():
         return ToolResult(content=f"Error: file '{path}' does not exist")
 
@@ -583,14 +604,69 @@ async def handle_run_data_gen_pipeline(
     validation_instructions: str | None = None,
     samples_per_item: int = 1,
     purpose: str = "unspecified",
+    execution: str = "local",
+    timeout_minutes: int = 720,
+    _script_consent: bool = False,
+    _cloud_consent: bool = False,
     **kwargs: Any,
 ) -> ToolResult:
-    """Execute a data generation pipeline. Requires user permission."""
+    """Execute a data generation pipeline. Requires user permission.
+
+    ``execution="cloud"`` submits a background CPU cloud job instead of
+    running in-process (CLOUD_OFFLOAD_PLAN.md §2), gated on a prior
+    successful local run of the same pipeline version plus user consent.
+    ``_script_consent`` / ``_cloud_consent`` are internal: the agent loop
+    sets them when re-invoking after the user granted the corresponding
+    prompt, so a one-time grant works without persisting anything.
+    """
     from lqh.tools.permissions import check_permission
+
+    if execution not in ("local", "cloud"):
+        return ToolResult(
+            content=f"Error: execution must be 'local' or 'cloud', got {execution!r}"
+        )
+    if num_samples <= 0:
+        return ToolResult(
+            content=f"Error: num_samples must be positive, got {num_samples}"
+        )
+    if samples_per_item <= 0:
+        return ToolResult(
+            content=f"Error: samples_per_item must be positive, got {samples_per_item}"
+        )
+    # Mirror the backend picker's clamp so the consent prompt's cost cap
+    # matches what actually gets scheduled.
+    timeout_minutes = max(10, min(int(timeout_minutes or 720), 1440))
+    # output_dataset becomes a path component (datasets/<name>/, and the
+    # cloud run dir name) — require a plain directory name so it can't
+    # escape the project layout or hide runs from the watcher.
+    if (
+        not output_dataset
+        or output_dataset in (".", "..")
+        or "/" in output_dataset
+        or "\\" in output_dataset
+    ):
+        return ToolResult(
+            content=(
+                f"Error: output_dataset must be a plain name (no path separators), "
+                f"got {output_dataset!r}"
+            )
+        )
 
     target = _validate_path(project_dir, script_path)
     if not target.exists():
         return ToolResult(content=f"Error: script '{script_path}' does not exist")
+    # Pipelines must sit directly under data_gen/: the engine derives the
+    # project root as script_path.parent.parent, so a script anywhere else
+    # resolves source() against the wrong directory (and the cloud bundle
+    # layout + import pre-scan assume the same location).
+    rel_parts = target.relative_to(project_dir.resolve()).parts
+    if len(rel_parts) != 2 or rel_parts[0] != "data_gen" or not rel_parts[1].endswith(".py"):
+        return ToolResult(
+            content=(
+                f"Error: pipeline scripts must be .py files directly under data_gen/ "
+                f"(got '{script_path}'). Move the script to data_gen/<name>.py and retry."
+            )
+        )
 
     # Pre-validate imports before executing
     try:
@@ -598,6 +674,7 @@ async def handle_run_data_gen_pipeline(
         bad_imports = [
             ("from data_gen.", "from data_gen."),
             ("from data_gen import", "from data_gen import"),
+            ("import data_gen.", "import data_gen."),
             ("from pipeline import", "from pipeline import"),
             ("import pipeline\n", "import pipeline"),
         ]
@@ -613,8 +690,9 @@ async def handle_run_data_gen_pipeline(
     except OSError:
         pass
 
-    # Check if we already have permission
-    if not check_permission(project_dir, script_path):
+    # Check if we already have permission (script-execution domain;
+    # applies to both execution targets — cloud runs the same script).
+    if not _script_consent and not check_permission(project_dir, script_path):
         # Need to ask for permission - this will be handled by the agent loop
         return ToolResult(
             content="PERMISSION_REQUIRED",
@@ -634,6 +712,20 @@ async def handle_run_data_gen_pipeline(
             ],
         )
 
+    if execution == "cloud":
+        return await _submit_cloud_data_gen(
+            project_dir,
+            script_path=script_path,
+            num_samples=num_samples,
+            output_dataset=output_dataset,
+            validation_instructions=validation_instructions,
+            samples_per_item=samples_per_item,
+            purpose=purpose,
+            timeout_minutes=timeout_minutes,
+            consent=_cloud_consent,
+            on_bg_started=kwargs.get("on_background_task_started"),
+        )
+
     # Execute the pipeline (pass through any callbacks from kwargs)
     return await _execute_pipeline(
         project_dir, script_path, num_samples, output_dataset, validation_instructions,
@@ -642,6 +734,349 @@ async def handle_run_data_gen_pipeline(
         on_pipeline_progress=kwargs.get("on_pipeline_progress"),
         on_pipeline_done=kwargs.get("on_pipeline_done"),
         legacy_progress_callback=bool(kwargs.get("legacy_progress_callback", True)),
+    )
+
+
+async def _fetch_data_gen_rate_usd() -> float | None:
+    """Billed data_gen $/hr from GET /v1/cloud/pricing; None if unreachable.
+
+    Fetched live so the consent prompt can't drift from operator
+    overrides of the rate or margin envvars; callers fall back to the
+    defaults with an explicit "at default rates" caveat.
+    """
+    try:
+        import httpx
+
+        from lqh.auth import api_root, get_token
+
+        token = get_token()
+        if not token:
+            return None
+        async with httpx.AsyncClient(base_url=api_root(), timeout=5.0) as client:
+            resp = await client.get(
+                "/v1/cloud/pricing",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code != 200:
+                return None
+            micros = resp.json().get("data_gen_cpu_rate_billed_micros_per_hour")
+            if isinstance(micros, (int, float)) and micros > 0:
+                return float(micros) / 1e6
+            return None
+    except Exception:
+        return None
+
+
+async def _submit_cloud_data_gen(
+    project_dir: Path,
+    *,
+    script_path: str,
+    num_samples: int,
+    output_dataset: str,
+    validation_instructions: str | None,
+    samples_per_item: int,
+    purpose: str,
+    timeout_minutes: int = 720,
+    consent: bool,
+    on_bg_started: Callable[[str, str, str, str | None], None] | None = None,
+) -> ToolResult:
+    """Submit the pipeline as a background cloud CPU job.
+
+    Two gates, in order (both after the script-execution permission
+    handled by the caller):
+
+    1. Correctness gate — a successful LOCAL run of this exact pipeline
+       version (content hash) must be on record. Handler-enforced, not
+       prompt-trusted: an agent edit to the file re-arms it.
+    2. Consent gate — the user approves the submit (sample count + cost
+       estimate) unless the project carries a standing grant.
+    """
+    from lqh.data_gen_validation import check_validation
+    from lqh.tools.permissions import check_cloud_data_gen_permission
+
+    target = _validate_path(project_dir, script_path)
+    # Canonical project-relative form: the sandbox resolves script_path
+    # against the extracted bundle root, so an absolute (even
+    # inside-project) path in config.json would break there.
+    script_path = target.relative_to(project_dir.resolve()).as_posix()
+
+    # validation_instructions becomes a bundle-manifest entry — validate
+    # it like every other path (a model-supplied absolute or ../ path
+    # would otherwise upload an arbitrary readable local file) and store
+    # it project-relative so the sandbox finds it under inputs/.
+    if validation_instructions:
+        try:
+            val_resolved = _validate_path(project_dir, validation_instructions)
+        except ValueError as e:
+            return ToolResult(content=f"Error: validation_instructions: {e}")
+        if not val_resolved.exists():
+            return ToolResult(
+                content=f"Error: validation_instructions file "
+                        f"'{validation_instructions}' does not exist"
+            )
+        validation_instructions = val_resolved.relative_to(
+            project_dir.resolve()
+        ).as_posix()
+
+    record = check_validation(project_dir, target)
+    if record is None:
+        return ToolResult(
+            content=(
+                "VALIDATION_REQUIRED: cloud execution is locked until this exact "
+                "pipeline version and its recorded local inputs have succeeded locally.\n"
+                f"Run `run_data_gen_pipeline` with execution='local' first — a draft "
+                f"(num_samples=3, purpose='smoke') to check correctness, then an "
+                f"inspection batch (num_samples≈20, purpose='inspection') to review "
+                f"quality — and retry execution='cloud' afterwards.\n"
+                f"Note: any edit to {script_path} re-arms this gate."
+            )
+        )
+
+    # The gate hashes code, not data — a recorded seed input deleted or
+    # moved since validation would silently vanish from the bundle
+    # (resolve_manifest skips missing paths) and only fail in the paid
+    # sandbox. Catch it here instead.
+    missing_sources = [s for s in record.source_paths if not (project_dir / s).exists()]
+    if missing_sources:
+        return ToolResult(
+            content=(
+                "VALIDATION_REQUIRED: recorded source inputs no longer exist: "
+                + ", ".join(missing_sources[:5])
+                + (" …" if len(missing_sources) > 5 else "")
+                + "\nRestore them or re-run the pipeline locally (which re-records "
+                "its inputs), then retry execution='cloud'."
+            )
+        )
+
+    total_calls = num_samples * max(1, samples_per_item)
+    if not consent and not check_cloud_data_gen_permission(project_dir):
+        rate_usd = await _fetch_data_gen_rate_usd()
+        if rate_usd is not None:
+            rate_note = f"≈ ${rate_usd:.2f}/hr"
+        else:
+            rate_usd = 1.0
+            rate_note = "≈ $1/hr at default rates"
+        hours = timeout_minutes / 60
+        inputs_line = ""
+        if record.source_paths:
+            shown = record.source_paths[:5]
+            more = len(record.source_paths) - len(shown)
+            inputs_line = (
+                f"  Inputs:  {', '.join(shown)}"
+                + (f" …and {more} more files" if more > 0 else "")
+                + " (uploaded with the job)\n"
+            )
+        hf_line = ""
+        if record.needs_hf:
+            # Be explicit that a credential leaves the machine with the
+            # job — this is a consent prompt, not a changelog.
+            if os.environ.get("HF_TOKEN"):
+                hf_line = (
+                    "  HF:      pipeline streams a Hugging Face dataset — your "
+                    "local HF_TOKEN is sent with this job (not persisted) and is "
+                    "available to the trusted pipeline Python process\n"
+                )
+            else:
+                hf_line = (
+                    "  HF:      pipeline streams a Hugging Face dataset — no "
+                    "local HF_TOKEN found; private datasets need one (or a "
+                    "stored account token) or the job will fail. Any stored token "
+                    "used is available to the trusted pipeline Python process\n"
+                )
+        return ToolResult(
+            content="PERMISSION_REQUIRED",
+            requires_user_input=True,
+            permission_key=f"cloud_data_gen:{script_path}",
+            question=(
+                f"The agent wants to run this data-gen pipeline in the cloud:\n"
+                f"  Script:  {script_path} (validated locally: "
+                f"{record.succeeded}/{record.num_samples} ok)\n"
+                f"  Samples: {num_samples}"
+                + (f" × {samples_per_item} per item (≈{total_calls} generations)"
+                   if samples_per_item > 1 else "")
+                + f"\n  Output:  datasets/{output_dataset}/ (auto-downloads on completion)\n"
+                + (f"  Rubric:  {validation_instructions} (uploaded with the job)\n"
+                   if validation_instructions else "")
+                + inputs_line
+                + hf_line
+                # Billed by wall-clock at the flat rate — fetched live
+                # from /v1/cloud/pricing so operator overrides of the
+                # rate/margin can't make this prompt lie; the fallback
+                # figures say "at default rates". The timeout is the
+                # hard cost cap for the compute part.
+                + f"  Compute: billed by wall-clock, {rate_note} — an "
+                f"8-hour overnight run bills ≈ ${8 * rate_usd:.0f}; hard cap "
+                f"≈ ${hours * rate_usd:.0f} at the {hours:g}-hour timeout. "
+                "LLM tokens are billed as usual. The backend allows at most "
+                f"{total_calls * 10} LLM requests for this job (10 per requested "
+                "output); the expected count shown above assumes one request per output.\n\n"
+                "Submit the cloud job?"
+            ),
+            options=[
+                "Submit to cloud (this time)",
+                "Submit and don't ask again for this project",
+                "Do not submit",
+            ],
+        )
+
+    from datetime import datetime, timezone
+
+    from lqh.remote.backend import RemoteConfig
+    from lqh.remote.cloud import CloudBackend, CloudError
+
+    # Random suffix: second-resolution timestamps collide under rapid
+    # double-submits, which would share a run dir and clobber its state.
+    run_name = "data_gen_{}_{}_{}".format(
+        output_dataset,
+        datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"),
+        __import__("uuid").uuid4().hex[:6],
+    )
+    run_dir = project_dir / "runs" / run_name
+
+    config: dict[str, Any] = {
+        "kind": "data_gen",
+        "type": "data_gen",
+        "script_path": script_path,
+        "num_samples": num_samples,
+        "samples_per_item": samples_per_item,
+        # Total work is num_samples × samples_per_item — sizing off
+        # num_samples alone would run a 1-item × 100-variant iterate-N×
+        # pipeline at concurrency 1 (and cloud bills wall-clock).
+        "concurrency": min(100, max(1, num_samples * max(1, samples_per_item))),
+        "output_dataset": output_dataset,
+        "validation_instructions": validation_instructions,
+        # Inputs recorded during the validated local run — the bundle
+        # builder resolves each manifest key's value(s) to files/dirs.
+        # Pipelines are self-contained single files (sibling imports are
+        # unsupported and fail locally), so no code beyond script_path
+        # ships.
+        "source_paths": record.source_paths,
+        "manifest": ["script_path", "validation_instructions", "source_paths"],
+        # The backend injects the user's stored HF token into a data_gen
+        # sandbox only when the pipeline actually uses HF. Observed
+        # during the validated local run (lqh.sources.hf_dataset ran) —
+        # not guessed from source text, so wrappers work and unrelated
+        # string matches don't leak the token.
+        "needs_hf": record.needs_hf,
+        # Wall-clock cap; the backend picker clamps to [10, 1440].
+        "timeout_minutes": timeout_minutes,
+    }
+
+    from lqh.telemetry import active_telemetry
+    telemetry = active_telemetry()
+    workflow_id = str(__import__("uuid").uuid4())
+    if purpose not in {"smoke", "inspection", "validation", "training", "unspecified"}:
+        purpose = "unspecified"
+    if telemetry:
+        await telemetry.run_deferred(telemetry.record_generation_attempt)
+        await telemetry.run_deferred(telemetry.event, "data_generation_started", {
+            "workflow_kind": "data_generation", "purpose": purpose,
+            "requested_count": num_samples, "execution_target": "cloud",
+        }, workflow_id)
+
+    cfg = RemoteConfig(
+        name="cloud",
+        type="cloud",
+        hostname="api.lqh.ai",  # informational; CloudBackend hits api_root()
+        remote_root="cloud:lqh",
+        # The validated local run observed lqh.sources.hf_dataset — donate
+        # the local HF_TOKEN (if the env carries one) so a PRIVATE dataset
+        # that worked locally also works in the sandbox. Without this the
+        # sandbox only gets the account-stored token, and a user relying
+        # on an env token validates locally, then fails after paying for
+        # the launch. submit_run reads this flag for the donate path.
+        hf_token_configured=record.needs_hf,
+    )
+    backend = CloudBackend(cfg, project_dir)
+    try:
+        job_id = await backend.submit_run(
+            str(run_dir), config,
+            module="lqh.remote.data_gen",
+            telemetry_workflow_id=workflow_id,
+        )
+    except CloudError as e:
+        if telemetry:
+            await telemetry.run_deferred(telemetry.event, "data_generation_failed", {
+                "workflow_kind": "data_generation", "purpose": purpose,
+                "execution_target": "cloud", "outcome": "failed",
+                "requested_count": num_samples,
+            }, workflow_id)
+        return ToolResult(content=f"Error submitting cloud data-gen job: {e}")
+    except Exception as e:
+        if telemetry:
+            await telemetry.run_deferred(telemetry.event, "data_generation_failed", {
+                "workflow_kind": "data_generation", "purpose": purpose,
+                "execution_target": "cloud", "outcome": "failed",
+                "requested_count": num_samples,
+            }, workflow_id)
+        return ToolResult(
+            content=f"Error submitting cloud data-gen job: {type(e).__name__}: {e}"
+        )
+
+    # Durable finalization marker: the TUI watcher downloads the dataset
+    # and notifies when it sees this file on a terminal job — including
+    # after a TUI restart where the running→terminal transition was
+    # never observed. Also carries the workflow id so the completion
+    # telemetry closes the workflow opened above.
+    marker = {
+        "workflow_id": workflow_id,
+        "output_dataset": output_dataset,
+        "purpose": purpose,
+        "job_id": job_id,
+        # Lets the finalizer refuse to clobber a dataset regenerated
+        # locally AFTER this submit (older job finishing later).
+        "submitted_at": time.time(),
+    }
+    marker_warning = ""
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / ".lqh_data_gen.json").write_text(json.dumps(marker, indent=2) + "\n")
+    except OSError as e:
+        # The job is running and remote_job.json is in place (submit_run
+        # cancels on ITS persistence failures), so the watcher still
+        # tracks it — only the auto-download after a TUI restart is
+        # degraded. Report it rather than failing a live submission.
+        marker_warning = (
+            f"\n⚠️ Could not write the finalization marker ({e}); if the TUI "
+            "restarts before the job completes, download the dataset via "
+            "the artifacts tool."
+        )
+
+    if on_bg_started is not None:
+        on_bg_started(run_name, "data_gen", run_name, "cloud")
+
+    from lqh.project_log import append_event, file_hash_prefix
+
+    append_event(
+        project_dir,
+        "data_gen_submitted",
+        f"Submitted cloud data gen for {output_dataset} (job {job_id})",
+        script_path=script_path,
+        script_hash=file_hash_prefix(project_dir / script_path),
+        output_dataset=output_dataset,
+        num_samples=num_samples,
+        job_id=job_id,
+        run_name=run_name,
+    )
+
+    return ToolResult(
+        content=(
+            f"☁️ Cloud data-gen job started\n"
+            f"  Run:     {run_name}\n"
+            f"  Job ID:  {job_id}\n"
+            f"  Samples: {num_samples}"
+            + (f" × {samples_per_item} per item" if samples_per_item > 1 else "")
+            + f"\n  Output:  datasets/{output_dataset}/ (downloads automatically "
+            "when the job completes)\n\n"
+            "The job runs in the background — never poll. You'll get a system "
+            "notification once the dataset has been downloaded; only then does "
+            f"datasets/{output_dataset}/ exist locally. In auto mode, if your "
+            f"next step needs the dataset, call "
+            f"training_status(run_name='{run_name}') — it parks until the job "
+            "finishes and the dataset is downloaded."
+            + marker_warning
+        ),
+        workflow_launched=True,
     )
 
 
@@ -665,7 +1100,8 @@ async def _execute_pipeline(
     from lqh.engine import run_pipeline
     from lqh.progress import ProgressReporter
 
-    concurrency = min(100, num_samples)
+    # Total work is num_samples × samples_per_item (iterate-N× mode).
+    concurrency = min(100, max(1, num_samples * max(1, samples_per_item)))
     from lqh.telemetry import active_telemetry
     telemetry = active_telemetry()
     workflow_id = str(__import__("uuid").uuid4())
@@ -708,6 +1144,9 @@ async def _execute_pipeline(
         client = create_client(token, config.api_base_url)
 
         target = _validate_path(project_dir, script_path)
+        from lqh.data_gen_validation import pipeline_digest
+
+        pre_run_pipeline_digest = pipeline_digest(target)
         output_dir = project_dir / "datasets" / output_dataset
 
         val_text: str | None = None
@@ -723,6 +1162,26 @@ async def _execute_pipeline(
                 concurrency=concurrency,
             )
 
+        import sys as _sys
+
+        # Evict project-local modules cached by earlier runs in this
+        # session: a cached module makes its import a no-op, so it would
+        # be invisible to the newly-loaded detection below and a
+        # non-self-contained pipeline could validate for cloud execution
+        # (where that dependency won't exist). Eviction is safe — the
+        # next import re-executes the module fresh.
+        project_resolved = project_dir.resolve()
+        for _name, _mod in list(_sys.modules.items()):
+            _mod_file = getattr(_mod, "__file__", None)
+            if not _mod_file:
+                continue
+            try:
+                Path(_mod_file).resolve().relative_to(project_resolved)
+            except (OSError, ValueError):
+                continue
+            del _sys.modules[_name]
+
+        modules_before = set(_sys.modules)
         result = await run_pipeline(
             script_path=target,
             num_samples=num_samples,
@@ -733,6 +1192,29 @@ async def _execute_pipeline(
             validation_instructions=val_text,
             on_progress=on_progress,
         )
+        # Detect project-local imports the static pre-scan can't (e.g.
+        # `import data_gen.helper` via a package path, or any other
+        # module resolved from inside the project). Such a pipeline runs
+        # locally but its dependency will not exist in the cloud bundle,
+        # so it must not validate for cloud execution.
+        project_imports: list[str] = []
+        target_resolved = target.resolve()
+        for name in set(_sys.modules) - modules_before:
+            mod = _sys.modules.get(name)
+            mod_file = getattr(mod, "__file__", None)
+            if not mod_file:
+                continue
+            try:
+                mod_path = Path(mod_file).resolve()
+            except OSError:
+                continue
+            if mod_path == target_resolved:
+                continue  # the pipeline module itself
+            try:
+                mod_path.relative_to(project_resolved)
+            except ValueError:
+                continue
+            project_imports.append(name)
 
         if result.succeeded <= 0:
             if telemetry_started and telemetry and telemetry.cached_consent_active(consent_epoch):
@@ -798,12 +1280,78 @@ async def _execute_pipeline(
             overall_fraction=1.0, result_ready=True, force=True,
         )
 
+        # This dataset is now locally produced: drop the cloud-download
+        # sidecar (if any) so a still-running cloud job targeting the
+        # same name applies its "was this modified locally?" guard
+        # against the fresh file instead of attributing it to an old
+        # download and clobbering it.
+        try:
+            (output_dir / ".lqh_source.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        # A successful local run validates this pipeline version for
+        # cloud submission and records which lqh.sources inputs it read
+        # (the cloud bundle manifest) — UNLESS the run imported
+        # project-local modules (they won't exist in the bundle) or
+        # resumed from a partial file (its source recording covers only
+        # this process, so the manifest would be incomplete).
+        # Best-effort — never fail the run over gate bookkeeping.
+        validation_note = ""
+        if project_imports:
+            validation_note = (
+                "\n⚠️ Not validated for cloud execution: the pipeline imported "
+                f"project-local modules ({', '.join(sorted(project_imports)[:5])}) — "
+                "cloud pipelines must be self-contained single files."
+            )
+        elif result.resumed_samples > 0:
+            validation_note = (
+                "\nℹ️ Not validated for cloud execution: this run resumed "
+                f"{result.resumed_samples} samples from an interrupted run, so its "
+                "input recording is incomplete. Run once uninterrupted to unlock "
+                "execution='cloud'."
+            )
+        elif pipeline_digest(target) != pre_run_pipeline_digest:
+            validation_note = (
+                "\n⚠️ Not validated for cloud execution: the pipeline file changed "
+                "while it was running. Run the current version once unchanged to "
+                "unlock execution='cloud'."
+            )
+        else:
+            try:
+                from lqh.data_gen_validation import record_validation
+
+                record_validation(
+                    project_dir, target,
+                    num_samples=num_samples,
+                    succeeded=result.succeeded,
+                    failed=result.failed,
+                    source_paths=result.source_paths,
+                    needs_hf=result.used_hf,
+                )
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "failed to record data-gen validation", exc_info=True
+                )
+
+        cloud_tip = ""
+        if num_samples >= 500:
+            cloud_tip = (
+                "\n\n💡 Runs this size can go to the cloud instead: "
+                "execution='cloud' submits a background CPU job (fire-and-forget, "
+                "dataset auto-downloads on completion)."
+            )
+
         return ToolResult(
             content=(
                 f"✅ Pipeline completed\n"
                 f"  Samples: {result.succeeded}/{result.total} succeeded"
                 + (f", {result.failed} failed" if result.failed else "")
                 + f"\n  Output:  {result.output_path}"
+                + validation_note
+                + cloud_tip
             ),
         )
     except asyncio.CancelledError:
@@ -3125,17 +3673,19 @@ async def handle_start_training(
     dataset_summary = " + ".join(_summarize(e) for e in dataset_sources)
     eval_summary = " + ".join(Path(e["path"]).parent.as_posix() for e in eval_sources)
 
-    # Cloud bundles are tarred fully in memory and uploaded in one POST —
-    # warn before shipping a very large dataset (image datasets inflate
-    # fast: base64 data-URLs inside the messages column).
+    # Cloud bundles are tarred to disk and uploaded (large ones via a
+    # presigned direct-to-storage PUT) — still warn before shipping a
+    # very large dataset (image datasets inflate fast: base64 data-URLs
+    # inside the messages column) since the upload takes bandwidth and
+    # the server caps staged bundles at 2 GiB.
     size_warning = ""
     try:
         total_bytes = sum(p.stat().st_size for p in (*train_resolved, *eval_resolved) if p.exists())
         if remote and total_bytes > 1 << 30:
             size_warning = (
                 f"\n  ⚠️ Datasets total {total_bytes / (1 << 30):.1f} GB — the cloud "
-                "bundle is built in memory and uploaded in one request, which may "
-                "be slow or hit the upload timeout. Consider fewer/smaller samples"
+                "bundle upload may be slow, and bundles over 2 GB are refused. "
+                "Consider fewer/smaller samples"
                 + (" or smaller images (max_dim)." if is_vision else ".")
             )
     except OSError:
@@ -3389,9 +3939,20 @@ async def handle_training_status(
             return ToolResult(content=f"Error: run '{run_name}' not found")
         meta = _read_remote_meta(run_dir)
         if meta is not None:
-            return await _training_status_remote(
+            result = await _training_status_remote(
                 project_dir, run_name, meta["remote_name"],
             )
+            # Cloud data-gen: the job reaching "completed" is not the
+            # end of the story — the dataset download happens in the
+            # background watcher afterwards (the marker is consumed once
+            # it lands). Without this note, an interactive agent seeing
+            # "completed" could proceed to scoring before the file exists.
+            if (run_dir / ".lqh_data_gen.json").exists():
+                result.content += (
+                    "\n⏳ Dataset download pending — wait for the completion "
+                    "notification before using the dataset locally."
+                )
+            return result
         status = manager.get_status(run_dir)
         return ToolResult(content=_format_status(run_name, status, run_dir))
 
@@ -5096,6 +5657,12 @@ async def execute_tool(
     handler = TOOL_HANDLERS.get(tool_name)
     if handler is None:
         return ToolResult(content=f"Error: unknown tool '{tool_name}'")
+
+    # Underscore-prefixed keys are loop-internal signals (e.g. the
+    # consent flags a permission grant sets). They may only arrive via
+    # extra_kwargs from the agent loop — never from model-controlled
+    # arguments, where they could bypass a permission gate.
+    arguments = {k: v for k, v in arguments.items() if not k.startswith("_")}
 
     # Tools that don't need project_dir
     if tool_name in (

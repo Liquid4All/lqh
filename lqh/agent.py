@@ -947,8 +947,19 @@ class Agent:
             ),
         }
 
-    async def _handle_tool_call(self, tool_name: str, arguments: dict) -> ToolResult:
-        """Handle a single tool call, including user interaction tools."""
+    async def _handle_tool_call(
+        self, tool_name: str, arguments: dict,
+        *, internal_kwargs: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        """Handle a single tool call, including user interaction tools.
+
+        ``internal_kwargs`` carries loop-internal signals (consent flags
+        granted through a permission prompt) to the handler OUT-OF-BAND
+        from the model-controlled ``arguments``. Underscore-prefixed keys
+        in ``arguments`` are stripped below so a model-generated call can
+        never smuggle those signals in and bypass a permission gate.
+        """
+        arguments = {k: v for k, v in arguments.items() if not k.startswith("_")}
         # Auto mode: show_file has no audience. Nudge the agent toward read_file
         # instead of running the handler (which would set show_file_path and
         # trigger the blocking TUI viewer callback at the bottom of this method).
@@ -990,6 +1001,11 @@ class Agent:
         extra: dict[str, Any] = {}
         if tool_name in ("run_data_gen_pipeline", "run_scoring", "run_data_filter"):
             extra = self._pipeline_kwargs()
+        if tool_name == "run_data_gen_pipeline":
+            # Cloud data-gen submits register a background task the moment
+            # the job is accepted (same rationale as start_training below);
+            # unused on the local execution path.
+            extra["on_background_task_started"] = self.callbacks.on_background_task_started
         if tool_name in ("start_training", "start_local_eval", "eval_hf_model"):
             # Lets handlers eagerly register a background task with the TUI
             # the moment a job is submitted, so the status bar updates
@@ -998,7 +1014,18 @@ class Agent:
             # registers here — without it, auto-mode parking would see no
             # running task and fall through to busy-polling that run.
             extra["on_background_task_started"] = self.callbacks.on_background_task_started
-        if tool_name in PROTECTED_SUBMISSION_TOOLS:
+        if internal_kwargs:
+            extra.update(internal_kwargs)
+        # Cloud data-gen submits create external billable state (job row,
+        # sandbox) — shield them like the other submission tools so an
+        # interrupt can't orphan a job the CLI never recorded. Local
+        # pipeline runs stay unshielded (they're long and must be
+        # interruptible immediately).
+        shielded = tool_name in PROTECTED_SUBMISSION_TOOLS or (
+            tool_name == "run_data_gen_pipeline"
+            and str(arguments.get("execution", "local")) == "cloud"
+        )
+        if shielded:
             result = await self._execute_shielded(tool_name, arguments, extra)
         else:
             result = await execute_tool(tool_name, arguments, self.project_dir, **extra)
@@ -1168,15 +1195,22 @@ class Agent:
                 inner.cancel()
                 raise asyncio.CancelledError() from None
 
-    async def _reinvoke_tool(self, tool_name: str, tool_args: dict) -> ToolResult:
+    async def _reinvoke_tool(
+        self, tool_name: str, tool_args: dict,
+        *, internal_kwargs: dict[str, Any] | None = None,
+    ) -> ToolResult:
         """Re-run the original tool after the compute target is persisted.
 
         Goes back through ``_handle_tool_call`` so permission prompts and
         background-task registration behave exactly as on a fresh call.
         The compute picker cannot re-fire here because the choice is now
-        saved (``_compute_pick_options`` returns None).
+        saved (``_compute_pick_options`` returns None). Consent flags for
+        a just-granted permission ride ``internal_kwargs`` — never
+        ``tool_args``, which is model-controlled and sanitized.
         """
-        return await self._handle_tool_call(tool_name, dict(tool_args))
+        return await self._handle_tool_call(
+            tool_name, dict(tool_args), internal_kwargs=internal_kwargs,
+        )
 
     async def _handle_compute_pick_response(
         self, response: str, tool_name: str, tool_args: dict
@@ -1269,6 +1303,23 @@ class Agent:
                 grant_training_permission(self.project_dir, key=permission_key)
             return await self._reinvoke_tool(tool_name, tool_args)
 
+        # Cloud data-gen consent (run_data_gen_pipeline execution="cloud").
+        # Dispatch on the permission_key, not the response text — auto mode
+        # synthesizes a fixed grant string that isn't among these options.
+        if permission_key and permission_key.startswith("cloud_data_gen:"):
+            if "do not" in response.lower():
+                return ToolResult(content="Cloud data-gen submission declined by user.")
+            if self.auto_mode or "don't ask again" in response:
+                from lqh.tools.permissions import grant_cloud_data_gen_permission
+                grant_cloud_data_gen_permission(self.project_dir)
+            # Re-invoke with both consents carried out-of-band so a
+            # "this time" grant works without persisting anything (and the
+            # already-approved script prompt doesn't re-fire).
+            return await self._reinvoke_tool(
+                tool_name, tool_args,
+                internal_kwargs={"_script_consent": True, "_cloud_consent": True},
+            )
+
         # Pipeline execution permission (run_data_gen_pipeline)
         script_path = tool_args.get("script_path", "")
 
@@ -1281,19 +1332,11 @@ class Agent:
         elif "don't ask again for this file" in response:
             grant_permission(self.project_dir, script_path)
 
-        # Execute the pipeline
-        from lqh.tools.handlers import _execute_pipeline
-        return await _execute_pipeline(
-            self.project_dir,
-            script_path,
-            tool_args.get("num_samples", 1),
-            tool_args.get("output_dataset", "output"),
-            tool_args.get("validation_instructions"),
-            on_pipeline_progress=self.callbacks.on_pipeline_progress,
-            on_pipeline_done=self.callbacks.on_pipeline_done,
-            legacy_progress_callback=(
-                self.callbacks.legacy_pipeline_progress_callback
-            ),
+        # Re-invoke the tool with the script consent carried out-of-band —
+        # NOT via a direct _execute_pipeline call, which would drop
+        # samples_per_item/purpose/execution and skip the cloud branch.
+        return await self._reinvoke_tool(
+            tool_name, tool_args, internal_kwargs={"_script_consent": True},
         )
 
     async def _handle_hf_push_permission(

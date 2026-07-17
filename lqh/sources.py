@@ -23,6 +23,9 @@ import base64
 import csv
 import json
 import mimetypes
+import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
@@ -36,6 +39,8 @@ __all__ = [
     "jsonl",
     "hf_dataset",
     "seed_data",
+    "record_source_paths",
+    "hf_dataset_was_used",
 ]
 
 
@@ -129,8 +134,64 @@ class PromptItem:
 
 
 # ---------------------------------------------------------------------------
-# Path validation
+# Path validation + source-path recording
 # ---------------------------------------------------------------------------
+
+# Active recording set for record_source_paths(). ContextVar (not a
+# module global) so concurrent pipeline runs in one process don't see
+# each other's paths; asyncio tasks created inside the context inherit
+# it automatically.
+_RECORDED_PATHS: ContextVar[set[Path] | None] = ContextVar(
+    "_RECORDED_PATHS", default=None
+)
+
+# Parallel flag set when hf_dataset() runs inside record_source_paths():
+# observed (not guessed) HF usage drives whether a cloud data_gen
+# sandbox receives the user's stored HF token. One-element list so the
+# same object is mutated across asyncio tasks sharing the context.
+_RECORDED_HF: ContextVar[list[bool] | None] = ContextVar(
+    "_RECORDED_HF", default=None
+)
+
+
+@contextmanager
+def record_source_paths() -> Iterator[set[Path]]:
+    """Collect every project file lqh.sources helpers actually consumed.
+
+    The engine wraps a whole pipeline run in this so a successful local
+    run yields the exact set of input files the pipeline read — the
+    trusted manifest for shipping those inputs to a cloud data_gen job
+    (CLOUD_OFFLOAD_PLAN.md §2). Recording is per-file, not per-folder:
+    ``image_folder`` records only the images that matched its extension
+    filter and ``seed_data`` records only the chosen seed file, so the
+    bundle never ships unrelated files that merely share a directory.
+    hf_dataset touches no local path and records nothing.
+    """
+    recorded: set[Path] = set()
+    token = _RECORDED_PATHS.set(recorded)
+    hf_token = _RECORDED_HF.set([False])
+    try:
+        yield recorded
+    finally:
+        _RECORDED_PATHS.reset(token)
+        _RECORDED_HF.reset(hf_token)
+
+
+def _record_path(p: Path) -> None:
+    """Add one consumed file to the active record_source_paths() set."""
+    recorded = _RECORDED_PATHS.get()
+    if recorded is not None:
+        recorded.add(p)
+
+
+def hf_dataset_was_used() -> bool:
+    """Whether hf_dataset() ran inside the current record context.
+
+    Must be called while the ``record_source_paths()`` context is still
+    active (the flag resets on exit).
+    """
+    flag = _RECORDED_HF.get()
+    return bool(flag and flag[0])
 
 
 def _resolve_inside_project(path: Path | str) -> Path:
@@ -219,6 +280,10 @@ def image_folder(
         raise FileNotFoundError(
             f"image_folder: no images matching {sorted(ext_set)} found under {root}"
         )
+    # Record only the matched images — not the folder root, which may
+    # hold unrelated files that must never ride a cloud bundle.
+    for it in items:
+        _record_path(it.path)
     return items
 
 
@@ -247,6 +312,7 @@ def prompts(
         raise FileNotFoundError(f"prompts: {p} does not exist")
     if not p.is_file():
         raise IsADirectoryError(f"prompts: {p} is not a file")
+    _record_path(p)
 
     suffix = p.suffix.lower()
     if suffix == ".txt":
@@ -345,6 +411,7 @@ def parquet(
     p = _resolve_inside_project(path)
     if not p.exists():
         raise FileNotFoundError(f"parquet: {p} does not exist")
+    _record_path(p)
     table = pq.read_table(p, columns=list(columns) if columns else None)
     names = table.column_names
     for i in range(len(table)):
@@ -359,6 +426,7 @@ def jsonl(path: Path | str) -> Iterator[dict[str, Any]]:
     p = _resolve_inside_project(path)
     if not p.exists():
         raise FileNotFoundError(f"jsonl: {p} does not exist")
+    _record_path(p)
     with p.open("r", encoding="utf-8") as f:
         for lineno, line in enumerate(f, start=1):
             line = line.strip()
@@ -386,6 +454,7 @@ def hf_dataset(
     split: str = "train",
     streaming: bool = True,
     columns: Sequence[str] | None = None,
+    revision: str | None = None,
 ) -> Iterable[dict[str, Any]]:
     """Load a Hugging Face dataset as an iterable of row dicts.
 
@@ -404,10 +473,26 @@ def hf_dataset(
         with ``num_samples``.  If ``False``, downloads to the HF cache.
     columns:
         If given, only these columns are yielded per row.
+    revision:
+        Optional Hub revision or commit SHA. Pin a commit for reproducible
+        long-running cloud jobs and restart continuations.
     """
+    flag = _RECORDED_HF.get()
+    if flag is not None:
+        flag[0] = True
+
     from datasets import load_dataset  # type: ignore
 
-    ds = load_dataset(repo, split=split, streaming=streaming)
+    ds = load_dataset(
+        repo,
+        split=split,
+        streaming=streaming,
+        revision=revision,
+        # Explicit rather than relying on implicit library discovery: cloud
+        # jobs receive HF_TOKEN as a Modal secret under the trusted-pipeline
+        # contract, including direct streaming of private datasets.
+        token=os.environ.get("HF_TOKEN") or None,
+    )
     col_set = set(columns) if columns else None
     for row in ds:
         if col_set is not None:
@@ -456,6 +541,7 @@ def seed_data(name: str) -> list[Any]:
         raise FileNotFoundError(
             f"seed_data: no {name}.{{jsonl,csv,txt}} in {base}"
         )
+    _record_path(candidate)
 
     suffix = candidate.suffix.lower()
     if suffix == ".txt":

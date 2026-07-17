@@ -247,6 +247,35 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                             "from the requested sample count."
                         ),
                     },
+                    "timeout_minutes": {
+                        "type": "integer",
+                        "default": 720,
+                        "description": (
+                            "Cloud only: wall-clock cap for the job in minutes "
+                            "(clamped to 10–1440). Compute bills by wall-clock, "
+                            "so this is also the compute cost cap (≈$1/hr at "
+                            "default rates). Raise above the 12h default only "
+                            "for runs that genuinely need it."
+                        ),
+                    },
+                    "execution": {
+                        "type": "string",
+                        "enum": ["local", "cloud"],
+                        "default": "local",
+                        "description": (
+                            "Where to run the pipeline. 'local' (default) runs "
+                            "in-process. 'cloud' submits a background CPU job — "
+                            "use it for large final runs (num_samples ≳ 500, "
+                            "overnight scale); the tool returns immediately and "
+                            "the dataset downloads into datasets/<name>/ when "
+                            "the job finishes. Cloud requires a prior successful "
+                            "LOCAL run of this exact pipeline version (run the "
+                            "n≈3 draft and n≈20 inspection batch first; editing "
+                            "the script re-arms this gate). Seed data read via "
+                            "lqh.sources during that local run is uploaded with "
+                            "the job automatically."
+                        ),
+                    },
                 },
                 "required": ["script_path", "num_samples", "output_dataset"],
             },

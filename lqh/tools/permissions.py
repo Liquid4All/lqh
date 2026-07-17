@@ -20,6 +20,10 @@ class PermissionStore:
     # grants arbitrary pipeline/script execution, and vice versa.
     training_allow_all: bool = False
     allowed_training: list[str] = field(default_factory=list)
+    # Cloud data-gen submission (run_data_gen_pipeline execution="cloud").
+    # Separate domain again: local script-exec approval must not imply
+    # spending cloud compute, and vice versa.
+    cloud_data_gen_allow_all: bool = False
 
 
 def load_permissions(project_dir: Path) -> PermissionStore:
@@ -35,6 +39,7 @@ def load_permissions(project_dir: Path) -> PermissionStore:
             hf_allowed_repos=data.get("hf_allowed_repos", []),
             training_allow_all=data.get("training_allow_all", False),
             allowed_training=data.get("allowed_training", []),
+            cloud_data_gen_allow_all=data.get("cloud_data_gen_allow_all", False),
         )
     except (json.JSONDecodeError, OSError):
         return PermissionStore()
@@ -91,6 +96,18 @@ def grant_training_permission(
         perms.training_allow_all = True
     elif key is not None and key not in perms.allowed_training:
         perms.allowed_training.append(key)
+    save_permissions(project_dir, perms)
+
+
+def check_cloud_data_gen_permission(project_dir: Path) -> bool:
+    """Whether cloud data-gen submits may proceed without a prompt."""
+    return load_permissions(project_dir).cloud_data_gen_allow_all
+
+
+def grant_cloud_data_gen_permission(project_dir: Path) -> None:
+    """Project-wide grant — used by "don't ask again" and by auto mode."""
+    perms = load_permissions(project_dir)
+    perms.cloud_data_gen_allow_all = True
     save_permissions(project_dir, perms)
 
 

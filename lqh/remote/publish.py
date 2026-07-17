@@ -34,6 +34,7 @@ from typing import Any, Iterable
 # Self-contained imports: pull only the artifacts module from lqh.
 # Avoid importing lqh.train so the remote venv doesn't need torch
 # in its publish-only path.
+from lqh.progress import emit_sentinel
 from lqh.artifacts import (
     ArtifactError,
     ArtifactHandle,
@@ -182,6 +183,21 @@ def _dir_has_weights(d: Path) -> bool:
     return False
 
 
+def _run_reported_completed(run_dir: Path) -> bool:
+    """Whether the workload wrote status.json with status=completed.
+
+    lqh.remote.data_gen writes it after the pipeline finishes (completed
+    only when at least one sample succeeded). Missing or unreadable
+    status.json means the process died before finishing — never treat
+    that as success.
+    """
+    try:
+        status = json.loads((run_dir / "status.json").read_text())
+    except Exception:
+        return False
+    return status.get("status") == "completed"
+
+
 def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
     """Enumerate publishable outputs in a run dir.
 
@@ -202,10 +218,27 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
         "stderr.log": "logs",
         "config.json": "other",
         "eval_history.json": "metrics",
+        # data_gen sandbox output (lqh.remote.data_gen). Train run dirs
+        # never carry a root-level data.parquet, so no collision.
+        # data.partial.jsonl is deliberately NOT published — it's the
+        # engine's resume scratch and stays on the volume.
+        "data.parquet": "dataset",
     }
     for name, kind in smalls.items():
         p = run_dir / name
         if p.exists() and p.is_file():
+            # A dataset artifact's mere EXISTENCE is treated as proof of
+            # success downstream (the backend's orphan reconciler and the
+            # TUI's restart-recovery both resolve a vanished data_gen job
+            # as completed when one is registered). The engine writes
+            # data.parquet even for a run with zero successful samples —
+            # and an OOM mid-write can leave a truncated file — so
+            # publish it only when the run itself reported success.
+            if kind == "dataset" and not _run_reported_completed(run_dir):
+                logger.info(
+                    "skipping %s: run did not report completed status", name
+                )
+                continue
             out.append(_Candidate(path=p, kind=kind, relpath=name))
 
     # --- logs/ — the cloud launcher tees stdout/stderr into
@@ -421,9 +454,40 @@ async def publish_run(
 
     store = BackendArtifactStore(api_base=api_base, token=token)
     candidates = _resolve_candidates(run_dir)
+    # Load-bearing artifacts first: a later failure (flaky network on a
+    # log upload) must not be able to precede — and thereby doom — the
+    # dataset a multi-hour data_gen run exists to produce.
+    candidates.sort(key=lambda c: 0 if c.kind == "dataset" else 1)
 
     successes: list[ArtifactHandle] = []
     failures: list[tuple[str, str]] = []
+
+    async def _upload_with_retries(path: Path, cand: "_Candidate") -> ArtifactHandle:
+        # Catch-all per attempt: besides ArtifactError/OSError, uploads
+        # can surface raw httpx transport errors, decode errors, etc. —
+        # none of which should discard the rest of an otherwise
+        # successful run. Two retries with a short pause ride out blips.
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                return await store.upload_file(
+                    path,
+                    project_id=project_id,
+                    kind=cand.kind,
+                    job_id=job_id,
+                    lineage=cand.lineage,
+                    checkpoint_role=cand.checkpoint_role,
+                )
+            except Exception as exc:  # noqa: BLE001 — see comment above
+                last = exc
+                if attempt < 2:
+                    logger.warning(
+                        "publish attempt %d for %s failed (%s); retrying",
+                        attempt + 1, cand.relpath, exc,
+                    )
+                    await asyncio.sleep(2.0 * (attempt + 1))
+        assert last is not None
+        raise last
 
     for cand in candidates:
         try:
@@ -433,26 +497,21 @@ async def publish_run(
                 with tempfile.TemporaryDirectory(dir=str(run_dir)) as td:
                     tar_path = Path(td) / f"{cand.path.name}.tar.gz"
                     _tar_directory(cand.path, tar_path)
-                    handle = await store.upload_file(
-                        tar_path,
-                        project_id=project_id,
-                        kind=cand.kind,
-                        job_id=job_id,
-                        lineage=cand.lineage,
-                        checkpoint_role=cand.checkpoint_role,
-                    )
+                    handle = await _upload_with_retries(tar_path, cand)
             else:
-                handle = await store.upload_file(
-                    cand.path,
-                    project_id=project_id,
-                    kind=cand.kind,
-                    job_id=job_id,
-                    lineage=cand.lineage,
-                    checkpoint_role=cand.checkpoint_role,
-                )
+                handle = await _upload_with_retries(cand.path, cand)
             logger.info("published %s -> %s", cand.relpath, handle.id)
             successes.append(handle)
-        except (ArtifactError, OSError) as exc:
+            # In a cloud sandbox (LQH_JOB_ID set) this streams through the
+            # event pipeline into the client's run_dir/artifacts.json, so
+            # the TUI can resolve e.g. the dataset artifact without listing
+            # the whole project. No-op outside sandboxes.
+            emit_sentinel("artifact", {
+                "artifact_id": handle.id,
+                "kind": handle.kind,
+                "relpath": cand.relpath,
+            })
+        except Exception as exc:  # noqa: BLE001 — per-candidate isolation
             logger.warning("publish failed for %s: %s", cand.relpath, exc)
             failures.append((cand.relpath, str(exc)))
 
@@ -523,6 +582,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         f"{len(result.failed)} failed",
         file=sys.stderr,
     )
+    # data_gen jobs (the launcher fails them on publish error): only the
+    # dataset artifact is load-bearing — a failed log/metrics upload must
+    # not flip an otherwise successful generation to failed.
+    if os.environ.get("LQH_KIND") == "data_gen":
+        if any(h.kind == "dataset" for h in result.artifacts):
+            return 0
+        print("publish: no dataset artifact was published", file=sys.stderr)
+        return 1
     # Surface a non-zero exit if anything failed so the launcher's
     # caller can decide whether to mark the run partially successful.
     return 0 if not result.failed else 1

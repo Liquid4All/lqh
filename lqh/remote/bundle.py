@@ -18,11 +18,11 @@ import io
 import json
 import tarfile
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from lqh.sync import resolve_manifest
 
-__all__ = ["build_bundle"]
+__all__ = ["build_bundle", "build_bundle_to_file"]
 
 
 def build_bundle(
@@ -31,17 +31,38 @@ def build_bundle(
 ) -> bytes:
     """Build the in-memory tarball.
 
-    Kept in memory because the bundle is uploaded via httpx multipart
-    in one go; spilling to disk would just add latency without
-    bounding memory (we'd still buffer it for the request). If we
-    grow large datasets that don't fit in RAM, that's a sign to use
-    lqh.sources / HF datasets instead of embedding them in a submit.
+    Right for the common case — training configs plus modest datasets —
+    where the bundle is uploaded via httpx multipart in one go. Bundles
+    that may be large (data_gen bring-your-own image folders) should use
+    :func:`build_bundle_to_file` so the bytes never sit in RAM; the
+    cloud client then ships them via the presigned-PUT staging path.
     """
+    buf = io.BytesIO()
+    _write_bundle(buf, config, project_dir)
+    return buf.getvalue()
+
+
+def build_bundle_to_file(
+    config: dict[str, Any],
+    project_dir: Path,
+    dest: Path,
+) -> int:
+    """Stream the tarball to *dest* on disk; returns its size in bytes.
+
+    Used for potentially-large bundles (image folders and other seed
+    data riding a data_gen submit) so memory stays flat regardless of
+    input size.
+    """
+    with dest.open("wb") as fh:
+        _write_bundle(fh, config, project_dir)
+    return dest.stat().st_size
+
+
+def _write_bundle(fileobj: BinaryIO, config: dict[str, Any], project_dir: Path) -> None:
     paths = resolve_manifest(config, project_dir)
     seen: set[str] = set()
 
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+    with tarfile.open(fileobj=fileobj, mode="w:gz") as tar:
         # 1. config.json at the tar root.
         cfg_bytes = (json.dumps(config, indent=2) + "\n").encode("utf-8")
         info = tarfile.TarInfo(name="config.json")
@@ -80,5 +101,3 @@ def build_bundle(
                         tar.add(f, arcname=str(sub))
             else:
                 tar.add(p_resolved, arcname=arc)
-
-    return buf.getvalue()

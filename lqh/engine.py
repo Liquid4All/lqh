@@ -12,7 +12,7 @@ import importlib.util
 import inspect
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,6 +26,7 @@ from lqh.pipeline import (
     GenerationError,
     Pipeline,
 )
+from lqh.sources import hf_dataset_was_used, record_source_paths
 
 __all__ = [
     "load_pipeline",
@@ -95,6 +96,18 @@ class EngineResult:
     succeeded: int
     failed: int
     output_path: Path
+    # Project files the pipeline read via lqh.sources helpers during
+    # this run. Recorded so a validated local run doubles as the
+    # bundle manifest for a cloud data_gen submit.
+    source_paths: list[Path] = field(default_factory=list)
+    # Whether the run consumed lqh.sources.hf_dataset — observed usage
+    # gates HF-token injection into the cloud sandbox.
+    used_hf: bool = False
+    # Samples carried over from an interrupted run's partial file. A
+    # resumed run's source_paths/used_hf only reflect THIS process, so
+    # callers must not treat it as a complete observation (the cloud
+    # validation gate skips recording when this is non-zero).
+    resumed_samples: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +217,15 @@ def _append_partial(path: Path, index: int, row: dict[str, str | None]) -> None:
 
 
 def _load_partial(
-    path: Path, total: int
+    path: Path, total: int, digest: str | None = None
 ) -> tuple[set[int], list[dict[str, Any] | None], int]:
     """Read partial JSONL, return (done_indices, results, succeeded_count).
 
-    If the meta header's total doesn't match, returns empty state (start fresh).
+    If the meta header's total doesn't match — or the header's pipeline
+    digest differs from *digest* — returns empty state (start fresh).
+    The digest binding matters for the cloud-validation gate: without
+    it, an edited pipeline could "complete" a local run by absorbing an
+    older version's leftover partial samples without executing them.
     Handles truncated last lines and duplicate indices gracefully.
     """
     results: list[dict[str, Any] | None] = [None] * total
@@ -229,6 +246,13 @@ def _load_partial(
                     entry.get("total"), total,
                 )
                 return set(), [None] * total, 0
+            if digest is not None and entry.get("digest") != digest:
+                # Strict: a digest-less legacy header also restarts —
+                # resumed samples must be attributable to THIS version.
+                logger.warning(
+                    "Partial file was written by a different pipeline version, starting fresh",
+                )
+                return set(), [None] * total, 0
             continue
         idx = entry.pop("index", None)
         if idx is not None and 0 <= idx < total:
@@ -247,6 +271,21 @@ def _load_partial(
         }
 
     return done, results, len(done)
+
+
+def _partial_has_samples(path: Path) -> bool:
+    """True if the partial JSONL holds at least one completed sample line."""
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "_meta" not in entry and entry.get("index") is not None:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +331,40 @@ async def run_pipeline(
         Optional callback invoked as ``on_progress(completed, total)`` after
         each sample finishes (success or permanent failure).
     """
+    # Record every lqh.sources path the pipeline touches — across both
+    # source() and generate() (helpers like seed_data are commonly
+    # called per-sample). The recorded set becomes the cloud-submit
+    # bundle manifest via the validation record.
+    with record_source_paths() as recorded_paths:
+        result = await _run_pipeline_inner(
+            script_path,
+            num_samples,
+            output_dir,
+            client,
+            max_retries=max_retries,
+            concurrency=concurrency,
+            samples_per_item=samples_per_item,
+            validation_instructions=validation_instructions,
+            on_progress=on_progress,
+        )
+        # Read before the context exits — the flag resets with it.
+        result.used_hf = hf_dataset_was_used()
+    result.source_paths = sorted(recorded_paths)
+    return result
+
+
+async def _run_pipeline_inner(
+    script_path: Path,
+    num_samples: int,
+    output_dir: Path,
+    client: AsyncOpenAI,
+    *,
+    max_retries: int,
+    concurrency: int,
+    samples_per_item: int,
+    validation_instructions: str | None,
+    on_progress: Callable[[int, int], Any] | None,
+) -> EngineResult:
     pipeline_cls = load_pipeline(script_path)
 
     # Determine the work items: list of (input_item | None) to process.
@@ -325,19 +398,46 @@ async def run_pipeline(
 
     # Incremental saves: write each completed sample to a JSONL file so
     # progress survives process kills.  On restart, already-done samples
-    # are skipped automatically.
+    # are skipped automatically — but only when the partial was written
+    # by the SAME pipeline version (digest binding): stale samples from
+    # an edited pipeline must not count toward this run (they'd also
+    # satisfy the cloud-validation gate without being executed).
+    # NOTE: resume is index-based — it assumes source() yields the same
+    # items in the same order on every run (the skill mandates
+    # deterministic sources). A nondeterministic iterator would resume
+    # against different records.
+    from lqh.data_gen_validation import pipeline_digest
+
+    digest = pipeline_digest(script_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     partial_path = output_dir / "data.partial.jsonl"
     done_indices: set[int] = set()
 
     if partial_path.exists():
-        done_indices, results, succeeded = _load_partial(partial_path, total)
+        done_indices, results, succeeded = _load_partial(partial_path, total, digest)
         completed = len(done_indices)
         if done_indices:
             logger.info("Resuming: %d/%d samples already completed", len(done_indices), total)
+        else:
+            # Invalidated (or empty) partial — rewrite the header so the
+            # digest/total on disk match this run. If the old file holds
+            # samples we're discarding (pre-digest legacy header, edited
+            # pipeline, or changed total), preserve them under a stale
+            # name rather than destroying paid-for work; they stay
+            # excluded from this run and from the validation gate.
+            if _partial_has_samples(partial_path):
+                stale_path = output_dir / "data.partial.stale.jsonl"
+                partial_path.replace(stale_path)
+                logger.warning(
+                    "Existing partial doesn't match this pipeline version; "
+                    "its samples were preserved at %s (not counted toward this run)",
+                    stale_path,
+                )
+            with open(partial_path, "w") as f:
+                f.write(json.dumps({"_meta": True, "total": total, "digest": digest}) + "\n")
     else:
         with open(partial_path, "w") as f:
-            f.write(json.dumps({"_meta": True, "total": total}) + "\n")
+            f.write(json.dumps({"_meta": True, "total": total, "digest": digest}) + "\n")
 
     # Set when a deterministic code bug is detected — signals all tasks to abort.
     abort_error: Exception | None = None
@@ -423,36 +523,36 @@ async def run_pipeline(
     if abort_error is not None:
         raise abort_error
 
-    # Build parquet table from successful results.
-    rows: list[dict[str, str | None]] = []
-    for r in results:
-        if r is not None:
-            rows.append({
-                "messages": json.dumps(r["messages"], ensure_ascii=False),
-                "audio": json.dumps(r["audio"], ensure_ascii=False) if r["audio"] is not None else None,
-                "tools": json.dumps(r["tools"], ensure_ascii=False) if r.get("tools") is not None else None,
-            })
+    # Build parquet columns directly from results, releasing each parsed
+    # conversation as it's serialized. The previous rows-of-dicts
+    # intermediate held a second full copy of every sample during
+    # finalization — for VLM datasets (base64 images inside messages)
+    # that doubled peak memory exactly at the step where a constrained
+    # sandbox OOMs.
+    messages_col: list[str] = []
+    audio_col: list[str | None] = []
+    tools_col: list[str | None] = []
+    for i, r in enumerate(results):
+        if r is None:
+            continue
+        messages_col.append(json.dumps(r["messages"], ensure_ascii=False))
+        audio_col.append(
+            json.dumps(r["audio"], ensure_ascii=False) if r["audio"] is not None else None
+        )
+        tools_col.append(
+            json.dumps(r["tools"], ensure_ascii=False) if r.get("tools") is not None else None
+        )
+        results[i] = None  # free the parsed dict promptly
 
     schema = pa.schema([
         pa.field("messages", pa.string()),
         pa.field("audio", pa.string()),
         pa.field("tools", pa.string()),
     ])
-
-    if rows:
-        table = pa.table(
-            {
-                "messages": [row["messages"] for row in rows],
-                "audio": [row["audio"] for row in rows],
-                "tools": [row["tools"] for row in rows],
-            },
-            schema=schema,
-        )
-    else:
-        table = pa.table(
-            {"messages": [], "audio": [], "tools": []},
-            schema=schema,
-        )
+    table = pa.table(
+        {"messages": messages_col, "audio": audio_col, "tools": tools_col},
+        schema=schema,
+    )
 
     output_path = output_dir / "data.parquet"
     pq.write_table(table, output_path)
@@ -463,6 +563,7 @@ async def run_pipeline(
         succeeded=succeeded,
         failed=failed,
         output_path=output_path,
+        resumed_samples=len(done_indices),
     )
 
 

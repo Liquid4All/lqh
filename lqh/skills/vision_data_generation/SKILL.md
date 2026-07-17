@@ -19,6 +19,13 @@ have not already. All of its rules apply unchanged: the pipeline interface
 default-on filter gate before training. This file covers only what is
 *different* for vision.
 
+Cloud execution (`execution="cloud"`, see the data_generation skill) works
+for vision pipelines too: the image folder read via `lqh.sources.image_folder`
+during the validated local run is uploaded with the job (large folders go via
+a direct-to-storage upload; the hard ceiling is 2 GB — downscale first if the
+raw folder exceeds it). VLM generation is exactly the kind of long, heavy run
+that belongs in the cloud.
+
 ## How vision requests work
 
 Images ride inside normal chat messages as OpenAI multi-part content:

@@ -36,7 +36,7 @@ import httpx
 from lqh.auth import api_root, get_token, require_token
 from lqh.project_meta import gather_project_meta
 from lqh.remote.backend import JobStatus, RemoteBackend, RemoteConfig
-from lqh.remote.bundle import build_bundle
+from lqh.remote.bundle import build_bundle_to_file
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +56,30 @@ _IDLE_RETURN_TIMEOUT_S = 5.0
 # the persisted last_seq.
 _MAX_SYNC_DURATION_S = 60.0
 
-# Map cloud event status → JobStatus.state values used by the watcher.
+# Bundles above this ride the presigned-PUT staging path instead of the
+# multipart submit form. The server tolerates larger forms (512 MiB
+# default, for older CLIs), but direct-to-storage is strictly better
+# for anything sizable: streamed from disk, no double buffering, and a
+# signature-bound Content-Length. Typical training bundles stay far
+# below; data_gen bring-your-own image folders are the case above.
+_MULTIPART_BUNDLE_MAX = 32 * 2**20
+
+# Backoff between submit retries after a transport failure (the retry is
+# safe because every submit carries an idempotency key). Module-level so
+# tests can zero it.
+_SUBMIT_RETRY_BACKOFF_SECONDS = 2.0
+
+# Map cloud event status → state values mirrored into status.json /
+# progress.jsonl. "cancelled" folds to "failed" here on purpose: the
+# run-watcher self-stop logic and ssh_direct terminal detection match on
+# failed/interrupted. The SNAPSHOT path (poll_status → TUI job watcher)
+# passes "cancelled" through instead, so user-initiated cancels are
+# reported as cancelled rather than failed.
 _STATUS_MAP = {
     "running": "running",
     "completed": "completed",
     "failed": "failed",
-    "cancelled": "failed",  # watcher treats cancelled like failed terminal
+    "cancelled": "failed",
 }
 
 
@@ -166,6 +184,7 @@ class CloudBackend(RemoteBackend):
         config: dict[str, Any],
         *,
         module: str = "lqh.train",
+        telemetry_workflow_id: str | None = None,
     ) -> str:
         """Build the bundle, POST to /v1/cloud/jobs, persist state, return
         the job_id.
@@ -173,6 +192,11 @@ class CloudBackend(RemoteBackend):
         The job_id (a UUID) plays the role of "PID" in the
         RemoteBackend contract — it's the handle for poll_status,
         teardown, and remote_job.json reconnection.
+
+        ``telemetry_workflow_id`` lets a caller that already opened a
+        client-side workflow (e.g. the data-gen handler's
+        ``data_generation_started``) correlate the cloud_jobs row with
+        it instead of this method minting an unrelated ID.
         """
         run_dir = Path(local_run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -191,7 +215,10 @@ class CloudBackend(RemoteBackend):
             )
             if telemetry else None
         )
-        telemetry_workflow_id = str(uuid.uuid4()) if telemetry_project_id else None
+        if telemetry_project_id and telemetry_workflow_id is None:
+            telemetry_workflow_id = str(uuid.uuid4())
+        elif not telemetry_project_id:
+            telemetry_workflow_id = None
         if telemetry and telemetry_workflow_id:
             if kind == "eval_hf":
                 await telemetry.run_deferred(telemetry.event, "zero_shot_evaluation_started", {
@@ -231,14 +258,39 @@ class CloudBackend(RemoteBackend):
 
         # Bundle construction and submission can fail before a cloud job
         # exists. Always close the client-side workflow in those paths.
+        bundle_tmp = run_dir / ".bundle.tar.gz.tmp"
+        # Idempotency: the key is persisted to disk BEFORE the POST so a
+        # lost response (timeout/disconnect after the backend launched
+        # the sandbox) never leaves a billable job with no local marker —
+        # resubmitting with the same key returns the existing job instead
+        # of launching a duplicate. The intent file is removed once
+        # remote_job.json is safely on disk; if it survives, it names the
+        # key of a submit whose fate is unknown.
+        idempotency_key = str(uuid.uuid4())
+        intent_path = run_dir / "submit_intent.json"
         try:
-            bundle = build_bundle(config, self.project_dir)
+            # Build to disk so bring-your-own seed data (image folders on
+            # data_gen submits) never sits fully in RAM.
+            bundle_size = build_bundle_to_file(config, self.project_dir, bundle_tmp)
             meta = {
                 "kind": kind,
                 "project_id": self.project_dir.name,
                 "module": module,
                 "config": config,
+                "idempotency_key": idempotency_key,
             }
+            intent_path.write_text(
+                json.dumps(
+                    {
+                        "idempotency_key": idempotency_key,
+                        "kind": kind,
+                        "module": module,
+                        "name": self.config.name,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
             if telemetry_project_id and telemetry_workflow_id:
                 meta["telemetry_project_id"] = telemetry_project_id
                 meta["telemetry_workflow_id"] = telemetry_workflow_id
@@ -255,54 +307,178 @@ class CloudBackend(RemoteBackend):
                 if hf:
                     meta["hf_token"] = hf
 
-            files = [
-                ("meta", (None, json.dumps(meta), "application/json")),
-                ("bundle", ("bundle.tar.gz", bundle, "application/gzip")),
-            ]
-            async with httpx.AsyncClient(base_url=self._api_base, timeout=120.0) as client:
-                resp = await client.post(
-                    "/v1/cloud/jobs",
-                    files=files,
-                    headers=self._auth_headers(),
+            files = [("meta", (None, json.dumps(meta), "application/json"))]
+            if bundle_size > _MULTIPART_BUNDLE_MAX:
+                # Too big for the multipart submit path — stage via
+                # presigned PUT and reference the key. The upload-url
+                # endpoint enforces the server's size ceiling (default
+                # 2 GiB) AND the kind-level submit gates, so a gated
+                # data_gen submit fails before the upload, not after.
+                meta["bundle_key"] = await self._stage_bundle(bundle_tmp, bundle_size, kind)
+                files = [("meta", (None, json.dumps(meta), "application/json"))]
+            else:
+                files.append(
+                    ("bundle", ("bundle.tar.gz", bundle_tmp.read_bytes(), "application/gzip"))
                 )
+            async with httpx.AsyncClient(base_url=self._api_base, timeout=120.0) as client:
+                # Transport failures (timeout, dropped connection) are the
+                # response-lost case: the backend may have already created
+                # the job. The idempotency key makes the retry safe — the
+                # server returns the existing job instead of a duplicate.
+                # HTTP error *responses* are not retried; the server
+                # answered and _raise_for_cloud_error reports it.
+                for attempt in range(3):
+                    try:
+                        resp = await client.post(
+                            "/v1/cloud/jobs",
+                            files=files,
+                            headers=self._auth_headers(),
+                        )
+                        break
+                    except httpx.TransportError as exc:
+                        if attempt == 2:
+                            raise
+                        logger.warning(
+                            "cloud submit attempt %d failed (%s); retrying with "
+                            "the same idempotency key",
+                            attempt + 1, exc,
+                        )
+                        await asyncio.sleep(_SUBMIT_RETRY_BACKOFF_SECONDS * (attempt + 1))
                 _raise_for_cloud_error(resp)
                 data = resp.json()
                 job_id = data["job_id"]
         except asyncio.CancelledError:
+            # Fate unknown (cancelled mid-POST?) — keep submit_intent.json.
             await emit_submit_terminal("cancelled")
             raise
-        except Exception:
+        except httpx.TransportError:
+            # Response lost even after retries — the job may be running
+            # server-side with no local marker. Keep submit_intent.json:
+            # it names the idempotency key, and the job (if any) shows up
+            # in the backend job list.
+            logger.error(
+                "cloud submit response lost; if the job launched it is visible "
+                "in the job list (idempotency key recorded in %s)", intent_path,
+            )
             await emit_submit_terminal("failed")
             raise
+        except Exception:
+            # The server answered with an error (or we failed before the
+            # POST) — no orphaned job, so drop the intent marker.
+            intent_path.unlink(missing_ok=True)
+            await emit_submit_terminal("failed")
+            raise
+        finally:
+            bundle_tmp.unlink(missing_ok=True)
 
         # Persist enough to reconnect after a client restart. We write
         # both remote_job.json (for parity with SSHDirect) and
-        # cloud_state.json (for the SSE seq cursor).
-        (run_dir / "remote_job.json").write_text(
-            json.dumps(
-                {
-                    "job_id": job_id,
-                    "remote_name": self.config.name,
-                    "remote_run_dir": f"cloud:{job_id}",
-                    "module": module,
-                    "kind": kind,
-                    "backend": "cloud",
-                },
-                indent=2,
+        # cloud_state.json (for the SSE seq cursor). If any of these
+        # writes fail (disk full, permissions), we'd otherwise report a
+        # failed submission while a billable job runs with no local
+        # watcher state — so cancel the job server-side before
+        # re-raising.
+        try:
+            (run_dir / "remote_job.json").write_text(
+                json.dumps(
+                    {
+                        "job_id": job_id,
+                        "remote_name": self.config.name,
+                        "remote_run_dir": f"cloud:{job_id}",
+                        "module": module,
+                        "kind": kind,
+                        "backend": "cloud",
+                    },
+                    indent=2,
+                )
+                + "\n"
             )
-            + "\n"
-        )
-        _CloudState(job_id=job_id, status=data.get("status", "pending")).save(
-            run_dir / "cloud_state.json"
-        )
+            _CloudState(job_id=job_id, status=data.get("status", "pending")).save(
+                run_dir / "cloud_state.json"
+            )
 
-        # Also stash the config locally so anything that reads the run
-        # dir (eg. the watcher's eval-scoring loop) sees what was
-        # submitted.
-        (run_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+            # Also stash the config locally so anything that reads the run
+            # dir (eg. the watcher's eval-scoring loop) sees what was
+            # submitted.
+            (run_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        except Exception:
+            logger.error(
+                "cloud job %s accepted but local state could not be written — cancelling",
+                job_id,
+            )
+            try:
+                await self.teardown(job_id)
+                intent_path.unlink(missing_ok=True)
+            except Exception as terr:
+                # Cancel failed too — keep submit_intent.json as the marker
+                # for the still-running job.
+                logger.warning("cancel after failed local persist also failed: %s", terr)
+            await emit_submit_terminal("failed")
+            raise
 
+        intent_path.unlink(missing_ok=True)
         logger.info("cloud job submitted: %s (kind=%s)", job_id, kind)
         return job_id
+
+    async def _stage_bundle(self, bundle_path: Path, size: int, kind: str) -> str:
+        """Upload a large bundle via presigned PUT; return its R2 key.
+
+        POST /v1/cloud/bundles/upload-url mints the target (and rejects
+        sizes over the server ceiling with a message that tells the
+        user to shrink the inputs or switch to lqh.sources.hf_dataset);
+        the PUT streams the tarball straight to R2 so neither we nor
+        the backend buffer it. Declaring the kind lets the server apply
+        kind-level submit gates here, before the upload spends time.
+        """
+        async with httpx.AsyncClient(base_url=self._api_base, timeout=60.0) as client:
+            resp = await client.post(
+                "/v1/cloud/bundles/upload-url",
+                json={
+                    "project_id": self.project_dir.name,
+                    "size_bytes": size,
+                    "kind": kind,
+                },
+                headers=self._auth_headers(),
+            )
+            _raise_for_cloud_error(resp)
+            data = resp.json()
+        bundle_key = data["bundle_key"]
+        upload_url = data["upload_url"]
+
+        async def _chunks() -> AsyncIterator[bytes]:
+            with bundle_path.open("rb") as fh:
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        return
+                    yield chunk
+
+        # Timeout scales with size: assume a 1 MiB/s floor plus slack so
+        # a maximum-size bundle on a slow uplink isn't killed mid-PUT
+        # (2 GiB needs ~35 min at that floor; a flat 10 min would demand
+        # ~27 Mbit/s).
+        put_timeout = max(600.0, size / (1 << 20) + 120.0)
+        # Explicit Content-Length: S3-style presigned PUTs reject
+        # chunked transfer encoding, which httpx would otherwise use
+        # for an iterable body. The URL's signature also binds this
+        # exact length server-side.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(put_timeout, connect=30.0)) as client:
+            resp = await client.put(
+                upload_url,
+                content=_chunks(),
+                headers={
+                    "Content-Type": "application/gzip",
+                    "Content-Length": str(size),
+                },
+            )
+            if resp.status_code < 200 or resp.status_code >= 300:
+                raise CloudError(
+                    f"bundle upload failed ({resp.status_code}): {resp.text[:200]}"
+                )
+        logger.info(
+            "bundle staged via presigned PUT: %s (%.1f MiB)", bundle_key, size / 2**20
+        )
+        return bundle_key
 
     # ------------------------------------------------------------------
     # Status
@@ -325,10 +501,12 @@ class CloudBackend(RemoteBackend):
         except Exception as exc:  # network blip → unknown is the safe fallback
             logger.warning("poll_status snapshot failed: %s", exc)
             return JobStatus(state="unknown")
-        return JobStatus(
-            state=_STATUS_MAP.get(snap.get("status", ""), snap.get("status", "unknown")),
-            error=snap.get("error"),
-        )
+        raw = snap.get("status", "")
+        # Unlike the progress-file mirror (see _STATUS_MAP), the snapshot
+        # feeds the TUI job watcher, which distinguishes cancelled from
+        # failed for its terminal notifications.
+        state = "cancelled" if raw == "cancelled" else _STATUS_MAP.get(raw, raw or "unknown")
+        return JobStatus(state=state, error=snap.get("error"))
 
     async def is_job_alive(self, job_id: str) -> bool:
         """The cloud equivalent of "is the PID still around." True iff
@@ -679,6 +857,10 @@ def _infer_kind(config: dict[str, Any], module: str) -> str:
     # doesn't get swallowed by the generic .infer test below.
     if module.endswith(".eval_hf") or cfg_type == "eval_hf":
         return "eval_hf"
+    # Cloud data generation (lqh.remote.data_gen) — before .infer so a
+    # hypothetical *.data_gen_infer style module can't shadow it.
+    if module.endswith(".data_gen") or cfg_type == "data_gen":
+        return "data_gen"
     if module.endswith(".infer") or cfg_type == "infer":
         return "infer"
     # Sweep dispatch: prefer the DPO sweep module/base_config type

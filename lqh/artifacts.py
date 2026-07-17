@@ -18,6 +18,7 @@ on the Python side.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 from dataclasses import dataclass
@@ -163,6 +164,7 @@ class ArtifactStore(Protocol):
         project_id: str,
         *,
         kind: ArtifactKind | None = None,
+        job_id: str | None = None,
         limit: int = 100,
     ) -> list[ArtifactHandle]: ...
 
@@ -342,18 +344,34 @@ class BackendArtifactStore:
                 raise ArtifactError(
                     f"R2 upload failed ({put.status_code}): {put.text[:200]}"
                 )
-            return await self._register(
-                client,
-                project_id=project_id,
-                kind=kind,
-                r2_key=r2_key,
-                size_bytes=size,
-                job_id=job_id,
-                sha256=sha256,
-                hf_repo=hf_repo,
-                lineage=lineage,
-                checkpoint_role=checkpoint_role,
-            )
+            # Register with its own retry, reusing the SAME r2_key: the
+            # bytes are already in R2, so a register-phase blip (or a
+            # lost response) must not force the caller to redo the PUT —
+            # a whole-operation retry would reserve a fresh key and
+            # duplicate the object. The backend's register endpoint is
+            # idempotent on r2_key (a lost-response retry returns the
+            # original row), so re-sending is always safe.
+            last: Exception | None = None
+            for attempt in range(3):
+                try:
+                    return await self._register(
+                        client,
+                        project_id=project_id,
+                        kind=kind,
+                        r2_key=r2_key,
+                        size_bytes=size,
+                        job_id=job_id,
+                        sha256=sha256,
+                        hf_repo=hf_repo,
+                        lineage=lineage,
+                        checkpoint_role=checkpoint_role,
+                    )
+                except Exception as exc:  # noqa: BLE001 — transport blips included
+                    last = exc
+                    if attempt < 2:
+                        await asyncio.sleep(2.0 * (attempt + 1))
+            assert last is not None
+            raise last
 
     async def signed_url(self, handle: ArtifactHandle | str) -> str:
         artifact_id = handle.id if isinstance(handle, ArtifactHandle) else handle
@@ -392,11 +410,20 @@ class BackendArtifactStore:
         project_id: str,
         *,
         kind: ArtifactKind | None = None,
+        job_id: str | None = None,
         limit: int = 100,
     ) -> list[ArtifactHandle]:
+        """List artifacts, newest first.
+
+        Pass ``job_id`` when resolving a specific job's output — a bare
+        newest-``limit`` scan silently misses the target once the
+        project has more than ``limit`` newer artifacts of that kind.
+        """
         params: dict[str, str] = {"limit": str(limit)}
         if kind:
             params["kind"] = kind
+        if job_id:
+            params["job_id"] = job_id
         async with httpx.AsyncClient(base_url=self._base, timeout=self._timeout) as client:
             r = await client.get(
                 f"/v1/projects/{project_id}/artifacts",

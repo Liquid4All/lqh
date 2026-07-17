@@ -36,6 +36,21 @@ from lqh.telemetry import set_active_telemetry
 # ---------------------------------------------------------------------
 
 
+def _extract_submit_meta(request: httpx.Request) -> dict | None:
+    """Pull the JSON `meta` field out of the multipart submit body."""
+    body = request.content
+    marker = b'name="meta"'
+    i = body.find(marker)
+    if i < 0:
+        return None
+    start = body.index(b"\r\n\r\n", i) + 4
+    end = body.index(b"\r\n--", start)
+    try:
+        return json.loads(body[start:end].decode())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
 class _FakeCloudBackend:
     """Minimal stand-in for api.lqh.ai cloud routes. Stores submitted
     jobs and an event log indexed by seq, replays from a given seq on
@@ -45,6 +60,7 @@ class _FakeCloudBackend:
         self.jobs: dict[str, dict] = {}
         self.events: dict[str, list[dict]] = {}  # job_id -> list of SSE events
         self.cancelled: set[str] = set()
+        self.idempotency: dict[str, str] = {}  # idempotency_key -> job_id
         self._next_id = 1
 
     def add_events(self, job_id: str, events: list[dict]) -> None:
@@ -65,6 +81,14 @@ class _FakeCloudBackend:
         method = request.method
 
         if path == "/v1/cloud/jobs" and method == "POST":
+            # Mirror the real backend's idempotency: a key that already
+            # resolved to a job returns that job with 200.
+            key = (_extract_submit_meta(request) or {}).get("idempotency_key")
+            if key and key in self.idempotency:
+                jid = self.idempotency[key]
+                return httpx.Response(
+                    200, json={"job_id": jid, "status": self.jobs[jid]["status"]}
+                )
             jid = f"job-{self._next_id:04d}"
             self._next_id += 1
             self.jobs[jid] = {
@@ -74,6 +98,8 @@ class _FakeCloudBackend:
                 "kind": "infer",
                 "submitted_at": "2026-05-21T12:00:00Z",
             }
+            if key:
+                self.idempotency[key] = jid
             return httpx.Response(201, json={"job_id": jid, "status": "pending"})
 
         if path.startswith("/v1/cloud/jobs/") and path.endswith("/stream") and method == "GET":
@@ -185,7 +211,7 @@ def test_submit_failure_closes_client_workflow(tmp_path, monkeypatch):
 
     recorder = Recorder()
     set_active_telemetry(recorder)  # type: ignore[arg-type]
-    monkeypatch.setattr("lqh.remote.cloud.build_bundle", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad bundle")))
+    monkeypatch.setattr("lqh.remote.cloud.build_bundle_to_file", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad bundle")))
     try:
         with pytest.raises(ValueError, match="bad bundle"):
             asyncio.run(backend.submit_run(str(project / "run"), {"type": "sft"}, module="lqh.train"))
@@ -193,6 +219,82 @@ def test_submit_failure_closes_client_workflow(tmp_path, monkeypatch):
         set_active_telemetry(None)
     assert [event[0] for event in recorder.events] == ["fine_tuning_started", "fine_tuning_failed"]
     assert recorder.events[-1][1]["outcome"] == "failed"
+
+
+def test_submit_retry_after_lost_response_reuses_job(tmp_path, monkeypatch):
+    """A response lost AFTER the backend created the job must not spawn a
+    billable duplicate: the retry carries the same idempotency key and the
+    server answers with the original job."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    be = _FakeCloudBackend()
+    failed_once = {"done": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        resp = be.handler(request)
+        if (request.url.path == "/v1/cloud/jobs" and request.method == "POST"
+                and not failed_once["done"]):
+            failed_once["done"] = True
+            # The job exists server-side; the response never arrives.
+            raise httpx.ReadTimeout("response lost", request=request)
+        return resp
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def _patched(*args, **kwargs):
+        kwargs.setdefault("transport", transport)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("lqh.remote.cloud.httpx.AsyncClient", _patched)
+    monkeypatch.setattr("lqh.remote.cloud._SUBMIT_RETRY_BACKOFF_SECONDS", 0.0)
+
+    run_dir = project / ".lqh" / "runs" / "run_001"
+    backend = _make_backend(project)
+    job_id = asyncio.run(backend.submit_run(
+        str(run_dir), {"manifest": [], "type": "infer"}, module="lqh.infer",
+    ))
+
+    # Exactly one job server-side, and the client adopted it.
+    assert len(be.jobs) == 1
+    assert job_id in be.jobs
+    meta = json.loads((run_dir / "remote_job.json").read_text())
+    assert meta["job_id"] == job_id
+    # Intent marker is cleaned up once local state is safely persisted.
+    assert not (run_dir / "submit_intent.json").exists()
+
+
+def test_submit_lost_response_keeps_intent_marker(tmp_path, monkeypatch):
+    """When every attempt's response is lost, submit_intent.json must
+    survive — it records the idempotency key of a job whose fate is
+    unknown, written to disk before the first POST."""
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/cloud/jobs" and request.method == "POST":
+            raise httpx.ConnectError("network down", request=request)
+        return httpx.Response(404, json={"error": {"message": "not mocked"}})
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def _patched(*args, **kwargs):
+        kwargs.setdefault("transport", transport)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("lqh.remote.cloud.httpx.AsyncClient", _patched)
+    monkeypatch.setattr("lqh.remote.cloud._SUBMIT_RETRY_BACKOFF_SECONDS", 0.0)
+
+    run_dir = project / ".lqh" / "runs" / "run_001"
+    backend = _make_backend(project)
+    with pytest.raises(httpx.ConnectError):
+        asyncio.run(backend.submit_run(
+            str(run_dir), {"manifest": [], "type": "infer"}, module="lqh.infer",
+        ))
+
+    intent = json.loads((run_dir / "submit_intent.json").read_text())
+    assert intent["idempotency_key"]
 
 
 def test_sync_progress_writes_progress_and_status(tmp_path, fake_cloud):
