@@ -1229,3 +1229,12 @@ When the user chooses to train, generate a **training dataset** (separate from t
 - **Add quality gates**: Check output length, required keywords, format compliance. Reject and retry bad samples early.
 - **Think about edge cases**: The spec's edge cases section tells you what tricky inputs to generate. Make sure some fraction of your data covers these.
 - **Match the spec's examples**: Your pipeline output should look like the examples in SPEC.md. If it does not, adjust your prompts.
+
+## Maintain NOTES.md
+
+Before finishing a work phase here (and whenever you make a significant decision
+or launch a long-running job), update the project-root `NOTES.md`: what was
+decided and why, which approach is active, what is blocked, and the explicit
+next steps. A future session resumes from that file — write for a reader with
+none of this conversation's context. NOTES.md is advisory prose; job status and
+artifacts are always verified with tools, never from notes.

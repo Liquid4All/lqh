@@ -205,3 +205,12 @@ Use exactly these names with `set_auto_stage`:
 
 The TUI uses these to render progress; deviating from the list still
 works but breaks the visual ordering.
+
+## Maintain NOTES.md
+
+Before finishing a work phase here (and whenever you make a significant decision
+or launch a long-running job), update the project-root `NOTES.md`: what was
+decided and why, which approach is active, what is blocked, and the explicit
+next steps. A future session resumes from that file — write for a reader with
+none of this conversation's context. NOTES.md is advisory prose; job status and
+artifacts are always verified with tools, never from notes.

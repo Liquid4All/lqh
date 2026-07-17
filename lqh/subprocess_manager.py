@@ -90,6 +90,17 @@ class SubprocessManager:
         # but we write it here too for immediate availability.
         (run_dir / "pid").write_text(str(proc.pid))
 
+        # Durable "running" baseline for the startup signals: without it,
+        # exiting the CLI before the next watcher scan would make a job
+        # that finishes while closed indistinguishable from an ancient
+        # terminal run (lqh/signals.py). Best-effort.
+        try:
+            from lqh.signals import record_seen_states
+
+            record_seen_states(cwd, {run_dir.name: "running"})
+        except Exception:
+            pass
+
         return proc.pid
 
     # ------------------------------------------------------------------

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
@@ -23,6 +25,8 @@ from lqh.tools.permissions import (
 )
 from lqh.session import Session
 from lqh.skills import load_skill_content
+
+logger = logging.getLogger("lqh.agent")
 
 # Maximum tokens to allow in a single orchestration response. The default is
 # set generously so large artifacts (long SPEC.md, detailed tool definitions,
@@ -242,6 +246,18 @@ file (opens an interactive dataset viewer) followed by ask_user to get feedback.
 These can be called together in one response. If no user is attached to the \
 session (headless runs), skip show_file and inspect files with read_file instead.
 
+### NOTES.md
+Your prose handoff file at the project root, next to SPEC.md. Maintain it with \
+create_file/edit_file so a future session (yours or another agent's) can pick up \
+where this one left off: the current objective, decisions made and why, the \
+approach currently selected (and rejected alternatives), open blockers, and \
+explicit next steps. Update it at meaningful boundaries — when a decision is \
+made, an approach is selected or abandoned, a long-running job is launched, or a \
+work phase completes. Keep it concise prose, not a log. NOTES.md is advisory \
+only: never trust it for job status or artifact existence — verify those with \
+tools (summary, training_status, list_files) before acting on them. When \
+present, it is injected into your context at session start.
+
 ### prompts/
 System prompts for model inference, managed separately from the data:
 - prompts/{task}_v0.md - baseline prompt derived from spec (for "zero-shot" eval)
@@ -423,6 +439,25 @@ class Agent:
         # turn after SYSTEM_PROMPT.
         self.auto_mode = auto_mode
         self.sticky_system_messages: list[str] = []
+        # Ephemeral project context (SPEC.md, NOTES.md, summary, activity
+        # log, signals). Rebuilt from disk by prepare_context() on every
+        # open — never persisted into the conversation, never summarized
+        # by compaction. _build_messages() injects it between the sticky
+        # messages and the conversation history.
+        self.context_messages: list[dict] = []
+        # Cloud snapshot facts supplied by the TUI at startup (see
+        # set_startup_facts); consumed by prepare_context for the signal
+        # block. Default: nothing fetched, nothing to warn about.
+        self._startup_snapshot: dict | None = None
+        self._startup_snapshot_fresh: bool = True
+        self._startup_jobs_refreshed: bool = True
+        # One-shot finished-while-away signals, computed ONCE per CLI open
+        # (they consume the job_seen.json baseline). None = never provided
+        # → prepare_context computes and records them itself (headless
+        # use). The TUI computes them in _refresh_startup_state and passes
+        # the same list to every agent it creates, so /clear and /resume
+        # retain them instead of finding the baseline already consumed.
+        self._startup_diff_signals: list | None = None
         self._auto_exit: tuple[str, str] | None = None
         if auto_mode:
             try:
@@ -434,6 +469,32 @@ class Agent:
                 "Additional user-provided context (always in scope, never drop):\n\n"
                 + extra_spec
             )
+
+    def set_startup_facts(
+        self,
+        *,
+        snapshot: dict | None,
+        snapshot_fresh: bool,
+        jobs_refreshed: bool = True,
+        diff_signals: list | None = None,
+    ) -> None:
+        """Provide the startup facts gathered by the TUI.
+
+        ``snapshot`` is the sanitized wrapper from ``lqh.snapshot`` (or
+        None); ``snapshot_fresh`` is False when it came from the offline
+        cache (or is missing). ``jobs_refreshed`` is False when the
+        startup remote-state scan failed — signals then warn that run
+        states may be stale. ``diff_signals`` are the one-shot
+        finished-while-away signals computed once per CLI open; passing
+        them (even as an empty list) stops prepare_context from
+        recomputing the already-consumed diff.
+        """
+        self._startup_snapshot = snapshot
+        self._startup_snapshot_fresh = snapshot_fresh
+        self._startup_jobs_refreshed = jobs_refreshed
+        self._startup_diff_signals = (
+            list(diff_signals) if diff_signals is not None else None
+        )
 
     def _get_client(self):
         if self._client is None:
@@ -453,25 +514,103 @@ class Agent:
         # compaction because they're reinjected here on every API call.
         for sticky in self.sticky_system_messages:
             messages.append({"role": "system", "content": sticky})
+        # Ephemeral project context: rebuilt each open, sits outside the
+        # conversation so it never duplicates on resume and never gets
+        # summarized away by compaction.
+        messages.extend(self.context_messages)
         if DISCARD_THINKING:
             messages.extend(_strip_thinking(msg) for msg in self.session.messages)
         else:
             messages.extend(self.session.messages)
         return messages
 
-    async def _compact_context(self) -> None:
-        """Summarize and compact the conversation to free context space.
+    # Compaction summarizer input is byte-capped so a single pass cannot
+    # itself overflow the context window. A pass covers only what it
+    # summarized; anything beyond the cap stays uncovered for the next
+    # pass (chunked, incremental compaction).
+    _COMPACTION_INPUT_MAX_BYTES = 400_000
+    _COMPACTION_KEEP_TAIL = 4
 
-        Keeps system messages (SYSTEM_PROMPT injected at call time, plus
-        skill/spec injections in session) and the last few turns.  Replaces
-        everything else with a summary generated by the orchestration model.
+    @staticmethod
+    def _tool_safe_boundary(
+        entries: list[tuple[int, dict]], start_idx: int, end_idx: int
+    ) -> int | None:
+        """Largest index ≤ ``end_idx`` that is a valid coverage boundary.
+
+        A boundary is invalid when it would separate an assistant message
+        carrying ``tool_calls`` from its tool results: either the boundary
+        message itself has tool calls (results land uncovered), or the
+        next message is a tool result (its call is covered). Walk the
+        boundary backwards until valid; None when no valid boundary
+        exists at or after ``start_idx`` (the group spans the whole
+        window — skip this pass rather than emit API-invalid history).
+        """
+        while end_idx >= start_idx:
+            msg = entries[end_idx][1]
+            nxt = entries[end_idx + 1][1] if end_idx + 1 < len(entries) else None
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                end_idx -= 1
+                continue
+            if nxt is not None and nxt.get("role") == "tool":
+                end_idx -= 1
+                continue
+            return end_idx
+        return None
+
+    async def _compact_context(self) -> None:
+        """Summarize the conversation into a derived checkpoint.
+
+        Non-destructive: the raw message log is never modified. On success
+        a coverage-aware checkpoint is appended and the working view
+        becomes ``carried system messages + summary + tail``
+        (``Session.set_compacted_view``). Re-summarization is incremental —
+        the input is the previous checkpoint's summary plus every log
+        message it did not cover. Any failure leaves log, checkpoints, and
+        view untouched.
         """
         if len(self.session.messages) < 10:
             return  # too few messages to compact
 
         try:
-            client = self._get_client()
-            # Ask the model to summarize the conversation so far
+            keep_tail = self._COMPACTION_KEEP_TAIL
+            entries = self.session.log_entries()
+            if len(entries) <= keep_tail:
+                return
+            previous = self.session.latest_checkpoint()
+            prev_covered = int(previous.get("covers_to_seq", 0)) if previous else 0
+
+            # Candidate coverage: everything not yet covered, minus the tail.
+            max_cover_idx = len(entries) - keep_tail - 1
+            start_idx = next(
+                (i for i, (seq, _) in enumerate(entries) if seq > prev_covered),
+                None,
+            )
+            if start_idx is None or start_idx > max_cover_idx:
+                return
+
+            # Byte-cap the pass from the FRONT (oldest first). Coverage only
+            # ever extends over messages that actually enter this summary —
+            # anything beyond the cap stays *uncovered* (still in the view)
+            # and is picked up by the next compaction pass. Never claim
+            # coverage of messages no summary has seen.
+            end_idx = start_idx
+            total = 0
+            for i in range(start_idx, max_cover_idx + 1):
+                size = len(json.dumps(entries[i][1]))
+                if i > start_idx and total + size > self._COMPACTION_INPUT_MAX_BYTES:
+                    break
+                total += size
+                end_idx = i
+
+            # Never split a tool-call group across the coverage boundary:
+            # the uncovered side must not start with orphaned tool results,
+            # and the covered side must not end with unanswered tool calls.
+            end_idx = self._tool_safe_boundary(entries, start_idx, end_idx)
+            if end_idx is None:
+                return
+            covers_to_seq = entries[end_idx][0]
+            window = entries[start_idx:end_idx + 1]
+
             summary_msgs: list[dict[str, Any]] = [
                 {
                     "role": "system",
@@ -483,10 +622,18 @@ class Agent:
                     ),
                 },
             ]
-            # Include last ~20 messages for context (or all if fewer)
-            context_msgs = self.session.messages[-20:]
-            summary_msgs.extend(context_msgs)
+            if previous and previous.get("summary"):
+                summary_msgs.append({
+                    "role": "system",
+                    "content": (
+                        f"An earlier summary covering the conversation up to "
+                        f"message {prev_covered} follows — fold it into the "
+                        f"new summary:\n\n{previous['summary']}"
+                    ),
+                })
+            summary_msgs.extend(msg for _, msg in window)
 
+            client = self._get_client()
             response = await chat_with_retry(
                 client, model=self.orchestration_model, messages=summary_msgs,
                 max_tokens=ORCHESTRATION_MAX_TOKENS,
@@ -496,19 +643,11 @@ class Agent:
             if not summary_text:
                 return
 
-            # Keep system messages + summary + last 4 turns
-            system_msgs = [m for m in self.session.messages if m.get("role") == "system"]
-            recent = self.session.messages[-4:]
-
-            self.session.messages = system_msgs + [
-                {
-                    "role": "system",
-                    "content": (
-                        f"[Context compacted] Summary of prior conversation:\n\n"
-                        f"{summary_text}"
-                    ),
-                },
-            ] + recent
+            self.session.set_compacted_view(
+                summary_text,
+                covers_to_seq=covers_to_seq,
+                model=self.orchestration_model,
+            )
 
             # Reset token counters (next API call will get fresh counts)
             self._total_prompt_tokens = 0
@@ -523,7 +662,12 @@ class Agent:
                     "🗜️ Context compacted to free up space."
                 )
         except Exception:
-            pass  # compaction is best-effort; don't break the agent loop
+            # Best-effort: never break the agent loop, but make the failure
+            # observable. The raw transcript is intact either way.
+            logger.warning(
+                "context compaction failed; raw transcript intact",
+                exc_info=True,
+            )
 
     async def process_user_input(self, user_input: str) -> None:
         """Process a user message and run the agent loop."""
@@ -568,7 +712,9 @@ class Agent:
                 }
                 for tc in messages[i].get("tool_calls") or []:
                     if tc.get("id") not in answered:
-                        messages.append({
+                        # Durable append: a resumed session must see the
+                        # repair, or the API rejects the stored history.
+                        self.session.add_message({
                             "role": "tool",
                             "tool_call_id": tc.get("id"),
                             "content": (
@@ -1381,56 +1527,142 @@ class Agent:
             api,
         )
 
+    # NOTES.md is injected up to this many bytes; the agent can read_file
+    # the rest if it was truncated.
+    _NOTES_INJECT_MAX_BYTES = 20_000
+
+    def _project_has_artifacts(self) -> bool:
+        """Whether the project has work products worth summarizing."""
+        for name in ("datasets", "runs", "data_gen", "evals", "prompts"):
+            directory = self.project_dir / name
+            if directory.is_dir() and any(directory.iterdir()):
+                return True
+        return False
+
     async def prepare_context(self) -> str:
-        """Pre-populate the agent context without making any LLM calls.
+        """Rebuild the ephemeral project context without any LLM calls.
+
+        Populates ``self.context_messages`` (replacing any previous
+        content) from the current on-disk state: SPEC.md, NOTES.md, the
+        project summary, and the activity log. Nothing is persisted into
+        the conversation — this runs on every open (startup, /clear,
+        /resume) and always reflects the present filesystem state.
 
         Returns a mode string indicating what was loaded:
         - "new_project" if no SPEC.md exists (spec_capture skill loaded)
         - "existing_project" if SPEC.md exists (spec + summary injected)
         """
+        context: list[dict] = []
+
+        def inject(content: str) -> None:
+            context.append({"role": "system", "content": content})
+
         spec_path = self.project_dir / "SPEC.md"
 
         if not spec_path.exists():
             # Load spec capture skill into context
             try:
-                content = load_skill_content("spec_capture")
-                self.session.add_message({"role": "system", "content": content})
+                inject(load_skill_content("spec_capture"))
             except FileNotFoundError:
                 pass
             mode = "new_project"
         else:
-            # Inject SPEC.md content into context
             spec_content = spec_path.read_text(encoding="utf-8")
-            self.session.add_message({
-                "role": "system",
-                "content": (
-                    f"The user's main specification (SPEC.md):\n\n{spec_content}"
-                ),
-            })
-
-            # Run summary tool directly (no LLM) and inject result
-            from lqh.tools.handlers import handle_summary
-            summary_result = await handle_summary(self.project_dir)
-            self.session.add_message({
-                "role": "system",
-                "content": (
-                    f"Current project state:\n\n{summary_result.content}"
-                ),
-            })
-
+            inject(f"The user's main specification (SPEC.md):\n\n{spec_content}")
             mode = "existing_project"
+
+        # NOTES.md and the project summary are injected whenever they carry
+        # information — a missing SPEC.md (never written, or deleted) must
+        # not hide notes or existing artifacts from the agent.
+        notes_path = self.project_dir / "NOTES.md"
+        if notes_path.exists():
+            try:
+                notes = notes_path.read_text(encoding="utf-8")
+            except OSError:
+                notes = ""
+            if notes.strip():
+                if len(notes) > self._NOTES_INJECT_MAX_BYTES:
+                    notes = (
+                        notes[: self._NOTES_INJECT_MAX_BYTES]
+                        + "\n\n[truncated — read NOTES.md for the rest]"
+                    )
+                inject(
+                    "Agent notes (NOTES.md — advisory prose handoff; "
+                    "verify job/artifact claims with tools before "
+                    f"relying on them):\n\n{notes}"
+                )
+
+        if mode == "existing_project" or self._project_has_artifacts():
+            # Run summary tool directly (no LLM) and inject result. A
+            # malformed artifact must degrade the summary, never abort
+            # startup/context preparation.
+            try:
+                from lqh.tools.handlers import handle_summary
+                summary_result = await handle_summary(self.project_dir)
+                inject(f"Current project state:\n\n{summary_result.content}")
+            except Exception:
+                logger.warning("project summary failed", exc_info=True)
+                inject(
+                    "Current project state: summary unavailable (an artifact "
+                    "on disk could not be read — run the summary tool or "
+                    "inspect files directly)."
+                )
 
         # Inject project activity log (last 50 events)
         from lqh.project_log import format_log_for_context, read_recent
 
         entries = read_recent(self.project_dir, n=50)
         if entries:
-            self.session.add_message({
+            inject(
+                f"Project activity log (most recent events):\n\n"
+                f"{format_log_for_context(entries)}"
+            )
+
+        # Attention signals: the things the agent wouldn't know to look
+        # for (jobs finished while closed, orphan submits, spec drift,
+        # stale cloud cache). The finished-while-away diff is one-shot
+        # per CLI open: the TUI computes it once (recording the new
+        # baseline) and passes it via set_startup_facts so /clear and
+        # /resume re-inject the same signals; only headless agents
+        # compute and record it here themselves.
+        try:
+            from lqh.signals import (
+                collect_signals,
+                finished_while_away_signals,
+                format_signal_block,
+                observe_run_states,
+                record_seen_states,
+            )
+
+            run_states = observe_run_states(self.project_dir)
+            if self._startup_diff_signals is None:
+                diff = finished_while_away_signals(self.project_dir, run_states)
+                record_seen_states(self.project_dir, run_states)
+            else:
+                diff = self._startup_diff_signals
+            stateless = collect_signals(
+                self.project_dir,
+                snapshot=self._startup_snapshot,
+                snapshot_fresh=self._startup_snapshot_fresh,
+                run_states=run_states,
+                jobs_refreshed=self._startup_jobs_refreshed,
+            )
+            block = format_signal_block(diff + stateless)
+            if block:
+                inject(block)
+        except Exception:
+            logger.warning("signal collection failed", exc_info=True)
+
+        if context:
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            context.insert(0, {
                 "role": "system",
                 "content": (
-                    f"Project activity log (most recent events):\n\n"
-                    f"{format_log_for_context(entries)}"
+                    f"Project context as of {stamp} — reflects the current "
+                    "filesystem/cloud state, which may postdate the "
+                    "conversation that follows."
                 ),
             })
 
+        self.context_messages = context
         return mode

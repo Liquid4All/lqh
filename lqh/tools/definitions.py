@@ -28,10 +28,12 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         _tool(
             name="summary",
             description=(
-                "Give a summary of the current project. Lists all specs, data generation "
-                "scripts, evals, datasets, and training runs with timestamps and sizes. "
-                "Also lists recent conversations with their first message. Use this at the "
-                "start of a session to understand the project state."
+                "Give a summary of the current project. Lists all specs, NOTES.md, data "
+                "generation scripts, datasets (row counts, scores, provenance), prompts, "
+                "evals, and training runs with semantic status (running/completed/failed, "
+                "local or remote). Includes cached cloud state (jobs, spend, deployments) "
+                "and recent conversations. Sections that truncate say what was omitted. "
+                "Use this at the start of a session to understand the project state."
             ),
         ),
         # ------------------------------------------------------------------

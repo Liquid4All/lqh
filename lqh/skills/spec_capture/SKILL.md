@@ -402,3 +402,12 @@ The recommended next step is always data generation (`/datagen`), because the hu
 - Use the examples section to ground the spec. Abstract requirements are often misinterpreted; concrete examples are unambiguous.
 - The SPEC.md will be used by the data generation skill to create training data. Write it so that an AI agent reading it can understand exactly what to generate.
 - Keep the language clear and direct. Avoid jargon unless the user introduced it.
+
+## Maintain NOTES.md
+
+After SPEC.md is written, create the project-root `NOTES.md` with the current
+objective and the agreed next step (usually: build the data generation
+pipeline). Keep it short prose. Future sessions read it at startup to pick up
+where this one left off; update it whenever a decision is made or a phase
+completes. It is advisory only — job status and artifacts are verified with
+tools, never from notes.

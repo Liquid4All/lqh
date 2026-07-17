@@ -194,6 +194,13 @@ def test_submit_writes_state_and_run_metadata(tmp_path, fake_cloud):
     assert state.job_id == job_id
     assert state.last_seq == 0
 
+    # Durable "running" baseline for the startup signals: exiting the CLI
+    # right after submitting must still let the next open detect a
+    # finished-while-closed transition (lqh/signals.py).
+    from lqh.signals import load_seen_states
+
+    assert load_seen_states(project) == {"run_001": "running"}
+
 
 def test_submit_failure_closes_client_workflow(tmp_path, monkeypatch):
     project = tmp_path / "proj"; project.mkdir()

@@ -994,14 +994,20 @@ class LqhApp:
             return True
 
         if command == "/clear":
-            self._save_session()
+            from lqh.project_log import set_log_session
+
+            if self._session is not None:
+                self._session.mark_state("completed")
             self._session = Session.create(self.project_dir)
+            set_log_session(self._session.id)
             self._status_bar.session_id = self._session.id
             self._status_bar.prompt_tokens = 0
             self._status_bar.completion_tokens = 0
             self._status_bar.active_skill = ""
             self._agent = self._create_agent()
             await self._emit(render_system_message("Started new session."))
+            # A fresh conversation still needs the current project context.
+            await self._prepare_agent_context()
             return True
 
         if command == "/resume":
@@ -1308,7 +1314,8 @@ class LqhApp:
             await self._emit(render_system_message("Feedback cancelled (nothing entered)."))
             return
 
-        context = list(self._session.messages) if self._session else []
+        # Full raw transcript, not the (possibly compacted) working view.
+        context = self._session.read_log() if self._session else []
         session_id = self._session.id if self._session else None
 
         # Lock input and show an in-flight indicator so the user knows the
@@ -1357,6 +1364,171 @@ class LqhApp:
                 self._status_bar.hf_cloud_configured = None
         self._invalidate()
 
+    async def _refresh_startup_state(self) -> None:
+        """One-shot startup refresh, BEFORE any context/signals are built.
+
+        1. Sync remote job state to disk (cloud_state.json / progress files
+           are only as fresh as the last sync — without this, a job that
+           finished while LQH was closed would be signaled as still
+           running, or not at all).
+        2. Fetch and cache the cloud snapshot (offline → cached copy,
+           marked not fresh; logged out without a cache → not fresh so the
+           unavailability is signaled).
+
+        The results land on the app (picked up by every subsequently
+        created agent) and on the current agent. The finished-while-away
+        diff is computed exactly once here — it consumes the
+        job_seen.json baseline, so /clear and /resume must reuse this
+        list rather than recompute an already-consumed diff.
+        """
+        self._jobs_refreshed = True
+        try:
+            from lqh.subprocess_manager import SubprocessManager
+
+            await asyncio.wait_for(
+                self._scan_jobs(SubprocessManager()), timeout=20.0
+            )
+        except Exception:
+            # Stale run-state files will be read below; the signals must
+            # say so instead of presenting them as trustworthy.
+            self._jobs_refreshed = False
+
+        try:
+            from lqh.signals import (
+                finished_while_away_signals,
+                observe_run_states,
+                record_seen_states,
+            )
+
+            run_states = observe_run_states(self.project_dir)
+            self._startup_diff_signals = finished_while_away_signals(
+                self.project_dir, run_states
+            )
+            if self._jobs_refreshed:
+                # Only advance the baseline when the states are real; a
+                # failed refresh must not consume terminal transitions it
+                # never actually observed.
+                record_seen_states(self.project_dir, run_states)
+        except Exception:
+            self._startup_diff_signals = []
+
+        from lqh.snapshot import fetch_and_cache_snapshot, read_cached_snapshot
+
+        self._cloud_snapshot = None
+        self._cloud_snapshot_fresh = True
+        try:
+            if get_token():
+                self._cloud_snapshot, self._cloud_snapshot_fresh = (
+                    await fetch_and_cache_snapshot(self.project_dir)
+                )
+            else:
+                self._cloud_snapshot = read_cached_snapshot(self.project_dir)
+                self._cloud_snapshot_fresh = False
+        except Exception:
+            self._cloud_snapshot_fresh = False
+        if self._agent:
+            self._apply_startup_facts(self._agent)
+
+    def _apply_startup_facts(self, agent: Agent) -> None:
+        agent.set_startup_facts(
+            snapshot=getattr(self, "_cloud_snapshot", None),
+            snapshot_fresh=getattr(self, "_cloud_snapshot_fresh", True),
+            jobs_refreshed=getattr(self, "_jobs_refreshed", True),
+            diff_signals=getattr(self, "_startup_diff_signals", None),
+        )
+
+    async def _prepare_agent_context(self) -> None:
+        """Run the agent's ephemeral context preparation and announce it.
+
+        Called at startup and after /clear and /resume so every conversation
+        (re)start sees the current SPEC.md, NOTES.md, summary, and log.
+        """
+        if not self._agent:
+            return
+        mode = await self._agent.prepare_context()
+        await self._announce_context_mode(mode)
+
+    async def _announce_context_mode(self, mode: str) -> None:
+        if mode == "new_project":
+            self._status_bar.active_skill = "spec_capture"
+            self._invalidate()
+            await self._emit(
+                render_agent_message(
+                    "👋 **Welcome to Liquid Harness!**\n\n"
+                    "I don't see a `SPEC.md` in this directory yet, so let's start "
+                    "by figuring out what problem you want to solve.\n\n"
+                    "**What kind of model do you want to build?** Describe the task — "
+                    "for example: *\"I need a model that summarizes academic papers into "
+                    "bullet points for students\"* or *\"I want a model that classifies "
+                    "customer support tickets by urgency.\"*\n\n"
+                    "The more context you give me, the better I can help. I'll ask "
+                    "follow-up questions to nail down the details before we create "
+                    "your specification."
+                )
+            )
+        else:
+            await self._emit(
+                render_system_message("📂 Loaded SPEC.md and project summary into context. Ready to go.")
+            )
+
+    async def _render_session_history(self, limit: int = 200) -> None:
+        """Re-render the resumed conversation from the raw transcript."""
+        if self._session is None:
+            return
+        for message in self._session.read_log(limit=limit):
+            role = message.get("role")
+            content = message.get("content", "")
+            if role == "user" and isinstance(content, str) and not content.startswith("[System:"):
+                await self._emit(render_user_message(content))
+            elif role == "assistant" and content:
+                await self._emit(render_agent_message(str(content)))
+
+    def _adopt_session(self, session: Session) -> None:
+        """Point the TUI and a fresh agent at ``session``."""
+        from lqh.project_log import set_log_session
+
+        self._session = session
+        set_log_session(session.id)
+        self._status_bar.session_id = session.id
+        self._status_bar.prompt_tokens = session.prompt_tokens
+        self._status_bar.completion_tokens = session.completion_tokens
+        self._agent = self._create_agent()
+        self._invalidate()
+
+    async def _offer_interrupted_resume(self) -> None:
+        """Offer to pick up the newest interrupted session at startup.
+
+        Sessions left ``active`` by a dead process were just repaired to
+        ``interrupted`` (``Session.repair_states`` in ``run()``). Only the
+        newest one is offered, resume preselected; anything older stays
+        reachable through /resume.
+        """
+        try:
+            sessions = Session.list_sessions(self.project_dir)
+        except Exception:
+            return
+        if not sessions or sessions[0].get("state") != "interrupted":
+            return
+        newest = sessions[0]
+        preview = (newest.get("preview") or "(no preview)")[:60]
+        choice = await self._wait_for_user_response(options=[
+            f"Resume interrupted session: {preview} ({newest.get('updated_at', '?')})",
+            "Start a new session",
+        ])
+        if not choice.startswith("Resume"):
+            return
+        try:
+            session = Session.load(self.project_dir, newest["id"])
+        except Exception:
+            await self._emit(render_error(
+                "Could not load the interrupted session — starting fresh."
+            ))
+            return
+        session.mark_state("active")
+        self._adopt_session(session)
+        await self._emit(render_system_message(f"Resumed session {newest['id'][:8]}"))
+        await self._render_session_history()
+
     async def _do_resume(self) -> None:
         """Handle the /resume command."""
         sessions = Session.list_sessions(self.project_dir)
@@ -1365,37 +1537,34 @@ class LqhApp:
             return
 
         options = []
-        for session_info in sessions[:10]:
+        for i, session_info in enumerate(sessions[:10]):
             preview = session_info.get("preview", "(empty)")[:60]
             timestamp = session_info.get("created_at", "?")
-            options.append(f"{timestamp} - {preview}")
+            options.append(f"{i + 1}. {timestamp} - {preview}")
 
         await self._emit(render_system_message("Select a session to resume:"))
         selected = await self._wait_for_user_response(options=options)
 
-        index = 0
-        for i, option in enumerate(options):
-            if option == selected or selected in option:
-                index = i
-                break
+        try:
+            index = options.index(selected)
+        except ValueError:
+            await self._emit(render_system_message(
+                "Selection did not match a session — nothing resumed."
+            ))
+            return
 
         session_info = sessions[index]
-        self._save_session()
-        self._session = Session.load(self.project_dir, session_info["id"])
-        self._status_bar.session_id = self._session.id
-        self._status_bar.prompt_tokens = self._session.prompt_tokens
-        self._status_bar.completion_tokens = self._session.completion_tokens
-        self._agent = self._create_agent()
-        self._invalidate()
+        if self._session is not None:
+            self._session.mark_state("completed")
+        loaded = Session.load(self.project_dir, session_info["id"])
+        loaded.mark_state("active")
+        self._adopt_session(loaded)
 
         await self._emit(render_system_message(f"Resumed session {session_info['id'][:8]}"))
-        for message in self._session.messages:
-            role = message.get("role")
-            content = message.get("content", "")
-            if role == "user" and isinstance(content, str) and not content.startswith("[System:"):
-                await self._emit(render_user_message(content))
-            elif role == "assistant" and content:
-                await self._emit(render_agent_message(str(content)))
+        await self._render_session_history()
+        # Stored messages are restored verbatim; the current project state
+        # arrives as the agent's ephemeral context prefix.
+        await self._prepare_agent_context()
 
     def _create_agent(self) -> Agent:
         """Create an agent with TUI callbacks."""
@@ -1420,13 +1589,15 @@ class LqhApp:
             on_await_background=self._await_background,
             on_auto_stage=self._on_auto_stage,
         )
-        return Agent(
+        agent = Agent(
             self.project_dir,
             self._session,
             callbacks,
             auto_mode=self.auto_mode,
             extra_spec=self.extra_spec,
         )
+        self._apply_startup_facts(agent)
+        return agent
 
     def _on_auto_stage(self, stage: str, note: str | None) -> None:
         """Auto-mode: agent reported a stage transition."""
@@ -2363,6 +2534,22 @@ class LqhApp:
                 except Exception:
                     pass
 
+            # Persist observed states so the next startup can report
+            # "finished while LQH was closed" (see lqh/signals.py).
+            try:
+                from lqh.signals import record_seen_states
+
+                record_seen_states(
+                    self.project_dir,
+                    {
+                        run: st
+                        for run, st, _, _ in snapshots
+                        if st != "unknown"
+                    },
+                )
+            except Exception:
+                pass
+
     def _run_type(self, run_name: str) -> str:
         """The run's config ``type`` ("sft", "data_gen", ...), "" if unknown."""
         import json
@@ -2943,7 +3130,15 @@ class LqhApp:
     async def run(self) -> None:
         """Run the persistent bottom application."""
         self._shutdown_requested = False
+        # Sessions left "active" by a dead process become "interrupted" so
+        # startup can offer to resume them.
+        try:
+            Session.repair_states(self.project_dir)
+        except Exception:
+            pass
         self._session = Session.create(self.project_dir)
+        from lqh.project_log import set_log_session
+        set_log_session(self._session.id)
         # Telemetry sessions are intentionally independent from conversation
         # sessions (/clear creates another conversation, not another CLI open).
         set_active_telemetry(self._telemetry)
@@ -2989,44 +3184,35 @@ class LqhApp:
                     "Continuing without login. Run /login when you're ready."
                 ))
 
+        await self._refresh_startup_state()
+
         # Auto mode: skip the interactive welcome / resume flow and run the
         # pipeline non-interactively. The agent's auto skill (sticky system
         # message) drives the pipeline; we only inject SPEC.md as the kickoff
         # user message and exit when exit_auto_mode is called.
         if self.auto_mode:
             try:
+                # Auto mode gets the same ephemeral project context
+                # (NOTES.md, summary, signals) — just without the
+                # interactive announcements or resume offer.
+                if self._agent:
+                    try:
+                        await self._agent.prepare_context()
+                    except Exception:
+                        pass
                 await self._run_auto_mode()
             finally:
                 await self._stop_update_check()
                 self._exit_application()
                 await self._wait_for_app_task(app_task)
                 self._save_session()
+                if self._session is not None:
+                    self._session.mark_state("completed")
                 await self._finish_telemetry()
             return
 
-        if self._agent:
-            mode = await self._agent.prepare_context()
-            if mode == "new_project":
-                self._status_bar.active_skill = "spec_capture"
-                self._invalidate()
-                await self._emit(
-                    render_agent_message(
-                        "👋 **Welcome to Liquid Harness!**\n\n"
-                        "I don't see a `SPEC.md` in this directory yet, so let's start "
-                        "by figuring out what problem you want to solve.\n\n"
-                        "**What kind of model do you want to build?** Describe the task — "
-                        "for example: *\"I need a model that summarizes academic papers into "
-                        "bullet points for students\"* or *\"I want a model that classifies "
-                        "customer support tickets by urgency.\"*\n\n"
-                        "The more context you give me, the better I can help. I'll ask "
-                        "follow-up questions to nail down the details before we create "
-                        "your specification."
-                    )
-                )
-            else:
-                await self._emit(
-                    render_system_message("📂 Loaded SPEC.md and project summary into context. Ready to go.")
-                )
+        await self._offer_interrupted_resume()
+        await self._prepare_agent_context()
 
         self._job_watcher_task = asyncio.create_task(self._watch_jobs())
 
@@ -3083,6 +3269,8 @@ class LqhApp:
             self._exit_application()
             await self._wait_for_app_task(app_task)
             self._save_session()
+            if self._session is not None:
+                self._session.mark_state("completed")
             await self._finish_telemetry()
 
     async def _telemetry_heartbeat(self) -> None:

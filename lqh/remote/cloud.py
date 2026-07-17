@@ -401,6 +401,15 @@ class CloudBackend(RemoteBackend):
             # dir (eg. the watcher's eval-scoring loop) sees what was
             # submitted.
             (run_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+
+            # Durable "running" baseline so the startup signals can report
+            # this job if it finishes while the CLI is closed. Best-effort.
+            try:
+                from lqh.signals import record_seen_states
+
+                record_seen_states(self.project_dir, {run_dir.name: "running"})
+            except Exception:
+                pass
         except Exception:
             logger.error(
                 "cloud job %s accepted but local state could not be written — cancelling",

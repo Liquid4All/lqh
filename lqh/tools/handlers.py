@@ -284,6 +284,388 @@ def _fmt_size(size: int) -> str:
         return f"{size / (1024 * 1024):.1f} MB"
 
 
+def _summarize_datasets(project_dir: Path) -> list[str]:
+    datasets_dir = project_dir / "datasets"
+    if not datasets_dir.is_dir():
+        return []
+    datasets = sorted(
+        [d for d in datasets_dir.iterdir() if d.is_dir()],
+        key=lambda d: d.stat().st_mtime,
+        reverse=True,
+    )
+    lines = [f"- **datasets/**: {len(datasets)} dataset(s)"]
+    for d in datasets[:15]:
+        parquet_files = [
+            p for p in d.glob("*.parquet") if p.name != "scores.parquet"
+        ]
+        if not parquet_files:
+            lines.append(f"  - {d.name}: (empty)")
+            continue
+        # Use parquet metadata for fast row count without loading data
+        ds_info = []
+        for pf in parquet_files:
+            row_count, file_size = _parquet_metadata(pf)
+            if row_count is not None:
+                ds_info.append(f"{pf.name}: {row_count:,} rows, {_fmt_size(file_size)}")
+            else:
+                ds_info.append(f"{pf.name}: {_fmt_size(pf.stat().st_size)}")
+        is_draft = d.name.endswith("_draft")
+        is_eval = d.name.endswith("_eval")
+        label = " (draft)" if is_draft else " (eval)" if is_eval else ""
+
+        # Check for co-located scores
+        scores_file = d / "scores.parquet"
+        score_info = ""
+        if scores_file.exists():
+            try:
+                import pyarrow.parquet as pq
+                st = pq.read_table(scores_file, columns=["score"])
+                score_vals = [s.as_py() for s in st.column("score") if s.as_py() and s.as_py() > 0]
+                if score_vals:
+                    avg = sum(score_vals) / len(score_vals)
+                    score_info = f", scored ✓ (avg {avg:.1f}/10)"
+                else:
+                    score_info = ", scored ✓"
+            except Exception:
+                score_info = ", scored ✓"
+
+        # Provenance from existing sidecars (best-effort). manifest.json
+        # (Phase 4 finalization manifests) is authoritative when present.
+        provenance = ""
+        manifest_path = d / "manifest.json"
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                purpose = manifest.get("purpose")
+                if purpose:
+                    provenance += f", {purpose}"
+                parent = manifest.get("parent_dataset") or manifest.get("parent")
+                if parent:
+                    provenance += f", supplements {Path(str(parent)).name}"
+                recorded_spec = manifest.get("spec_sha256") or manifest.get("spec_hash")
+                if recorded_spec:
+                    from lqh.project_meta import compute_spec_sha256
+
+                    current_spec = compute_spec_sha256(project_dir)
+                    if current_spec and recorded_spec != current_spec:
+                        provenance += ", built against an OLDER spec"
+                    elif current_spec:
+                        provenance += ", spec ✓"
+            except Exception:
+                pass
+        filter_summary = d / "summary.json"
+        if filter_summary.exists():
+            try:
+                fs = json.loads(filter_summary.read_text(encoding="utf-8"))
+                kept, total = fs.get("kept"), fs.get("total")
+                threshold = fs.get("threshold")
+                if kept is not None and total:
+                    provenance += f", filtered {kept}/{total}"
+                    if threshold is not None:
+                        provenance += f" @ ≥{threshold}"
+            except Exception:
+                pass
+        source_sidecar = d / ".lqh_source.json"
+        if source_sidecar.exists():
+            try:
+                src = json.loads(source_sidecar.read_text(encoding="utf-8"))
+                origin = src.get("run_name") or src.get("job_id")
+                if origin:
+                    provenance += f", cloud output of {origin}"
+            except Exception:
+                pass
+
+        mtime = datetime.fromtimestamp(d.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        lines.append(
+            f"  - {d.name}{label}: {', '.join(ds_info)}{score_info}{provenance} [{mtime}]"
+        )
+    if len(datasets) > 15:
+        lines.append(
+            f"  …{len(datasets) - 15} older datasets not shown (use list_files datasets/)"
+        )
+    return lines
+
+
+def _summarize_prompts(project_dir: Path) -> list[str]:
+    prompts_dir = project_dir / "prompts"
+    if not prompts_dir.is_dir():
+        return []
+    prompt_files = sorted(
+        list(prompts_dir.glob("*.md")) + list(prompts_dir.glob("*.schema.json")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not prompt_files:
+        return []
+    lines = [f"- **prompts/**: {len(prompt_files)} file(s)"]
+    for p in prompt_files[:10]:
+        lines.append(f"  - {p.name}")
+    if len(prompt_files) > 10:
+        lines.append(
+            f"  …{len(prompt_files) - 10} more not shown (use list_files prompts/)"
+        )
+    return lines
+
+
+def _progress_terminal(run_dir: Path) -> tuple[str, str | None] | None:
+    """Last terminal status row from progress.jsonl: (state, error) or None."""
+    path = run_dir / "progress.jsonl"
+    if not path.exists():
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        status = row.get("status")
+        if status in ("completed", "failed", "cancelled", "interrupted"):
+            state = "failed" if status == "interrupted" else status
+            return state, row.get("error")
+    return None
+
+
+def _dataset_display_name(path_str: str) -> str:
+    """Dataset name for display: canonical paths end in data.parquet, and
+    'data: data.parquet' tells the reader nothing — use the dataset dir."""
+    p = Path(path_str)
+    if p.suffix == ".parquet" and p.parent.name not in ("", "."):
+        return p.parent.name
+    return p.name
+
+
+def _dataset_entry_name(value: Any) -> str | None:
+    """Display name of one training-dataset entry (string path or dict form)."""
+    if isinstance(value, str) and value:
+        return _dataset_display_name(value)
+    if isinstance(value, dict):
+        for key in ("path", "dataset", "dataset_path", "name"):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner:
+                name = _dataset_display_name(inner)
+                repeat = value.get("repeat") or value.get("repeats")
+                return f"{name}×{repeat}" if repeat else name
+    return None
+
+
+def _run_updated_at(run_dir: Path) -> float:
+    """Best-known last-activity time: progress/status files beat dir mtime.
+
+    Appending to progress.jsonl does not touch the directory mtime, so
+    sorting by dir mtime alone would order active runs as stale.
+    """
+    times = [run_dir.stat().st_mtime]
+    for name in ("progress.jsonl", "status.json", "cloud_state.json"):
+        try:
+            times.append((run_dir / name).stat().st_mtime)
+        except OSError:
+            pass
+    return max(times)
+
+
+def _run_status_line(run_dir: Path) -> str:
+    """One line of semantic status for a training/eval/inference run."""
+    from lqh.subprocess_manager import SubprocessManager
+
+    config: dict[str, Any] = {}
+    try:
+        config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+    except Exception:
+        pass
+
+    remote_job = run_dir / "remote_job.json"
+    submit_intent = run_dir / "submit_intent.json"
+    if remote_job.exists():
+        # Cloud submissions stamp `"backend": "cloud"`; SSH metadata has
+        # the same job_id/remote_name fields but no backend marker.
+        remote_kind = "remote"
+        try:
+            rj = json.loads(remote_job.read_text(encoding="utf-8"))
+            remote_kind = "cloud" if rj.get("backend") == "cloud" else "ssh"
+        except Exception:
+            pass
+        status: str | None = None
+        error: str | None = None
+        cloud_state = run_dir / "cloud_state.json"
+        if cloud_state.exists():
+            try:
+                cs = json.loads(cloud_state.read_text(encoding="utf-8"))
+                if cs.get("status") in ("completed", "failed", "cancelled"):
+                    status = cs.get("status")
+                    error = cs.get("error")
+            except Exception:
+                pass
+        terminal = _progress_terminal(run_dir)
+        if status is None:
+            # SSH runs (and stale cloud state): the synced progress log
+            # carries the terminal verdict and failure reason.
+            if terminal:
+                status, error = terminal
+            else:
+                status = "running (as of last sync)"
+        elif error is None and terminal:
+            # cloud_state.json records the terminal status but not the
+            # failure reason — the replayed progress row carries it.
+            error = terminal[1]
+        status_desc = f"{remote_kind}, {status}"
+        if error:
+            status_desc += f" — {str(error)[:80]}"
+    elif submit_intent.exists():
+        # Idempotency marker without an accepted job: fate unknown.
+        status_desc = "submitted, fate unknown (submit_intent.json present)"
+    else:
+        st = SubprocessManager().get_status(run_dir)
+        status_desc = st.state
+        if st.step is not None:
+            status_desc += f" @ step {st.step}"
+            if st.loss is not None:
+                status_desc += f", loss {st.loss:.4g}"
+        if st.state == "failed" and st.error:
+            status_desc += f" — {str(st.error)[:80]}"
+
+    # Sweep configs nest the model/data facts under base_config.
+    base_config = config.get("base_config")
+    if not isinstance(base_config, dict):
+        base_config = {}
+
+    def _cfg(key: str) -> Any:
+        value = config.get(key)
+        return value if value is not None else base_config.get(key)
+
+    extras = []
+    base_model = _cfg("base_model") or _cfg("model")
+    if base_model:
+        extras.append(str(base_model))
+    for key in ("datasets", "dataset", "dataset_path", "data_path", "eval_dataset"):
+        value = _cfg(key)
+        if isinstance(value, list) and value:
+            names = [n for n in (_dataset_entry_name(v) for v in value[:3]) if n]
+            if names:
+                extras.append(f"data: {', '.join(names)}")
+            break
+        name = _dataset_entry_name(value)
+        if name:
+            extras.append(f"data: {name}")
+            break
+    checkpoints_dir = run_dir / "checkpoints"
+    try:
+        if checkpoints_dir.is_dir() and any(checkpoints_dir.iterdir()):
+            extras.append("ckpt ✓")
+    except OSError:
+        pass
+    suffix = f" ({'; '.join(extras)})" if extras else ""
+    return f"{run_dir.name}: {status_desc}{suffix}"
+
+
+def _summarize_runs(project_dir: Path) -> list[str]:
+    runs_dir = project_dir / "runs"
+    if not runs_dir.is_dir():
+        return []
+    runs = sorted(
+        [d for d in runs_dir.iterdir() if d.is_dir()],
+        key=_run_updated_at,
+        reverse=True,
+    )
+    lines = [f"- **runs/**: {len(runs)} run(s)"]
+    for r in runs[:10]:
+        try:
+            lines.append(f"  - {_run_status_line(r)}")
+        except Exception:
+            lines.append(f"  - {r.name}")
+    if len(runs) > 10:
+        lines.append(
+            f"  …{len(runs) - 10} older runs not shown (use list_files runs/)"
+        )
+    return lines
+
+
+def _summarize_cloud(project_dir: Path) -> list[str]:
+    """Cloud facts from the cached snapshot only — never touches the network."""
+    from lqh.snapshot import read_cached_snapshot
+
+    wrapper = read_cached_snapshot(project_dir)
+    if wrapper is None:
+        return []
+    snap = wrapper.get("snapshot") or {}
+    if not isinstance(snap, dict) or not snap:
+        return []
+    fetched = wrapper.get("fetched_at") or "unknown time"
+    lines = [f"\n- **Cloud** (snapshot as of {fetched}):"]
+
+    jobs = snap.get("jobs") or snap.get("recent_jobs") or []
+    if isinstance(jobs, list) and jobs:
+        lines.append(f"  - {len(jobs)} recent cloud job(s):")
+        for job in jobs[:5]:
+            if not isinstance(job, dict):
+                continue
+            job_id = job.get("job_id") or job.get("id") or "?"
+            status = job.get("status") or "?"
+            kind = job.get("kind") or job.get("purpose") or ""
+            kind_label = f" {kind}" if kind else ""
+            lines.append(f"    - {job_id}{kind_label}: {status}")
+        if len(jobs) > 5:
+            lines.append(f"    …{len(jobs) - 5} more not shown")
+
+    spend = snap.get("lifetime_spend_micros")
+    if isinstance(spend, (int, float)) and spend > 0:
+        lines.append(f"  - lifetime cloud spend: ${spend / 1_000_000:.2f}")
+
+    best = snap.get("best_checkpoint")
+    if isinstance(best, dict) and best:
+        best_id = best.get("artifact_id") or best.get("id") or best.get("name")
+        if best_id:
+            lines.append(f"  - selected best checkpoint: {best_id}")
+
+    stale_sections = wrapper.get("stale_sections") or []
+
+    artifacts = wrapper.get("artifacts")
+    if isinstance(artifacts, list) and artifacts:
+        stale_note = (
+            " (STALE — last refresh failed, carried from an older snapshot)"
+            if "artifacts" in stale_sections else ""
+        )
+        lines.append(f"  - {len(artifacts)} cloud artifact(s):{stale_note}")
+        for art in artifacts[:5]:
+            if not isinstance(art, dict):
+                continue
+            art_id = art.get("artifact_id") or art.get("id") or "?"
+            kind = art.get("kind") or "?"
+            name = art.get("name") or art.get("logical_name") or ""
+            name_label = f" {name}" if name else ""
+            lines.append(f"    - {art_id} [{kind}]{name_label}")
+        if len(artifacts) > 5:
+            lines.append(f"    …{len(artifacts) - 5} more not shown (use the artifacts tool)")
+
+    # Deployments live at the wrapper top level (fetched separately from
+    # the project snapshot); the in-snapshot key is a fallback.
+    deployments = wrapper.get("deployments")
+    if not isinstance(deployments, list):
+        deployments = snap.get("deployments")
+    if isinstance(deployments, list) and deployments:
+        stale_note = (
+            " (STALE — last refresh failed, carried from an older snapshot)"
+            if "deployments" in stale_sections else ""
+        )
+        lines.append(f"  - {len(deployments)} deployment(s):{stale_note}")
+        for dep in deployments[:5]:
+            if not isinstance(dep, dict):
+                continue
+            name = dep.get("name") or dep.get("deployment_id") or dep.get("id") or "?"
+            status = dep.get("status") or "?"
+            lines.append(f"    - {name}: {status}")
+        if len(deployments) > 5:
+            lines.append(
+                f"    …{len(deployments) - 5} more not shown (use list_deployments)"
+            )
+
+    return lines
+
+
 async def handle_summary(project_dir: Path, **kwargs: Any) -> ToolResult:
     """Give a summary of the project state."""
     parts: list[str] = []
@@ -298,6 +680,15 @@ async def handle_summary(project_dir: Path, **kwargs: Any) -> ToolResult:
     else:
         parts.append("- **SPEC.md**: not found (new project)")
 
+    # Agent notes (prose handoff, see NOTES.md convention)
+    notes = project_dir / "NOTES.md"
+    if notes.exists():
+        stat = notes.stat()
+        parts.append(
+            f"- **NOTES.md**: {stat.st_size} bytes, modified "
+            f"{datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()}"
+        )
+
     # Other specs
     other_specs = project_dir / "other_specs"
     if other_specs.is_dir():
@@ -306,6 +697,8 @@ async def handle_summary(project_dir: Path, **kwargs: Any) -> ToolResult:
             parts.append(f"- **other_specs/**: {len(specs)} file(s)")
             for s in specs[:10]:
                 parts.append(f"  - {s.name}")
+            if len(specs) > 10:
+                parts.append(f"  …{len(specs) - 10} more not shown (use list_files other_specs/)")
 
     # Data gen pipelines
     data_gen = project_dir / "data_gen"
@@ -314,59 +707,12 @@ async def handle_summary(project_dir: Path, **kwargs: Any) -> ToolResult:
         parts.append(f"- **data_gen/**: {len(scripts)} pipeline(s)")
         for s in scripts[:10]:
             parts.append(f"  - {s.name}")
+        if len(scripts) > 10:
+            parts.append(f"  …{len(scripts) - 10} more not shown (use list_files data_gen/)")
 
-    # Datasets
-    datasets_dir = project_dir / "datasets"
-    if datasets_dir.is_dir():
-        datasets = sorted(
-            [d for d in datasets_dir.iterdir() if d.is_dir()],
-            key=lambda d: d.stat().st_mtime,
-            reverse=True,
-        )
-        parts.append(f"- **datasets/**: {len(datasets)} dataset(s)")
-        for d in datasets[:15]:
-            parquet_files = list(d.glob("*.parquet"))
-            if not parquet_files:
-                parts.append(f"  - {d.name}: (empty)")
-                continue
-            # Use parquet metadata for fast row count without loading data
-            ds_info = []
-            for pf in parquet_files:
-                row_count, file_size = _parquet_metadata(pf)
-                if row_count is not None:
-                    ds_info.append(f"{pf.name}: {row_count:,} rows, {_fmt_size(file_size)}")
-                else:
-                    ds_info.append(f"{pf.name}: {_fmt_size(pf.stat().st_size)}")
-            is_draft = d.name.endswith("_draft")
-            is_eval = d.name.endswith("_eval")
-            label = " (draft)" if is_draft else " (eval)" if is_eval else ""
-
-            # Check for co-located scores
-            scores_file = d / "scores.parquet"
-            score_info = ""
-            if scores_file.exists():
-                try:
-                    import pyarrow.parquet as pq
-                    st = pq.read_table(scores_file, columns=["score"])
-                    score_vals = [s.as_py() for s in st.column("score") if s.as_py() and s.as_py() > 0]
-                    if score_vals:
-                        avg = sum(score_vals) / len(score_vals)
-                        score_info = f", scored ✓ (avg {avg:.1f}/10)"
-                    else:
-                        score_info = ", scored ✓"
-                except Exception:
-                    score_info = ", scored ✓"
-
-            mtime = datetime.fromtimestamp(d.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-            parts.append(f"  - {d.name}{label}: {', '.join(ds_info)}{score_info} [{mtime}]")
-
-    # Runs
-    runs_dir = project_dir / "runs"
-    if runs_dir.is_dir():
-        runs = [d for d in runs_dir.iterdir() if d.is_dir()]
-        parts.append(f"- **runs/**: {len(runs)} run(s)")
-        for r in runs[:10]:
-            parts.append(f"  - {r.name}")
+    parts.extend(_summarize_datasets(project_dir))
+    parts.extend(_summarize_prompts(project_dir))
+    parts.extend(_summarize_runs(project_dir))
 
     # Evals
     evals_dir = project_dir / "evals"
@@ -379,6 +725,10 @@ async def handle_summary(project_dir: Path, **kwargs: Any) -> ToolResult:
                 parts.append(f"- **evals/scorers/**: {len(scorer_files)} scorer(s)")
                 for sf in scorer_files[:10]:
                     parts.append(f"  - {sf.name}")
+                if len(scorer_files) > 10:
+                    parts.append(
+                        f"  …{len(scorer_files) - 10} more not shown (use list_files evals/scorers/)"
+                    )
 
         # Eval runs
         runs_dir_evals = evals_dir / "runs"
@@ -393,30 +743,49 @@ async def handle_summary(project_dir: Path, **kwargs: Any) -> ToolResult:
                 for er in eval_runs[:10]:
                     summary_file = er / "summary.json"
                     if summary_file.exists():
+                        # Broad except: a malformed artifact (e.g.
+                        # {"scores": null}) must degrade to a bare name,
+                        # never abort the whole summary/startup path.
                         try:
                             summary_data = json.loads(summary_file.read_text(encoding="utf-8"))
-                            scores = summary_data.get("scores", {})
+                            scores = summary_data.get("scores") or {}
+                            if not isinstance(scores, dict):
+                                scores = {}
                             mean = scores.get("mean", "?")
                             n = summary_data.get("num_samples", "?")
                             parts.append(f"  - {er.name}: mean {mean}/10 ({n} samples)")
-                        except (json.JSONDecodeError, KeyError):
+                        except Exception:
                             parts.append(f"  - {er.name}")
                     else:
                         parts.append(f"  - {er.name} (no summary)")
+                if len(eval_runs) > 10:
+                    parts.append(
+                        f"  …{len(eval_runs) - 10} older eval runs not shown "
+                        "(use list_files evals/runs/)"
+                    )
 
-    # Recent conversations
+    parts.extend(_summarize_cloud(project_dir))
+
+    # Recent conversations (covers both the v2 directory format and
+    # unmigrated legacy single-file sessions).
     convos_dir = project_dir / ".lqh" / "conversations"
     if convos_dir.is_dir():
-        sessions = sorted(convos_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-        parts.append(f"\n- **Conversations**: {len(sessions)} session(s)")
-        for s in sessions[:5]:
-            try:
-                first_line = s.read_text().split("\n")[0]
-                meta = json.loads(first_line)
-                preview = meta.get("preview", "")[:60]
-                parts.append(f"  - {meta.get('created_at', '?')}: {preview}")
-            except (json.JSONDecodeError, IndexError):
-                parts.append(f"  - {s.stem}")
+        from lqh.session import Session
+
+        sessions = Session.list_sessions(project_dir)
+        if sessions:
+            parts.append(f"\n- **Conversations**: {len(sessions)} session(s)")
+            for s in sessions[:5]:
+                preview = s.get("preview", "")[:60]
+                state = s.get("state", "")
+                state_label = f" [{state}]" if state and state != "completed" else ""
+                parts.append(
+                    f"  - {s.get('created_at', '?')}: {preview}{state_label}"
+                )
+            if len(sessions) > 5:
+                parts.append(
+                    f"  …{len(sessions) - 5} older session(s) not shown (use /resume to browse)"
+                )
 
     return ToolResult(content="\n".join(parts))
 

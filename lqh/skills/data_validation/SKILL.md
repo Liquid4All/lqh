@@ -225,3 +225,12 @@ After fine-tuning, the next step is to re-run model eval (`/eval`) to compare th
 - **Check for systematic patterns.** If many samples share the same structure or phrasing, that's a diversity problem worth flagging.
 - **Compare to spec examples.** The examples in SPEC.md are the ground truth. If the generated data diverges from them, flag it.
 - **Look for subtle issues.** Common problems: all outputs start the same way, diversity in one dimension but not another, technically correct but unhelpful responses.
+
+## Maintain NOTES.md
+
+Before finishing a work phase here (and whenever you make a significant decision
+or launch a long-running job), update the project-root `NOTES.md`: what was
+decided and why, which approach is active, what is blocked, and the explicit
+next steps. A future session resumes from that file — write for a reader with
+none of this conversation's context. NOTES.md is advisory prose; job status and
+artifacts are always verified with tools, never from notes.

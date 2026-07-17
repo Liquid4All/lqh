@@ -1,12 +1,36 @@
-"""Project activity log for tracking major events in .lqh/project.log (JSONL)."""
+"""Project activity log for tracking major events in .lqh/project.log (JSONL).
+
+The log is a best-effort recovery hint, not a ledger: writes never raise
+(workflow execution always wins over logging), but failures are logged
+instead of silently swallowed, appends are serialized across processes,
+and each entry is stamped with the conversation session that produced it
+when the TUI has registered one via ``set_log_session``.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Conversation session responsible for subsequent append_event calls. A
+# plain module global (not a ContextVar): long-lived background tasks
+# (the job watcher) are created once and must observe later /clear and
+# /resume switches, which a ContextVar snapshot would hide from them.
+# One process has exactly one active conversation, so a global is
+# correct.
+_session_id: str | None = None
+
+
+def set_log_session(session_id: str | None) -> None:
+    """Register the active conversation session for event attribution."""
+    global _session_id
+    _session_id = session_id
 
 
 def file_hash_prefix(path: Path, n: int = 6) -> str:
@@ -26,6 +50,8 @@ def is_spec_file(rel_path: str) -> bool:
 def append_event(project_dir: Path, event: str, desc: str, **kwargs: Any) -> None:
     """Append one JSONL line to .lqh/project.log.  Never raises."""
     try:
+        from lqh.fsio import append_line_durable, file_lock
+
         log_dir = project_dir / ".lqh"
         log_dir.mkdir(parents=True, exist_ok=True)
         entry: dict[str, Any] = {
@@ -34,10 +60,17 @@ def append_event(project_dir: Path, event: str, desc: str, **kwargs: Any) -> Non
             "desc": desc,
             **kwargs,
         }
-        with (log_dir / "project.log").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        if _session_id:
+            entry.setdefault("session_id", _session_id)
+        with file_lock(log_dir / "project.log.lock"):
+            append_line_durable(
+                log_dir / "project.log",
+                json.dumps(entry, ensure_ascii=False),
+            )
     except Exception:
-        pass
+        # Best-effort by contract, but observable: a workflow must never
+        # fail because its log line couldn't be written.
+        logger.warning("project.log append failed", exc_info=True)
 
 
 def read_recent(project_dir: Path, n: int = 50) -> list[dict[str, Any]]:
@@ -84,6 +117,8 @@ def format_log_for_context(entries: list[dict[str, Any]]) -> str:
             if "script_hash" in e:
                 s += f"@{e['script_hash']}"
             suffix_parts.append(f"script={s}")
+        if e.get("session_id"):
+            suffix_parts.append(f"session={str(e['session_id'])[:8]}")
 
         suffix = f"  ({', '.join(suffix_parts)})" if suffix_parts else ""
         line = f"[{ts}] {event} — {desc}{suffix}"

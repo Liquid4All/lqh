@@ -157,6 +157,42 @@ async def fetch_snapshot(
         return r.json()
 
 
+async def fetch_project_artifacts(
+    project_id: str,
+    *,
+    limit: int = 25,
+    api_base: str | None = None,
+    token: str | None = None,
+    timeout: float = 30.0,
+) -> list[dict[str, Any]]:
+    """GET /v1/projects/{project_id}/artifacts → newest-first raw items."""
+    base = (api_base or api_root()).rstrip("/")
+    async with httpx.AsyncClient(base_url=base, timeout=timeout) as client:
+        r = await client.get(
+            f"/v1/projects/{project_id}/artifacts",
+            params={"limit": str(limit)},
+            headers=_auth_headers(token),
+        )
+        r.raise_for_status()
+        items = r.json().get("artifacts", [])
+        return items if isinstance(items, list) else []
+
+
+async def fetch_deployments(
+    *,
+    api_base: str | None = None,
+    token: str | None = None,
+    timeout: float = 30.0,
+) -> list[dict[str, Any]]:
+    """GET /v1/deployments → raw deployment rows for the caller's account."""
+    base = (api_base or api_root()).rstrip("/")
+    async with httpx.AsyncClient(base_url=base, timeout=timeout) as client:
+        r = await client.get("/v1/deployments", headers=_auth_headers(token))
+        r.raise_for_status()
+        items = r.json().get("deployments", [])
+        return items if isinstance(items, list) else []
+
+
 async def fetch_lineage(
     project_id: str,
     *,

@@ -207,6 +207,15 @@ class SSHDirectBackend(RemoteBackend):
             json.dumps(meta, indent=2) + "\n"
         )
 
+        # Durable "running" baseline so the startup signals can report
+        # this job if it finishes while the CLI is closed. Best-effort.
+        try:
+            from lqh.signals import record_seen_states
+
+            record_seen_states(run_dir.parent.parent, {run_dir.name: "running"})
+        except Exception:
+            pass
+
         return pid
 
     async def _configure_api_creds(self, env_file: str) -> None:

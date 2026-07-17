@@ -482,3 +482,12 @@ Watch for these — they are the recurring ways a training effort goes wrong:
   genuinely needs a model orders of magnitude larger, no matter how good the data.
   If a model scores poorly even after training on a large, high-quality, filtered
   dataset, try a **larger base model** before assuming the data is the problem.
+
+## Maintain NOTES.md
+
+Before finishing a work phase here (and whenever you make a significant decision
+or launch a long-running job), update the project-root `NOTES.md`: what was
+decided and why, which approach is active, what is blocked, and the explicit
+next steps. A future session resumes from that file — write for a reader with
+none of this conversation's context. NOTES.md is advisory prose; job status and
+artifacts are always verified with tools, never from notes.
