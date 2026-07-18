@@ -256,6 +256,73 @@ async def test_filtered_dataset_keeps_manifest_provenance(
     assert "filtered 4/9 @ ≥6" in line
 
 
+async def test_derived_dataset_renders_filtered_from(
+    project_dir: Path, sample_conversations, write_chatml_parquet
+) -> None:
+    ds = project_dir / "datasets" / "clean_v1"
+    write_chatml_parquet(ds / "data.parquet", sample_conversations(2))
+    (ds / "manifest.json").write_text(json.dumps({
+        "derived_from": "datasets/raw_v1/data.parquet",
+    }))
+
+    result = await handle_summary(project_dir)
+
+    assert "filtered from raw_v1" in result.content
+
+
+async def test_stale_empty_cloud_sections_are_reported(
+    project_dir: Path,
+) -> None:
+    (project_dir / ".lqh" / "snapshot.json").write_text(json.dumps({
+        "schema_version": 1,
+        "fetched_at": "2026-07-16T00:00:00+00:00",
+        "snapshot": {"jobs": [{"job_id": "j1", "status": "completed"}]},
+        "artifacts": None,
+        "deployments": None,
+        "stale_sections": ["artifacts", "deployments"],
+    }))
+
+    result = await handle_summary(project_dir)
+
+    assert "artifact list unavailable (last refresh failed" in result.content
+    assert "deployment state unavailable (last refresh failed" in result.content
+
+
+async def test_cloud_section_renders_wrapper_deployments_without_core(
+    project_dir: Path,
+) -> None:
+    """The exact shape a core 404 with live deployments produces: empty
+    snapshot, wrapper-level deployments. They must not be omitted."""
+    (project_dir / ".lqh" / "snapshot.json").write_text(json.dumps({
+        "schema_version": 1,
+        "fetched_at": "2026-07-17T00:00:00+00:00",
+        "project_key": project_dir.name,
+        "snapshot": {},
+        "artifacts": [{"artifact_id": "a1", "kind": "checkpoint"}],
+        "deployments": [{"id": "d1", "name": "triage-prod", "status": "running"}],
+        "stale_sections": [],
+    }))
+
+    result = await handle_summary(project_dir)
+
+    assert "triage-prod: running" in result.content
+    assert "a1 [checkpoint]" in result.content
+
+
+async def test_run_manifest_spec_note_in_summary(project_dir: Path) -> None:
+    (project_dir / "SPEC.md").write_text("# current spec\n")
+    run = project_dir / "runs" / "sft_old"
+    run.mkdir(parents=True)
+    (run / "config.json").write_text("{}")
+    (run / "progress.jsonl").write_text(json.dumps({"status": "completed"}) + "\n")
+    (run / "manifest.json").write_text(json.dumps({"spec_sha256": "d" * 64}))
+
+    result = await handle_summary(project_dir)
+
+    assert "sft_old: completed" in result.content
+    assert "built against an OLDER spec" in result.content
+
+
 async def test_cloud_stale_sections_are_labeled(project_dir: Path) -> None:
     (project_dir / ".lqh" / "snapshot.json").write_text(json.dumps({
         "schema_version": 1,
@@ -309,7 +376,8 @@ async def test_cloud_section_renders_from_cached_snapshot(
 
     result = await handle_summary(project_dir)
 
-    assert "**Cloud** (snapshot as of 2026-07-15T18:02:00+00:00)" in result.content
+    assert "**Cloud** (cached snapshot from 2026-07-15T18:02:00+00:00" in result.content
+    assert "may lag live state" in result.content
     assert "j-123 sft: completed" in result.content
     assert "lifetime cloud spend: $2.50" in result.content
     assert "selected best checkpoint: ckpt-9" in result.content

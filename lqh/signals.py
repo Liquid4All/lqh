@@ -282,6 +282,18 @@ def collect_signals(
                 f"{shown}{more} — reuse, supplement, or regenerate deliberately",
             ))
 
+    # A "fresh" snapshot can still carry stale sections (a partial
+    # enrichment failure) — that is an unknown-unknown the agent must be
+    # told about, since the summary is pull-only.
+    stale_sections = (snapshot or {}).get("stale_sections") or []
+    if snapshot_fresh and stale_sections:
+        signals.append(Signal(
+            "snapshot_partial",
+            f"cloud snapshot refresh was partial — {', '.join(stale_sections)} "
+            "carried from an older snapshot (or unavailable); verify with "
+            "the artifacts/list_deployments tools",
+        ))
+
     if not snapshot_fresh:
         if snapshot is not None:
             fetched = snapshot.get("fetched_at") or "an unknown time"

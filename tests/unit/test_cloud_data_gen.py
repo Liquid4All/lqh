@@ -710,13 +710,23 @@ async def test_rapid_double_submit_gets_distinct_run_dirs(
         return f"job-{len(run_dirs)}"
 
     monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
-    for _ in range(2):
+    for name in ("name_a", "name_b"):
         result = await handle_run_data_gen_pipeline(
             project, script_path=script_rel, num_samples=600,
-            output_dataset="same_name", execution="cloud", _cloud_consent=True,
+            output_dataset=name, execution="cloud", _cloud_consent=True,
         )
         assert "job-" in result.content
     assert len(set(run_dirs)) == 2, run_dirs
+
+    # A second submission targeting an output a PENDING job already owns
+    # is refused — "newest submission wins" must not be reachable by
+    # accident (see lqh/dataset_guard.py).
+    refused = await handle_run_data_gen_pipeline(
+        project, script_path=script_rel, num_samples=600,
+        output_dataset="name_a", execution="cloud", _cloud_consent=True,
+    )
+    assert "pending cloud data-gen job" in refused.content
+    assert len(run_dirs) == 2  # no third submission happened
 
 
 @pytest.mark.asyncio

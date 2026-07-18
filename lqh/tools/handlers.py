@@ -284,6 +284,13 @@ def _fmt_size(size: int) -> str:
         return f"{size / (1024 * 1024):.1f} MB"
 
 
+def _eval_spec_hash(project_dir: Path) -> str | None:
+    """Submission-time spec hash for eval/infer configs (R6 traceability)."""
+    from lqh.project_meta import compute_spec_sha256
+
+    return compute_spec_sha256(project_dir)
+
+
 def _summarize_datasets(project_dir: Path) -> list[str]:
     datasets_dir = project_dir / "datasets"
     if not datasets_dir.is_dir():
@@ -342,6 +349,15 @@ def _summarize_datasets(project_dir: Path) -> list[str]:
                 parent = manifest.get("parent_dataset") or manifest.get("parent")
                 if parent:
                     provenance += f", supplements {Path(str(parent)).name}"
+                derived = manifest.get("derived_from")
+                if derived:
+                    origin = Path(str(derived))
+                    origin_name = (
+                        origin.parent.name
+                        if origin.suffix == ".parquet" and origin.parent.name
+                        else origin.name
+                    )
+                    provenance += f", filtered from {origin_name}"
                 recorded_spec = manifest.get("spec_sha256") or manifest.get("spec_hash")
                 if recorded_spec:
                     from lqh.project_meta import compute_spec_sha256
@@ -558,8 +574,30 @@ def _run_status_line(run_dir: Path) -> str:
             extras.append("ckpt ✓")
     except OSError:
         pass
+    spec_note = _manifest_spec_note(run_dir, run_dir.parent.parent)
+    if spec_note:
+        extras.append(spec_note)
     suffix = f" ({'; '.join(extras)})" if extras else ""
     return f"{run_dir.name}: {status_desc}{suffix}"
+
+
+def _manifest_spec_note(artifact_dir: Path, project_dir: Path) -> str | None:
+    """Spec match/mismatch marker from an artifact's manifest, if any."""
+    try:
+        manifest = json.loads(
+            (artifact_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+        recorded = manifest.get("spec_sha256") or manifest.get("spec_hash")
+        if not recorded:
+            return None
+        from lqh.project_meta import compute_spec_sha256
+
+        current = compute_spec_sha256(project_dir)
+        if not current:
+            return None
+        return "spec ✓" if recorded == current else "built against an OLDER spec"
+    except Exception:
+        return None
 
 
 def _summarize_runs(project_dir: Path) -> list[str]:
@@ -592,10 +630,19 @@ def _summarize_cloud(project_dir: Path) -> list[str]:
     if wrapper is None:
         return []
     snap = wrapper.get("snapshot") or {}
-    if not isinstance(snap, dict) or not snap:
-        return []
+    if not isinstance(snap, dict):
+        snap = {}
+    # NOTE: an empty core snapshot must NOT short-circuit — wrapper-level
+    # deployments/artifacts exist independently (e.g. the project endpoint
+    # 404s but live deployments were fetched).
     fetched = wrapper.get("fetched_at") or "unknown time"
-    lines = [f"\n- **Cloud** (snapshot as of {fetched}):"]
+    # The summary tool never fetches — this is always the cached view, and
+    # the label must say so (a snapshot cached before going offline would
+    # otherwise read as current).
+    lines = [
+        f"\n- **Cloud** (cached snapshot from {fetched} — may lag live "
+        "state; verify with training_status/list_deployments/artifacts):"
+    ]
 
     jobs = snap.get("jobs") or snap.get("recent_jobs") or []
     if isinstance(jobs, list) and jobs:
@@ -624,6 +671,13 @@ def _summarize_cloud(project_dir: Path) -> list[str]:
     stale_sections = wrapper.get("stale_sections") or []
 
     artifacts = wrapper.get("artifacts")
+    if "artifacts" in stale_sections and not artifacts:
+        # A stale section with nothing carried forward must not vanish
+        # silently — absence of data is not absence of artifacts.
+        lines.append(
+            "  - artifact list unavailable (last refresh failed and no "
+            "older data was cached)"
+        )
     if isinstance(artifacts, list) and artifacts:
         stale_note = (
             " (STALE — last refresh failed, carried from an older snapshot)"
@@ -646,6 +700,11 @@ def _summarize_cloud(project_dir: Path) -> list[str]:
     deployments = wrapper.get("deployments")
     if not isinstance(deployments, list):
         deployments = snap.get("deployments")
+    if "deployments" in stale_sections and not deployments:
+        lines.append(
+            "  - deployment state unavailable (last refresh failed and no "
+            "older data was cached)"
+        )
     if isinstance(deployments, list) and deployments:
         stale_note = (
             " (STALE — last refresh failed, carried from an older snapshot)"
@@ -663,6 +722,8 @@ def _summarize_cloud(project_dir: Path) -> list[str]:
                 f"    …{len(deployments) - 5} more not shown (use list_deployments)"
             )
 
+    if len(lines) == 1:
+        return []  # nothing beyond the header — omit the section
     return lines
 
 
@@ -741,6 +802,8 @@ async def handle_summary(project_dir: Path, **kwargs: Any) -> ToolResult:
             if eval_runs:
                 parts.append(f"- **evals/runs/**: {len(eval_runs)} run(s)")
                 for er in eval_runs[:10]:
+                    spec_note = _manifest_spec_note(er, project_dir)
+                    spec_suffix = f" ({spec_note})" if spec_note else ""
                     summary_file = er / "summary.json"
                     if summary_file.exists():
                         # Broad except: a malformed artifact (e.g.
@@ -753,11 +816,11 @@ async def handle_summary(project_dir: Path, **kwargs: Any) -> ToolResult:
                                 scores = {}
                             mean = scores.get("mean", "?")
                             n = summary_data.get("num_samples", "?")
-                            parts.append(f"  - {er.name}: mean {mean}/10 ({n} samples)")
+                            parts.append(f"  - {er.name}: mean {mean}/10 ({n} samples){spec_suffix}")
                         except Exception:
-                            parts.append(f"  - {er.name}")
+                            parts.append(f"  - {er.name}{spec_suffix}")
                     else:
-                        parts.append(f"  - {er.name} (no summary)")
+                        parts.append(f"  - {er.name} (no summary){spec_suffix}")
                 if len(eval_runs) > 10:
                     parts.append(
                         f"  …{len(eval_runs) - 10} older eval runs not shown "
@@ -975,8 +1038,11 @@ async def handle_run_data_gen_pipeline(
     purpose: str = "unspecified",
     execution: str = "local",
     timeout_minutes: int = 720,
+    overwrite: bool = False,
+    parent_dataset: str | None = None,
     _script_consent: bool = False,
     _cloud_consent: bool = False,
+    _overwrite_consent: bool = False,
     **kwargs: Any,
 ) -> ToolResult:
     """Execute a data generation pipeline. Requires user permission.
@@ -1020,6 +1086,15 @@ async def handle_run_data_gen_pipeline(
                 f"got {output_dataset!r}"
             )
         )
+
+    # Fast read-only immutability refusal BEFORE the permission prompt so
+    # the agent gets immediate feedback; the atomic claim below re-checks
+    # under the cross-process lock right before work starts.
+    from lqh.dataset_guard import overwrite_refusal
+
+    early_refusal = overwrite_refusal(project_dir, output_dataset, overwrite=overwrite)
+    if early_refusal:
+        return ToolResult(content=f"Error: {early_refusal}")
 
     target = _validate_path(project_dir, script_path)
     if not target.exists():
@@ -1081,29 +1156,77 @@ async def handle_run_data_gen_pipeline(
             ],
         )
 
-    if execution == "cloud":
-        return await _submit_cloud_data_gen(
-            project_dir,
-            script_path=script_path,
-            num_samples=num_samples,
-            output_dataset=output_dataset,
-            validation_instructions=validation_instructions,
-            samples_per_item=samples_per_item,
-            purpose=purpose,
-            timeout_minutes=timeout_minutes,
-            consent=_cloud_consent,
-            on_bg_started=kwargs.get("on_background_task_started"),
+    # Expensive outputs are immutable by default (PERSISTENCY_PLAN.md R5).
+    # claim_output is an atomic check-and-reserve under a cross-process
+    # lock: it refuses when finalized data exists (a leftover
+    # data.partial.jsonl does NOT bypass this — resume only applies while
+    # no data.parquet exists) and when another live process is currently
+    # generating into the same name.
+    from lqh.dataset_guard import claim_output, release_output
+
+    existing = project_dir / "datasets" / output_dataset / "data.parquet"
+    if overwrite and existing.exists() and not _overwrite_consent:
+        # overwrite=true from the model is a REQUEST, not consent —
+        # destroying data needs an explicit human yes (the agent loop
+        # relays this prompt and re-invokes with the consent flag).
+        return ToolResult(
+            content="OVERWRITE_CONFIRMATION_REQUIRED",
+            requires_user_input=True,
+            question=(
+                f"The agent wants to OVERWRITE datasets/{output_dataset}/ — "
+                "the existing data.parquet (and its scores/summaries) will "
+                "be destroyed and regenerated. Data generation is expensive "
+                "and this cannot be undone. Allow?"
+            ),
+            options=[
+                "Yes, destroy and regenerate this dataset",
+                "No, keep the existing data",
+            ],
         )
 
-    # Execute the pipeline (pass through any callbacks from kwargs)
-    return await _execute_pipeline(
-        project_dir, script_path, num_samples, output_dataset, validation_instructions,
-        samples_per_item=samples_per_item,
-        purpose=purpose,
-        on_pipeline_progress=kwargs.get("on_pipeline_progress"),
-        on_pipeline_done=kwargs.get("on_pipeline_done"),
-        legacy_progress_callback=bool(kwargs.get("legacy_progress_callback", True)),
-    )
+    refusal = claim_output(project_dir, output_dataset, overwrite=overwrite)
+    if refusal:
+        return ToolResult(content=f"Error: {refusal}")
+
+    if overwrite and existing.exists():
+        # Confirmed overwrite: also drop co-located artifacts describing
+        # the OLD contents, so summary can't report stale scores/filters.
+        for stale in ("scores.parquet", "summary.json", ".lqh_source.json"):
+            try:
+                (existing.parent / stale).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    try:
+        if execution == "cloud":
+            # After submission the cloud job outlives this process; the
+            # download-side newest-submission-wins policy governs overlap
+            # from here, so the pid-scoped claim is released either way.
+            return await _submit_cloud_data_gen(
+                project_dir,
+                script_path=script_path,
+                num_samples=num_samples,
+                output_dataset=output_dataset,
+                validation_instructions=validation_instructions,
+                samples_per_item=samples_per_item,
+                purpose=purpose,
+                timeout_minutes=timeout_minutes,
+                consent=_cloud_consent,
+                on_bg_started=kwargs.get("on_background_task_started"),
+            )
+
+        # Execute the pipeline (pass through any callbacks from kwargs)
+        return await _execute_pipeline(
+            project_dir, script_path, num_samples, output_dataset, validation_instructions,
+            samples_per_item=samples_per_item,
+            purpose=purpose,
+            parent_dataset=parent_dataset,
+            on_pipeline_progress=kwargs.get("on_pipeline_progress"),
+            on_pipeline_done=kwargs.get("on_pipeline_done"),
+            legacy_progress_callback=bool(kwargs.get("legacy_progress_callback", True)),
+        )
+    finally:
+        release_output(project_dir, output_dataset)
 
 
 async def _fetch_data_gen_rate_usd() -> float | None:
@@ -1334,7 +1457,7 @@ async def _submit_cloud_data_gen(
     from lqh.telemetry import active_telemetry
     telemetry = active_telemetry()
     workflow_id = str(__import__("uuid").uuid4())
-    if purpose not in {"smoke", "inspection", "validation", "training", "unspecified"}:
+    if purpose not in {"smoke", "inspection", "validation", "training", "failures", "imported", "unspecified"}:
         purpose = "unspecified"
     if telemetry:
         await telemetry.run_deferred(telemetry.record_generation_attempt)
@@ -1387,10 +1510,19 @@ async def _submit_cloud_data_gen(
     # after a TUI restart where the running→terminal transition was
     # never observed. Also carries the workflow id so the completion
     # telemetry closes the workflow opened above.
+    # Provenance captured AT SUBMISSION: the job runs the submitted
+    # pipeline against the submitted spec, regardless of local edits made
+    # while it executes.
+    from lqh.project_log import file_hash_prefix as _hash_prefix
+    from lqh.project_meta import compute_spec_sha256 as _spec_hash
+
     marker = {
         "workflow_id": workflow_id,
         "output_dataset": output_dataset,
         "purpose": purpose,
+        "script_path": script_path,
+        "pipeline_hash": _hash_prefix(project_dir / script_path, n=12),
+        "spec_sha256": _spec_hash(project_dir),
         "job_id": job_id,
         # Lets the finalizer refuse to clobber a dataset regenerated
         # locally AFTER this submit (older job finishing later).
@@ -1458,6 +1590,7 @@ async def _execute_pipeline(
     *,
     samples_per_item: int = 1,
     purpose: str = "unspecified",
+    parent_dataset: str | None = None,
     on_pipeline_progress: Callable | None = None,
     on_pipeline_done: Callable | None = None,
     legacy_progress_callback: bool = True,
@@ -1486,7 +1619,7 @@ async def _execute_pipeline(
     telemetry_started = bool(
         telemetry and telemetry.cached_consent_active(consent_epoch)
     )
-    if purpose not in {"smoke", "inspection", "validation", "training", "unspecified"}:
+    if purpose not in {"smoke", "inspection", "validation", "training", "failures", "imported", "unspecified"}:
         purpose = "unspecified"
     if telemetry_started and telemetry:
         await telemetry.run_deferred(telemetry.record_generation_attempt)
@@ -1516,6 +1649,14 @@ async def _execute_pipeline(
         from lqh.data_gen_validation import pipeline_digest
 
         pre_run_pipeline_digest = pipeline_digest(target)
+        # Provenance hashes are captured BEFORE the run: if SPEC.md or the
+        # pipeline is edited while a long generation runs, the manifest
+        # must attribute the artifact to the inputs it was built from.
+        from lqh.project_log import file_hash_prefix as _hash_prefix
+        from lqh.project_meta import compute_spec_sha256 as _spec_hash
+
+        pre_run_spec_sha256 = _spec_hash(project_dir)
+        pre_run_pipeline_hash = _hash_prefix(target, n=12)
         output_dir = project_dir / "datasets" / output_dataset
 
         val_text: str | None = None
@@ -1659,6 +1800,33 @@ async def _execute_pipeline(
         except OSError:
             pass
 
+        # Finalization manifest: provenance for the summary tool, spec-
+        # drift signals, and future sessions. Hashes were captured before
+        # the run; a failed write is surfaced in the result, not hidden.
+        from lqh.manifest import write_dataset_manifest
+
+        manifest_written = write_dataset_manifest(
+            project_dir,
+            output_dir,
+            purpose=purpose,
+            rows=result.succeeded,
+            pipeline_path=script_path,
+            pipeline_hash=pre_run_pipeline_hash,
+            spec_sha256=pre_run_spec_sha256,
+            parent_dataset=parent_dataset,
+            source_paths=[str(p) for p in (result.source_paths or [])],
+            provenance_note=(
+                f"resumed run — source recording covers only the final "
+                f"process ({result.resumed_samples} samples carried over)"
+                if result.resumed_samples > 0 else None
+            ),
+        ) is not None
+        manifest_warning = (
+            "" if manifest_written else
+            "\n⚠️ Provenance manifest could not be written — this dataset is "
+            "not traceable to its spec/pipeline revision (check disk/logs)."
+        )
+
         # A successful local run validates this pipeline version for
         # cloud submission and records which lqh.sources inputs it read
         # (the cloud bundle manifest) — UNLESS the run imported
@@ -1719,6 +1887,7 @@ async def _execute_pipeline(
                 f"  Samples: {result.succeeded}/{result.total} succeeded"
                 + (f", {result.failed} failed" if result.failed else "")
                 + f"\n  Output:  {result.output_path}"
+                + manifest_warning
                 + validation_note
                 + cloud_tip
             ),
@@ -1905,6 +2074,7 @@ async def handle_get_eval_failures(
     threshold: float = 6.0,
     min_failures: int = 5,
     max_failures: int = 15,
+    export_path: str | None = None,
     **kwargs: Any,
 ) -> ToolResult:
     """Extract and format failure cases from an eval run."""
@@ -1924,6 +2094,77 @@ async def handle_get_eval_failures(
 
     if not failures and not scoring_errors:
         return ToolResult(content="No failure cases found. All samples scored above threshold.")
+
+    export_note = ""
+    if export_path:
+        # Durable, untruncated export (the feedback/ workflow): full
+        # messages plus the origin of each case — which eval run and
+        # which model produced it. Confined to feedback/ and never
+        # overwrites: an errant path must not be able to replace
+        # SPEC.md, NOTES.md, or an artifact.
+        normalized = export_path.replace("\\", "/")
+        if not normalized.startswith("feedback/") or ".." in normalized.split("/"):
+            return ToolResult(content=(
+                f"Error: export_path must live under feedback/ "
+                f"(got {export_path!r}) — e.g. 'feedback/eval_failures_v1.jsonl'."
+            ))
+        export_abs = _validate_path(project_dir, export_path)
+        if export_abs.exists():
+            return ToolResult(content=(
+                f"Error: {export_path} already exists — exports never "
+                "overwrite. Pick a new file name."
+            ))
+        model_origin: dict[str, Any] = {}
+        try:
+            run_config = json.loads(
+                (run_dir / "config.json").read_text(encoding="utf-8")
+            )
+            model_origin = {
+                k: run_config[k]
+                for k in (
+                    "hf_repo", "revision", "base_model",
+                    "inference_model", "model_path", "type",
+                )
+                if run_config.get(k) is not None
+            }
+        except Exception:
+            pass
+        try:
+            export_abs.parent.mkdir(parents=True, exist_ok=True)
+            from datetime import datetime as _dt, timezone as _tz
+
+            exported_at = _dt.now(_tz.utc).isoformat(timespec="seconds")
+            with open(export_abs, "w", encoding="utf-8") as f:
+                for failure in failures:
+                    f.write(json.dumps({
+                        "sample_index": failure["sample_index"],
+                        "score": failure["score"],
+                        "reasoning": failure["reasoning"],
+                        "messages": failure["messages"],
+                        "eval_run": eval_run,
+                        "model": model_origin,
+                        "threshold": threshold,
+                        "exported_at": exported_at,
+                        "scoring_error": False,
+                    }, ensure_ascii=False) + "\n")
+                for err in scoring_errors:
+                    f.write(json.dumps({
+                        "sample_index": err["sample_index"],
+                        "score": None,
+                        "reasoning": err["reasoning"],
+                        "messages": err.get("messages"),
+                        "eval_run": eval_run,
+                        "model": model_origin,
+                        "exported_at": exported_at,
+                        "scoring_error": True,
+                    }, ensure_ascii=False) + "\n")
+            export_note = (
+                f"\n💾 Exported {len(failures)} failure(s)"
+                + (f" + {len(scoring_errors)} scoring error(s)" if scoring_errors else "")
+                + f" (full, untruncated) to {export_path}"
+            )
+        except OSError as exc:
+            export_note = f"\n⚠️ Export to {export_path} failed: {exc}"
 
     import pyarrow.parquet as pq_mod
 
@@ -1968,7 +2209,7 @@ async def handle_get_eval_failures(
             parts.append(f"- **Sample {e['sample_index']}** — {err}")
         parts.append("")
 
-    content = "\n".join(parts)
+    content = "\n".join(parts) + export_note
     content, _ = _truncate_content(content)
     return ToolResult(content=content)
 
@@ -2130,6 +2371,17 @@ async def handle_run_scoring(
                 mean_score=round(result.mean_score, 2),
                 median_score=round(result.median_score, 2),
             )
+
+            # Record the scoring pass on the dataset's manifest (no-op if
+            # the dataset has none — annotation never invents provenance).
+            from lqh.manifest import annotate_manifest
+
+            annotate_manifest(
+                dataset_dir,
+                scored_by=scorer,
+                scored_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                score_mean=round(result.mean_score, 2),
+            )
             reporter.update(
                 phase="completed",
                 phase_label=(
@@ -2211,10 +2463,13 @@ async def handle_run_scoring(
 
             # Write config.json
             scoring_model = JUDGE_MODELS.get(model_size, f"judge:{model_size}")
+            from lqh.project_meta import compute_spec_sha256 as _spec_hash2
+
             config_data: dict[str, Any] = {
                 "eval_dataset": dataset,
                 "scorer": scorer,
                 "mode": mode,
+                "spec_sha256": _spec_hash2(project_dir),
                 "scoring_model": scoring_model,
                 "inference_model": inference_model,
             }
@@ -2239,6 +2494,12 @@ async def handle_run_scoring(
                 mean_score=round(result.mean_score, 2),
                 median_score=round(result.median_score, 2),
             )
+
+            # Finalization manifest for the eval run (reads the config.json
+            # and summary.json just written above).
+            from lqh.manifest import write_run_manifest
+
+            write_run_manifest(project_dir, output_dir, state="completed")
             reporter.update(
                 phase="completed",
                 phase_label=(
@@ -3118,6 +3379,7 @@ async def handle_hf_pull(
     subset: str | None = None,
     files: list[str] | None = None,
     revision: str | None = None,
+    overwrite: bool = False,
     **kwargs: Any,
 ) -> ToolResult:
     """Download a dataset or model from HF Hub to local storage."""
@@ -3138,6 +3400,20 @@ async def handle_hf_pull(
         local_path = f"{'datasets' if repo_type == 'dataset' else 'models'}/{repo_name}"
 
     target = _validate_path(project_dir, local_path)
+    # Dataset immutability applies to imports too: refuse to clobber an
+    # existing local dataset's parquet files without explicit overwrite.
+    if repo_type == "dataset" and not overwrite:
+        existing_parquet = sorted(
+            p.name for p in target.glob("*.parquet")
+        ) if target.is_dir() else []
+        if existing_parquet:
+            return ToolResult(content=(
+                f"Error: {local_path}/ already contains "
+                f"{', '.join(existing_parquet[:3])} — refusing to overwrite "
+                "an existing dataset. Pull into a different local_path "
+                "(e.g. a versioned name), or pass overwrite=true only "
+                "after the user confirmed replacing it."
+            ))
     target.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -3157,10 +3433,27 @@ async def handle_hf_pull(
                 downloaded.append(out)
 
             _save_hf_mapping(project_dir, local_path, repo_id, repo_type, split)
+            _mf = None
+            if repo_type == "dataset":
+                from lqh.manifest import write_dataset_manifest
+
+                _mf = write_dataset_manifest(
+                    project_dir, target,
+                    purpose="imported",
+                    source_paths=[
+                        f"hf://{repo_id}/{f}" + (f"@{revision}" if revision else "")
+                        for f in files
+                    ],
+                )
+            _mf_warn = (
+                "\n⚠️ Provenance manifest could not be written (check disk/logs)."
+                if repo_type == "dataset" and _mf is None else ""
+            )
             return ToolResult(
                 content=(
                     f"✅ Downloaded {len(downloaded)} file(s) from {repo_id} ({repo_type}) to {local_path}/\n"
                     + "\n".join(f"  - {Path(d).name}" for d in downloaded)
+                    + _mf_warn
                 )
             )
 
@@ -3207,6 +3500,8 @@ async def handle_hf_pull(
 
         dataset = ds_lib.load_dataset(**load_kwargs)
 
+        from lqh.manifest import write_dataset_manifest
+
         if isinstance(dataset, ds_lib.DatasetDict):
             total_rows = 0
             split_info = []
@@ -3217,10 +3512,17 @@ async def handle_hf_pull(
                 split_info.append(f"  - {split_name}: {len(split_ds):,} rows -> {split_name}.parquet")
 
             _save_hf_mapping(project_dir, local_path, repo_id, "dataset")
+            _mf = write_dataset_manifest(
+                project_dir, target,
+                purpose="imported",
+                rows=total_rows,
+                source_paths=[f"hf://{repo_id}" + (f"@{revision}" if revision else "")],
+            )
             return ToolResult(
                 content=(
                     f"✅ Downloaded {repo_id} to {local_path}/ ({total_rows:,} rows total)\n"
                     + "\n".join(split_info)
+                    + ("\n⚠️ Provenance manifest could not be written (check disk/logs)." if _mf is None else "")
                 )
             )
 
@@ -3228,10 +3530,17 @@ async def handle_hf_pull(
         dataset.to_parquet(str(out_path))
 
         _save_hf_mapping(project_dir, local_path, repo_id, "dataset", split)
+        _mf = write_dataset_manifest(
+            project_dir, target,
+            purpose="imported",
+            rows=len(dataset),
+            source_paths=[f"hf://{repo_id}" + (f"@{revision}" if revision else "")],
+        )
         return ToolResult(
             content=(
                 f"✅ Downloaded {repo_id} to {local_path}/data.parquet "
                 f"({len(dataset):,} rows)"
+                + ("\n⚠️ Provenance manifest could not be written (check disk/logs)." if _mf is None else "")
             )
         )
 
@@ -3982,10 +4291,16 @@ async def handle_start_training(
             ],
         }
 
+    from lqh.project_meta import compute_spec_sha256
+
     config: dict[str, Any] = {
         "type": type,
         "base_model": base_model,
         "dataset": _sources_to_config(dataset_sources),
+        # Spec revision at submission time: checkpoints trained from this
+        # config stay traceable to the spec they were built against even
+        # after SPEC.md changes mid-run (PERSISTENCY_PLAN.md R6).
+        "spec_sha256": compute_spec_sha256(project_dir),
         "training": {
             "learning_rate": lr,
             "max_seq_length": 2048,
@@ -5078,10 +5393,17 @@ async def handle_start_local_eval(
         run_name = _next_run_name(project_dir, "local_eval")
 
     eval_run_dir = project_dir / "runs" / run_name
+    if eval_run_dir.exists():
+        return ToolResult(content=(
+            f"Error: run '{run_name}' already exists — run names must be "
+            "unique (an existing run's config/logs would be overwritten). "
+            "Pick a different run_name or omit it for an auto-generated one."
+        ))
 
     # Build infer config
     config: dict[str, Any] = {
         "type": "infer",
+        "spec_sha256": _eval_spec_hash(project_dir),
         "base_model": str(model_dir),
         "dataset": _sources_to_config(eval_sources),
         "scorer": scorer,
@@ -5181,6 +5503,12 @@ async def handle_eval_hf_model(
     if not run_name:
         run_name = _next_run_name(project_dir, "eval_hf")
     run_dir = project_dir / "runs" / run_name
+    if run_dir.exists():
+        return ToolResult(content=(
+            f"Error: run '{run_name}' already exists — run names must be "
+            "unique (an existing run's config/logs would be overwritten). "
+            "Pick a different run_name or omit it for an auto-generated one."
+        ))
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Build sandbox config ---
@@ -5191,6 +5519,7 @@ async def handle_eval_hf_model(
     # ship under those same paths.
     config: dict[str, Any] = {
         "type": "eval_hf",
+        "spec_sha256": _eval_spec_hash(project_dir),
         "hf_repo": repo,
         "revision": revision,
         "training_method": training_method,
@@ -5322,8 +5651,15 @@ async def _start_local_eval_remote(
         run_name = _next_run_name(project_dir, "remote_eval")
 
     run_dir = project_dir / "runs" / run_name
+    if run_dir.exists():
+        return ToolResult(content=(
+            f"Error: run '{run_name}' already exists — run names must be "
+            "unique (an existing run's config/logs would be overwritten). "
+            "Pick a different run_name or omit it for an auto-generated one."
+        ))
     config: dict[str, Any] = {
         "type": "infer",
+        "spec_sha256": _eval_spec_hash(project_dir),
         "base_model": model_path,
         "dataset": _sources_to_config(eval_sources),
         "scorer": scorer,
@@ -5846,6 +6182,8 @@ async def handle_run_data_filter(
     output_dataset: str,
     threshold: float = 6.0,
     model_size: str = "small",
+    overwrite: bool = False,
+    _overwrite_consent: bool = False,
     **kwargs: Any,
 ) -> ToolResult:
     """Score a user-brought dataset and emit a filtered subset."""
@@ -5854,6 +6192,19 @@ async def handle_run_data_filter(
     from lqh.config import load_config
     from lqh.scoring import run_data_filter
 
+    # output_dataset becomes a path component under datasets/ — require a
+    # plain directory name so it can't escape the project layout.
+    if (
+        not output_dataset
+        or output_dataset in (".", "..")
+        or "/" in output_dataset
+        or "\\" in output_dataset
+    ):
+        return ToolResult(content=(
+            f"Error: output_dataset must be a plain name (no path "
+            f"separators), got {output_dataset!r}"
+        ))
+
     input_abs = _validate_path(project_dir, input_path)
     scorer_abs = _validate_path(project_dir, scorer_path)
     if not input_abs.exists():
@@ -5861,11 +6212,37 @@ async def handle_run_data_filter(
     if not scorer_abs.exists():
         return ToolResult(content=f"Error: scorer '{scorer_path}' does not exist")
 
+    # Immutable-by-default outputs (PERSISTENCY_PLAN.md R5). Fast
+    # read-only refusal here; the atomic claim happens inside the
+    # release-protected block below so an auth/config failure can never
+    # leak a held claim.
+    from lqh.dataset_guard import claim_output, overwrite_refusal, release_output
+
+    early_refusal = overwrite_refusal(
+        project_dir, output_dataset, overwrite=overwrite
+    )
+    if early_refusal:
+        return ToolResult(content=f"Error: {early_refusal}")
+
+    output_dir = project_dir / "datasets" / output_dataset
+    if overwrite and (output_dir / "data.parquet").exists() and not _overwrite_consent:
+        return ToolResult(
+            content="OVERWRITE_CONFIRMATION_REQUIRED",
+            requires_user_input=True,
+            question=(
+                f"The agent wants to OVERWRITE datasets/{output_dataset}/ "
+                "with a filtered dataset — the existing data.parquet will be "
+                "destroyed. Allow?"
+            ),
+            options=[
+                "Yes, destroy and replace this dataset",
+                "No, keep the existing data",
+            ],
+        )
+
     config = load_config()
     token = require_token()
     client = create_client(token, config.api_base_url)
-
-    output_dir = project_dir / "datasets" / output_dataset
 
     from lqh.progress import ProgressReporter
 
@@ -5888,8 +6265,19 @@ async def handle_run_data_filter(
             concurrency=min(100, total), force=completed == total,
         )
 
+    # Captured pre-run: the manifest must reflect the spec the filter ran
+    # under, not one edited while it ran.
+    from lqh.project_meta import compute_spec_sha256 as _spec_hash
+
+    pre_run_spec_sha256 = _spec_hash(project_dir)
+
     succeeded = False
+    claimed = False
     try:
+        refusal = claim_output(project_dir, output_dataset, overwrite=overwrite)
+        if refusal:
+            return ToolResult(content=f"Error: {refusal}")
+        claimed = True
         result = await run_data_filter(
             input_path=input_abs,
             scorer_path=scorer_abs,
@@ -5903,6 +6291,8 @@ async def handle_run_data_filter(
     except Exception as exc:
         return ToolResult(content=f"❌ run_data_filter failed: {type(exc).__name__}: {exc}")
     finally:
+        if claimed:
+            release_output(project_dir, output_dataset)
         if succeeded:
             reporter.update(
                 phase="completed", phase_label="filtered dataset ready",
@@ -5912,6 +6302,27 @@ async def handle_run_data_filter(
         on_done = kwargs.get("on_pipeline_done")
         if on_done:
             on_done()
+
+    # Finalization manifest: a filtered output is a DERIVATIVE (subset) of
+    # its input — recorded as derived_from, not as a supplement. Unknown
+    # input provenance stays unknown (purpose defaults to "unspecified").
+    from lqh.manifest import inherit_purpose, write_dataset_manifest
+
+    manifest_written = write_dataset_manifest(
+        project_dir,
+        output_dir,
+        purpose=inherit_purpose(input_abs.parent),
+        rows=result.kept,
+        spec_sha256=pre_run_spec_sha256,
+        source_paths=[input_path],
+        scorer_path=scorer_path,
+        threshold=threshold,
+        derived_from=input_path,
+    ) is not None
+    manifest_warning = (
+        "" if manifest_written else
+        "\n  ⚠️ Provenance manifest could not be written (check disk/logs)."
+    )
 
     distribution = _format_score_distribution(output_dir / "scores.parquet")
     return ToolResult(
@@ -5925,6 +6336,7 @@ async def handle_run_data_filter(
             f"  Mean score: {result.mean_score:.2f}\n"
             + (f"\n{distribution}\n" if distribution else "")
             + f"  Output:    datasets/{output_dataset}/ (data.parquet, scores.parquet, summary.json)"
+            + manifest_warning
         )
     )
 

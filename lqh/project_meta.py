@@ -225,12 +225,14 @@ async def fetch_lineage(
 def write_local_snapshot(project_dir: Path | str, snapshot: dict[str, Any]) -> Path:
     """Persist a snapshot dict under ``<project_dir>/.lqh/snapshot.json``.
 
-    Used by the "reopen the laptop" path: when the TUI reconnects and
-    fetches the cloud-side snapshot, we drop a copy on disk so a
-    subsequent offline reopen still has the last known state.
+    Prefer ``lqh.snapshot.fetch_and_cache_snapshot`` — it wraps, scopes,
+    and enriches. This low-level writer is kept for direct payloads; it
+    sanitizes (no signed URLs/credentials on disk) and writes atomically.
     """
+    from lqh.fsio import atomic_write_json
+    from lqh.snapshot import sanitize
+
     project_dir = Path(project_dir)
     target = project_dir / ".lqh" / "snapshot.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(snapshot, indent=2, default=str) + "\n")
+    atomic_write_json(target, sanitize(snapshot))
     return target

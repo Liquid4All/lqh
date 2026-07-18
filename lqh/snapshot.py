@@ -43,16 +43,33 @@ def _snapshot_path(project_dir: Path) -> Path:
     return project_dir / ".lqh" / "snapshot.json"
 
 
+def _sensitive_value(value: Any) -> bool:
+    """Value-shape check: catches URLs/credentials under unexpected keys."""
+    if not isinstance(value, str):
+        return False
+    lowered = value.lower()
+    return (
+        lowered.startswith(("http://", "https://"))
+        or lowered.startswith("bearer ")
+        or lowered.startswith("eyj")  # JWT-shaped
+    )
+
+
 def sanitize(value: Any) -> Any:
-    """Recursively drop dict keys that look like URLs/credentials."""
+    """Recursively drop entries that look like URLs/credentials.
+
+    Both key-name markers AND value shapes are checked — key heuristics
+    alone would let a signed URL survive under an innocent key.
+    """
     if isinstance(value, dict):
         return {
             k: sanitize(v)
             for k, v in value.items()
             if not any(marker in k.lower() for marker in _SENSITIVE_KEY_MARKERS)
+            and not _sensitive_value(v)
         }
     if isinstance(value, list):
-        return [sanitize(v) for v in value]
+        return [sanitize(v) for v in value if not _sensitive_value(v)]
     return value
 
 
@@ -76,12 +93,13 @@ def read_cached_snapshot(project_dir: Path) -> dict | None:
         return None
     if "snapshot" in data and "schema_version" in data:
         return data
-    # Legacy write_local_snapshot format: the payload itself.
+    # Legacy write_local_snapshot format: the payload itself, possibly
+    # written before sanitization existed — scrub it on the way in.
     return {
         "schema_version": SCHEMA_VERSION,
         "fetched_at": None,
         "project_key": project_dir.name,
-        "snapshot": data,
+        "snapshot": sanitize(data),
     }
 
 
@@ -103,26 +121,73 @@ async def fetch_and_cache_snapshot(
     import asyncio
 
     # One wall-clock budget: the three requests run concurrently, each
-    # bounded by the same timeout, so the whole refresh takes ~timeout —
-    # not 3× it.
-    payload, artifacts_result, deployments_result = await asyncio.gather(
-        fetch_snapshot(project_dir.name, timeout=timeout),
-        fetch_project_artifacts(project_dir.name, timeout=timeout),
-        fetch_deployments(timeout=timeout),
-        return_exceptions=True,
-    )
+    # bounded by the same timeout — and the WHOLE operation is bounded by
+    # an outer deadline too. Per-request httpx timeouts don't cover every
+    # stall (slow trickling bodies, misbehaving mocks/proxies), and CLI
+    # startup must never hang on this.
+    try:
+        payload, artifacts_result, deployments_result = await asyncio.wait_for(
+            asyncio.gather(
+                fetch_snapshot(project_dir.name, timeout=timeout),
+                fetch_project_artifacts(project_dir.name, timeout=timeout),
+                fetch_deployments(timeout=timeout),
+                return_exceptions=True,
+            ),
+            timeout=timeout * 2,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning("snapshot refresh exceeded its deadline; using cache")
+        return read_cached_snapshot(project_dir), False
+
+    def _scoped_deployments(rows: Any) -> list | None:
+        if not isinstance(rows, list):
+            return None
+        return sanitize([
+            d for d in rows
+            if not isinstance(d, dict)
+            or not d.get("project_id")
+            or d.get("project_id") == project_dir.name
+        ])
 
     if isinstance(payload, BaseException):
         if (
             isinstance(payload, httpx.HTTPStatusError)
             and payload.response.status_code == 404
         ):
-            # Authoritative: this project has no cloud state. A leftover
-            # cache would feed obsolete jobs/spend into summary forever.
+            # Authoritative: this project has no cloud jobs/spend. A
+            # leftover cache would feed obsolete facts into summary
+            # forever — but deployment state must not vanish with it:
+            # freshly fetched rows are kept, and a FAILED deployment
+            # refresh carries the previously cached rows forward marked
+            # stale (hiding a possibly-live deployment risks a duplicate
+            # redeploy).
+            previous_cache = read_cached_snapshot(project_dir) or {}
             try:
                 _snapshot_path(project_dir).unlink(missing_ok=True)
             except OSError:
                 logger.warning("could not remove stale snapshot cache", exc_info=True)
+            stale: list[str] = []
+            deployments = _scoped_deployments(deployments_result)
+            if deployments is None and previous_cache.get("deployments"):
+                deployments = previous_cache.get("deployments")
+                stale = ["deployments"]
+            if deployments:
+                wrapper = {
+                    "schema_version": SCHEMA_VERSION,
+                    "fetched_at": datetime.now(timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
+                    "project_key": project_dir.name,
+                    "snapshot": {},
+                    "artifacts": [],
+                    "deployments": deployments,
+                    "stale_sections": stale,
+                }
+                try:
+                    atomic_write_json(_snapshot_path(project_dir), wrapper)
+                except OSError:
+                    logger.warning("could not cache snapshot", exc_info=True)
+                return wrapper, True
             return None, True
         # Offline, not logged in, timeout, DNS, 5xx… — every one of these
         # means "use the cache and label it stale".
@@ -148,12 +213,7 @@ async def fetch_and_cache_snapshot(
         # this project (unattributed rows are kept — they may be this
         # project's pre-stamping deployments, and hiding them risks a
         # duplicate redeploy).
-        deployments = sanitize([
-            d for d in deployments_result
-            if not isinstance(d, dict)
-            or not d.get("project_id")
-            or d.get("project_id") == project_dir.name
-        ])
+        deployments = _scoped_deployments(deployments_result)
 
     wrapper = {
         "schema_version": SCHEMA_VERSION,

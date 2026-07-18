@@ -241,6 +241,16 @@ They are always labelled (full conversations). The _eval suffix signals \
 intent. The scoring engine strips assistant turns at score-time when running \
 model inference.
 
+Datasets are IMMUTABLE once finalized: generation and filtering refuse to \
+overwrite an existing datasets/<name>/data.parquet. Data generation is \
+expensive — iterate by creating NEW versioned names (summarization_v2, \
+summarization_v1_filtered) and keep old data for reuse and mixing; pass \
+overwrite=true only after the user explicitly confirmed destroying the old \
+data. Each finalized dataset gets a manifest.json recording its provenance \
+(purpose, producing pipeline, sources, spec revision, filter settings); the \
+summary tool and startup signals read it — e.g. to flag datasets built \
+against an older spec after SPEC.md changes.
+
 When showing generated data to the user for review, use show_file on the parquet \
 file (opens an interactive dataset viewer) followed by ask_user to get feedback. \
 These can be called together in one response. If no user is attached to the \
@@ -269,6 +279,19 @@ injected at eval time via the system_prompt_path parameter on run_scoring. \
 If prompts/{task}.schema.json exists, it is auto-discovered and used to constrain \
 the model's output format (e.g., enforcing exact JSON keys). This allows testing \
 different prompts on the same eval data with guaranteed format compliance.
+
+### feedback/
+Production failure cases the user brings back after deploying (wrong \
+input/output pairs, JSONL/CSV/Parquet files). When the user reports failures, \
+save or ask them to drop the raw cases under feedback/ first — they are \
+valuable ground truth and must survive the session. The remediation loop: \
+inspect the cases → update SPEC.md if the requirements actually changed → \
+write a TARGETED data_gen pipeline covering the failure modes → generate a \
+supplemental dataset (a NEW name, e.g. {task}_failures_v1; its manifest \
+purpose is "failures") → build a regression eval from held-out cases → train \
+on old + supplemental datasets together (multi-source) → compare against the \
+deployed model before redeploying. Never discard the original training data — \
+supplement it.
 
 ### evals/
 Scoring and evaluation artifacts:
@@ -593,6 +616,12 @@ class Agent:
             # anything beyond the cap stays *uncovered* (still in the view)
             # and is picked up by the next compaction pass. Never claim
             # coverage of messages no summary has seen.
+            #
+            # A single message can alone exceed the cap. It is then
+            # summarized WHOLE in its own solo pass — it fit the model's
+            # context when it was originally sent, so it fits here too.
+            # Truncating it would advance coverage past content no summary
+            # ever saw.
             end_idx = start_idx
             total = 0
             for i in range(start_idx, max_cover_idx + 1):
@@ -601,6 +630,8 @@ class Agent:
                     break
                 total += size
                 end_idx = i
+                if size > self._COMPACTION_INPUT_MAX_BYTES:
+                    break  # solo pass for the oversized head message
 
             # Never split a tool-call group across the coverage boundary:
             # the uncovered side must not start with orphaned tool results,
@@ -1234,6 +1265,35 @@ class Agent:
                 return ToolResult(content="[No user input handler available]")
 
         # Handle permission request (pipeline execution or HF push)
+        if (
+            result.requires_user_input
+            and result.content == "OVERWRITE_CONFIRMATION_REQUIRED"
+        ):
+            # Destroying an existing dataset requires a HUMAN decision —
+            # overwrite=true from the model alone is not consent. Auto
+            # mode therefore always declines.
+            if self.auto_mode:
+                return ToolResult(content=(
+                    "Overwrite declined: auto mode never destroys existing "
+                    "datasets. Use a new versioned output name instead."
+                ))
+            if self.callbacks.on_ask_user:
+                response = await self.callbacks.on_ask_user(
+                    result.question or "", result.options
+                )
+                if response.strip().lower().startswith("yes"):
+                    return await self._reinvoke_tool(
+                        tool_name, arguments,
+                        internal_kwargs={
+                            "_overwrite_consent": True,
+                            "_script_consent": True,
+                        },
+                    )
+                return ToolResult(
+                    content="Overwrite declined by user — existing dataset kept."
+                )
+            return ToolResult(content="[No user input handler available]")
+
         if result.requires_user_input and result.content == "PERMISSION_REQUIRED":
             # Auto mode: auto-grant project-wide so the pipeline never blocks.
             if self.auto_mode:
@@ -1592,30 +1652,35 @@ class Agent:
                     f"relying on them):\n\n{notes}"
                 )
 
-        if mode == "existing_project" or self._project_has_artifacts():
-            # Run summary tool directly (no LLM) and inject result. A
-            # malformed artifact must degrade the summary, never abort
-            # startup/context preparation.
-            try:
-                from lqh.tools.handlers import handle_summary
-                summary_result = await handle_summary(self.project_dir)
-                inject(f"Current project state:\n\n{summary_result.content}")
-            except Exception:
-                logger.warning("project summary failed", exc_info=True)
-                inject(
-                    "Current project state: summary unavailable (an artifact "
-                    "on disk could not be read — run the summary tool or "
-                    "inspect files directly)."
-                )
-
-        # Inject project activity log (last 50 events)
-        from lqh.project_log import format_log_for_context, read_recent
-
-        entries = read_recent(self.project_dir, n=50)
-        if entries:
+        # R3 — push signals, not dossiers: the full project summary and
+        # activity log are PULL (the summary tool, read_file, list_files);
+        # startup injects only a one-line inventory so the agent knows
+        # what exists and where to dig.
+        counts: list[str] = []
+        for label, rel, pattern in (
+            ("dataset(s)", "datasets", None),
+            ("run(s)", "runs", None),
+            ("eval run(s)", "evals/runs", None),
+            ("pipeline(s)", "data_gen", "*.py"),
+            ("prompt file(s)", "prompts", None),
+        ):
+            directory = self.project_dir / rel
+            if directory.is_dir():
+                try:
+                    n = len(list(
+                        directory.glob(pattern) if pattern else directory.iterdir()
+                    ))
+                except OSError:
+                    continue
+                if n:
+                    counts.append(f"{n} {label}")
+        if counts:
             inject(
-                f"Project activity log (most recent events):\n\n"
-                f"{format_log_for_context(entries)}"
+                "Project inventory: " + ", ".join(counts) + ". "
+                "Call the summary tool for details (run status, scores, "
+                "provenance, cached cloud state) and read_file/list_files "
+                "to inspect artifacts; recent events are in "
+                ".lqh/project.log."
             )
 
         # Attention signals: the things the agent wouldn't know to look

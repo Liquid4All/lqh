@@ -116,3 +116,14 @@ decided and why, which approach is active, what is blocked, and the explicit
 next steps. A future session resumes from that file — write for a reader with
 none of this conversation's context. NOTES.md is advisory prose; job status and
 artifacts are always verified with tools, never from notes.
+
+## Production failure cases (feedback/)
+
+When the user returns with failures from a deployed model, preserve the raw
+cases under `feedback/` (JSONL/CSV/Parquet) before anything else. Then: read
+them, decide whether SPEC.md needs updating, build a targeted pipeline for the
+failure modes, generate a supplemental dataset under a NEW name (manifest
+purpose "failures"), keep some held-out cases as a regression eval, and train
+on the original + supplemental datasets together. Compare against the deployed
+model before recommending a redeploy. Existing datasets are never edited or
+regenerated in place.

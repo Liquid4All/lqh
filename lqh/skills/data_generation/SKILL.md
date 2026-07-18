@@ -1238,3 +1238,14 @@ decided and why, which approach is active, what is blocked, and the explicit
 next steps. A future session resumes from that file — write for a reader with
 none of this conversation's context. NOTES.md is advisory prose; job status and
 artifacts are always verified with tools, never from notes.
+
+## Dataset immutability and versioning
+
+Finalized datasets are immutable: run_data_gen_pipeline refuses to overwrite an
+existing `datasets/<name>/data.parquet`. Iterate with versioned names
+(`{task}_v2`) instead of regenerating in place — old data stays reusable for
+mixing into later training runs. Only pass `overwrite=true` after the user
+explicitly confirmed the existing data should be destroyed. Every finalized
+dataset gets a `manifest.json` (purpose, pipeline, sources, spec revision)
+written automatically — when SPEC.md changes later, these manifests let lqh
+flag which datasets were built against the older spec.

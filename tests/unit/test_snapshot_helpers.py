@@ -48,7 +48,12 @@ def fake_projects_api(monkeypatch: pytest.MonkeyPatch):
     Mirrors the ``fake_cloud`` pattern in test_cloud_backend.py: wrap the
     real AsyncClient so a MockTransport is injected by default.
     """
-    state = {"status": 200, "artifacts_status": 200, "requests": []}
+    state = {
+        "status": 200,
+        "artifacts_status": 200,
+        "deployments_status": None,  # None → follow "status"
+        "requests": [],
+    }
 
     def handler(request: httpx.Request) -> httpx.Response:
         state["requests"].append(request)
@@ -57,10 +62,15 @@ def fake_projects_api(monkeypatch: pytest.MonkeyPatch):
             if state["artifacts_status"] != 200:
                 return httpx.Response(state["artifacts_status"], json={"error": "nope"})
             return httpx.Response(200, json={"artifacts": _ARTIFACTS})
+        if path == "/v1/deployments":
+            dep_status = state["deployments_status"]
+            if dep_status is None:
+                dep_status = state["status"]
+            if dep_status != 200:
+                return httpx.Response(dep_status, json={"error": "nope"})
+            return httpx.Response(200, json={"deployments": _DEPLOYMENTS})
         if state["status"] != 200:
             return httpx.Response(state["status"], json={"error": "nope"})
-        if path == "/v1/deployments":
-            return httpx.Response(200, json={"deployments": _DEPLOYMENTS})
         return httpx.Response(200, json=_SNAPSHOT)
 
     transport = httpx.MockTransport(handler)
@@ -172,21 +182,30 @@ async def test_fetch_404_means_no_cloud_activity(
     assert not (project_dir / ".lqh" / "snapshot.json").exists()
 
 
-async def test_authoritative_404_removes_stale_cache(
+async def test_authoritative_404_clears_jobs_but_keeps_deployment_state(
     project_dir: Path, fake_projects_api, snapshot_auth
 ) -> None:
-    """A 404 is an authoritative 'no cloud state' — an old cache must not
-    keep feeding obsolete jobs/spend into summary as current."""
+    """A 404 is authoritative for jobs/spend — the old core snapshot must
+    not resurface. But when the deployment refresh ALSO failed, the last
+    known deployment state is carried forward marked stale rather than
+    erased (a possibly-live deployment must never become invisible)."""
     from lqh.snapshot import fetch_and_cache_snapshot, read_cached_snapshot
 
     await fetch_and_cache_snapshot(project_dir)
     assert (project_dir / ".lqh" / "snapshot.json").exists()
 
-    fake_projects_api["status"] = 404
+    fake_projects_api["status"] = 404  # deployments follow → also fail
     wrapper, fresh = await fetch_and_cache_snapshot(project_dir)
 
+    assert fresh is True
+    assert wrapper["snapshot"] == {}  # obsolete jobs/spend are gone
+    assert wrapper["deployments"] == [_DEPLOYMENTS[0]]  # carried forward
+    assert wrapper["stale_sections"] == ["deployments"]
+
+    # With no previously known deployments either, 404 clears everything.
+    (project_dir / ".lqh" / "snapshot.json").unlink()
+    wrapper, fresh = await fetch_and_cache_snapshot(project_dir)
     assert (wrapper, fresh) == (None, True)
-    assert not (project_dir / ".lqh" / "snapshot.json").exists()
     assert read_cached_snapshot(project_dir) is None
 
 
@@ -211,9 +230,39 @@ async def test_fetch_offline_without_cache_returns_none(
     async def _boom(*args, **kwargs):
         raise httpx.ConnectError("no network")
 
+    # ALL THREE requests must be stubbed — patching only the core fetch
+    # once left the enrichment requests hitting the real network and
+    # hanging this test.
     monkeypatch.setattr("lqh.snapshot.fetch_snapshot", _boom)
+    monkeypatch.setattr("lqh.snapshot.fetch_project_artifacts", _boom)
+    monkeypatch.setattr("lqh.snapshot.fetch_deployments", _boom)
     wrapper, fresh = await fetch_and_cache_snapshot(project_dir)
 
+    assert wrapper is None
+    assert fresh is False
+
+
+async def test_refresh_has_a_hard_deadline(
+    project_dir: Path, monkeypatch: pytest.MonkeyPatch, snapshot_auth
+) -> None:
+    """A stalled request that evades per-request timeouts must not hang
+    CLI startup — the whole refresh is bounded by an outer deadline."""
+    import asyncio
+    import time
+
+    from lqh.snapshot import fetch_and_cache_snapshot
+
+    async def _hang(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr("lqh.snapshot.fetch_snapshot", _hang)
+    monkeypatch.setattr("lqh.snapshot.fetch_project_artifacts", _hang)
+    monkeypatch.setattr("lqh.snapshot.fetch_deployments", _hang)
+
+    start = time.monotonic()
+    wrapper, fresh = await fetch_and_cache_snapshot(project_dir, timeout=0.2)
+
+    assert time.monotonic() - start < 2.0
     assert wrapper is None
     assert fresh is False
 
@@ -229,6 +278,40 @@ def test_sanitize_drops_urls_and_credentials() -> None:
     clean = sanitize(dirty)
 
     assert clean == {"jobs": [{"job_id": "j1", "status": "ok"}], "nested": {"kept": 1}}
+
+
+def test_sanitize_scrubs_by_value_shape() -> None:
+    """URL/credential VALUES under innocent key names must not survive —
+    key-name heuristics alone are not a privacy boundary."""
+    from lqh.snapshot import sanitize
+
+    dirty = {
+        "note": "https://r2.example/signed?sig=abc",
+        "auth": "Bearer abc123",
+        "jwt_ish": "eyJhbGciOiJIUzI1NiJ9.x.y",
+        "fine": "a plain string",
+        "items": ["https://leak", "kept"],
+    }
+
+    assert sanitize(dirty) == {"fine": "a plain string", "items": ["kept"]}
+
+
+async def test_core_404_keeps_fetched_deployments(
+    project_dir: Path, fake_projects_api, snapshot_auth
+) -> None:
+    """No project row (404) is authoritative for jobs/spend — but live
+    deployment state that WAS fetched must not be discarded with it
+    (hiding a deployment risks a duplicate redeploy)."""
+    from lqh.snapshot import fetch_and_cache_snapshot
+
+    fake_projects_api["status"] = 404
+    fake_projects_api["deployments_status"] = 200
+    wrapper, fresh = await fetch_and_cache_snapshot(project_dir)
+
+    assert fresh is True
+    assert wrapper is not None
+    assert wrapper["snapshot"] == {}
+    assert wrapper["deployments"] == [_DEPLOYMENTS[0]]  # project-scoped
 
 
 def test_read_cached_snapshot_wraps_legacy_format(project_dir: Path) -> None:

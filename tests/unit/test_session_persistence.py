@@ -282,6 +282,92 @@ def test_stale_save_does_not_regress_last_seq(project_dir: Path) -> None:
     assert len(seqs) == len(set(seqs)) == 4
 
 
+def test_seq_allocation_survives_meta_write_failure(
+    project_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sequence allocation consults the log tail, not just meta.json — a
+    failed meta update after a successful append must not let a stale
+    handle allocate a duplicate seq."""
+    import lqh.session as session_module
+
+    a = Session.create(project_dir)
+    a.add_message({"role": "user", "content": "one"})
+    b = Session.load(project_dir, a.id)
+
+    # b appends, but its meta update fails: the log has seq 2, meta says 1.
+    real_write = session_module.atomic_write_json
+
+    def failing_meta_write(path, obj, **kwargs):
+        if path.name == "meta.json":
+            raise OSError("disk full (simulated)")
+        return real_write(path, obj, **kwargs)
+
+    monkeypatch.setattr(session_module, "atomic_write_json", failing_meta_write)
+    b.add_message({"role": "user", "content": "two"})
+    monkeypatch.undo()
+    meta = json.loads(
+        (sessions_dir(project_dir) / a.id / "meta.json").read_text()
+    )
+    assert meta["last_seq"] == 1  # meta is genuinely stale
+
+    # The stale handle appends next: must allocate seq 3, not reuse 2.
+    a.add_message({"role": "user", "content": "three"})
+
+    entries = Session.load(project_dir, a.id).log_entries()
+    seqs = [seq for seq, _ in entries]
+    assert seqs == [1, 2, 3]
+    assert [m["content"] for _, m in entries] == ["one", "two", "three"]
+
+
+def test_seq_allocation_survives_huge_tail_message(
+    project_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log-tail scan must find the last envelope even when it is
+    larger than the initial read window — otherwise a stale handle would
+    reuse its sequence number."""
+    import lqh.session as session_module
+
+    a = Session.create(project_dir)
+    a.add_message({"role": "user", "content": "one"})
+    b = Session.load(project_dir, a.id)
+
+    real_write = session_module.atomic_write_json
+
+    def failing_meta_write(path, obj, **kwargs):
+        if path.name == "meta.json":
+            raise OSError("disk full (simulated)")
+        return real_write(path, obj, **kwargs)
+
+    monkeypatch.setattr(session_module, "atomic_write_json", failing_meta_write)
+    b.add_message({"role": "user", "content": "x" * 200_000})  # > 64 KiB line
+    monkeypatch.undo()
+
+    a.add_message({"role": "user", "content": "three"})
+
+    entries = Session.load(project_dir, a.id).log_entries()
+    seqs = [seq for seq, _ in entries]
+    assert seqs == [1, 2, 3]
+
+
+def test_repair_preserves_recency(project_dir: Path) -> None:
+    """Repair must not bump updated_at — an old abandoned session would
+    otherwise hijack the 'newest interrupted' startup offer."""
+    session = _make_session(project_dir)
+    meta_path = sessions_dir(project_dir) / session.id / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["state"] = "active"
+    meta["pid"] = 2**22 + 7
+    meta["updated_at"] = "2026-01-01T00:00:00+00:00"
+    meta_path.write_text(json.dumps(meta))
+
+    assert Session.repair_states(project_dir) == [session.id]
+
+    repaired = json.loads(meta_path.read_text())
+    assert repaired["state"] == "interrupted"
+    assert repaired["updated_at"] == "2026-01-01T00:00:00+00:00"
+    assert repaired["interrupted_at"]
+
+
 def test_session_without_meta_is_still_discoverable(project_dir: Path) -> None:
     """If the meta write failed after a durable append, the raw log alone
     must keep the session listed and resumable."""

@@ -42,8 +42,6 @@ async def test_existing_project_injects_spec_summary_and_log(
     assert mode == "existing_project"
     contents = [m["content"] for m in agent.context_messages]
     assert any("Train a triage model." in c for c in contents)
-    assert any("Current project state:" in c for c in contents)
-    assert any("Project activity log" in c for c in contents)
     # The first context message labels the injection with its freshness.
     assert contents[0].startswith("Project context as of ")
 
@@ -64,28 +62,36 @@ async def test_missing_spec_still_injects_notes_and_summary(
     assert mode == "new_project"
     contents = [m["content"] for m in agent.context_messages]
     assert any("spec was removed" in c for c in contents)
-    assert any("Current project state:" in c for c in contents)
+    assert any(c.startswith("Project inventory:") for c in contents)
 
 
-async def test_summary_failure_does_not_abort_context_preparation(
-    project_dir: Path, monkeypatch,
-) -> None:
-    """A bug or malformed artifact inside handle_summary must degrade the
-    injected summary, never abort startup//clear//resume preparation."""
+async def test_startup_injects_inventory_not_dossier(project_dir: Path) -> None:
+    """R3: the full project summary and activity log are PULL-only. Startup
+    injects a one-line inventory pointing at the tools, nothing more —
+    which also removes the old failure mode where a malformed artifact
+    inside handle_summary could abort context preparation."""
     (project_dir / "SPEC.md").write_text("# spec\n")
+    run = project_dir / "runs" / "sft_v1"
+    run.mkdir(parents=True)
+    (run / "config.json").write_text("{}")
+    (project_dir / "datasets" / "d1").mkdir(parents=True)
+    from lqh.project_log import append_event
 
-    async def broken_summary(_project_dir, **_kwargs):
-        raise AttributeError("'NoneType' object has no attribute 'get'")
-
-    monkeypatch.setattr("lqh.tools.handlers.handle_summary", broken_summary)
+    append_event(project_dir, "data_gen_completed", "made d1")
 
     agent = _make_agent(project_dir)
     mode = await agent.prepare_context()
 
     assert mode == "existing_project"
     contents = [m["content"] for m in agent.context_messages]
-    assert any("summary unavailable" in c for c in contents)
-    assert any("# spec" in c for c in contents)  # the rest still injected
+    inventory = [c for c in contents if c.startswith("Project inventory:")]
+    assert len(inventory) == 1
+    assert "1 dataset(s)" in inventory[0]
+    assert "1 run(s)" in inventory[0]
+    assert "summary tool" in inventory[0]
+    # The dossier is gone: no full summary, no activity-log dump.
+    assert not any("Current project state:" in c for c in contents)
+    assert not any("Project activity log" in c for c in contents)
 
 
 async def test_notes_md_is_injected_when_present(project_dir: Path) -> None:

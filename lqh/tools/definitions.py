@@ -242,7 +242,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     },
                     "purpose": {
                         "type": "string",
-                        "enum": ["smoke", "inspection", "validation", "training", "unspecified"],
+                        "enum": ["smoke", "inspection", "validation", "training", "failures", "imported", "unspecified"],
                         "default": "unspecified",
                         "description": (
                             "Semantic purpose of this run. Declare it explicitly; do not infer it "
@@ -276,6 +276,28 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                             "the script re-arms this gate). Seed data read via "
                             "lqh.sources during that local run is uploaded with "
                             "the job automatically."
+                        ),
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Existing datasets are immutable by default: if "
+                            "datasets/<output_dataset>/data.parquet already exists "
+                            "the call is refused. Prefer a new versioned name "
+                            "(name_v2) so expensive data is never destroyed. Set "
+                            "true ONLY after the user explicitly confirmed the "
+                            "existing dataset should be replaced (a confirmation "
+                            "prompt is shown either way before data is destroyed)."
+                        ),
+                    },
+                    "parent_dataset": {
+                        "type": "string",
+                        "description": (
+                            "Optional: name/path of the existing dataset this run "
+                            "SUPPLEMENTS (e.g. the base training set a failures "
+                            "dataset extends). Recorded in the output's provenance "
+                            "manifest so supplement relationships survive sessions."
                         ),
                     },
                 },
@@ -353,6 +375,17 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                             "'medium' for production, 'large' for final filter."
                         ),
                         "default": "small",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Existing datasets are immutable by default: if "
+                            "datasets/<output_dataset>/data.parquet already exists "
+                            "the call is refused. Prefer a new versioned name so "
+                            "existing data is never destroyed. Set true ONLY after "
+                            "the user explicitly confirmed replacement."
+                        ),
                     },
                 },
                 "required": ["input_path", "scorer_path", "output_dataset"],
@@ -599,6 +632,16 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         ),
                         "default": 15,
                     },
+                    "export_path": {
+                        "type": "string",
+                        "description": (
+                            "Optional relative path (e.g. 'feedback/eval_failures_v1.jsonl') "
+                            "to durably export the failures as JSONL — full untruncated "
+                            "messages plus origin metadata (eval run, evaluated model). "
+                            "Use this to feed the feedback/ remediation workflow instead "
+                            "of copying from the truncated display."
+                        ),
+                    },
                 },
                 "required": ["eval_run"],
             },
@@ -776,6 +819,15 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                             "(e.g. ['data/train-00000-of-00001.parquet'] or "
                             "['config.json', 'tokenizer.json']). Useful for "
                             "lightweight inspection without pulling weights."
+                        ),
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Dataset pulls refuse to overwrite an existing local "
+                            "dataset's parquet files. Prefer a fresh local_path; "
+                            "set true ONLY after the user confirmed replacement."
                         ),
                     },
                 },

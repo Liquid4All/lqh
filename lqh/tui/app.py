@@ -2444,6 +2444,36 @@ class LqhApp:
                 if state == "unknown":
                     # Transient SSH/FS hiccup — don't update last_state, retry next tick.
                     continue
+                # Every terminal run gets a finalization manifest exactly
+                # once — INDEPENDENT of the notification gates below, so a
+                # run first observed terminal after a restart (no
+                # running→terminal transition, telemetry disabled) is
+                # still traceable.
+                if state in terminal_states:
+                    run_dir = self.project_dir / "runs" / run_name
+                    if not (run_dir / "manifest.json").exists():
+                        try:
+                            from lqh.manifest import write_run_manifest
+
+                            written = write_run_manifest(
+                                self.project_dir, run_dir,
+                                state=state, error=error,
+                            )
+                        except Exception:
+                            written = None
+                        if written is None:
+                            # Surfaced through the activity log — the run
+                            # is terminal but not traceable.
+                            try:
+                                from lqh.project_log import append_event
+
+                                append_event(
+                                    self.project_dir, "manifest_write_failed",
+                                    f"Provenance manifest could not be written for runs/{run_name}",
+                                    run_name=run_name,
+                                )
+                            except Exception:
+                                pass
                 if state == "completed" and self._results_pending(run_name):
                     # The process has exited, but the user-facing job has not:
                     # inference/judging still owes its final result artifact.
@@ -2840,6 +2870,47 @@ class LqhApp:
         except OSError:
             pass
 
+        # Finalization manifest for the downloaded dataset (provenance for
+        # summary, spec-drift signals, and future sessions). Spec/pipeline
+        # hashes come from the submission marker — the job ran the
+        # submitted revisions, not whatever is on disk now.
+        try:
+            from lqh.manifest import write_dataset_manifest
+
+            rows: int | None = None
+            try:
+                import pyarrow.parquet as _pq
+
+                rows = _pq.read_metadata(dest).num_rows
+            except Exception:
+                pass
+            manifest_ok = write_dataset_manifest(
+                self.project_dir,
+                dest.parent,
+                purpose=str(marker.get("purpose") or "unspecified"),
+                rows=rows,
+                pipeline_path=marker.get("script_path"),
+                pipeline_hash=marker.get("pipeline_hash"),
+                spec_sha256=marker.get("spec_sha256"),
+                run_name=run_name,
+                job_id=str(marker.get("job_id") or "") or None,
+                cloud_artifact_id=artifact_id,
+            ) is not None
+        except Exception:
+            manifest_ok = False
+        if not manifest_ok:
+            # Surface it: the artifact exists but is not traceable.
+            try:
+                from lqh.project_log import append_event
+
+                append_event(
+                    self.project_dir, "manifest_write_failed",
+                    f"Provenance manifest could not be written for datasets/{output_dataset}",
+                    run_name=run_name,
+                )
+            except Exception:
+                pass
+
         try:
             from lqh.project_log import append_event
 
@@ -2856,10 +2927,15 @@ class LqhApp:
         _emit_terminal("succeeded")
 
         replaced_note = " (replaced the existing local file)" if replaced else ""
+        manifest_note = (
+            "" if manifest_ok else
+            " ⚠️ Its provenance manifest could not be written — the dataset "
+            "is not traceable to its spec/pipeline revision."
+        )
         return (
             f"[System: cloud data-gen run {run_name} completed{counts}{recovered_note}. "
             f"The dataset was downloaded to datasets/{output_dataset}/data.parquet"
-            f"{replaced_note} — continue with the natural next step "
+            f"{replaced_note}{manifest_note} — continue with the natural next step "
             "(e.g. scoring or training).]"
         )
 
@@ -3062,6 +3138,21 @@ class LqhApp:
     ) -> None:
         """Mirror the transition in the project log so summary/restart see it."""
         from lqh.project_log import append_event
+
+        # Finalization manifest for the run itself: traces checkpoints/
+        # eval results back to their spec revision, base model, and
+        # dataset composition. Best-effort.
+        try:
+            from lqh.manifest import write_run_manifest
+
+            write_run_manifest(
+                self.project_dir,
+                self.project_dir / "runs" / run_name,
+                state=state,
+                error=error,
+            )
+        except Exception:
+            pass
 
         telemetry_job = self._telemetry_jobs.pop(run_name, None) or self._load_telemetry_job(run_name)
         if telemetry_job is not None:

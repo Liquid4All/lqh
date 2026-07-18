@@ -216,10 +216,49 @@ class Session:
         except (OSError, ValueError, TypeError):
             return 0
 
+    def _log_tail_seq(self) -> int:
+        """Highest seq in messages.jsonl itself — the authoritative source.
+
+        meta.json can lag the log (its write is best-effort after the
+        append), so sequence allocation must consult the log tail or a
+        concurrent stale handle could allocate a duplicate seq. The read
+        window grows until the final envelope parses — a single message
+        larger than the initial window must not be skipped (its seq would
+        be reused).
+        """
+        path = self._messages_path
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                window = 65536
+                while True:
+                    f.seek(max(0, size - window))
+                    tail = f.read().decode("utf-8", errors="replace")
+                    lines = tail.splitlines()
+                    if size > window:
+                        # The first line is (likely) a partial read —
+                        # only trust lines after the first newline.
+                        lines = lines[1:]
+                    for line in reversed(lines):
+                        if not line.strip():
+                            continue
+                        try:
+                            return int(json.loads(line)["seq"])
+                        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                            continue
+                    if window >= size:
+                        return 0
+                    window *= 8
+        except OSError:
+            return 0
+
     def _append_to_log(self, message: dict) -> None:
         """Durably append one message envelope under the session lock."""
         with file_lock(self._lock_path):
-            self.last_seq = max(self.last_seq, self._disk_last_seq()) + 1
+            self.last_seq = max(
+                self.last_seq, self._disk_last_seq(), self._log_tail_seq()
+            ) + 1
             envelope = {"seq": self.last_seq, "ts": _now(), "msg": message}
             append_line_durable(self._messages_path, json.dumps(envelope))
             self.updated_at = _now()
@@ -387,11 +426,16 @@ class Session:
                 raise ValueError("coverage includes no messages")
 
             tail = [(seq, msg) for seq, msg in entries if seq > covers_to_seq]
+            # Carry only the NEWEST few covered system messages (active
+            # skill instructions). Older ones — superseded skills, stale
+            # injections — are represented by the summary instead;
+            # carrying them all forever would grow the view unboundedly
+            # and retain conflicting instructions.
             carried = [
                 (seq, msg)
                 for seq, msg in entries
                 if seq <= covers_to_seq and msg.get("role") == "system"
-            ]
+            ][-4:]
 
             checkpoint = {
                 "schema_version": 1,
@@ -759,7 +803,11 @@ class Session:
                     if _pid_alive(meta.get("pid"), meta.get("pid_start")):
                         continue
                     meta["state"] = STATE_INTERRUPTED
-                    meta["updated_at"] = _now()
+                    # updated_at stays untouched: it reflects the session's
+                    # real last activity, and bumping it here would let an
+                    # old abandoned session hijack the "newest interrupted"
+                    # startup offer from genuinely recent work.
+                    meta["interrupted_at"] = _now()
                     atomic_write_json(meta_path, meta)
                     repaired.append(meta.get("id", meta_path.parent.name))
             except (json.JSONDecodeError, OSError):

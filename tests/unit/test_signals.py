@@ -342,6 +342,25 @@ def test_manifest_spec_drift_is_signaled(project_dir: Path) -> None:
     assert "train_v2" not in signals[0].text
 
 
+def test_partial_snapshot_refresh_is_signaled(project_dir: Path) -> None:
+    """A fresh core snapshot with stale enrichment sections is an
+    unknown-unknown — the agent must be told the artifact/deployment
+    lists may be old."""
+    snapshot = {
+        "schema_version": 1,
+        "fetched_at": "2026-07-17T00:00:00+00:00",
+        "snapshot": {"jobs": []},
+        "stale_sections": ["artifacts"],
+    }
+
+    signals = collect_signals(
+        project_dir, snapshot=snapshot, snapshot_fresh=True, run_states={}
+    )
+
+    assert [s.kind for s in signals] == ["snapshot_partial"]
+    assert "artifacts" in signals[0].text
+
+
 def test_quiet_project_has_no_signals(project_dir: Path) -> None:
     signals = collect_signals(
         project_dir, snapshot=None, snapshot_fresh=True, run_states={}

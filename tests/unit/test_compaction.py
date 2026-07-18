@@ -189,6 +189,42 @@ async def test_byte_capped_compaction_never_claims_unsummarized_coverage(
         assert f"turn {i}:" in sent
 
 
+async def test_single_oversized_message_gets_a_whole_solo_pass(
+    project_dir: Path, mock_openai_client, monkeypatch
+) -> None:
+    """A message larger than the byte cap is summarized WHOLE in its own
+    solo pass — coverage must never advance past content no summary
+    actually saw (it fit the model's context when originally sent, so it
+    fits the summarizer too)."""
+    client = mock_openai_client(contents=["s1", "s2"])
+    monkeypatch.setattr(Agent, "_COMPACTION_INPUT_MAX_BYTES", 500)
+    session2 = Session.create(project_dir)
+    agent2 = Agent(project_dir, session2)
+    agent2._client = client
+    for msg in (
+        [{"role": "user", "content": "y" * 5_000}]
+        + [
+            {"role": "assistant" if i % 2 == 0 else "user", "content": f"turn {i}"}
+            for i in range(11)
+        ]
+    ):
+        session2.add_message(msg)
+
+    await agent2._compact_context()
+
+    # Solo pass: only the oversized message (whole) entered the summary,
+    # and coverage claims exactly that one message.
+    first_call = client.chat.completions.create.await_args_list[0].kwargs
+    sent = [m.get("content") or "" for m in first_call["messages"]]
+    assert any(c == "y" * 5_000 for c in sent)
+    assert not any("turn 0" in c for c in sent)
+    assert session2.latest_checkpoint()["covers_to_seq"] == 1
+
+    # The next pass proceeds past it normally.
+    await agent2._compact_context()
+    assert session2.latest_checkpoint()["covers_to_seq"] > 1
+
+
 async def test_compaction_boundary_never_splits_tool_call_groups(
     project_dir: Path, mock_openai_client
 ) -> None:
