@@ -40,6 +40,32 @@ def test_copy_detected(tmp_path: Path) -> None:
     assert boot.copy_status == "copied"
 
 
+def test_claim_loop_does_not_overwrite_live_owner(tmp_path: Path) -> None:
+    import json
+
+    from lqh.headless import claim_loop, live_loop_owner, release_loop
+
+    marker = tmp_path / ".lqh" / "agent_loop.json"
+    marker.parent.mkdir(parents=True)
+    # A live foreign owner (pid 1, no pid_start so reuse check is skipped).
+    marker.write_text(json.dumps({"pid": 1, "pid_start": None}))
+    assert live_loop_owner(tmp_path) == 1
+    assert claim_loop(tmp_path) is False
+    assert json.loads(marker.read_text())["pid"] == 1  # not overwritten
+    # release by a non-owner is a no-op.
+    release_loop(tmp_path)
+    assert marker.exists()
+
+    # A dead owner is claimable.
+    marker.write_text(json.dumps({"pid": 2 ** 22 + 1, "pid_start": None}))
+    assert claim_loop(tmp_path) is True
+    import os
+
+    assert json.loads(marker.read_text())["pid"] == os.getpid()
+    release_loop(tmp_path)
+    assert not marker.exists()
+
+
 def test_repair_sessions_toggle(tmp_path: Path, monkeypatch) -> None:
     calls: list = []
     monkeypatch.setattr(

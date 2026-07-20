@@ -32,6 +32,10 @@ async def _gather(project_dir: Path) -> dict:
         jobs_refreshed = False
 
     run_states = {r: s for r, s, _, _ in snapshots if s != "unknown"}
+    if any(s == "unknown" for _, s, _, _ in snapshots):
+        # A per-run poll failed (SSH/cloud hiccup): the picture is partial
+        # — never present locally cached states as refreshed.
+        jobs_refreshed = False
     snapshot = read_cached_snapshot(project_dir)
     signals = collect_signals(
         project_dir,

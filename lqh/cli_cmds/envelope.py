@@ -41,6 +41,22 @@ def exit_code_for_kind(kind: str | None) -> int:
     return _EXIT_BY_KIND.get(kind or "", EXIT_FAILURE)
 
 
+# Prose markers of a missing/expired LQH token in handler error messages.
+_AUTH_MARKERS = (
+    "not logged in",
+    "not authenticated",
+    "run /login",
+    "run `lqh login`",
+    "authentication failed",
+    "api key is invalid",
+)
+
+
+def _looks_like_auth_error(content: str) -> bool:
+    lowered = content.lower()
+    return any(marker in lowered for marker in _AUTH_MARKERS)
+
+
 def build_envelope(
     *,
     tool: str,
@@ -127,16 +143,18 @@ def stdout_to_stderr() -> Iterator[int]:
     Handlers and the subprocesses they spawn inherit fd 1, so a
     Python-level ``sys.stdout`` swap is not enough to keep the
     one-JSON-object stdout contract. Yields the saved real-stdout fd for
-    ``emit(..., fd=saved)``.
+    ``emit(..., fd=saved)``. Restores the exact ``sys.stdout`` object
+    present on entry (an embedding caller may have installed its own).
     """
     saved = os.dup(1)
+    prior_stdout = sys.stdout
     try:
         sys.stdout.flush()
         os.dup2(2, 1)
         sys.stdout = sys.stderr
         yield saved
     finally:
-        sys.stdout = sys.__stdout__
+        sys.stdout = prior_stdout
         os.dup2(saved, 1)
         os.close(saved)
 
@@ -230,6 +248,12 @@ def interpret_result(
 
     if result.ok is False:
         kind = result.error_kind or "runtime"
+        # Conditionally-cloud tools (tokenless locally, so not tagged
+        # needs_auth) surface a missing token as an upstream/runtime
+        # message — reclassify so the caller gets auth/exit 4 with the
+        # login hint instead of a generic failure.
+        if kind in ("upstream", "runtime") and _looks_like_auth_error(content):
+            kind = "auth"
         envelope = build_envelope(
             tool=tool_name,
             ok=False,
@@ -244,7 +268,12 @@ def interpret_result(
     # Legacy/unclassified result: best-effort prefix sniff (CLI_PLAN §5.3).
     is_error = content.startswith("Error:") or content.startswith("❌")
     if is_error:
-        kind = "conflict" if "refusing to overwrite" in content else "runtime"
+        if "refusing to overwrite" in content:
+            kind = "conflict"
+        elif _looks_like_auth_error(content):
+            kind = "auth"
+        else:
+            kind = "runtime"
         envelope = build_envelope(
             tool=tool_name,
             ok=False,
@@ -253,7 +282,7 @@ def interpret_result(
             duration_s=duration_s,
             classified=False,
         )
-        return envelope, EXIT_FAILURE
+        return envelope, exit_code_for_kind(kind)
     envelope = build_envelope(
         tool=tool_name,
         ok=True,

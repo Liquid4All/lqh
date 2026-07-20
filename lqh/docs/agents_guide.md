@@ -79,11 +79,15 @@ and the exact re-invocation.
 `status` ∈ `success | failure | needs_permission | needs_configuration |
 auth_required | limit_exceeded | interrupted | timed_out`. Artifacts with
 `source: "ledger"` were recorded deterministically from successful tool
-calls; `"reported"` ones are validated model claims. NDJSON progress
-events stream on stderr (`{"schema_version","run_id","seq","event",…}`
-with events `start`, `agent_message`, `tool_call`, `tool_result`,
-`stage`, `end`). `--resume <session_id>` continues a prior run
-contextually — e.g. after granting `--allow-publish`.
+calls; `"reported"` ones are validated model claims (metric provenance is
+likewise `"reported"` — corroborate against eval artifacts yourself).
+Progress events stream on stderr as NDJSON
+(`{"schema_version","run_id","seq","event",…}` with events `start`,
+`agent_message`, `tool_call`, `tool_result`, `progress`, `job_running`,
+`stage`, `end`) — but stderr is a MIXED stream: log lines, warnings, and
+redirected library output appear between events, so parse only lines
+that start with `{` and JSON-decode. `--resume <session_id>` continues a
+prior run contextually — e.g. after granting `--allow-publish`.
 
 ## Contracts
 

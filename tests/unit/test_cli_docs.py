@@ -60,7 +60,7 @@ def test_docs_skill_prints_verbatim(monkeypatch, capsys) -> None:
 
     assert _run(["lqh", "docs", "skill", "auto"], monkeypatch) == 0
     out = capsys.readouterr().out
-    assert out == load_skill_content("auto") + "\n"
+    assert out == load_skill_content("auto")  # verbatim, no extra newline
 
 
 def test_docs_unknown_skill_exit_2(monkeypatch, capsys) -> None:

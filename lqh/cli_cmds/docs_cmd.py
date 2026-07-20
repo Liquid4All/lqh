@@ -61,7 +61,9 @@ def cmd_docs(args: argparse.Namespace) -> int:
         from lqh.skills import load_skill_content
 
         try:
-            print(load_skill_content(args.name))
+            # Verbatim: SKILL.md already ends with a newline; print() would
+            # append a second one.
+            sys.stdout.write(load_skill_content(args.name))
         except FileNotFoundError:
             from lqh.skills import list_available_skills
 

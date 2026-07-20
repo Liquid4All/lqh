@@ -53,6 +53,11 @@ def list_available_skills() -> list[dict[str, str]]:
             "description": "Create and optimize system prompts via iterative eval refinement",
             "command": "/prompt",
         },
+        {
+            "name": "subagent",
+            "description": "Sub-agent contract for delegated headless runs (lqh run)",
+            "command": "",
+        },
     ]
     return skills
 

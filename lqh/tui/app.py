@@ -1570,7 +1570,15 @@ class LqhApp:
                 "Could not load the interrupted session — starting fresh."
             ))
             return
-        session.mark_state("active")
+        # Atomic ownership claim (CLI_PLAN §7): a headless `lqh run` may
+        # own this session right now — never interleave two loops in one
+        # conversation.
+        if not session.claim_active():
+            await self._emit(render_error(
+                "That session is active in another process (e.g. `lqh run`) "
+                "— starting fresh instead."
+            ))
+            return
         self._adopt_session(session)
         await self._emit(render_system_message(f"Resumed session {newest['id'][:8]}"))
         await self._render_session_history()
@@ -1600,10 +1608,17 @@ class LqhApp:
             return
 
         session_info = sessions[index]
+        loaded = Session.load(self.project_dir, session_info["id"])
+        # Atomic ownership claim (CLI_PLAN §7): refuse to interleave with a
+        # session a headless `lqh run` currently owns.
+        if not loaded.claim_active():
+            await self._emit(render_error(
+                "That session is active in another process (e.g. `lqh run`) "
+                "— not resumed."
+            ))
+            return
         if self._session is not None:
             self._session.mark_state("completed")
-        loaded = Session.load(self.project_dir, session_info["id"])
-        loaded.mark_state("active")
         self._adopt_session(loaded)
 
         await self._emit(render_system_message(f"Resumed session {session_info['id'][:8]}"))

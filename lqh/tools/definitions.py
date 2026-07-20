@@ -2162,12 +2162,16 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
         _tool(
             name="exit_auto_mode",
             description=(
-                "Terminate the auto-mode run. Use status='success' when a checkpoint "
-                "exists that meaningfully improves over the baseline, or "
-                "status='failure' when no usable improvement was achieved or an "
-                "unrecoverable error occurred (out of credits, data pipeline cannot "
-                "satisfy the spec, training repeatedly fails). Always provide a "
-                "concise reason explaining the terminal state."
+                "Terminate the autonomous run. Use status='success' when the run's "
+                "goal was achieved — for the full auto-mode pipeline that means a "
+                "checkpoint meaningfully improving over the baseline; for a "
+                "delegated sub-agent task (lqh run) it means the requested work "
+                "(e.g. a spec written, a dataset generated and scored, an "
+                "inspection completed) is done. Use status='failure' when the goal "
+                "was not achieved or an unrecoverable error occurred (out of "
+                "credits, data pipeline cannot satisfy the spec, training "
+                "repeatedly fails). Always provide a concise reason explaining "
+                "the terminal state."
             ),
             parameters={
                 "type": "object",

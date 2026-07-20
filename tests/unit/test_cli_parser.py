@@ -112,6 +112,67 @@ def test_negative_limits_rejected(monkeypatch, capsys) -> None:
         capsys.readouterr()
 
 
+def test_run_parse_error_emits_result_json(monkeypatch, capsys) -> None:
+    """Parser-level errors keep the one-JSON-document stdout contract."""
+    import json
+
+    monkeypatch.setattr(sys, "argv", ["lqh", "run", "x", "--max-turns", "0"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    out, err = capsys.readouterr()
+    payload = json.loads(out)
+    assert payload["status"] == "failure"
+    assert "usage" in payload["reason"]
+    assert "error" in err
+
+
+def test_tool_parse_error_emits_envelope_json(monkeypatch, capsys) -> None:
+    import json
+
+    monkeypatch.setattr(sys, "argv", ["lqh", "tool", "call", "summary", "--wat"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    out, _ = capsys.readouterr()
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["error"]["kind"] == "validation"
+
+
+def test_root_spec_survives_run_subcommand(monkeypatch) -> None:
+    """`lqh --spec X run task` must not silently drop X."""
+    seen: dict = {}
+
+    def fake_dispatch(args):
+        seen["spec"] = args.spec
+        return 0
+
+    monkeypatch.setattr("lqh.cli._dispatch", fake_dispatch)
+    monkeypatch.setattr(sys, "argv", ["lqh", "--spec", "use small model", "run", "t"])
+    with pytest.raises(SystemExit):
+        main()
+    assert seen["spec"] == "use small model"
+
+    # And the subcommand-level flag still wins when given.
+    monkeypatch.setattr(
+        sys, "argv", ["lqh", "run", "t", "--spec", "override"]
+    )
+    with pytest.raises(SystemExit):
+        main()
+    assert seen["spec"] == "override"
+
+
+def test_auto_with_subcommand_refused(monkeypatch, tmp_path: Path, capsys) -> None:
+    """`lqh --auto DIR run …` must error, not silently ignore --auto."""
+    (tmp_path / "SPEC.md").write_text("# spec")
+    monkeypatch.setattr(sys, "argv", ["lqh", "--auto", str(tmp_path), "run", "t"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert "--auto cannot be combined" in capsys.readouterr().err
+
+
 def test_parser_import_hygiene() -> None:
     """Building the parser must not pull the TUI, handlers, or telemetry.
 

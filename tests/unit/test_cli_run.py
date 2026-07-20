@@ -59,6 +59,9 @@ class _FakeAgent:
         self._total_completion_tokens = 7
         self._run_prompt_tokens = 11
         self._run_completion_tokens = 7
+        self._llm_calls_made = 1
+        self.max_llm_calls = None
+        self.max_total_tool_calls = None
         self._handle_tool_call = self._handle  # driver wraps this attribute
 
     async def _handle(self, tool_name, arguments, **kw):
@@ -81,7 +84,17 @@ class _FakeAgent:
         if cls.delay:
             await asyncio.sleep(cls.delay)
         if self.callbacks and self.callbacks.on_tool_call:
-            for tool, args, content in cls.script or []:
+            for i, (tool, args, content) in enumerate(cls.script or []):
+                # Mirror the real agent's deterministic pre-dispatch cap.
+                if (
+                    self.max_total_tool_calls is not None
+                    and i >= self.max_total_tool_calls
+                ):
+                    self._policy_halt = (
+                        "limit_exceeded",
+                        f"tool-call limit ({self.max_total_tool_calls}) reached",
+                    )
+                    return
                 await self.callbacks.on_tool_call(tool, args)
                 if self.callbacks.on_tool_result:
                     await self.callbacks.on_tool_result(tool, content)
@@ -243,7 +256,7 @@ def test_max_tool_calls_limit(run_project, capfd) -> None:
     code = cmd_run(_ns("x", max_tool_calls=1))
     result, _ = _read_result(capfd)
     assert result["status"] == "limit_exceeded"
-    assert "--max-tool-calls" in result["reason"]
+    assert "tool-call limit (1)" in result["reason"]
     assert code == 1
 
 

@@ -76,7 +76,7 @@ class _ArtifactLedger:
     def observe(self, tool: str, args: dict, result: Any) -> None:
         ok = result.ok is True or (
             result.ok is None
-            and not result.content.startswith(("Error", "❌"))
+            and not result.content.startswith(("Error", "❌", "Internal error"))
             and not result.requires_user_input
         )
         if not ok:
@@ -358,37 +358,11 @@ async def _run_async(
 
     claim_loop(project_dir)
 
-    llm_calls = 0
-    tool_calls = 0
-    pending_args: dict[str, dict] = {}
-    agent_task: asyncio.Task | None = None
-    limit_hit: str | None = None
-
-    def _check_limits() -> None:
-        nonlocal limit_hit
-        if limit_hit is not None:
-            return
-        if ns.max_turns is not None and llm_calls > ns.max_turns:
-            limit_hit = f"--max-turns {ns.max_turns} exceeded"
-        elif ns.max_tool_calls is not None and tool_calls > ns.max_tool_calls:
-            limit_hit = f"--max-tool-calls {ns.max_tool_calls} exceeded"
-        if limit_hit and agent_task is not None:
-            agent_task.cancel()
-
-    def _on_spinner_start() -> None:
-        nonlocal llm_calls
-        llm_calls += 1
-        _check_limits()
-
     async def _on_agent_message(text: str) -> None:
         events.emit("agent_message", text=text)
 
     async def _on_tool_call(tool: str, args: dict) -> None:
-        nonlocal tool_calls
-        tool_calls += 1
-        pending_args[tool] = args
         events.emit("tool_call", tool=tool, args=args)
-        _check_limits()
 
     async def _on_tool_result(tool: str, content: str) -> None:
         events.emit(
@@ -437,92 +411,136 @@ async def _run_async(
     )
 
     policy = subagent_policy(allow_publish=ns.allow_publish)
-    agent = Agent(
-        project_dir, session, callbacks, policy=policy, extra_spec=ns.spec,
-    )
-
-    # Ledger observation rides the tool-result path via a wrapper around
-    # the agent's tool executor — observe AFTER interpretation so ok/
-    # sentinel handling has happened.
-    original_handle = agent._handle_tool_call
-
-    async def _observing_handle(tool_name: str, arguments: dict, **kw):
-        result = await original_handle(tool_name, arguments, **kw)
-        try:
-            ledger.observe(tool_name, arguments, result)
-        except Exception:
-            pass
-        return result
-
-    agent._handle_tool_call = _observing_handle  # type: ignore[method-assign]
-
-    # Fresh cloud signals when authenticated (same as TUI startup, §4.8).
-    # fetch_and_cache_snapshot reports freshness itself — a stale cached
-    # fallback must keep its "may be stale" warning.
-    try:
-        from lqh.snapshot import fetch_and_cache_snapshot
-
-        snapshot, fresh = await asyncio.wait_for(
-            fetch_and_cache_snapshot(project_dir), 10.0
-        )
-        agent.set_startup_facts(snapshot=snapshot, snapshot_fresh=fresh)
-    except Exception:
-        pass
-
-    # prepare_context BEFORE the supervisor starts scanning: its
-    # finished-while-away diff consumes the job_seen.json baseline, which
-    # the supervisor's first scan would otherwise overwrite first.
-    await agent.prepare_context()
-    watch_task = asyncio.create_task(supervisor.watch_loop())
-
-    # Telemetry (CLI_PLAN §4.7): start a session only when consent was
-    # previously recorded (the TUI notice); otherwise a one-line note.
-    telemetry = _maybe_start_telemetry(project_dir)
-
-    events.emit("start", task=task, session_id=session.id)
 
     status: str
     reason: str
     interrupted = False
     timed_out = False
+    watch_task: asyncio.Task | None = None
+    telemetry = None
     try:
-        agent_task = asyncio.create_task(agent.process_user_input(task or ""))
-        if ns.timeout:
-            try:
-                await asyncio.wait_for(asyncio.shield(agent_task), ns.timeout)
-            except asyncio.TimeoutError:
-                timed_out = True
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except BaseException:
-                    pass
-        else:
-            await agent_task
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        interrupted = True
-    except Exception as e:  # noqa: BLE001 — result JSON is the contract
-        import traceback
-
-        traceback.print_exc(file=sys.stderr)
-        agent.abort_turn()
-        session.mark_state(STATE_INTERRUPTED)
-        watch_task.cancel()
-        await supervisor.stop_watchers()
-        release_loop(project_dir)
-        await _end_telemetry(telemetry, "failure")
-        return _finish(_result_json(
-            run_id=run_id, status="failure", reason=f"{type(e).__name__}: {e}",
-            summary=f"The run crashed: {e}", artifacts=ledger.entries,
-            metrics={}, session_id=session.id,
-            usage=_usage(agent, llm_calls), duration_s=time.monotonic() - start,
-        ))
-    finally:
-        watch_task.cancel()
+        # ------------------------------------------------------------------
+        # Setup — any failure here still yields the one JSON result doc.
+        # ------------------------------------------------------------------
         try:
-            await watch_task
-        except BaseException:
-            pass
+            agent = Agent(
+                project_dir, session, callbacks,
+                policy=policy, extra_spec=ns.spec,
+            )
+            # Deterministic limits, enforced by the agent BEFORE the next
+            # API/tool call (a cooperative post-hoc cancel could not stop
+            # a synchronous or shielded call from completing).
+            agent.max_llm_calls = ns.max_turns
+            agent.max_total_tool_calls = ns.max_tool_calls
+
+            # Ledger observation rides the tool-result path via a wrapper
+            # around the agent's tool executor — observe AFTER
+            # interpretation so ok/sentinel handling has happened.
+            original_handle = agent._handle_tool_call
+
+            async def _observing_handle(tool_name: str, arguments: dict, **kw):
+                result = await original_handle(tool_name, arguments, **kw)
+                try:
+                    ledger.observe(tool_name, arguments, result)
+                except Exception:
+                    pass
+                return result
+
+            agent._handle_tool_call = _observing_handle  # type: ignore[method-assign]
+
+            # Fresh cloud signals when authenticated (same as TUI startup,
+            # §4.8). fetch_and_cache_snapshot reports freshness itself — a
+            # stale cached fallback must keep its "may be stale" warning.
+            try:
+                from lqh.snapshot import fetch_and_cache_snapshot
+
+                snapshot, fresh = await asyncio.wait_for(
+                    fetch_and_cache_snapshot(project_dir), 10.0
+                )
+                agent.set_startup_facts(snapshot=snapshot, snapshot_fresh=fresh)
+            except Exception:
+                pass
+
+            # prepare_context BEFORE the supervisor starts scanning: its
+            # finished-while-away diff consumes the job_seen.json baseline,
+            # which the supervisor's first scan would otherwise overwrite.
+            await agent.prepare_context()
+            watch_task = asyncio.create_task(supervisor.watch_loop())
+            # Wait for the first scan so a resumed agent's immediate
+            # training_status sees pre-existing jobs in the registry
+            # (otherwise parking would see nothing running and fall back
+            # to LLM polling).
+            await supervisor.wait_primed()
+
+            # Telemetry (CLI_PLAN §4.7): start a session only when consent
+            # was previously recorded (the TUI notice); else a one-line note.
+            telemetry = _maybe_start_telemetry(project_dir)
+        except Exception as e:  # noqa: BLE001 — result JSON is the contract
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+            session.mark_state(STATE_INTERRUPTED)
+            return _finish(_result_json(
+                run_id=run_id, status="failure",
+                reason=f"run setup failed: {type(e).__name__}: {e}",
+                summary=f"run setup failed: {e}", artifacts=[],
+                metrics={}, session_id=session.id,
+                usage={"prompt_tokens": 0, "completion_tokens": 0, "turns": 0},
+                duration_s=time.monotonic() - start,
+            ))
+
+        events.emit("start", task=task, session_id=session.id)
+
+        try:
+            agent_task = asyncio.create_task(agent.process_user_input(task or ""))
+            if ns.timeout:
+                # Wall-clock budget measured from command start (identity
+                # boot, snapshot fetch, and priming already spent part of
+                # it). Best-effort: an in-flight protected submission may
+                # extend past it by its bounded grace.
+                remaining = ns.timeout - (time.monotonic() - start)
+                if remaining <= 0:
+                    timed_out = True
+                    agent_task.cancel()
+                else:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(agent_task), remaining
+                        )
+                    except asyncio.TimeoutError:
+                        timed_out = True
+                        agent_task.cancel()
+                if timed_out:
+                    try:
+                        await agent_task
+                    except BaseException:
+                        pass
+            else:
+                await agent_task
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            interrupted = True
+        except Exception as e:  # noqa: BLE001 — result JSON is the contract
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+            agent.abort_turn()
+            session.mark_state(STATE_INTERRUPTED)
+            ledger.finalize()
+            await _end_telemetry(telemetry, "failure")
+            return _finish(_result_json(
+                run_id=run_id, status="failure",
+                reason=f"{type(e).__name__}: {e}",
+                summary=f"The run crashed: {e}", artifacts=ledger.entries,
+                metrics={}, session_id=session.id,
+                usage=_usage(agent), duration_s=time.monotonic() - start,
+            ))
+    finally:
+        if watch_task is not None:
+            watch_task.cancel()
+            try:
+                await watch_task
+            except BaseException:
+                pass
         await supervisor.stop_watchers()
         release_loop(project_dir)
 
@@ -543,10 +561,7 @@ async def _run_async(
         session.mark_state(STATE_INTERRUPTED)
     elif interrupted:
         agent.abort_turn()
-        if limit_hit:
-            status, reason = "limit_exceeded", limit_hit
-        else:
-            status, reason = "interrupted", "the run was interrupted"
+        status, reason = "interrupted", "the run was interrupted"
         session.mark_state(STATE_INTERRUPTED)
     elif agent._policy_halt is not None:
         status, reason = agent._policy_halt
@@ -584,7 +599,7 @@ async def _run_async(
         run_id=run_id, status=status, reason=reason,
         summary=summary or reason,
         artifacts=ledger.entries, metrics=metrics,
-        session_id=session.id, usage=_usage(agent, llm_calls),
+        session_id=session.id, usage=_usage(agent),
         duration_s=time.monotonic() - start,
         secrets=secrets or None,
     ))
@@ -629,9 +644,9 @@ async def _end_telemetry(telemetry, status: str) -> None:
         pass
 
 
-def _usage(agent, llm_calls: int) -> dict:
+def _usage(agent) -> dict:
     return {
         "prompt_tokens": agent._run_prompt_tokens,
         "completion_tokens": agent._run_completion_tokens,
-        "turns": llm_calls,
+        "turns": agent._llm_calls_made,
     }

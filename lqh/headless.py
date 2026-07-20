@@ -45,19 +45,28 @@ def live_loop_owner(project_dir: Path) -> int | None:
     return None
 
 
-def claim_loop(project_dir: Path) -> None:
-    """Register this process as the project's running agent loop (best-effort)."""
-    from lqh.fsio import atomic_write_json
+def claim_loop(project_dir: Path) -> bool:
+    """Register this process as the project's running agent loop.
+
+    Best-effort and advisory — but a LIVE foreign owner is never
+    overwritten (that would silence the very warning the marker exists
+    for). Returns True when this process now holds the marker.
+    """
+    from lqh.fsio import atomic_write_json, file_lock
     from lqh.session import _pid_start_time
 
     pid = os.getpid()
     try:
-        atomic_write_json(project_dir / _LOOP_MARKER, {
-            "pid": pid,
-            "pid_start": _pid_start_time(pid),
-        })
+        with file_lock(project_dir / ".lqh" / "agent_loop.lock"):
+            if live_loop_owner(project_dir) is not None:
+                return False
+            atomic_write_json(project_dir / _LOOP_MARKER, {
+                "pid": pid,
+                "pid_start": _pid_start_time(pid),
+            })
+            return True
     except OSError:
-        pass
+        return False
 
 
 def release_loop(project_dir: Path) -> None:

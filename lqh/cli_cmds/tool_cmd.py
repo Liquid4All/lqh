@@ -51,6 +51,8 @@ def _cmd_list(*, json_out: bool) -> int:
                     "description": _first_sentence(t["function"]["description"]),
                     "mutating": t[METADATA_KEY]["mutating"],
                     "needs_auth": t[METADATA_KEY]["needs_auth"],
+                    "permission_domain": t[METADATA_KEY]["permission_domain"],
+                    "needs_loop": t[METADATA_KEY]["needs_loop"],
                 }
                 for t in tools
             ],

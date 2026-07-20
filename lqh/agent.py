@@ -449,6 +449,16 @@ class Agent:
         self._total_completion_tokens = 0
         self._run_prompt_tokens = 0
         self._run_completion_tokens = 0
+        # Deterministic run limits (headless driver): checked BEFORE the
+        # next API/tool call is made — a cooperative cancel after dispatch
+        # could not stop a synchronous or shielded call from completing.
+        # _llm_calls_made counts every chat_with_retry invocation,
+        # including compaction (per-attempt retries inside a single
+        # invocation cannot be observed from here).
+        self.max_llm_calls: int | None = None
+        self.max_total_tool_calls: int | None = None
+        self._llm_calls_made = 0
+        self._tool_calls_made = 0
         self._turn_number = 0
         self._active_skill: str | None = None
         self._spec_edit_logged: dict[str, bool] = {}
@@ -687,11 +697,17 @@ class Agent:
             summary_msgs.extend(msg for _, msg in window)
 
             client = self._get_client()
+            self._llm_calls_made += 1
             response = await chat_with_retry(
                 client, model=self.orchestration_model, messages=summary_msgs,
                 max_tokens=ORCHESTRATION_MAX_TOKENS,
                 temperature=0.0,
             )
+            # Compaction consumes real tokens — include it in the run-wide
+            # billed totals the headless driver reports.
+            if response.usage:
+                self._run_prompt_tokens += response.usage.prompt_tokens or 0
+                self._run_completion_tokens += response.usage.completion_tokens or 0
             summary_text = (response.choices[0].message.content or "").strip()
             if not summary_text:
                 return
@@ -803,6 +819,17 @@ class Agent:
                         "Breaking to avoid an infinite loop. Please try a different approach."
                     )
                 break
+            # Deterministic LLM-call limit: enforced BEFORE the call is
+            # made — a post-hoc cancel could not un-spend it.
+            if (
+                self.max_llm_calls is not None
+                and self._llm_calls_made >= self.max_llm_calls
+            ):
+                self._policy_halt = (
+                    "limit_exceeded",
+                    f"LLM-call limit ({self.max_llm_calls}) reached",
+                )
+                break
             # Call the API
             if self.callbacks.on_spinner_start:
                 self.callbacks.on_spinner_start()
@@ -811,6 +838,7 @@ class Agent:
                 client = self._get_client()
                 self._current_operation = f"awaiting_chat_completion (turn {self._turn_number + 1})"
                 _api_call_start = time.monotonic()
+                self._llm_calls_made += 1
                 response = await chat_with_retry(
                     client,
                     model=self.orchestration_model,
@@ -1016,6 +1044,24 @@ class Agent:
                             ),
                         })
                         continue
+                    # Deterministic tool-call limit: checked BEFORE dispatch
+                    # — a cooperative cancel after dispatch cannot stop a
+                    # synchronous or shielded call from completing.
+                    if (
+                        self.max_total_tool_calls is not None
+                        and self._tool_calls_made >= self.max_total_tool_calls
+                    ):
+                        self._policy_halt = (
+                            "limit_exceeded",
+                            f"tool-call limit ({self.max_total_tool_calls}) reached",
+                        )
+                        self.session.add_message({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": "[Skipped: tool-call limit reached.]",
+                        })
+                        continue
+                    self._tool_calls_made += 1
                     try:
                         arguments = json.loads(tc.function.arguments) if tc.function and tc.function.arguments else {}
                     except json.JSONDecodeError:
@@ -1029,8 +1075,9 @@ class Agent:
                         result = await self._handle_tool_call(tool_name, arguments)
                         self._current_operation = None
                     except Exception as e:
-                        result = ToolResult(
-                            content=f"Internal error executing {tool_name}: {type(e).__name__}: {e}"
+                        result = ToolResult.fail(
+                            "runtime",
+                            f"Internal error executing {tool_name}: {type(e).__name__}: {e}",
                         )
 
                     # Add tool result to conversation

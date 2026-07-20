@@ -336,6 +336,13 @@ class JobSupervisor:
                     # Transient SSH/FS hiccup — don't update last_state,
                     # retry next tick.
                     continue
+                if state == "completed" and self.results_pending(run_name):
+                    # The process has exited, but the user-facing job has
+                    # not: inference/judging still owes its final result
+                    # artifact. Demote BEFORE the manifest write below, or
+                    # the manifest would be finalized without the final
+                    # evaluation artifact and never rewritten.
+                    state = "running"
                 # Every terminal run gets a finalization manifest exactly
                 # once — INDEPENDENT of the notification gates below, so a
                 # run first observed terminal after a restart (no
@@ -365,11 +372,6 @@ class JobSupervisor:
                                 )
                             except Exception:
                                 pass
-                if state == "completed" and self.results_pending(run_name):
-                    # The process has exited, but the user-facing job has
-                    # not: inference/judging still owes its final result
-                    # artifact.
-                    state = "running"
                 prev = self.job_last_state.get(run_name)
                 # A caller-held job record (e.g. a persisted telemetry
                 # workflow) warrants a completion notification even

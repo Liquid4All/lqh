@@ -23,7 +23,9 @@ def cmd_project(args: argparse.Namespace) -> int:
     if boot.identity_error:
         print(
             "Project identity file is corrupt and will NOT be auto-replaced: "
-            f"{boot.identity_error}\nFix or remove .lqh/project.json, then retry.",
+            f"{boot.identity_error}\nRestore .lqh/project.json (e.g. from a "
+            "backup or the original project directory) — do NOT delete it; "
+            "a fresh identity would disconnect this project's cloud history.",
             file=sys.stderr,
         )
         return 5

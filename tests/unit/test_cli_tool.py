@@ -57,7 +57,10 @@ def test_list_json_shape(capsys) -> None:
     assert by_name["start_training"]["mutating"] is True
     assert set(by_name["summary"]) == {
         "name", "description", "mutating", "needs_auth",
+        "permission_domain", "needs_loop",
     }
+    assert by_name["start_training"]["permission_domain"] == ["training"]
+    assert by_name["start_training"]["needs_loop"] is True
 
 
 def test_schema_prints_definition(capsys) -> None:

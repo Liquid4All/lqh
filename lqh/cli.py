@@ -61,8 +61,63 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+class _ContractParser(argparse.ArgumentParser):
+    """Subcommand parser that keeps the machine contracts on parse errors.
+
+    `lqh run` and `lqh tool` promise exactly one JSON document on stdout;
+    argparse errors fire before command dispatch, so without this a typo'd
+    flag would exit 2 with empty stdout. Other subcommands keep argparse's
+    plain-text behavior.
+    """
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        import json
+
+        parts = self.prog.split()
+        if parts == ["lqh"]:
+            # Unrecognized options are reported by the ROOT parser even
+            # when they belong to a subcommand invocation — recover the
+            # intended command from argv (first non-flag token).
+            for token in sys.argv[1:]:
+                if not token.startswith("-"):
+                    parts = ["lqh", token]
+                    break
+        if "run" in parts:
+            print(json.dumps({
+                "schema_version": 1,
+                "run_id": None,
+                "status": "failure",
+                "reason": f"usage: {message}",
+                "summary": f"usage: {message}",
+                "artifacts": [],
+                "metrics": {},
+                "session_id": None,
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "turns": 0},
+                "duration_s": 0.0,
+            }))
+            print(f"{self.prog}: error: {message}", file=sys.stderr)
+            raise SystemExit(2)
+        if "tool" in parts:
+            print(json.dumps({
+                "schema_version": 1,
+                "ok": False,
+                "tool": None,
+                "result": None,
+                "error": {
+                    "kind": "validation",
+                    "message": f"usage: {message}",
+                    "retryable": False,
+                    "details": {},
+                },
+                "meta": {"duration_s": 0.0, "lqh_version": __version__},
+            }))
+            print(f"{self.prog}: error: {message}", file=sys.stderr)
+            raise SystemExit(2)
+        super().error(message)
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ContractParser(
         prog="lqh",
         description=(
             "Liquid Harness — agent for customizing Liquid AI foundation "
@@ -103,7 +158,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     sub = parser.add_subparsers(
-        dest="command", title="commands", metavar="[command]"
+        dest="command", title="commands", metavar="[command]",
+        parser_class=_ContractParser,
     )
 
     sub.add_parser(
@@ -232,7 +288,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--timeout", type=_positive_int, default=None, metavar="SECONDS",
-        help="Abort with timed_out after SECONDS of wall clock.",
+        help=(
+            "Abort with timed_out after SECONDS of wall clock (best-effort: "
+            "an in-flight protected submission gets a bounded grace)."
+        ),
     )
     run.add_argument(
         "--save-secret", action="store_true",
@@ -243,7 +302,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Suppress NDJSON progress events on stderr.",
     )
     run.add_argument(
-        "--spec", metavar="STRING", default=None,
+        # SUPPRESS: a root-level `lqh --spec X run …` must survive — a
+        # plain default here would silently overwrite it with None.
+        "--spec", metavar="STRING", default=argparse.SUPPRESS,
         help="Extra sticky context appended to every agent turn.",
     )
 
@@ -326,9 +387,19 @@ def _dispatch(args: argparse.Namespace) -> int:
 
 def main() -> None:
     """Main entry point for the lqh CLI."""
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
 
     if getattr(args, "command", None) is not None:
+        if args.auto is not None:
+            # `lqh --auto DIR run …` would silently ignore --auto (and its
+            # project directory) — refuse instead of doing the wrong thing.
+            parser.error(
+                "--auto cannot be combined with a subcommand; use "
+                "`lqh run --project DIR` for headless runs."
+            )
+        if not hasattr(args, "spec"):
+            args.spec = None
         sys.exit(_dispatch(args))
 
     if args.auto is not None:
