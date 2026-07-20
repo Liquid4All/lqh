@@ -12,6 +12,7 @@ from lqh.manifest import (
 )
 from lqh.project_meta import compute_spec_sha256
 from lqh.tools.handlers import handle_run_data_filter, handle_run_data_gen_pipeline
+from lqh.tools.permissions import PermissionContext
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +331,7 @@ async def test_overwrite_flag_requires_human_confirmation(
         num_samples=10,
         output_dataset="train_v1",
         overwrite=True,
-        _script_consent=True,
+        _permissions=PermissionContext.granting("script"),
     )
 
     assert result.content == "OVERWRITE_CONFIRMATION_REQUIRED"
@@ -345,7 +346,7 @@ async def test_overwrite_flag_requires_human_confirmation(
         num_samples=10,
         output_dataset="train_v1",
         overwrite=True,
-        _script_consent=True,
+        _permissions=PermissionContext.granting("script"),
         _overwrite_consent=True,
     )
     assert "does not exist" in confirmed.content  # passed both gates

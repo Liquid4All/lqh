@@ -19,6 +19,7 @@ from lqh.context_stats import ContextStats, TurnStats
 from lqh.tools.definitions import get_all_tools
 from lqh.tools.handlers import execute_tool, ToolResult
 from lqh.tools.permissions import (
+    PermissionContext,
     grant_permission,
     grant_hf_permission,
     grant_training_permission,
@@ -1286,7 +1287,7 @@ class Agent:
                         tool_name, arguments,
                         internal_kwargs={
                             "_overwrite_consent": True,
-                            "_script_consent": True,
+                            "_permissions": PermissionContext.granting("script"),
                         },
                     )
                 return ToolResult(
@@ -1492,7 +1493,9 @@ class Agent:
     ) -> ToolResult:
         """Process the user's permission choice for pipeline execution or HF push."""
         if tool_name == "hf_push":
-            return await self._handle_hf_push_permission(response, tool_args)
+            return await self._handle_hf_push_permission(
+                response, tool_args, permission_key=permission_key
+            )
 
         if tool_name in ("start_training", "start_local_eval"):
             if "do not" in response.lower():
@@ -1523,7 +1526,11 @@ class Agent:
             # already-approved script prompt doesn't re-fire).
             return await self._reinvoke_tool(
                 tool_name, tool_args,
-                internal_kwargs={"_script_consent": True, "_cloud_consent": True},
+                internal_kwargs={
+                    "_permissions": PermissionContext.granting(
+                        "script", "cloud_data_gen"
+                    ),
+                },
             )
 
         # Pipeline execution permission (run_data_gen_pipeline)
@@ -1542,17 +1549,24 @@ class Agent:
         # NOT via a direct _execute_pipeline call, which would drop
         # samples_per_item/purpose/execution and skip the cloud branch.
         return await self._reinvoke_tool(
-            tool_name, tool_args, internal_kwargs={"_script_consent": True},
+            tool_name, tool_args,
+            internal_kwargs={"_permissions": PermissionContext.granting("script")},
         )
 
     async def _handle_hf_push_permission(
-        self, response: str, push_args: dict
+        self, response: str, push_args: dict,
+        permission_key: str | None = None,
     ) -> ToolResult:
         """Process the user's permission choice for HF push."""
         if "Do not push" in response:
             return ToolResult(content="HF push declined by user.")
 
-        repo_id = push_args.get("repo_id", "")
+        # The sentinel's permission_key carries the RESOLVED repo id —
+        # push_args may omit it (auto-generated in the handler), in which
+        # case granting/pushing with "" would be wrong.
+        repo_id = push_args.get("repo_id") or (
+            permission_key.split(":", 1)[1] if permission_key else ""
+        )
 
         # Grant appropriate permission
         if "don't ask again for this project" in response:

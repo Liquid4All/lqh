@@ -18,6 +18,7 @@ from lqh.dataset_guard import (
     overwrite_refusal,
     release_output,
 )
+from lqh.tools.permissions import PermissionContext
 
 
 def test_existing_output_recognizes_any_parquet(project_dir: Path) -> None:
@@ -96,7 +97,7 @@ def test_pending_cloud_target_needs_confirmation_even_with_overwrite(
         num_samples=3,
         output_dataset="claimed",
         overwrite=True,
-        _script_consent=True,
+        _permissions=PermissionContext.granting("script"),
     ))
 
     assert result.content == "OVERWRITE_CONFIRMATION_REQUIRED"

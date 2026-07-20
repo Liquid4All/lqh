@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from pathlib import Path
 
+from lqh.fsio import atomic_write_json, file_lock
+
 PERMISSIONS_FILE = ".lqh/permissions.json"
+PERMISSIONS_LOCK = ".lqh/permissions.lock"
 
 
 @dataclass
@@ -24,6 +27,10 @@ class PermissionStore:
     # Separate domain again: local script-exec approval must not imply
     # spending cloud compute, and vice versa.
     cloud_data_gen_allow_all: bool = False
+
+
+def _permissions_lock(project_dir: Path):
+    return file_lock(project_dir / PERMISSIONS_LOCK)
 
 
 def load_permissions(project_dir: Path) -> PermissionStore:
@@ -46,9 +53,7 @@ def load_permissions(project_dir: Path) -> PermissionStore:
 
 
 def save_permissions(project_dir: Path, perms: PermissionStore) -> None:
-    path = project_dir / PERMISSIONS_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(perms), indent=2) + "\n")
+    atomic_write_json(project_dir / PERMISSIONS_FILE, asdict(perms))
 
 
 def check_permission(project_dir: Path, script_path: str) -> bool:
@@ -61,12 +66,13 @@ def grant_permission(
     script_path: str | None = None,
     project_wide: bool = False,
 ) -> None:
-    perms = load_permissions(project_dir)
-    if project_wide:
-        perms.project_allow_all = True
-    elif script_path is not None and script_path not in perms.allowed_files:
-        perms.allowed_files.append(script_path)
-    save_permissions(project_dir, perms)
+    with _permissions_lock(project_dir):
+        perms = load_permissions(project_dir)
+        if project_wide:
+            perms.project_allow_all = True
+        elif script_path is not None and script_path not in perms.allowed_files:
+            perms.allowed_files.append(script_path)
+        save_permissions(project_dir, perms)
 
 
 def check_training_permission(project_dir: Path, run_name: str) -> bool:
@@ -91,12 +97,13 @@ def grant_training_permission(
     by autonomous auto mode so it never re-prompts). Otherwise ``key`` — a
     ``"training:<run_name>"`` string — grants exactly that one run.
     """
-    perms = load_permissions(project_dir)
-    if project_wide:
-        perms.training_allow_all = True
-    elif key is not None and key not in perms.allowed_training:
-        perms.allowed_training.append(key)
-    save_permissions(project_dir, perms)
+    with _permissions_lock(project_dir):
+        perms = load_permissions(project_dir)
+        if project_wide:
+            perms.training_allow_all = True
+        elif key is not None and key not in perms.allowed_training:
+            perms.allowed_training.append(key)
+        save_permissions(project_dir, perms)
 
 
 def check_cloud_data_gen_permission(project_dir: Path) -> bool:
@@ -106,9 +113,10 @@ def check_cloud_data_gen_permission(project_dir: Path) -> bool:
 
 def grant_cloud_data_gen_permission(project_dir: Path) -> None:
     """Project-wide grant — used by "don't ask again" and by auto mode."""
-    perms = load_permissions(project_dir)
-    perms.cloud_data_gen_allow_all = True
-    save_permissions(project_dir, perms)
+    with _permissions_lock(project_dir):
+        perms = load_permissions(project_dir)
+        perms.cloud_data_gen_allow_all = True
+        save_permissions(project_dir, perms)
 
 
 def check_hf_permission(project_dir: Path, repo_id: str) -> bool:
@@ -121,9 +129,78 @@ def grant_hf_permission(
     repo_id: str | None = None,
     project_wide: bool = False,
 ) -> None:
-    perms = load_permissions(project_dir)
-    if project_wide:
-        perms.hf_push_allow_all = True
-    elif repo_id is not None and repo_id not in perms.hf_allowed_repos:
-        perms.hf_allowed_repos.append(repo_id)
-    save_permissions(project_dir, perms)
+    with _permissions_lock(project_dir):
+        perms = load_permissions(project_dir)
+        if project_wide:
+            perms.hf_push_allow_all = True
+        elif repo_id is not None and repo_id not in perms.hf_allowed_repos:
+            perms.hf_allowed_repos.append(repo_id)
+        save_permissions(project_dir, perms)
+
+
+# ---------------------------------------------------------------------------
+# PermissionContext — invocation-scoped consent (CLI_PLAN §3.4)
+# ---------------------------------------------------------------------------
+
+# Consent domain names. Keep aligned with the `permission_domain` tool
+# metadata in lqh/tools/definitions.py.
+PERMISSION_DOMAINS = frozenset({"script", "cloud_data_gen", "training", "hf_push"})
+
+
+@dataclass(frozen=True)
+class PermissionContext:
+    """Invocation-scoped consent, consulted by all permission-gated handlers.
+
+    Precedence: ``full_consent`` -> invocation ``grants`` -> durable store
+    -> deny (the handler returns its PERMISSION_REQUIRED sentinel).
+
+    Threaded to handlers as the ``_permissions`` extra-kwarg — the
+    underscore channel is already stripped from model-controlled arguments
+    (``execute_tool``), so a model call can never smuggle consent in.
+    Invocation grants never persist anything; durable grants remain the
+    agent loop's job at its grant sites.
+    """
+
+    full_consent: bool = False  # CLI `lqh tool call` surface (invocation-is-consent)
+    grants: frozenset[str] = frozenset()  # domains granted for THIS invocation
+
+    @classmethod
+    def granting(cls, *domains: str) -> "PermissionContext":
+        unknown = set(domains) - PERMISSION_DOMAINS
+        if unknown:
+            raise ValueError(f"unknown permission domain(s): {sorted(unknown)}")
+        return cls(grants=frozenset(domains))
+
+    def with_grants(self, *domains: str) -> "PermissionContext":
+        unknown = set(domains) - PERMISSION_DOMAINS
+        if unknown:
+            raise ValueError(f"unknown permission domain(s): {sorted(unknown)}")
+        return replace(self, grants=self.grants | frozenset(domains))
+
+    def allows_script(self, project_dir: Path, script_path: str) -> bool:
+        return (
+            self.full_consent
+            or "script" in self.grants
+            or check_permission(project_dir, script_path)
+        )
+
+    def allows_cloud_data_gen(self, project_dir: Path) -> bool:
+        return (
+            self.full_consent
+            or "cloud_data_gen" in self.grants
+            or check_cloud_data_gen_permission(project_dir)
+        )
+
+    def allows_training(self, project_dir: Path, run_name: str) -> bool:
+        return (
+            self.full_consent
+            or "training" in self.grants
+            or check_training_permission(project_dir, run_name)
+        )
+
+    def allows_hf_push(self, project_dir: Path, repo_id: str) -> bool:
+        return (
+            self.full_consent
+            or "hf_push" in self.grants
+            or check_hf_permission(project_dir, repo_id)
+        )

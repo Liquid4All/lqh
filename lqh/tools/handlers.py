@@ -14,6 +14,7 @@ from lqh.project_identity import cloud_project_key as _ckey
 from typing import Any, Callable, Awaitable
 
 from lqh.skills import list_available_skills, load_skill_content
+from lqh.tools.permissions import PermissionContext
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,14 @@ class SecretDelivery:
     env_comment: str | None = None  # comment line written above the .env entry
 
 
+# Error taxonomy for structured tool failures (CLI_PLAN §5.3).
+# "conflict" covers overwrite-guard / already-exists refusals.
+ERROR_KINDS = frozenset({
+    "auth", "permission", "config", "validation",
+    "not_found", "conflict", "upstream", "runtime",
+})
+
+
 @dataclass
 class ToolResult:
     """Result from a tool execution."""
@@ -74,6 +83,38 @@ class ToolResult:
     # been accepted. Permission and compute-picker sentinels deliberately
     # leave this false so pipeline readiness cannot complete prematurely.
     workflow_launched: bool = False
+    # Structured outcome (CLI_PLAN §5.3). None = legacy/unclassified —
+    # downstream consumers fall back to the "Error:"/"❌" prefix sniff.
+    # Interactive sentinels (PERMISSION_REQUIRED etc.) are not failures
+    # and keep ok=None.
+    ok: bool | None = None
+    error_kind: str | None = None  # member of ERROR_KINDS
+    retryable: bool = False
+    details: dict[str, Any] | None = None
+
+    @classmethod
+    def fail(
+        cls,
+        kind: str,
+        content: str,
+        *,
+        retryable: bool = False,
+        details: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> "ToolResult":
+        """Build a classified failure. ``content`` keeps the exact prose the
+        agent sees; the structured fields ride alongside for headless
+        consumers."""
+        if kind not in ERROR_KINDS:
+            raise ValueError(f"unknown error_kind {kind!r}")
+        return cls(
+            content=content,
+            ok=False,
+            error_kind=kind,
+            retryable=retryable,
+            details=details,
+            **kwargs,
+        )
 
 
 def _validate_path(project_dir: Path, rel_path: str) -> Path:
@@ -1074,8 +1115,7 @@ async def handle_run_data_gen_pipeline(
     timeout_minutes: int = 720,
     overwrite: bool = False,
     parent_dataset: str | None = None,
-    _script_consent: bool = False,
-    _cloud_consent: bool = False,
+    _permissions: PermissionContext | None = None,
     _overwrite_consent: bool = False,
     **kwargs: Any,
 ) -> ToolResult:
@@ -1084,23 +1124,27 @@ async def handle_run_data_gen_pipeline(
     ``execution="cloud"`` submits a background CPU cloud job instead of
     running in-process (CLOUD_OFFLOAD_PLAN.md §2), gated on a prior
     successful local run of the same pipeline version plus user consent.
-    ``_script_consent`` / ``_cloud_consent`` are internal: the agent loop
-    sets them when re-invoking after the user granted the corresponding
-    prompt, so a one-time grant works without persisting anything.
+    ``_permissions`` is internal: the agent loop passes an invocation-scoped
+    ``PermissionContext`` grant when re-invoking after the user approved the
+    corresponding prompt, so a one-time grant works without persisting
+    anything; headless surfaces pass full consent.
     """
-    from lqh.tools.permissions import check_permission
+    perms = _permissions or PermissionContext()
 
     if execution not in ("local", "cloud"):
-        return ToolResult(
-            content=f"Error: execution must be 'local' or 'cloud', got {execution!r}"
+        return ToolResult.fail(
+            "validation",
+            f"Error: execution must be 'local' or 'cloud', got {execution!r}",
         )
     if num_samples <= 0:
-        return ToolResult(
-            content=f"Error: num_samples must be positive, got {num_samples}"
+        return ToolResult.fail(
+            "validation",
+            f"Error: num_samples must be positive, got {num_samples}",
         )
     if samples_per_item <= 0:
-        return ToolResult(
-            content=f"Error: samples_per_item must be positive, got {samples_per_item}"
+        return ToolResult.fail(
+            "validation",
+            f"Error: samples_per_item must be positive, got {samples_per_item}",
         )
     # Mirror the backend picker's clamp so the consent prompt's cost cap
     # matches what actually gets scheduled.
@@ -1114,11 +1158,12 @@ async def handle_run_data_gen_pipeline(
         or "/" in output_dataset
         or "\\" in output_dataset
     ):
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "validation",
+            (
                 f"Error: output_dataset must be a plain name (no path separators), "
                 f"got {output_dataset!r}"
-            )
+            ),
         )
 
     # Fast read-only immutability refusal BEFORE the permission prompt so
@@ -1128,22 +1173,23 @@ async def handle_run_data_gen_pipeline(
 
     early_refusal = overwrite_refusal(project_dir, output_dataset, overwrite=overwrite)
     if early_refusal:
-        return ToolResult(content=f"Error: {early_refusal}")
+        return ToolResult.fail("conflict", f"Error: {early_refusal}")
 
     target = _validate_path(project_dir, script_path)
     if not target.exists():
-        return ToolResult(content=f"Error: script '{script_path}' does not exist")
+        return ToolResult.fail("not_found", f"Error: script '{script_path}' does not exist")
     # Pipelines must sit directly under data_gen/: the engine derives the
     # project root as script_path.parent.parent, so a script anywhere else
     # resolves source() against the wrong directory (and the cloud bundle
     # layout + import pre-scan assume the same location).
     rel_parts = target.relative_to(project_dir.resolve()).parts
     if len(rel_parts) != 2 or rel_parts[0] != "data_gen" or not rel_parts[1].endswith(".py"):
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "validation",
+            (
                 f"Error: pipeline scripts must be .py files directly under data_gen/ "
                 f"(got '{script_path}'). Move the script to data_gen/<name>.py and retry."
-            )
+            ),
         )
 
     # Pre-validate imports before executing
@@ -1158,23 +1204,25 @@ async def handle_run_data_gen_pipeline(
         ]
         for pattern, display in bad_imports:
             if pattern in source:
-                return ToolResult(
-                    content=(
+                return ToolResult.fail(
+                    "validation",
+                    (
                         f"Error: Pipeline has incorrect import: `{display}`\n"
                         f"Fix: use `from lqh.pipeline import Pipeline, ChatMLMessage, Conversation`\n"
                         f"All pipeline imports must come from `lqh.pipeline`, not `data_gen` or `pipeline`."
-                    )
+                    ),
                 )
     except OSError:
         pass
 
     # Check if we already have permission (script-execution domain;
     # applies to both execution targets — cloud runs the same script).
-    if not _script_consent and not check_permission(project_dir, script_path):
+    if not perms.allows_script(project_dir, script_path):
         # Need to ask for permission - this will be handled by the agent loop
         return ToolResult(
             content="PERMISSION_REQUIRED",
             requires_user_input=True,
+            permission_key=f"script:{script_path}",
             question=(
                 f"The agent wants to execute the pipeline script:\n"
                 f"  {script_path}\n"
@@ -1237,7 +1285,7 @@ async def handle_run_data_gen_pipeline(
 
     refusal = claim_output(project_dir, output_dataset, overwrite=overwrite)
     if refusal:
-        return ToolResult(content=f"Error: {refusal}")
+        return ToolResult.fail("conflict", f"Error: {refusal}")
 
     if overwrite and existing_name:
         # Confirmed overwrite: drop EVERY artifact describing the OLD
@@ -1271,7 +1319,7 @@ async def handle_run_data_gen_pipeline(
                 samples_per_item=samples_per_item,
                 purpose=purpose,
                 timeout_minutes=timeout_minutes,
-                consent=_cloud_consent,
+                permissions=perms,
                 on_bg_started=kwargs.get("on_background_task_started"),
             )
 
@@ -1329,7 +1377,7 @@ async def _submit_cloud_data_gen(
     samples_per_item: int,
     purpose: str,
     timeout_minutes: int = 720,
-    consent: bool,
+    permissions: PermissionContext,
     on_bg_started: Callable[[str, str, str, str | None], None] | None = None,
 ) -> ToolResult:
     """Submit the pipeline as a background cloud CPU job.
@@ -1341,10 +1389,9 @@ async def _submit_cloud_data_gen(
        version (content hash) must be on record. Handler-enforced, not
        prompt-trusted: an agent edit to the file re-arms it.
     2. Consent gate — the user approves the submit (sample count + cost
-       estimate) unless the project carries a standing grant.
+       estimate) unless the invocation or the project carries a grant.
     """
     from lqh.data_gen_validation import check_validation
-    from lqh.tools.permissions import check_cloud_data_gen_permission
 
     target = _validate_path(project_dir, script_path)
     # Canonical project-relative form: the sandbox resolves script_path
@@ -1360,11 +1407,12 @@ async def _submit_cloud_data_gen(
         try:
             val_resolved = _validate_path(project_dir, validation_instructions)
         except ValueError as e:
-            return ToolResult(content=f"Error: validation_instructions: {e}")
+            return ToolResult.fail("validation", f"Error: validation_instructions: {e}")
         if not val_resolved.exists():
-            return ToolResult(
-                content=f"Error: validation_instructions file "
-                        f"'{validation_instructions}' does not exist"
+            return ToolResult.fail(
+                "not_found",
+                f"Error: validation_instructions file "
+                f"'{validation_instructions}' does not exist",
             )
         validation_instructions = val_resolved.relative_to(
             project_dir.resolve()
@@ -1372,8 +1420,9 @@ async def _submit_cloud_data_gen(
 
     record = check_validation(project_dir, target)
     if record is None:
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "config",
+            (
                 "VALIDATION_REQUIRED: cloud execution is locked until this exact "
                 "pipeline version and its recorded local inputs have succeeded locally.\n"
                 f"Run `run_data_gen_pipeline` with execution='local' first — a draft "
@@ -1381,7 +1430,7 @@ async def _submit_cloud_data_gen(
                 f"inspection batch (num_samples≈20, purpose='inspection') to review "
                 f"quality — and retry execution='cloud' afterwards.\n"
                 f"Note: any edit to {script_path} re-arms this gate."
-            )
+            ),
         )
 
     # The gate hashes code, not data — a recorded seed input deleted or
@@ -1390,18 +1439,19 @@ async def _submit_cloud_data_gen(
     # sandbox. Catch it here instead.
     missing_sources = [s for s in record.source_paths if not (project_dir / s).exists()]
     if missing_sources:
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "config",
+            (
                 "VALIDATION_REQUIRED: recorded source inputs no longer exist: "
                 + ", ".join(missing_sources[:5])
                 + (" …" if len(missing_sources) > 5 else "")
                 + "\nRestore them or re-run the pipeline locally (which re-records "
                 "its inputs), then retry execution='cloud'."
-            )
+            ),
         )
 
     total_calls = num_samples * max(1, samples_per_item)
-    if not consent and not check_cloud_data_gen_permission(project_dir):
+    if not permissions.allows_cloud_data_gen(project_dir):
         rate_usd = await _fetch_data_gen_rate_usd()
         if rate_usd is not None:
             rate_note = f"≈ ${rate_usd:.2f}/hr"
@@ -1567,7 +1617,7 @@ async def _submit_cloud_data_gen(
                 "execution_target": "cloud", "outcome": "failed",
                 "requested_count": num_samples,
             }, workflow_id)
-        return ToolResult(content=f"Error submitting cloud data-gen job: {e}")
+        return ToolResult.fail("upstream", f"Error submitting cloud data-gen job: {e}")
     except Exception as e:
         if telemetry:
             await telemetry.run_deferred(telemetry.event, "data_generation_failed", {
@@ -1575,8 +1625,9 @@ async def _submit_cloud_data_gen(
                 "execution_target": "cloud", "outcome": "failed",
                 "requested_count": num_samples,
             }, workflow_id)
-        return ToolResult(
-            content=f"Error submitting cloud data-gen job: {type(e).__name__}: {e}"
+        return ToolResult.fail(
+            "upstream",
+            f"Error submitting cloud data-gen job: {type(e).__name__}: {e}",
         )
 
     # Durable finalization marker: the TUI watcher downloads the dataset
@@ -1830,7 +1881,7 @@ async def _execute_pipeline(
                 completed=result.total, total=result.total, unit="samples",
                 overall_fraction=1.0, force=True,
             )
-            return ToolResult(content=(
+            return ToolResult.fail("runtime", (
                 "❌ Pipeline failed: no samples were generated successfully\n"
                 f"  Samples: 0/{result.total} succeeded, {result.failed} failed"
             ))
@@ -2017,7 +2068,7 @@ async def _execute_pipeline(
                 "\n\nHint: The generate() method must accept input as a parameter:\n"
                 "  async def generate(self, client, input=None) -> Conversation:"
             )
-        return ToolResult(content=f"❌ Pipeline failed: {type(e).__name__}: {e}{hint}\n\n{tb}")
+        return ToolResult.fail("runtime", f"❌ Pipeline failed: {type(e).__name__}: {e}{hint}\n\n{tb}")
     finally:
         if on_pipeline_done:
             on_pipeline_done()
@@ -2084,7 +2135,7 @@ async def handle_compute_set(
         return ToolResult(content="\n".join(lines))
 
     if scope not in ("global", "project"):
-        return ToolResult(content=f"Error: scope must be 'global' or 'project', got {scope!r}")
+        return ToolResult.fail("validation", f"Error: scope must be 'global' or 'project', got {scope!r}")
 
     value = value.strip()
     if value == "":
@@ -2097,7 +2148,7 @@ async def handle_compute_set(
 
     # Validate the shape — clearer to fail here than at /train time.
     if value not in ("cloud", "local") and not value.startswith("ssh:"):
-        return ToolResult(content=(
+        return ToolResult.fail("validation", (
             f"Error: value must be 'cloud', 'local', or 'ssh:<remote_name>', "
             f"got {value!r}."
         ))
@@ -2157,7 +2208,7 @@ async def handle_get_eval_failures(
     run_dir = _validate_path(project_dir, eval_run)
     results_path = run_dir / "results.parquet"
     if not results_path.exists():
-        return ToolResult(content=f"Error: no results.parquet in '{eval_run}'")
+        return ToolResult.fail("not_found", f"Error: no results.parquet in '{eval_run}'")
 
     from lqh.scoring import extract_failures
 
@@ -2180,13 +2231,13 @@ async def handle_get_eval_failures(
         # SPEC.md, NOTES.md, or an artifact.
         normalized = export_path.replace("\\", "/")
         if not normalized.startswith("feedback/") or ".." in normalized.split("/"):
-            return ToolResult(content=(
+            return ToolResult.fail("validation", (
                 f"Error: export_path must live under feedback/ "
                 f"(got {export_path!r}) — e.g. 'feedback/eval_failures_v1.jsonl'."
             ))
         export_abs = _validate_path(project_dir, export_path)
         if export_abs.exists():
-            return ToolResult(content=(
+            return ToolResult.fail("conflict", (
                 f"Error: {export_path} already exists — exports never "
                 "overwrite. Pick a new file name."
             ))
@@ -2357,17 +2408,17 @@ async def handle_run_scoring(
     dataset_dir = _validate_path(project_dir, dataset)
     data_path = dataset_dir / "data.parquet"
     if not data_path.exists():
-        return ToolResult(content=f"Error: no data.parquet in '{dataset}'")
+        return ToolResult.fail("not_found", f"Error: no data.parquet in '{dataset}'")
 
     scorer_path = _validate_path(project_dir, scorer)
     if not scorer_path.exists():
-        return ToolResult(content=f"Error: scorer '{scorer}' does not exist")
+        return ToolResult.fail("not_found", f"Error: scorer '{scorer}' does not exist")
 
     # Resolve system_prompt_path -> inference_system_prompt if needed
     if system_prompt_path and not inference_system_prompt:
         prompt_file = _validate_path(project_dir, system_prompt_path)
         if not prompt_file.exists():
-            return ToolResult(content=f"Error: prompt file '{system_prompt_path}' does not exist")
+            return ToolResult.fail("not_found", f"Error: prompt file '{system_prompt_path}' does not exist")
         inference_system_prompt = prompt_file.read_text(encoding="utf-8")
 
     # Auto-discover response_format schema from prompt path
@@ -2377,7 +2428,7 @@ async def handle_run_scoring(
     if response_format_path:
         schema_file = _validate_path(project_dir, response_format_path)
         if not schema_file.exists():
-            return ToolResult(content=f"Error: schema file '{response_format_path}' does not exist")
+            return ToolResult.fail("not_found", f"Error: schema file '{response_format_path}' does not exist")
         inference_response_format = json.loads(schema_file.read_text(encoding="utf-8"))
     elif system_prompt_path:
         # Auto-discover: prompts/translation_v0.md → prompts/translation.schema.json
@@ -2397,7 +2448,7 @@ async def handle_run_scoring(
         token = require_token()
         client = create_client(token, config.api_base_url)
     except Exception as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("auth", f"Error: {e}")
 
     from lqh.progress import ProgressReporter
 
@@ -2487,11 +2538,12 @@ async def handle_run_scoring(
 
         elif mode == "model_eval":
             if not run_name:
-                return ToolResult(content="Error: run_name is required for mode='model_eval'")
+                return ToolResult.fail("validation", "Error: run_name is required for mode='model_eval'")
             if not inference_model:
-                return ToolResult(
-                    content="Error: inference_model is required for mode='model_eval'. "
-                    "Use list_models to discover available models."
+                return ToolResult.fail(
+                    "validation",
+                    "Error: inference_model is required for mode='model_eval'. "
+                    "Use list_models to discover available models.",
                 )
 
             # Liquid checkpoints can no longer be evaluated through the API:
@@ -2501,8 +2553,9 @@ async def handle_run_scoring(
             from lqh.models import is_liquid_model_name
 
             if is_liquid_model_name(inference_model):
-                return ToolResult(
-                    content=(
+                return ToolResult.fail(
+                    "validation",
+                    (
                         f"Error: Liquid model '{inference_model}' cannot be evaluated via "
                         "run_scoring mode='model_eval' — the router.liquid.ai API has been "
                         "retired (see MODELS.md). To evaluate a Liquid checkpoint, use the "
@@ -2511,7 +2564,7 @@ async def handle_run_scoring(
                         "  - start_local_eval — local or SSH-remote GPU eval of a checkpoint dir\n"
                         "run_scoring mode='model_eval' remains available for non-Liquid "
                         "baselines (small / medium / large / orchestration)."
-                    )
+                    ),
                 )
 
             from lqh.scoring import JUDGE_MODELS, run_scoring
@@ -2521,12 +2574,14 @@ async def handle_run_scoring(
                 # Atomic claim — a bare exists() check races a second CLI.
                 output_dir.mkdir(parents=True, exist_ok=False)
             except FileExistsError:
-                return ToolResult(
-                    content=f"Error: eval run '{run_name}' already exists. Use a different name."
+                return ToolResult.fail(
+                    "conflict",
+                    f"Error: eval run '{run_name}' already exists. Use a different name.",
                 )
             except OSError as exc:
-                return ToolResult(
-                    content=f"Error: cannot create evals/runs/{run_name}: {exc}"
+                return ToolResult.fail(
+                    "runtime",
+                    f"Error: cannot create evals/runs/{run_name}: {exc}",
                 )
 
             # Spec provenance is captured BEFORE the eval runs: a spec
@@ -2626,7 +2681,7 @@ async def handle_run_scoring(
                 )
             )
         else:
-            return ToolResult(content=f"Error: unknown mode '{mode}'. Use 'data_quality' or 'model_eval'.")
+            return ToolResult.fail("validation", f"Error: unknown mode '{mode}'. Use 'data_quality' or 'model_eval'.")
 
     except Exception as e:
         import traceback
@@ -2644,7 +2699,7 @@ async def handle_run_scoring(
         )
 
         tb = traceback.format_exc()
-        return ToolResult(content=f"❌ Scoring failed: {type(e).__name__}: {e}\n\n{tb}")
+        return ToolResult.fail("runtime", f"❌ Scoring failed: {type(e).__name__}: {e}\n\n{tb}")
     finally:
         on_done = kwargs.get("on_pipeline_done")
         if on_done:
@@ -2740,7 +2795,7 @@ async def handle_hf_repo_info(
     try:
         api = _get_hf_api()
     except ValueError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("auth", f"Error: {e}")
 
     try:
         if repo_id is None:
@@ -2775,7 +2830,7 @@ async def handle_hf_repo_info(
                     lines.append(f"    ... and {len(siblings) - 20} more")
             return ToolResult(content="\n".join(lines))
     except Exception as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("upstream", f"Error: {e}")
 
 
 # ----------------------------------------------------------------------
@@ -2794,7 +2849,7 @@ async def handle_pull(
     try:
         loc = parse_location(source)
     except LocationError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("validation", f"Error: {e}")
 
     if loc.scheme == "hf":
         return await handle_hf_pull(
@@ -2802,8 +2857,9 @@ async def handle_pull(
         )
     if loc.scheme == "lqh":
         return await _pull_lqh_artifact(project_dir, loc.value, dest)
-    return ToolResult(
-        content=(
+    return ToolResult.fail(
+        "validation",
+        (
             f"Error: pull source must be 'hf:owner/repo' or 'lqh:<artifact_id>'; "
             f"got a local path {source!r}. Local files are already on disk — use "
             "read_file / list_files instead."
@@ -2818,15 +2874,15 @@ async def _pull_lqh_artifact(project_dir: Path, artifact_id: str, dest: str | No
     try:
         target = _validate_path(project_dir, rel)
     except ValueError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("validation", f"Error: {e}")
 
     store = BackendArtifactStore()
     try:
         await store.download(artifact_id, target)
     except ArtifactError as e:
-        return ToolResult(content=f"Error downloading lqh:{artifact_id}: {e}")
+        return ToolResult.fail("upstream", f"Error downloading lqh:{artifact_id}: {e}")
     except Exception as e:  # noqa: BLE001 - surface any client error to the agent
-        return ToolResult(content=f"Error downloading lqh:{artifact_id}: {e}")
+        return ToolResult.fail("upstream", f"Error downloading lqh:{artifact_id}: {e}")
 
     size = target.stat().st_size if target.exists() else 0
     return ToolResult(
@@ -2852,11 +2908,12 @@ async def handle_push(
         src = parse_location(source)
         dst = parse_location(dest)
     except LocationError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("validation", f"Error: {e}")
 
     if dst.scheme != "hf":
-        return ToolResult(
-            content=f"Error: push destination must be 'hf:owner/repo'; got {dest!r}"
+        return ToolResult.fail(
+            "validation",
+            f"Error: push destination must be 'hf:owner/repo'; got {dest!r}",
         )
 
     if src.scheme == "local":
@@ -2865,8 +2922,9 @@ async def handle_push(
         )
     if src.scheme == "lqh":
         return await _push_lqh_to_hf(project_dir, src.value, dst.value, private)
-    return ToolResult(
-        content=(
+    return ToolResult.fail(
+        "validation",
+        (
             f"Error: push source must be a local path or 'lqh:<artifact_id>'; "
             f"got {source!r}"
         ),
@@ -2887,7 +2945,7 @@ async def _push_lqh_to_hf(
             private=private,
         )
     except Exception as e:  # noqa: BLE001 - surface clearly to the agent
-        return ToolResult(content=f"Error starting transfer of lqh:{artifact_id}: {e}")
+        return ToolResult.fail("upstream", f"Error starting transfer of lqh:{artifact_id}: {e}")
     return ToolResult(
         content=(
             f"🚚 Transferring lqh:{artifact_id} → hf:{target_repo} via a CPU sandbox "
@@ -2915,7 +2973,7 @@ async def handle_gguf_convert(
     from lqh.remote.gguf_convert import submit_gguf
 
     if not quant_types:
-        return ToolResult(content="Error: quant_types must list at least one type.")
+        return ToolResult.fail("validation", "Error: quant_types must list at least one type.")
 
     try:
         job_id = await submit_gguf(
@@ -2929,7 +2987,7 @@ async def handle_gguf_convert(
             artifact_format=artifact_format,
         )
     except Exception as e:  # noqa: BLE001 - surface clearly to the agent
-        return ToolResult(content=f"Error starting gguf conversion of lqh:{artifact_id}: {e}")
+        return ToolResult.fail("upstream", f"Error starting gguf conversion of lqh:{artifact_id}: {e}")
 
     quants = ", ".join(quant_types)
     push = f" and pushing to hf:{target_hf_repo}" if target_hf_repo else ""
@@ -2983,7 +3041,7 @@ async def handle_artifacts(
             return ToolResult(content="\n".join(lines))
 
         if not artifact_id:
-            return ToolResult(content=f"Error: action '{act}' requires artifact_id")
+            return ToolResult.fail("validation", f"Error: action '{act}' requires artifact_id")
 
         if act == "pin":
             await store.pin(artifact_id)
@@ -2994,11 +3052,11 @@ async def handle_artifacts(
         if act == "delete":
             await store.delete(artifact_id)
             return ToolResult(content=f"Deleted {artifact_id} (R2 bytes purged on the next retention tick).")
-        return ToolResult(content=f"Error: unknown action '{act}' (use list/pin/unpin/delete)")
+        return ToolResult.fail("validation", f"Error: unknown action '{act}' (use list/pin/unpin/delete)")
     except ArtifactError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("upstream", f"Error: {e}")
     except Exception as e:  # noqa: BLE001
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("upstream", f"Error: {e}")
 
 
 # ----------------------------------------------------------------------
@@ -3130,25 +3188,28 @@ async def handle_push_to_production(
     try:
         status, data = await _backend_json("POST", "/v1/deployments", json_body=body)
     except Exception as e:  # noqa: BLE001 - surface clearly to the agent
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("upstream", f"Error: {e}")
 
     if status == 402:
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "permission",
+            (
                 "❌ Out of credits — the deployment was not created. The org has "
                 "insufficient credits to run a GPU deployment; top up and retry."
-            )
+            ),
         )
     if status == 409:
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "conflict",
+            (
                 f"❌ Deployment name '{name}' is already taken. Pick a different "
                 "name (list_deployments shows the existing ones) and retry."
-            )
+            ),
         )
     if status not in (200, 201):
-        return ToolResult(
-            content=f"Error creating deployment: {_api_error_message(status, data)}"
+        return ToolResult.fail(
+            "upstream",
+            f"Error creating deployment: {_api_error_message(status, data)}",
         )
 
     dep = data
@@ -3178,10 +3239,11 @@ async def handle_list_deployments(project_dir: Path, **kwargs: Any) -> ToolResul
     try:
         status, data = await _backend_json("GET", "/v1/deployments")
     except Exception as e:  # noqa: BLE001
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("upstream", f"Error: {e}")
     if status != 200:
-        return ToolResult(
-            content=f"Error listing deployments: {_api_error_message(status, data)}"
+        return ToolResult.fail(
+            "upstream",
+            f"Error listing deployments: {_api_error_message(status, data)}",
         )
 
     deployments = data.get("deployments") or []
@@ -3216,10 +3278,11 @@ async def handle_get_deployment(
     try:
         status, dep = await _backend_json("GET", f"/v1/deployments/{deployment_id}")
     except Exception as e:  # noqa: BLE001
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("upstream", f"Error: {e}")
     if status != 200:
-        return ToolResult(
-            content=f"Error fetching deployment: {_api_error_message(status, dep)}"
+        return ToolResult.fail(
+            "upstream",
+            f"Error fetching deployment: {_api_error_message(status, dep)}",
         )
 
     lines = [
@@ -3282,10 +3345,11 @@ async def _deployment_action(deployment_id: str, action: str, emoji: str) -> Too
             "POST", f"/v1/deployments/{deployment_id}/{action}",
         )
     except Exception as e:  # noqa: BLE001
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("upstream", f"Error: {e}")
     if status != 200:
-        return ToolResult(
-            content=f"Error on {action}: {_api_error_message(status, dep)}"
+        return ToolResult.fail(
+            "upstream",
+            f"Error on {action}: {_api_error_message(status, dep)}",
         )
     return ToolResult(
         content=(
@@ -3332,17 +3396,19 @@ async def handle_create_inference_key(
     try:
         status, data = await _backend_json("POST", "/v1/inference-keys", json_body=body)
     except Exception as e:  # noqa: BLE001
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("upstream", f"Error: {e}")
     if status == 403:
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "permission",
+            (
                 "❌ The org has reached its inference-key cap. Revoke an unused "
                 "key (list_inference_keys / revoke_inference_key) and retry."
-            )
+            ),
         )
     if status not in (200, 201):
-        return ToolResult(
-            content=f"Error creating inference key: {_api_error_message(status, data)}"
+        return ToolResult.fail(
+            "upstream",
+            f"Error creating inference key: {_api_error_message(status, data)}",
         )
 
     key = data.get("key", "")
@@ -3402,10 +3468,11 @@ async def handle_list_inference_keys(project_dir: Path, **kwargs: Any) -> ToolRe
     try:
         status, data = await _backend_json("GET", "/v1/inference-keys")
     except Exception as e:  # noqa: BLE001
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("upstream", f"Error: {e}")
     if status != 200:
-        return ToolResult(
-            content=f"Error listing inference keys: {_api_error_message(status, data)}"
+        return ToolResult.fail(
+            "upstream",
+            f"Error listing inference keys: {_api_error_message(status, data)}",
         )
 
     keys = data.get("keys") or []
@@ -3442,10 +3509,11 @@ async def handle_revoke_inference_key(
             "POST", f"/v1/inference-keys/{key_id}/revoke",
         )
     except Exception as e:  # noqa: BLE001
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("upstream", f"Error: {e}")
     if status != 200:
-        return ToolResult(
-            content=f"Error revoking key: {_api_error_message(status, data)}"
+        return ToolResult.fail(
+            "upstream",
+            f"Error revoking key: {_api_error_message(status, data)}",
         )
     return ToolResult(
         content=(
@@ -3495,11 +3563,11 @@ async def handle_hf_pull(
     try:
         api = _get_hf_api()
     except ValueError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("auth", f"Error: {e}")
 
     resolved_type, err = _resolve_hf_pull_repo_type(api, repo_id, repo_type)
     if err is not None:
-        return ToolResult(content=f"Error: {err}")
+        return ToolResult.fail("validation", f"Error: {err}")
     repo_type = resolved_type
 
     repo_name = repo_id.split("/")[-1] if "/" in repo_id else repo_id
@@ -3518,7 +3586,7 @@ async def handle_hf_pull(
             str(p.relative_to(target)) for p in target.rglob("*.parquet")
         ) if target.is_dir() else []
         if existing_parquet and not overwrite:
-            return ToolResult(content=(
+            return ToolResult.fail("conflict", (
                 f"Error: {local_path}/ already contains "
                 f"{', '.join(existing_parquet[:3])} — refusing to overwrite "
                 "an existing dataset. Pull into a different local_path "
@@ -3585,8 +3653,9 @@ async def handle_hf_pull(
 
         if repo_type == "model":
             if split or subset:
-                return ToolResult(
-                    content="Error: split/subset are dataset-only options; omit them for model pulls."
+                return ToolResult.fail(
+                    "validation",
+                    "Error: split/subset are dataset-only options; omit them for model pulls.",
                 )
 
             from huggingface_hub import snapshot_download
@@ -3678,7 +3747,7 @@ async def handle_hf_pull(
             hint = " Check the repo ID and whether the repo exists."
         else:
             hint = ""
-        return ToolResult(content=f"Error downloading {repo_id}: {e}{hint}")
+        return ToolResult.fail("upstream", f"Error downloading {repo_id}: {e}{hint}")
 
 
 _MODEL_WEIGHT_GLOBS = ("*.safetensors", "*.bin", "*.ckpt", "*.pt", "*.pth")
@@ -3714,6 +3783,7 @@ async def handle_hf_push(
     split: str = "train",
     subset: str | None = None,
     commit_message: str | None = None,
+    _permissions: PermissionContext | None = None,
     **kwargs: Any,
 ) -> ToolResult:
     """Push a local dataset or model checkpoint to HF Hub. Requires permission."""
@@ -3721,51 +3791,56 @@ async def handle_hf_push(
     try:
         api = _get_hf_api()
     except ValueError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("auth", f"Error: {e}")
 
     # Validate local path
     target = _validate_path(project_dir, local_path)
     if not target.exists():
-        return ToolResult(content=f"Error: '{local_path}' does not exist")
+        return ToolResult.fail("not_found", f"Error: '{local_path}' does not exist")
     if not target.is_dir():
-        return ToolResult(
-            content=f"Error: '{local_path}' is not a directory. hf_push expects a folder containing either parquet files (dataset) or model files (config.json + weights)."
+        return ToolResult.fail(
+            "validation",
+            f"Error: '{local_path}' is not a directory. hf_push expects a folder containing either parquet files (dataset) or model files (config.json + weights).",
         )
 
     if repo_type is not None and repo_type not in ("dataset", "model"):
-        return ToolResult(content=f"Error: invalid repo_type '{repo_type}' (must be 'dataset' or 'model')")
+        return ToolResult.fail("validation", f"Error: invalid repo_type '{repo_type}' (must be 'dataset' or 'model')")
 
     detected, parquet_files, model_files = _detect_hf_repo_type(target)
 
     if repo_type is None:
         if detected is None:
             if parquet_files and model_files:
-                return ToolResult(
-                    content=(
+                return ToolResult.fail(
+                    "validation",
+                    (
                         f"Error: '{local_path}' contains both parquet files and model files — "
                         f"cannot auto-detect repo type. Pass repo_type='dataset' or repo_type='model' to disambiguate."
-                    )
+                    ),
                 )
-            return ToolResult(
-                content=(
+            return ToolResult.fail(
+                "validation",
+                (
                     f"Error: '{local_path}' is not recognizable as a dataset or model folder. "
                     f"Expected either .parquet files or HF-style model files "
                     f"(config.json, *.safetensors, *.bin, *.ckpt, *.pt, *.pth)."
-                )
+                ),
             )
         repo_type = detected
     else:
         # Validate explicit override against what we found.
         if repo_type == "dataset" and not parquet_files:
-            return ToolResult(
-                content=f"Error: repo_type='dataset' but no .parquet files found in '{local_path}'."
+            return ToolResult.fail(
+                "validation",
+                f"Error: repo_type='dataset' but no .parquet files found in '{local_path}'.",
             )
         if repo_type == "model" and not model_files:
-            return ToolResult(
-                content=(
+            return ToolResult.fail(
+                "validation",
+                (
                     f"Error: repo_type='model' but '{local_path}' has no model files "
                     f"(config.json, *.safetensors, *.bin, *.ckpt, *.pt, *.pth)."
-                )
+                ),
             )
 
     # Auto-generate repo_id if not provided
@@ -3774,19 +3849,18 @@ async def handle_hf_push(
             info = api.whoami()
             username = info.get("name", "unknown")
         except Exception as e:
-            return ToolResult(content=f"Error getting HF username: {e}")
+            return ToolResult.fail("auth", f"Error getting HF username: {e}")
 
         project_name = project_dir.name
         repo_id = f"{username}/{project_name}-{target.name}"
 
     # Check permission
-    from lqh.tools.permissions import check_hf_permission
-
-    if not check_hf_permission(project_dir, repo_id):
+    if not (_permissions or PermissionContext()).allows_hf_push(project_dir, repo_id):
         details = f"  Split: {split}\n" if repo_type == "dataset" else ""
         return ToolResult(
             content="PERMISSION_REQUIRED",
             requires_user_input=True,
+            permission_key=f"hf_push:{repo_id}",
             question=(
                 f"The agent wants to push to Hugging Face Hub:\n"
                 f"  Local: {local_path}\n"
@@ -3888,7 +3962,7 @@ async def _execute_hf_push_dataset(
             hint = " Your HF_TOKEN may not have write access. Check token permissions at https://huggingface.co/settings/tokens"
         else:
             hint = ""
-        return ToolResult(content=f"Error pushing to {repo_id}: {e}{hint}")
+        return ToolResult.fail("upstream", f"Error pushing to {repo_id}: {e}{hint}")
 
 
 def _looks_like_hub_id(value: str) -> bool:
@@ -3984,7 +4058,7 @@ async def _execute_hf_push_model(
     try:
         is_adapter, base_model = _prepare_adapter_for_upload(target, repo_id)
     except RuntimeError as exc:
-        return ToolResult(content=f"Error preparing adapter for upload: {exc}")
+        return ToolResult.fail("runtime", f"Error preparing adapter for upload: {exc}")
 
     try:
         api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
@@ -4025,7 +4099,7 @@ async def _execute_hf_push_model(
             hint = " Your HF_TOKEN may not have write access. Check token permissions at https://huggingface.co/settings/tokens"
         else:
             hint = ""
-        return ToolResult(content=f"Error pushing to {repo_id}: {e}{hint}")
+        return ToolResult.fail("upstream", f"Error pushing to {repo_id}: {e}{hint}")
 
 
 # ---------------------------------------------------------------------------
@@ -4191,6 +4265,7 @@ async def handle_start_training(
     golden_source: str = "dataset",
     enable_sweep: bool = True,
     grid_size: str = "small",
+    _permissions: PermissionContext | None = None,
     **kwargs: Any,
 ) -> ToolResult:
     """Start a training subprocess.
@@ -4242,8 +4317,6 @@ async def handle_start_training(
     on-policy DPO builds its preference pairs from scored rollouts every
     iteration, so a scorer is mandatory for DPO to run at all.
     """
-    from lqh.tools.permissions import check_training_permission
-
     # Compute target is fixed per project — there is no per-call override.
     # When the project has a real choice to make (a BYOC remote and/or a
     # local GPU) but hasn't pinned a target yet, defer to the one-time
@@ -4266,14 +4339,15 @@ async def handle_start_training(
     if remote is None:
         err = _check_torch_available()
         if err:
-            return ToolResult(content=f"❌ {err}")
+            return ToolResult.fail("config", f"❌ {err}")
 
         try:
             import torch
 
             if not torch.cuda.is_available():
-                return ToolResult(
-                    content="⚠️ No CUDA GPU detected. Training requires a GPU."
+                return ToolResult.fail(
+                    "config",
+                    "⚠️ No CUDA GPU detected. Training requires a GPU.",
                 )
             gpu_info = ", ".join(
                 f"{torch.cuda.get_device_name(i)}" for i in range(torch.cuda.device_count())
@@ -4290,25 +4364,26 @@ async def handle_start_training(
         project_dir, dataset, kind="dataset", allow_repeat=True
     )
     if ds_err:
-        return ToolResult(content=ds_err)
+        return ToolResult.fail("validation", ds_err)
 
     # eval_dataset is mandatory: the sweep needs a held-out signal to pick its
     # winner, and the judge eval-of-best needs rollouts to score. (The tool
     # schema marks it required; this guards non-schema callers.)
     if not eval_dataset:
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "validation",
+            (
                 "Error: eval_dataset is required. Pass the project's held-out eval "
                 "set (e.g. 'datasets/<name>_eval'). It is the signal used to select "
                 "the sweep winner and the set the best checkpoint is judge-scored on."
-            )
+            ),
         )
 
     eval_sources, eval_resolved, eval_err = _resolve_training_sources(
         project_dir, eval_dataset, kind="eval_dataset", allow_repeat=False
     )
     if eval_err:
-        return ToolResult(content=eval_err)
+        return ToolResult.fail("validation", eval_err)
 
     # Reject duplicate eval sources — scoring the same set twice would
     # double-count it in the macro-average.
@@ -4316,12 +4391,13 @@ async def handle_start_training(
     for p in eval_resolved:
         key = str(p)
         if key in eval_seen:
-            return ToolResult(
-                content=(
+            return ToolResult.fail(
+                "validation",
+                (
                     "Error: eval_dataset lists the same source twice "
                     f"({p.name}). Each eval source must be distinct so the "
                     "macro-average weights them once each."
-                )
+                ),
             )
         eval_seen.add(key)
 
@@ -4331,46 +4407,49 @@ async def handle_start_training(
     overlap = {str(p) for p in train_resolved} & eval_seen
     if overlap:
         names = ", ".join(sorted(Path(p).as_posix() for p in overlap))
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "validation",
+            (
                 "Error: eval_dataset must be different from dataset — these "
                 f"source(s) appear in both: {names}. Evaluating on the training "
                 "prompts leaks train into eval. Pass separate held-out eval "
                 "set(s) (e.g. 'datasets/<name>_eval')."
-            )
+            ),
         )
 
     # On-policy DPO builds its preference pairs by judge-scoring generated
     # rollouts every iteration, so a scorer is mandatory — scoring cannot be
     # disabled the way it can for SFT (where it only gates the final eval).
     if type in ("on_policy_dpo", "dpo") and disable_scoring:
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "validation",
+            (
                 "Error: scoring cannot be disabled for DPO. On-policy DPO assembles "
                 "its preference pairs from scored rollouts each iteration, so a scorer "
                 "is required — pass `scorer=<path>` (the project's default/best scorer)."
-            )
+            ),
         )
 
     # Scoring must be an explicit decision: pass a scorer, or opt out via
     # disable_scoring. Silently omitting the scorer would degrade eval-of-best
     # to proxy-only with no judge score — a common, quiet failure mode.
     if not scorer and not disable_scoring:
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "validation",
+            (
                 "Error: no scorer provided. The best checkpoint needs a scorer to get "
                 "a real judge score. Pass `scorer=<path>` set to the project's "
                 "default/current scorer (the one under evals/scorers/ used for the "
                 "baseline eval), or — only if the user explicitly asked not to score — "
                 "set disable_scoring=true."
-            )
+            ),
         )
 
     scorer_path: str | None = None
     if scorer:
         scorer_resolved = _validate_path(project_dir, scorer)
         if not scorer_resolved.exists():
-            return ToolResult(content=f"Error: scorer not found at {scorer}")
+            return ToolResult.fail("not_found", f"Error: scorer not found at {scorer}")
         scorer_path = scorer
 
     # Vision-language (LFM-VL) bases switch the run into the vision path:
@@ -4381,11 +4460,12 @@ async def handle_start_training(
 
     is_vision = is_vlm_model_name(base_model)
     if is_vision and type != "sft":
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "validation",
+            (
                 f"Error: {type} is not supported for vision-language models yet — "
                 f"only SFT is. Train {base_model} with type='sft'."
-            )
+            ),
         )
 
     # Atomically claim the run name (auto-generated names retry on a
@@ -4394,7 +4474,7 @@ async def handle_start_training(
         project_dir, run_name or None, "sft" if type == "sft" else "dpo"
     )
     if claim_err:
-        return ToolResult(content=f"Error: {claim_err}")
+        return ToolResult.fail("conflict", f"Error: {claim_err}")
 
     run_dir = project_dir / "runs" / run_name
 
@@ -4541,7 +4621,7 @@ async def handle_start_training(
     # permissions.check_training_permission) so approving a run never grants
     # arbitrary pipeline/script execution.
     perm_key = f"training:{run_name}"
-    if not check_training_permission(project_dir, run_name):
+    if not (_permissions or PermissionContext()).allows_training(project_dir, run_name):
         return ToolResult(
             content="PERMISSION_REQUIRED",
             requires_user_input=True,
@@ -4626,7 +4706,7 @@ async def _execute_start_training_remote(
         try:
             job_id = await backend.submit_run(str(run_dir), config, module=module)
         except Exception as e:
-            return ToolResult(content=f"Error launching cloud training: {e}")
+            return ToolResult.fail("upstream", f"Error launching cloud training: {e}")
 
         if on_bg_started is not None:
             on_bg_started(run_name, "train", run_name, "cloud")
@@ -4660,12 +4740,13 @@ async def _execute_start_training_remote(
     ssh_name = ssh_remote_name(remote_name) or remote_name
     remote_config = get_remote(project_dir, ssh_name)
     if remote_config is None:
-        return ToolResult(
-            content=f"Error: remote '{ssh_name}' not found. Use remote_list to see configured remotes."
+        return ToolResult.fail(
+            "config",
+            f"Error: remote '{ssh_name}' not found. Use remote_list to see configured remotes.",
         )
 
     if remote_config.type == "ssh_slurm":
-        return ToolResult(content="Error: SSH+Slurm backend is not yet implemented.")
+        return ToolResult.fail("config", "Error: SSH+Slurm backend is not yet implemented.")
 
     backend = SSHDirectBackend(remote_config, project_dir)
     remote_run_dir = f"{remote_config.remote_root}/runs/{run_name}"
@@ -4673,7 +4754,7 @@ async def _execute_start_training_remote(
     try:
         job_id = await backend.submit_run(str(run_dir), config, module=module)
     except Exception as e:
-        return ToolResult(content=f"Error launching remote training: {e}")
+        return ToolResult.fail("upstream", f"Error launching remote training: {e}")
 
     if on_bg_started is not None:
         on_bg_started(run_name, "train", run_name, ssh_name)
@@ -4782,7 +4863,7 @@ async def handle_training_status(
     if run_name:
         run_dir = _validate_path(project_dir, f"runs/{run_name}")
         if not run_dir.exists():
-            return ToolResult(content=f"Error: run '{run_name}' not found")
+            return ToolResult.fail("not_found", f"Error: run '{run_name}' not found")
         meta = _read_remote_meta(run_dir)
         if meta is not None:
             result = await _training_status_remote(
@@ -4853,7 +4934,7 @@ async def _training_status_remote(
 
     meta_file = run_dir / "remote_job.json"
     if not meta_file.exists():
-        return ToolResult(content=f"Error: no remote job metadata for run '{run_name}'.")
+        return ToolResult.fail("not_found", f"Error: no remote job metadata for run '{run_name}'.")
     meta = json.loads(meta_file.read_text())
     job_id = meta["job_id"]
     remote_run_dir = meta["remote_run_dir"]
@@ -4878,7 +4959,7 @@ async def _training_status_remote(
         ssh_name = ssh_remote_name(remote_name) or remote_name
         remote_config = get_remote(project_dir, ssh_name)
         if remote_config is None:
-            return ToolResult(content=f"Error: remote '{ssh_name}' not found.")
+            return ToolResult.fail("config", f"Error: remote '{ssh_name}' not found.")
         backend = SSHDirectBackend(remote_config, project_dir)
         display_remote = ssh_name
 
@@ -4887,7 +4968,7 @@ async def _training_status_remote(
         await backend.sync_progress(remote_run_dir, str(run_dir))
         status = await backend.poll_status(job_id)
     except Exception as e:
-        return ToolResult(content=_format_training_status_error(e))
+        return ToolResult.fail("upstream", _format_training_status_error(e))
 
     state_emoji = {
         "running": "🏃", "completed": "✅", "failed": "❌",
@@ -5344,7 +5425,7 @@ async def handle_stop_training(
 
     run_dir = _validate_path(project_dir, f"runs/{run_name}")
     if not run_dir.exists():
-        return ToolResult(content=f"Error: run '{run_name}' not found")
+        return ToolResult.fail("not_found", f"Error: run '{run_name}' not found")
 
     meta = _read_remote_meta(run_dir)
     if meta is not None:
@@ -5352,7 +5433,7 @@ async def handle_stop_training(
 
     manager = SubprocessManager()
     if not manager.is_alive(run_dir):
-        return ToolResult(content=f"Run '{run_name}' is not currently running.")
+        return ToolResult.fail("conflict", f"Run '{run_name}' is not currently running.")
 
     stopped = manager.stop(run_dir)
     if stopped:
@@ -5366,7 +5447,7 @@ async def handle_stop_training(
         )
         return ToolResult(content=f"🛑 Training run '{run_name}' stopped.")
     else:
-        return ToolResult(content=f"Failed to stop run '{run_name}'.")
+        return ToolResult.fail("runtime", f"Failed to stop run '{run_name}'.")
 
 
 async def _stop_training_remote(
@@ -5384,7 +5465,7 @@ async def _stop_training_remote(
     run_dir = project_dir / "runs" / run_name
     meta_file = run_dir / "remote_job.json"
     if not meta_file.exists():
-        return ToolResult(content=f"Error: no remote job metadata for run '{run_name}'.")
+        return ToolResult.fail("not_found", f"Error: no remote job metadata for run '{run_name}'.")
 
     meta = json.loads(meta_file.read_text())
     job_id = meta["job_id"]
@@ -5409,14 +5490,14 @@ async def _stop_training_remote(
         ssh_name = ssh_remote_name(remote_name) or remote_name
         remote_config = get_remote(project_dir, ssh_name)
         if remote_config is None:
-            return ToolResult(content=f"Error: remote '{ssh_name}' not found.")
+            return ToolResult.fail("config", f"Error: remote '{ssh_name}' not found.")
         remote_name = ssh_name
         backend = SSHDirectBackend(remote_config, project_dir)
 
     try:
         await backend.teardown(job_id)
     except Exception as e:
-        return ToolResult(content=f"Error stopping remote run: {e}")
+        return ToolResult.fail("upstream", f"Error stopping remote run: {e}")
 
     from lqh.project_log import append_event
 
@@ -5521,12 +5602,12 @@ async def handle_start_local_eval(
     # Check torch
     err = _check_torch_available()
     if err:
-        return ToolResult(content=f"❌ {err}")
+        return ToolResult.fail("config", f"❌ {err}")
 
     # Validate paths
     model_dir = _validate_path(project_dir, model_path)
     if not model_dir.exists():
-        return ToolResult(content=f"Error: model not found at {model_path}")
+        return ToolResult.fail("not_found", f"Error: model not found at {model_path}")
 
     # Eval dataset(s) — one path or a list of held-out sources. Multiple
     # sources are scored separately and combined into a macro-average (each
@@ -5535,11 +5616,11 @@ async def handle_start_local_eval(
         project_dir, dataset, kind="dataset", allow_repeat=False
     )
     if ds_err:
-        return ToolResult(content=ds_err)
+        return ToolResult.fail("validation", ds_err)
 
     scorer_resolved = _validate_path(project_dir, scorer)
     if not scorer_resolved.exists():
-        return ToolResult(content=f"Error: scorer not found at {scorer}")
+        return ToolResult.fail("not_found", f"Error: scorer not found at {scorer}")
 
     try:
         system_prompt, schema_dict = _resolve_eval_extras(
@@ -5548,11 +5629,11 @@ async def handle_start_local_eval(
             response_format_path=response_format_path,
         )
     except FileNotFoundError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("not_found", f"Error: {e}")
 
     run_name, claim_err = _claim_run_name(project_dir, run_name or None, "local_eval")
     if claim_err:
-        return ToolResult(content=f"Error: {claim_err}")
+        return ToolResult.fail("conflict", f"Error: {claim_err}")
 
     eval_run_dir = project_dir / "runs" / run_name
 
@@ -5623,16 +5704,19 @@ async def handle_eval_hf_model(
 
     # --- Validate inputs ---
     if training_method not in ("lora", "full"):
-        return ToolResult(
-            content=f"Error: training_method must be 'lora' or 'full', got {training_method!r}"
+        return ToolResult.fail(
+            "validation",
+            f"Error: training_method must be 'lora' or 'full', got {training_method!r}",
         )
     if training_method == "lora" and not base_model:
-        return ToolResult(
-            content="Error: base_model is required when training_method='lora'"
+        return ToolResult.fail(
+            "validation",
+            "Error: base_model is required when training_method='lora'",
         )
     if judge_size not in ("small", "medium", "large"):
-        return ToolResult(
-            content=f"Error: judge_size must be small/medium/large, got {judge_size!r}"
+        return ToolResult.fail(
+            "validation",
+            f"Error: judge_size must be small/medium/large, got {judge_size!r}",
         )
 
     # Eval dataset(s) — one path or a list of held-out sources, scored
@@ -5641,11 +5725,11 @@ async def handle_eval_hf_model(
         project_dir, eval_dataset, kind="eval_dataset", allow_repeat=False
     )
     if ds_err:
-        return ToolResult(content=ds_err)
+        return ToolResult.fail("validation", ds_err)
 
     scorer_resolved = _validate_path(project_dir, scorer)
     if not scorer_resolved.exists():
-        return ToolResult(content=f"Error: scorer not found at {scorer}")
+        return ToolResult.fail("not_found", f"Error: scorer not found at {scorer}")
 
     try:
         system_prompt, schema_dict = _resolve_eval_extras(
@@ -5654,11 +5738,11 @@ async def handle_eval_hf_model(
             response_format_path=None,
         )
     except FileNotFoundError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("not_found", f"Error: {e}")
 
     run_name, claim_err = _claim_run_name(project_dir, run_name or None, "eval_hf")
     if claim_err:
-        return ToolResult(content=f"Error: {claim_err}")
+        return ToolResult.fail("conflict", f"Error: {claim_err}")
     run_dir = project_dir / "runs" / run_name
 
     # --- Build sandbox config ---
@@ -5713,7 +5797,7 @@ async def handle_eval_hf_model(
             str(run_dir), config, module="lqh.infer.eval_hf",
         )
     except Exception as e:  # noqa: BLE001
-        return ToolResult(content=f"Error submitting eval_hf job: {e}")
+        return ToolResult.fail("upstream", f"Error submitting eval_hf job: {e}")
 
     if on_bg_started is not None:
         on_bg_started(run_name, "eval", run_name, "cloud")
@@ -5770,11 +5854,11 @@ async def _start_local_eval_remote(
     ssh_name = ssh_remote_name(remote_name) or remote_name
     remote_config = get_remote(project_dir, ssh_name)
     if remote_config is None:
-        return ToolResult(content=f"Error: remote '{ssh_name}' not found.")
+        return ToolResult.fail("config", f"Error: remote '{ssh_name}' not found.")
     remote_name = ssh_name
 
     if remote_config.type == "ssh_slurm":
-        return ToolResult(content="Error: SSH+Slurm backend is not yet implemented.")
+        return ToolResult.fail("config", "Error: SSH+Slurm backend is not yet implemented.")
 
     # Validate eval dataset source(s) — one path or a list of held-out
     # sources, scored separately and macro-averaged (same as the local path).
@@ -5782,11 +5866,11 @@ async def _start_local_eval_remote(
         project_dir, dataset, kind="dataset", allow_repeat=False
     )
     if ds_err:
-        return ToolResult(content=ds_err)
+        return ToolResult.fail("validation", ds_err)
 
     scorer_resolved = _validate_path(project_dir, scorer)
     if not scorer_resolved.exists():
-        return ToolResult(content=f"Error: scorer not found at {scorer}")
+        return ToolResult.fail("not_found", f"Error: scorer not found at {scorer}")
 
     try:
         system_prompt, schema_dict = _resolve_eval_extras(
@@ -5795,11 +5879,11 @@ async def _start_local_eval_remote(
             response_format_path=response_format_path,
         )
     except FileNotFoundError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("not_found", f"Error: {e}")
 
     run_name, claim_err = _claim_run_name(project_dir, run_name or None, "remote_eval")
     if claim_err:
-        return ToolResult(content=f"Error: {claim_err}")
+        return ToolResult.fail("conflict", f"Error: {claim_err}")
 
     run_dir = project_dir / "runs" / run_name
     config: dict[str, Any] = {
@@ -5821,7 +5905,7 @@ async def _start_local_eval_remote(
     try:
         job_id = await backend.submit_run(str(run_dir), config, module="lqh.infer")
     except Exception as e:
-        return ToolResult(content=f"Error launching remote inference: {e}")
+        return ToolResult.fail("upstream", f"Error launching remote inference: {e}")
 
     if on_bg_started is not None:
         on_bg_started(run_name, "eval", run_name, remote_name)
@@ -5912,7 +5996,7 @@ async def handle_remote_add(
     try:
         add_machine(machine)
     except ValueError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("validation", f"Error: {e}")
 
     return ToolResult(
         content=(
@@ -5940,11 +6024,12 @@ async def handle_remote_bind(
 
     machine = get_machine(name)
     if machine is None:
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "not_found",
+            (
                 f"Error: machine '{name}' not found globally. "
                 f"Use remote_add to create it first."
-            )
+            ),
         )
 
     # Resolve "~" / "$HOME" against the remote user's home so persisted paths
@@ -5958,23 +6043,26 @@ async def handle_remote_bind(
                 machine.hostname, f"echo {remote_root}", timeout=10.0,
             )
         except Exception as e:
-            return ToolResult(
-                content=f"Error resolving '{remote_root}' on {machine.hostname}: {e}"
+            return ToolResult.fail(
+                "upstream",
+                f"Error resolving '{remote_root}' on {machine.hostname}: {e}",
             )
         if rc != 0:
-            return ToolResult(
-                content=(
+            return ToolResult.fail(
+                "upstream",
+                (
                     f"Error resolving '{remote_root}' on {machine.hostname}: "
                     f"{stderr.strip() or 'ssh exited with code ' + str(rc)}"
-                )
+                ),
             )
         resolved = stdout.strip()
         if not resolved or not resolved.startswith("/"):
-            return ToolResult(
-                content=(
+            return ToolResult.fail(
+                "validation",
+                (
                     f"Error: could not resolve '{remote_root}' to an absolute path "
                     f"on {machine.hostname} (got: {resolved!r})"
-                )
+                ),
             )
         remote_root = resolved
 
@@ -5986,7 +6074,7 @@ async def handle_remote_bind(
     try:
         add_binding(project_dir, binding)
     except ValueError as e:
-        return ToolResult(content=f"Error: {e}")
+        return ToolResult.fail("validation", f"Error: {e}")
 
     return ToolResult(
         content=(
@@ -6010,7 +6098,7 @@ async def handle_remote_remove(
     try:
         remove_binding(project_dir, name)
     except KeyError:
-        return ToolResult(content=f"Error: remote '{name}' not bound to this project.")
+        return ToolResult.fail("config", f"Error: remote '{name}' not bound to this project.")
 
     return ToolResult(
         content=(
@@ -6032,7 +6120,7 @@ async def handle_remote_remove_machine(
     try:
         remove_machine(name)
     except KeyError:
-        return ToolResult(content=f"Error: machine '{name}' not found globally.")
+        return ToolResult.fail("not_found", f"Error: machine '{name}' not found globally.")
 
     return ToolResult(content=f"✅ Machine '{name}' removed globally.")
 
@@ -6050,27 +6138,29 @@ async def handle_remote_setup(
 
     remote_config = get_remote(project_dir, name)
     if remote_config is None:
-        return ToolResult(content=f"Error: remote '{name}' not found.")
+        return ToolResult.fail("config", f"Error: remote '{name}' not found.")
 
     if remote_config.type == "ssh_slurm":
-        return ToolResult(content="Error: SSH+Slurm backend is not yet implemented.")
+        return ToolResult.fail("config", "Error: SSH+Slurm backend is not yet implemented.")
 
     # Check SSH connectivity first
     reachable = await ssh_check(remote_config.hostname)
     if not reachable:
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "upstream",
+            (
                 f"Error: cannot reach {remote_config.hostname} via SSH. "
                 f"Check that SSH public key auth is configured and the host "
                 f"is reachable."
-            )
+            ),
+            retryable=True,
         )
 
     backend = SSHDirectBackend(remote_config, project_dir)
     try:
         log = await backend.setup()
     except Exception as e:
-        return ToolResult(content=f"Error during setup: {e}")
+        return ToolResult.fail("upstream", f"Error during setup: {e}")
 
     # Update config to mark HF token as configured if it was
     remote_config.hf_token_configured = True
@@ -6093,19 +6183,21 @@ async def handle_remote_status(
 
     machine = get_machine(name)
     if machine is None:
-        return ToolResult(content=f"Error: machine '{name}' not found globally.")
+        return ToolResult.fail("not_found", f"Error: machine '{name}' not found globally.")
 
     hostname = machine.hostname
 
     # Check SSH connectivity first
     reachable = await ssh_check(hostname)
     if not reachable:
-        return ToolResult(
-            content=(
+        return ToolResult.fail(
+            "upstream",
+            (
                 f"❌ Cannot reach **{name}** ({hostname}) via SSH.\n"
                 f"Check that SSH public key auth is configured and the host "
                 f"is reachable."
-            )
+            ),
+            retryable=True,
         )
 
     lines = [f"**Remote status: {name}** ({hostname})\n"]
@@ -6345,7 +6437,7 @@ async def handle_run_data_filter(
         or "/" in output_dataset
         or "\\" in output_dataset
     ):
-        return ToolResult(content=(
+        return ToolResult.fail("validation", (
             f"Error: output_dataset must be a plain name (no path "
             f"separators), got {output_dataset!r}"
         ))
@@ -6353,9 +6445,9 @@ async def handle_run_data_filter(
     input_abs = _validate_path(project_dir, input_path)
     scorer_abs = _validate_path(project_dir, scorer_path)
     if not input_abs.exists():
-        return ToolResult(content=f"Error: input '{input_path}' does not exist")
+        return ToolResult.fail("not_found", f"Error: input '{input_path}' does not exist")
     if not scorer_abs.exists():
-        return ToolResult(content=f"Error: scorer '{scorer_path}' does not exist")
+        return ToolResult.fail("not_found", f"Error: scorer '{scorer_path}' does not exist")
 
     # Immutable-by-default outputs (PERSISTENCY_PLAN.md R5). Fast
     # read-only refusal here; the atomic claim happens inside the
@@ -6367,7 +6459,7 @@ async def handle_run_data_filter(
         project_dir, output_dataset, overwrite=overwrite
     )
     if early_refusal:
-        return ToolResult(content=f"Error: {early_refusal}")
+        return ToolResult.fail("conflict", f"Error: {early_refusal}")
 
     output_dir = project_dir / "datasets" / output_dataset
     if overwrite and (output_dir / "data.parquet").exists() and not _overwrite_consent:
@@ -6421,7 +6513,7 @@ async def handle_run_data_filter(
     try:
         refusal = claim_output(project_dir, output_dataset, overwrite=overwrite)
         if refusal:
-            return ToolResult(content=f"Error: {refusal}")
+            return ToolResult.fail("conflict", f"Error: {refusal}")
         claimed = True
         result = await run_data_filter(
             input_path=input_abs,
@@ -6434,7 +6526,7 @@ async def handle_run_data_filter(
         )
         succeeded = True
     except Exception as exc:
-        return ToolResult(content=f"❌ run_data_filter failed: {type(exc).__name__}: {exc}")
+        return ToolResult.fail("runtime", f"❌ run_data_filter failed: {type(exc).__name__}: {exc}")
     finally:
         if claimed:
             release_output(project_dir, output_dataset)
@@ -6582,7 +6674,7 @@ async def execute_tool(
     """Dispatch a tool call to the appropriate handler."""
     handler = TOOL_HANDLERS.get(tool_name)
     if handler is None:
-        return ToolResult(content=f"Error: unknown tool '{tool_name}'")
+        return ToolResult.fail("validation", f"Error: unknown tool '{tool_name}'")
 
     # Underscore-prefixed keys are loop-internal signals (e.g. the
     # consent flags a permission grant sets). They may only arrive via

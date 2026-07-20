@@ -1,8 +1,37 @@
 from __future__ import annotations
 
 
-def _tool(name: str, description: str, parameters: dict | None = None) -> dict:
-    """Helper to build a single OpenAI function-calling tool definition."""
+METADATA_KEY = "x-lqh"
+
+
+def _tool(
+    name: str,
+    description: str,
+    parameters: dict | None = None,
+    *,
+    cli: bool = False,
+    mutating: bool = False,
+    needs_auth: bool = False,
+    permission_domain: str | tuple[str, ...] | None = None,
+    needs_loop: bool = False,
+) -> dict:
+    """Helper to build a single OpenAI function-calling tool definition.
+
+    The keyword-only flags are lqh-internal metadata for the headless CLI
+    surface (CLI_PLAN §5.2), stored under the top-level ``x-lqh`` key —
+    a sibling of ``function`` so it can never leak into the payload the
+    API validates. ``get_all_tools`` strips it by default.
+
+    - ``cli``: exposed via ``lqh tool`` (opt-in; new tools stay hidden
+      unless someone decides otherwise).
+    - ``mutating``: changes local project, cloud, or external state.
+    - ``needs_auth``: unconditionally requires the LQH API token (tools
+      that work tokenless in local mode stay False).
+    - ``permission_domain``: consent domain(s) the handler gates on —
+      values must match ``lqh.tools.permissions.PERMISSION_DOMAINS``.
+    - ``needs_loop``: may return an interactive sentinel only the agent
+      loop can service (permission/overwrite/compute-pick/secret).
+    """
     func: dict = {
         "name": name,
         "description": description,
@@ -11,22 +40,49 @@ def _tool(name: str, description: str, parameters: dict | None = None) -> dict:
         func["parameters"] = parameters
     else:
         func["parameters"] = {"type": "object", "properties": {}, "required": []}
-    return {"type": "function", "function": func}
+    if permission_domain is None:
+        domains: list[str] = []
+    elif isinstance(permission_domain, str):
+        domains = [permission_domain]
+    else:
+        domains = list(permission_domain)
+    return {
+        "type": "function",
+        "function": func,
+        METADATA_KEY: {
+            "cli": cli,
+            "mutating": mutating,
+            "needs_auth": needs_auth,
+            "permission_domain": domains,
+            "needs_loop": needs_loop,
+        },
+    }
 
 
-def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
+def get_all_tools(*, auto_mode: bool = False, include_meta: bool = False) -> list[dict]:
     """Return the list of all built-in tool definitions in OpenAI function-calling format.
 
     When ``auto_mode`` is True the auto-mode-only tools (``exit_auto_mode``,
     ``set_auto_stage``) are appended. They are otherwise hidden so the
     interactive agent cannot accidentally call them.
+
+    The lqh-internal ``x-lqh`` metadata is stripped unless
+    ``include_meta=True`` — the default is what goes to the LLM API.
     """
+    tools = _build_all_tools(auto_mode=auto_mode)
+    if include_meta:
+        return tools
+    return [{k: v for k, v in t.items() if k != METADATA_KEY} for t in tools]
+
+
+def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
     base = [
         # ------------------------------------------------------------------
         # summary
         # ------------------------------------------------------------------
         _tool(
             name="summary",
+            cli=True,
             description=(
                 "Give a summary of the current project. Lists all specs, NOTES.md, data "
                 "generation scripts, datasets (row counts, scores, provenance), prompts, "
@@ -100,6 +156,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="create_file",
+            mutating=True,
             description=(
                 "Create a new file within the project. Parent directories are created "
                 "automatically. Fails if the file already exists (use write_file to overwrite). "
@@ -126,6 +183,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="write_file",
+            mutating=True,
             description=(
                 "Write or overwrite a file within the project. Creates the file and any "
                 "parent directories if they do not exist; replaces contents if the file exists."
@@ -150,6 +208,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="edit_file",
+            mutating=True,
             description=(
                 "Perform a string-replacement edit on a file within the project. The "
                 "old_string must be unique in the file unless replace_all is true."
@@ -186,6 +245,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="run_data_gen_pipeline",
+            cli=True, mutating=True, permission_domain=("script", "cloud_data_gen"), needs_loop=True,
             description=(
                 "Execute a data generation pipeline script from data_gen/. The script "
                 "must contain a single Pipeline subclass. The engine instantiates it "
@@ -309,6 +369,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="list_user_data",
+            cli=True,
             description=(
                 "Report user-brought data in the project directory. Scans for: "
                 "seed_data/ (JSONL/CSV/TXT seed files), images/ or other folders "
@@ -329,6 +390,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="run_data_filter",
+            cli=True, mutating=True, needs_loop=True,
             description=(
                 "Score a user-brought dataset and emit a filtered subset for "
                 "training. Input parquet must follow the ChatML schema (messages "
@@ -396,6 +458,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="ask_user",
+            needs_loop=True,
             description=(
                 "Present a question to the user in the TUI and wait for their response. "
                 "If options are provided, they are shown as a selectable list (single-select "
@@ -442,6 +505,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="show_file",
+            needs_loop=True,
             description=(
                 "Display a file's contents to the user in a formatted, scrollable TUI "
                 "view. The user sees the full file, but only a truncated summary is "
@@ -466,6 +530,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="run_scoring",
+            cli=True, mutating=True, needs_auth=True,
             description=(
                 "Score a dataset using LLM-as-judge against spec-derived criteria. "
                 "Two modes: (1) 'data_quality' scores existing labelled samples and "
@@ -575,6 +640,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="list_models",
+            cli=True,
             description=(
                 "List the Liquid AI model catalog (HuggingFace IDs + kind: "
                 "base/instruct/thinking) plus the baseline/judge pool models. "
@@ -589,6 +655,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="get_eval_failures",
+            cli=True,
             description=(
                 "Extract failure cases from an eval run's results. Returns the "
                 "lowest-scoring samples with their messages, scores, and judge "
@@ -651,6 +718,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="list_skills",
+            cli=True,
             description=(
                 "List all available skills (modes) with their names and descriptions. "
                 "Use this to discover what skills are available before loading one."
@@ -685,6 +753,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="hf_push",
+            cli=True, mutating=True, permission_domain="hf_push", needs_loop=True,
             description=(
                 "Push a local directory to Hugging Face Hub as either a dataset "
                 "(folder containing .parquet files) or a model (folder containing "
@@ -761,6 +830,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="hf_pull",
+            cli=True, mutating=True, needs_loop=True,
             description=(
                 "Download a dataset or model from Hugging Face Hub to local storage. "
                 "The repo type is auto-detected by querying the Hub (model first, "
@@ -839,6 +909,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="hf_repo_info",
+            cli=True,
             description=(
                 "Get info about a HF repo or the authenticated user. "
                 "Call with no arguments to get the current user's username, "
@@ -872,6 +943,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="pull",
+            cli=True, mutating=True, needs_loop=True,
             description=(
                 "Download a model, dataset, or artifact into local storage using a "
                 "location URI. The scheme is explicit and never guessed:\n"
@@ -909,6 +981,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="push",
+            cli=True, mutating=True,
             description=(
                 "Upload to Hugging Face Hub from a location URI. The destination must "
                 "be an 'hf:owner/repo'. The source is either:\n"
@@ -947,6 +1020,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="gguf_convert",
+            cli=True, mutating=True, needs_auth=True,
             description=(
                 "Convert an LQH checkpoint artifact to GGUF (the llama.cpp / "
                 "local-inference format) and quantize it, via a short CPU-only "
@@ -1035,6 +1109,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="artifacts",
+            cli=True, mutating=True, needs_auth=True,
             description=(
                 "Manage the cloud artifacts (checkpoints, predictions, metrics, logs) "
                 "registered for this project. Actions:\n"
@@ -1082,6 +1157,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="push_to_production",
+            cli=True, mutating=True, needs_auth=True,
             description=(
                 "Deploy a trained checkpoint artifact as a live inference endpoint "
                 "on LQH Cloud. The model is served OpenAI-compatible at "
@@ -1171,6 +1247,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="list_deployments",
+            cli=True, needs_auth=True,
             description=(
                 "List all inference deployments for the account: name, status, "
                 "tier, GPU, estimated $/hr, and billed cost to date. Use this to "
@@ -1183,6 +1260,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="get_deployment",
+            cli=True, needs_auth=True,
             description=(
                 "Get one deployment's full status plus a current-period usage "
                 "summary (requests, errors, tokens, latency, GPU cost). Use this "
@@ -1205,6 +1283,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="stop_deployment",
+            cli=True, mutating=True, needs_auth=True,
             description=(
                 "Stop a running deployment. GPU billing stops; the deployment's "
                 "name and configuration are kept so it can be brought back with "
@@ -1227,6 +1306,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="restart_deployment",
+            cli=True, mutating=True, needs_auth=True,
             description=(
                 "Restart a stopped (or errored) deployment. GPU billing resumes "
                 "once it is running again. The endpoint and model name stay the "
@@ -1248,6 +1328,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="create_inference_key",
+            cli=True, mutating=True, needs_auth=True, needs_loop=True,
             description=(
                 "Create an inference API key (lqh_inf_...) for the customer-facing "
                 "endpoint https://inference.lqh.ai/v1. The plaintext key is returned "
@@ -1291,6 +1372,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="list_inference_keys",
+            cli=True, needs_auth=True,
             description=(
                 "List the org's inference API keys: name, prefix, scope, and "
                 "revocation status. Plaintext keys are never shown here — only "
@@ -1302,6 +1384,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="revoke_inference_key",
+            cli=True, mutating=True, needs_auth=True,
             description=(
                 "Revoke an inference API key immediately. Requests using it will "
                 "start failing with 401. This cannot be undone — create a new key "
@@ -1323,6 +1406,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="start_training",
+            cli=True, mutating=True, permission_domain="training", needs_loop=True,
             description=(
                 "Start a fine-tuning run as a background subprocess. Supports SFT "
                 "(supervised fine-tuning) and on-policy DPO (direct preference "
@@ -1561,6 +1645,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="training_status",
+            cli=True,
             description=(
                 "Check the status of training runs. Shows current step, loss, "
                 "learning rate, eval scores, and whether the subprocess is alive. "
@@ -1588,6 +1673,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="stop_training",
+            cli=True, mutating=True,
             description=(
                 "Stop a running training subprocess. Sends SIGTERM for graceful "
                 "shutdown, then SIGKILL if it doesn't exit within 10 seconds."
@@ -1608,6 +1694,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="start_local_eval",
+            cli=True, mutating=True, needs_loop=True,
             description=(
                 "Run model inference as a subprocess and score the results "
                 "via the API judge. Best for evaluating a checkpoint that "
@@ -1698,6 +1785,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="eval_hf_model",
+            cli=True, mutating=True, needs_auth=True,
             description=(
                 "Evaluate any HuggingFace checkpoint on a project's eval set "
                 "via LQH Cloud. Use this to score a public/private HF model "
@@ -1809,6 +1897,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="remote_list",
+            cli=True,
             description=(
                 "List remote targets. Shows global machines (available to all "
                 "projects) and which ones are bound to the current project."
@@ -1819,6 +1908,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="remote_add",
+            cli=True, mutating=True,
             description=(
                 "Add a new remote machine globally (available to all projects). "
                 "After adding, use remote_bind to bind it to the current project, "
@@ -1863,6 +1953,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="remote_bind",
+            cli=True, mutating=True,
             description=(
                 "Bind a global remote machine to the current project by setting "
                 "the remote_root path.  After binding, run remote_setup to "
@@ -1902,6 +1993,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="remote_remove",
+            cli=True, mutating=True,
             description=(
                 "Remove a remote from the current project (unbinds it). "
                 "The global machine definition is kept. Use remote_remove_machine "
@@ -1923,6 +2015,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="remote_remove_machine",
+            cli=True, mutating=True,
             description=(
                 "Remove a remote machine globally. It will no longer be "
                 "available to any project."
@@ -1943,6 +2036,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="remote_setup",
+            cli=True, mutating=True,
             description=(
                 "Provision or re-provision a remote environment. Detects available "
                 "tools (python3, uv, pip, GPU), creates a Python venv, "
@@ -1970,6 +2064,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="remote_status",
+            cli=True,
             description=(
                 "Query a remote machine's current status: GPU utilization and "
                 "memory, running training processes, SSH connectivity, and the "
@@ -1994,6 +2089,7 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="compute_set",
+            cli=True, mutating=True,
             description=(
                 "Persist the default compute target so future "
                 "start_training and start_local_eval calls auto-route. "

@@ -613,3 +613,27 @@ class TestFullEvalWorkflowIntegration:
         )
         assert "Failure Cases" in failures.content
         assert "Score:" in failures.content
+
+
+class TestHfPushPermissionSentinel:
+    """The HF-push sentinel must carry the RESOLVED repo id as its key."""
+
+    @pytest.mark.asyncio
+    async def test_hf_push_permission_sentinel_has_key(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from lqh.tools.handlers import handle_hf_push
+
+        class FakeApi:
+            def whoami(self):
+                return {"name": "tester"}
+
+        monkeypatch.setattr("lqh.tools.handlers._get_hf_api", lambda: FakeApi())
+        dataset = tmp_path / "datasets" / "demo"
+        dataset.mkdir(parents=True)
+        (dataset / "data.parquet").write_bytes(b"x")
+
+        result = await handle_hf_push(tmp_path, local_path="datasets/demo")
+        assert result.content == "PERMISSION_REQUIRED"
+        # repo_id was auto-generated inside the handler; the key exposes it.
+        assert result.permission_key == f"hf_push:tester/{tmp_path.name}-demo"

@@ -28,6 +28,7 @@ from lqh.remote.bundle import build_bundle_to_file
 from lqh.remote.cloud import CloudBackend, _infer_kind
 from lqh.tools.handlers import handle_run_data_gen_pipeline
 from lqh.tools.permissions import (
+    PermissionContext,
     check_cloud_data_gen_permission,
     grant_cloud_data_gen_permission,
     grant_permission,
@@ -295,6 +296,46 @@ async def test_model_supplied_consent_flags_are_stripped(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_script_permission_sentinel_has_key(tmp_path: Path) -> None:
+    """The script-execution sentinel must carry a grantable permission_key."""
+    project, script_rel = _handler_project(tmp_path)
+    result = await handle_run_data_gen_pipeline(
+        project, script_path=script_rel, num_samples=3, output_dataset="d",
+    )
+    assert result.content == "PERMISSION_REQUIRED"
+    assert result.permission_key == f"script:{script_rel}"
+
+
+@pytest.mark.asyncio
+async def test_full_consent_context_skips_prompts(tmp_path: Path, monkeypatch) -> None:
+    """The headless CLI surface passes full consent — no sentinel fires."""
+    from lqh.remote.cloud import CloudBackend
+
+    project, script_rel = _handler_project(tmp_path)
+    record_validation(
+        project, project / script_rel,
+        num_samples=20, succeeded=20, failed=0,
+        source_paths=[project / "seeds.txt"],
+    )
+
+    async def fake_submit(self, run_dir, config, *, module="lqh.train",
+                          telemetry_workflow_id=None):
+        return "job-full-consent"
+
+    monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
+    result = await handle_run_data_gen_pipeline(
+        project, script_path=script_rel, num_samples=600,
+        output_dataset="d", execution="cloud",
+        _permissions=PermissionContext(full_consent=True),
+    )
+    assert "job-full-consent" in result.content
+    # And nothing was persisted into the durable store.
+    perms = load_permissions(project)
+    assert perms.project_allow_all is False
+    assert perms.cloud_data_gen_allow_all is False
+
+
+@pytest.mark.asyncio
 async def test_output_dataset_path_rejected(tmp_path: Path) -> None:
     project, script_rel = _handler_project(tmp_path)
     for bad in ("../evil", "a/b", "", "..", "runs\\x"):
@@ -386,7 +427,7 @@ async def test_cloud_submit_with_consent(tmp_path: Path, monkeypatch) -> None:
     result = await handle_run_data_gen_pipeline(
         project, script_path=script_rel, num_samples=1000,
         output_dataset="big", execution="cloud",
-        _cloud_consent=True,
+        _permissions=PermissionContext.granting("cloud_data_gen"),
         on_background_task_started=lambda *a: started.append(a),
     )
     assert "job-42" in result.content
@@ -426,14 +467,14 @@ async def test_validation_instructions_path_escape_rejected(tmp_path: Path) -> N
         result = await handle_run_data_gen_pipeline(
             project, script_path=script_rel, num_samples=600,
             output_dataset="d", execution="cloud",
-            validation_instructions=bad, _cloud_consent=True,
+            validation_instructions=bad, _permissions=PermissionContext.granting("cloud_data_gen"),
         )
         assert "Error" in result.content and "validation_instructions" in result.content, bad
 
     result = await handle_run_data_gen_pipeline(
         project, script_path=script_rel, num_samples=600,
         output_dataset="d", execution="cloud",
-        validation_instructions="missing.md", _cloud_consent=True,
+        validation_instructions="missing.md", _permissions=PermissionContext.granting("cloud_data_gen"),
     )
     assert "does not exist" in result.content
 
@@ -461,7 +502,7 @@ async def test_validation_instructions_stored_project_relative(
         project, script_path=script_rel, num_samples=600,
         output_dataset="d", execution="cloud",
         validation_instructions=str(project / "data_gen" / "rubric.md"),
-        _cloud_consent=True,
+        _permissions=PermissionContext.granting("cloud_data_gen"),
     )
     assert seen["config"]["validation_instructions"] == "data_gen/rubric.md"
 
@@ -533,7 +574,7 @@ async def test_cloud_concurrency_accounts_for_samples_per_item(
     monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
     await handle_run_data_gen_pipeline(
         project, script_path=script_rel, num_samples=5, samples_per_item=10,
-        output_dataset="d", execution="cloud", _cloud_consent=True,
+        output_dataset="d", execution="cloud", _permissions=PermissionContext.granting("cloud_data_gen"),
     )
     assert seen["config"]["concurrency"] == 50
 
@@ -613,7 +654,7 @@ async def test_missing_source_input_blocks_submit(tmp_path: Path) -> None:
 
     result = await handle_run_data_gen_pipeline(
         project, script_path=script_rel, num_samples=600,
-        output_dataset="d", execution="cloud", _cloud_consent=True,
+        output_dataset="d", execution="cloud", _permissions=PermissionContext.granting("cloud_data_gen"),
     )
     assert result.content.startswith("VALIDATION_REQUIRED")
     assert "seeds.txt" in result.content
@@ -713,7 +754,7 @@ async def test_rapid_double_submit_gets_distinct_run_dirs(
     for name in ("name_a", "name_b"):
         result = await handle_run_data_gen_pipeline(
             project, script_path=script_rel, num_samples=600,
-            output_dataset=name, execution="cloud", _cloud_consent=True,
+            output_dataset=name, execution="cloud", _permissions=PermissionContext.granting("cloud_data_gen"),
         )
         assert "job-" in result.content
     assert len(set(run_dirs)) == 2, run_dirs
@@ -723,7 +764,7 @@ async def test_rapid_double_submit_gets_distinct_run_dirs(
     # accident (see lqh/dataset_guard.py).
     refused = await handle_run_data_gen_pipeline(
         project, script_path=script_rel, num_samples=600,
-        output_dataset="name_a", execution="cloud", _cloud_consent=True,
+        output_dataset="name_a", execution="cloud", _permissions=PermissionContext.granting("cloud_data_gen"),
     )
     assert "pending cloud data-gen job" in refused.content
     assert len(run_dirs) == 2  # no third submission happened
@@ -751,7 +792,7 @@ async def test_observed_hf_usage_sets_needs_hf(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
     await handle_run_data_gen_pipeline(
         project, script_path=script_rel, num_samples=600,
-        output_dataset="d", execution="cloud", _cloud_consent=True,
+        output_dataset="d", execution="cloud", _permissions=PermissionContext.granting("cloud_data_gen"),
     )
     assert seen["config"]["needs_hf"] is True
 
@@ -1158,7 +1199,7 @@ async def test_needs_hf_configures_token_donation(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
     await handle_run_data_gen_pipeline(
         project, script_path=script_rel, num_samples=5,
-        output_dataset="d", execution="cloud", _cloud_consent=True,
+        output_dataset="d", execution="cloud", _permissions=PermissionContext.granting("cloud_data_gen"),
     )
     assert seen["hf_flag"] is True
 
@@ -1182,7 +1223,7 @@ async def test_no_hf_usage_means_no_token_donation(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
     await handle_run_data_gen_pipeline(
         project, script_path=script_rel, num_samples=5,
-        output_dataset="d", execution="cloud", _cloud_consent=True,
+        output_dataset="d", execution="cloud", _permissions=PermissionContext.granting("cloud_data_gen"),
     )
     assert seen["hf_flag"] is False
 
