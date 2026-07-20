@@ -162,6 +162,30 @@ lqh --spec "use the smallest base model"   # sticky run-time directive (works in
 
 Auto mode requires an existing `SPEC.md` (write one interactively first, or by hand). It runs rubric → data gen → filter → baseline → SFT → DPO → report without ever prompting, and always terminates with an explicit success or failure.
 
+## 🤝 Using lqh from Claude Code, Codex & other agent harnesses
+
+lqh's built-in agent is optional: any agentic harness can orchestrate the same pipeline through the headless CLI, calling individual steps with `lqh tool` and reading JSON results. If you prefer your own harness's judgment (or want lqh inside a bigger workflow), point it at the bootstrap command:
+
+```
+Run `lqh hello` to learn how to drive lqh, then create a spec for
+<my task> and generate a first draft dataset.
+```
+
+Or make it a standing instruction in your project's `CLAUDE.md` / `AGENTS.md`:
+
+> Before working with lqh, run `lqh hello` and follow its contracts.
+
+`lqh hello` prints the full harness guide: the workflow, every exposed tool, the JSON envelope, and exit codes. A call looks like:
+
+```bash
+$ lqh tool call summary
+{"schema_version": 1, "ok": true, "tool": "summary",
+ "result": {"text": "…project state…", "secret": null, "details": {}},
+ "error": null, "meta": {"duration_s": 0.02, "lqh_version": "0.4.19"}}
+```
+
+Consent lives in *your* harness for direct calls — lqh's interactive permission prompts never fire on this surface (destroying existing datasets still requires an explicit `"overwrite": true` argument). Authenticate once with `lqh login`.
+
 ## 📁 Your project is just a directory
 
 `cd` into any directory and run `lqh` — the agent reads what's there to understand current state. No init command, no project marker file.
