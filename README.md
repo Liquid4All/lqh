@@ -162,39 +162,19 @@ lqh --spec "use the smallest base model"   # sticky run-time directive (works in
 
 Auto mode requires an existing `SPEC.md` (write one interactively first, or by hand). It runs rubric → data gen → filter → baseline → SFT → DPO → report without ever prompting, and always terminates with an explicit success or failure.
 
-## 🤝 Using lqh from Claude Code, Codex & other agent harnesses
+## 🤝 Bring your own harness
 
-lqh's built-in agent is optional: any agentic harness can orchestrate the same pipeline through the headless CLI — delegating whole tasks (`lqh run "<task>"`, one JSON result + a resumable session) or calling individual steps (`lqh tool`, one JSON envelope per call). If you prefer your own harness's judgment (or want lqh inside a bigger workflow), point it at the bootstrap command:
+lqh works with third-party harnesses such as Claude Code, Codex, and other agents. If you already live in one of them, you don't need lqh's chat interface — your agent drives the whole fine-tuning workflow for you, and you keep your familiar tools, context, and way of working.
+
+Just tell your agent:
 
 ```
-Run `lqh hello` to learn how to drive lqh, then create a spec for
-<my task> and generate a first draft dataset.
+run `lqh hello`
 ```
 
-Or make it a standing instruction in your project's `CLAUDE.md` / `AGENTS.md`:
+That's it. Your agent learns how to drive lqh, checks where your project stands, and picks up from there — starting with the spec interview if the project is empty. To make this permanent, add one line to your project's `CLAUDE.md` / `AGENTS.md`:
 
 > Before working with lqh, run `lqh hello` and follow its contracts.
-
-`lqh hello` prints the full harness guide: the workflow, every exposed tool, the JSON envelope, and exit codes. A call looks like:
-
-```bash
-$ lqh tool call summary
-{"schema_version": 1, "ok": true, "tool": "summary",
- "result": {"text": "…project state…", "secret": null, "details": {}},
- "error": null, "meta": {"duration_s": 0.02, "lqh_version": "0.4.19"}}
-```
-
-Delegating a coarse step instead:
-
-```bash
-$ lqh run "Smoke-test data_gen/task.py (n=3), then generate and score a 200-sample training set."
-{"schema_version": 1, "run_id": "…", "status": "success",
- "summary": "Generated datasets/train_v1 (200 rows, mean score 0.81)…",
- "artifacts": [{"kind": "dataset", "path": "datasets/train_v1", "source": "ledger"}],
- "session_id": "…", …}
-```
-
-Consent lives in *your* harness for direct calls — lqh's interactive permission prompts never fire on this surface (destroying existing datasets still requires an explicit `"overwrite": true` argument). `lqh run` needs `--allow-publish` before it may push to HF or deploy. Authenticate once with `lqh login`.
 
 ## 📁 Your project is just a directory
 
