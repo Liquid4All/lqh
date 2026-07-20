@@ -164,7 +164,7 @@ Auto mode requires an existing `SPEC.md` (write one interactively first, or by h
 
 ## 🤝 Using lqh from Claude Code, Codex & other agent harnesses
 
-lqh's built-in agent is optional: any agentic harness can orchestrate the same pipeline through the headless CLI, calling individual steps with `lqh tool` and reading JSON results. If you prefer your own harness's judgment (or want lqh inside a bigger workflow), point it at the bootstrap command:
+lqh's built-in agent is optional: any agentic harness can orchestrate the same pipeline through the headless CLI — delegating whole tasks (`lqh run "<task>"`, one JSON result + a resumable session) or calling individual steps (`lqh tool`, one JSON envelope per call). If you prefer your own harness's judgment (or want lqh inside a bigger workflow), point it at the bootstrap command:
 
 ```
 Run `lqh hello` to learn how to drive lqh, then create a spec for
@@ -184,7 +184,17 @@ $ lqh tool call summary
  "error": null, "meta": {"duration_s": 0.02, "lqh_version": "0.4.19"}}
 ```
 
-Consent lives in *your* harness for direct calls — lqh's interactive permission prompts never fire on this surface (destroying existing datasets still requires an explicit `"overwrite": true` argument). Authenticate once with `lqh login`.
+Delegating a coarse step instead:
+
+```bash
+$ lqh run "Smoke-test data_gen/task.py (n=3), then generate and score a 200-sample training set."
+{"schema_version": 1, "run_id": "…", "status": "success",
+ "summary": "Generated datasets/train_v1 (200 rows, mean score 0.81)…",
+ "artifacts": [{"kind": "dataset", "path": "datasets/train_v1", "source": "ledger"}],
+ "session_id": "…", …}
+```
+
+Consent lives in *your* harness for direct calls — lqh's interactive permission prompts never fire on this surface (destroying existing datasets still requires an explicit `"overwrite": true` argument). `lqh run` needs `--allow-publish` before it may push to HF or deploy. Authenticate once with `lqh login`.
 
 ## 📁 Your project is just a directory
 

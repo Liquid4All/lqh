@@ -37,11 +37,13 @@ back to 3–6, a model that doesn't learn sends you back to 5–8.
 
 ## Integration modes
 
-- **`lqh tool …`** (available now): call individual pipeline steps and
-  get a JSON envelope per call. You keep the orchestration loop.
-- **`lqh run "<task>"`** (planned, not in this version): delegate a whole
-  task to lqh's own agent headlessly.
-<!-- lqh-run-docs: insert `lqh run` contract here when phase 5 ships -->
+- **`lqh tool …`**: call individual pipeline steps and get a JSON
+  envelope per call. You keep the orchestration loop. Fine-grained.
+- **`lqh run "<task>"`**: delegate a whole task to lqh's own agent
+  headlessly — it plans, executes tools, waits on runs, and returns one
+  structured JSON result (plus a resumable session). Use it when the
+  step is coarse ("generate and score a 500-sample training set") and
+  you don't want to micro-manage.
 
 ## Consent model
 
@@ -52,6 +54,36 @@ destruction: overwriting an existing dataset/run still requires the
 explicit `"overwrite": true` argument in your call — without it the call
 fails with `error.kind: "conflict"` (allocate a versioned name like
 `my_dataset_v2` instead, unless the user explicitly asked to replace).
+
+`lqh run` auto-grants task-implied work (scripts, cloud data-gen,
+training) for the run, but **publishing** (`hf_push`,
+`push_to_production`, `create_inference_key`) is gated: without
+`--allow-publish` the run terminates with `status: "needs_permission"`
+and the exact re-invocation.
+
+### `lqh run` result (stdout, exactly one JSON document)
+
+```json
+{
+  "schema_version": 1, "run_id": "…",
+  "status": "success",
+  "reason": "…", "summary": "…markdown…",
+  "artifacts": [ {"kind": "run", "path": "runs/sft_v1", "source": "ledger"} ],
+  "metrics": { "post_sft": {"value": 0.78, "provenance": "reported"} },
+  "session_id": "…",
+  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "turns": 0 },
+  "duration_s": 0
+}
+```
+
+`status` ∈ `success | failure | needs_permission | needs_configuration |
+auth_required | limit_exceeded | interrupted | timed_out`. Artifacts with
+`source: "ledger"` were recorded deterministically from successful tool
+calls; `"reported"` ones are validated model claims. NDJSON progress
+events stream on stderr (`{"schema_version","run_id","seq","event",…}`
+with events `start`, `agent_message`, `tool_call`, `tool_result`,
+`stage`, `end`). `--resume <session_id>` continues a prior run
+contextually — e.g. after granting `--allow-publish`.
 
 ## Contracts
 
@@ -106,6 +138,8 @@ lqh hello                       # this guide (alias: lqh docs agents)
 lqh docs skills                 # list built-in skills
 lqh docs skill <name>           # print a skill's SKILL.md (workflow playbooks)
 lqh login [--no-browser]        # device-flow auth
+lqh run "<task>" [--allow-publish] [--resume ID] [--max-turns N]
+        [--max-tool-calls N] [--prompt-file f|-] [--quiet] [--save-secret]
 lqh tool list [--json]          # the tools below
 lqh tool schema <name>          # JSON schema for a tool's arguments
 lqh tool call <name> --args '<json>' [--args-file f|-] [--pretty] [--save-secret]
@@ -127,6 +161,12 @@ Discover project state (read-only, no auth):
 
 ```
 lqh tool call summary
+```
+
+Delegate a whole step to lqh's agent:
+
+```
+lqh run "Generate a 200-sample draft training set for the spec, score it, and report the quality distribution."
 ```
 
 Run a data-generation pipeline (smoke test, 3 samples):

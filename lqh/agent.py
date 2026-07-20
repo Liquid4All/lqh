@@ -432,6 +432,7 @@ class Agent:
         callbacks: AgentCallbacks | None = None,
         *,
         auto_mode: bool = False,
+        policy: "AgentPolicy | None" = None,
         extra_spec: str | None = None,
     ) -> None:
         self.project_dir = project_dir
@@ -458,10 +459,25 @@ class Agent:
         # tool's result has been recorded in the session.
         self._deferred_interrupt = False
 
-        # Auto mode: sticky system messages live outside session.messages so
-        # they survive compaction; _build_messages() prepends them on every
+        # Behavior policy (CLI_PLAN §4.2): the auto_mode boolean is a preset
+        # selector — TUI behavior unchanged. An explicit policy (e.g. the
+        # SUBAGENT preset from `lqh run`) takes precedence.
+        from lqh.agent_policy import TUI_AUTO, TUI_INTERACTIVE
+
+        self.policy = policy or (TUI_AUTO if auto_mode else TUI_INTERACTIVE)
+        # Kept for TUI/back-compat reads; agent-internal decisions use
+        # self.policy fields.
+        self.auto_mode = auto_mode or (policy is not None and self.policy.no_user)
+        # Terminal state forced by policy (publish gate, missing compute
+        # config): (status, reason) with status "needs_permission" |
+        # "needs_configuration". Ends the inner loop like _auto_exit.
+        self._policy_halt: tuple[str, str] | None = None
+        # Secrets delivered out-of-band under secret_delivery="result" —
+        # the run driver folds them into the result payload.
+        self.delivered_secrets: list[Any] = []
+        # Sticky system messages live outside session.messages so they
+        # survive compaction; _build_messages() prepends them on every
         # turn after SYSTEM_PROMPT.
-        self.auto_mode = auto_mode
         self.sticky_system_messages: list[str] = []
         # Ephemeral project context (SPEC.md, NOTES.md, summary, activity
         # log, signals). Rebuilt from disk by prepare_context() on every
@@ -483,9 +499,12 @@ class Agent:
         # retain them instead of finding the baseline already consumed.
         self._startup_diff_signals: list | None = None
         self._auto_exit: tuple[str, str] | None = None
-        if auto_mode:
+        self._auto_exit_details: dict[str, Any] = {}
+        if self.policy.sticky_skill:
             try:
-                self.sticky_system_messages.append(load_skill_content("auto"))
+                self.sticky_system_messages.append(
+                    load_skill_content(self.policy.sticky_skill)
+                )
             except FileNotFoundError:
                 pass
         if extra_spec:
@@ -765,8 +784,9 @@ class Agent:
         empty_tool_call_retries = 0
 
         while has_tools_or_first:
-            # Auto-mode: terminate cleanly once exit_auto_mode was called
-            if self._auto_exit is not None:
+            # Terminate cleanly once exit_auto_mode was called or a policy
+            # gate (publish / missing configuration) ended the run.
+            if self._auto_exit is not None or self._policy_halt is not None:
                 break
             # Safety: break if too many tool calls in a single turn (only
             # enforced when the cap has been explicitly set, e.g. by the E2E
@@ -793,7 +813,7 @@ class Agent:
                     client,
                     model=self.orchestration_model,
                     messages=self._build_messages(),
-                    tools=get_all_tools(auto_mode=self.auto_mode),
+                    tools=get_all_tools(auto_mode=self.policy.terminal_tools),
                     tool_choice="auto",
                     max_tokens=ORCHESTRATION_MAX_TOKENS,
                     temperature=0.0,
@@ -1001,11 +1021,14 @@ class Agent:
                         )
 
                     # Auto-mode: explicit termination tool was called
-                    if result.exit_auto_mode and self.auto_mode:
+                    if result.exit_auto_mode and self.policy.terminal_tools:
                         self._auto_exit = (
                             result.auto_status or "failure",
                             result.auto_reason or "",
                         )
+                        # Structured-exit claims (summary/artifacts/metrics)
+                        # for the headless run driver.
+                        self._auto_exit_details = result.details or {}
 
                     # Project activity log: reset coalescing on non-edit events
                     if tool_name in ("run_data_gen_pipeline", "run_scoring") and not result.content.startswith("❌"):
@@ -1047,10 +1070,14 @@ class Agent:
                         self._deferred_interrupt = False
                         raise asyncio.CancelledError()
             else:
-                if self.auto_mode and self._auto_exit is None:
-                    # Auto mode: a turn with no tool call would otherwise return
-                    # control to the user. There is no user — nudge the agent to
-                    # keep going. Per AUTOMODE.md §7.4.
+                if (
+                    self.policy.no_user
+                    and self._auto_exit is None
+                    and self._policy_halt is None
+                ):
+                    # No user attached: a turn with no tool call would
+                    # otherwise return control to the user. Nudge the agent
+                    # to keep going. Per AUTOMODE.md §7.4.
                     self.session.add_message({
                         "role": "user",
                         "content": (
@@ -1138,10 +1165,30 @@ class Agent:
         never smuggle those signals in and bypass a permission gate.
         """
         arguments = {k: v for k, v in arguments.items() if not k.startswith("_")}
-        # Auto mode: show_file has no audience. Nudge the agent toward read_file
-        # instead of running the handler (which would set show_file_path and
-        # trigger the blocking TUI viewer callback at the bottom of this method).
-        if tool_name == "show_file" and self.auto_mode:
+        # Sub-agent publish gate (CLI_PLAN §3.3): outward-facing publishing
+        # is denied unless the caller passed --allow-publish. The denial is
+        # TERMINAL — the run ends with needs_permission and the exact
+        # re-invocation hint, so the model must not retry or work around it.
+        from lqh.agent_policy import PUBLISH_TOOLS
+
+        if tool_name in PUBLISH_TOOLS and not self.policy.allow_publish:
+            hint = (
+                f"The '{tool_name}' capability is gated on this surface. "
+                "Re-invoke with `lqh run --allow-publish ...` (or grant it "
+                "in the TUI) to enable publishing."
+            )
+            self._policy_halt = ("needs_permission", hint)
+            return ToolResult(
+                content=(
+                    f"[Policy] {hint} This run will now terminate with "
+                    "status needs_permission; do not retry the tool."
+                ),
+            )
+        # No user attached: show_file has no audience. Nudge the agent toward
+        # read_file instead of running the handler (which would set
+        # show_file_path and trigger the blocking TUI viewer callback at the
+        # bottom of this method).
+        if tool_name == "show_file" and self.policy.no_user:
             return ToolResult(
                 content=(
                     "[Auto mode] No user is attached to view the file. "
@@ -1160,7 +1207,7 @@ class Agent:
         # exactly as before — the wait is transparent.
         if (
             tool_name == "training_status"
-            and self.auto_mode
+            and self.policy.no_user
             and self.callbacks.on_await_background is not None
         ):
             run_name = arguments.get("run_name")
@@ -1192,8 +1239,21 @@ class Agent:
             # registers here — without it, auto-mode parking would see no
             # running task and fall through to busy-polling that run.
             extra["on_background_task_started"] = self.callbacks.on_background_task_started
+        # Policy-scoped consent (SUBAGENT preset): task-implied domains are
+        # granted for the invocation without touching the durable store.
+        if self.policy.granted_domains:
+            extra["_permissions"] = PermissionContext.granting(
+                *self.policy.granted_domains
+            )
         if internal_kwargs:
-            extra.update(internal_kwargs)
+            merged = dict(internal_kwargs)
+            # A re-invocation grant must extend — not replace — the
+            # policy grants.
+            if "_permissions" in merged and "_permissions" in extra:
+                merged["_permissions"] = extra["_permissions"].with_grants(
+                    *merged["_permissions"].grants
+                )
+            extra.update(merged)
         # Cloud data-gen submits create external billable state (job row,
         # sandbox) — shield them like the other submission tools so an
         # interrupt can't orphan a job the CLI never recorded. Local
@@ -1224,9 +1284,9 @@ class Agent:
 
         # Handle ask_user tool
         if result.requires_user_input and tool_name == "ask_user":
-            # Auto mode: never block on a user. Inject a synthetic nudge instead.
+            # No user attached: never block. Inject a synthetic nudge instead.
             # Per AUTOMODE.md §7.2.
-            if self.auto_mode:
+            if self.policy.no_user:
                 return ToolResult(
                     content=(
                         "[Auto mode] You called ask_user, but there is no user. "
@@ -1249,12 +1309,28 @@ class Agent:
         # handlers._compute_pick_options). The choice is saved to the
         # project (or globally) so it never re-fires.
         if result.requires_user_input and result.content == "COMPUTE_PICK_REQUIRED":
-            # Auto mode: never block. Persist LQH Cloud for the project so
-            # routing is stable, then re-run the tool.
-            if self.auto_mode:
-                from lqh.remote.compute import save_project_default
-                save_project_default(self.project_dir, "cloud")
-                return await self._reinvoke_tool(tool_name, arguments)
+            # No user attached: never block. Persist the policy's default
+            # compute target so routing is stable, then re-run the tool —
+            # or, without a default (sub-agent mode), terminate the run
+            # with needs_configuration and the exact fix.
+            if self.policy.no_user:
+                if self.policy.compute_default:
+                    from lqh.remote.compute import save_project_default
+                    save_project_default(self.project_dir, self.policy.compute_default)
+                    return await self._reinvoke_tool(tool_name, arguments)
+                hint = (
+                    "No compute target is configured for this project. Set one "
+                    "first: `lqh tool call compute_set --args "
+                    "'{\"target\": \"cloud\"}'` (or pick one in the TUI), "
+                    "then re-run."
+                )
+                self._policy_halt = ("needs_configuration", hint)
+                return ToolResult(
+                    content=(
+                        f"[Policy] {hint} This run will now terminate with "
+                        "status needs_configuration."
+                    ),
+                )
             if self.callbacks.on_ask_user:
                 user_response = await self.callbacks.on_ask_user(
                     result.question or "", result.options, False
@@ -1271,9 +1347,9 @@ class Agent:
             and result.content == "OVERWRITE_CONFIRMATION_REQUIRED"
         ):
             # Destroying an existing dataset requires a HUMAN decision —
-            # overwrite=true from the model alone is not consent. Auto
-            # mode therefore always declines.
-            if self.auto_mode:
+            # overwrite=true from the model alone is not consent. With no
+            # user attached, always decline.
+            if self.policy.no_user:
                 return ToolResult(content=(
                     "Overwrite declined: auto mode never destroys existing "
                     "datasets. Use a new versioned output name instead."
@@ -1296,12 +1372,29 @@ class Agent:
             return ToolResult(content="[No user input handler available]")
 
         if result.requires_user_input and result.content == "PERMISSION_REQUIRED":
-            # Auto mode: auto-grant project-wide so the pipeline never blocks.
-            if self.auto_mode:
+            # TUI auto mode: auto-grant project-wide so the pipeline never
+            # blocks.
+            if self.policy.auto_grant_permissions:
                 synthetic_choice = "Execute and don't ask again for this project"
                 return await self._handle_permission_response(
                     synthetic_choice, tool_name, arguments,
                     permission_key=result.permission_key,
+                )
+            if self.policy.no_user:
+                # Sub-agent mode: task-implied domains were pre-granted, so
+                # only an ungranted (publishing) domain can reach here —
+                # terminal, same contract as the publish gate above.
+                hint = (
+                    f"The '{tool_name}' action needs a permission grant not "
+                    "available on this surface. Re-invoke with `lqh run "
+                    "--allow-publish ...` or grant it in the TUI."
+                )
+                self._policy_halt = ("needs_permission", hint)
+                return ToolResult(
+                    content=(
+                        f"[Policy] {hint} This run will now terminate with "
+                        "status needs_permission; do not retry the tool."
+                    ),
                 )
             if self.callbacks.on_ask_user:
                 user_response = await self.callbacks.on_ask_user(
@@ -1335,9 +1428,20 @@ class Agent:
                     delivery.env_comment,
                 )
 
-            # Auto mode (no user to copy the key): default to .env append.
-            if self.auto_mode:
+            # Policy-directed delivery when no user can copy the key.
+            if self.policy.secret_delivery == "env" or (
+                self.policy.no_user and self.policy.secret_delivery == "prompt"
+            ):
                 return ToolResult(content=delivery.redacted + _append_env())
+            if self.policy.secret_delivery == "result":
+                # Sub-agent mode: never silently write .env — the secret
+                # rides the run result payload (the caller's transcript is
+                # the delivery channel; --save-secret opts into .env).
+                self.delivered_secrets.append(delivery)
+                return ToolResult(
+                    content=delivery.redacted
+                    + " (the key is included in this run's result payload)"
+                )
 
             # Interactive: show the key out-of-band, then offer to save it.
             if self.callbacks.on_show_secret and self.callbacks.on_ask_user:
@@ -1506,7 +1610,7 @@ class Agent:
             # Auto mode grants project-wide so the unattended run never
             # re-prompts; interactive mode grants only the specific run the
             # user just approved (permission_key = "training:<run_name>").
-            if self.auto_mode or not permission_key:
+            if self.policy.auto_grant_permissions or not permission_key:
                 grant_training_permission(self.project_dir, project_wide=True)
             else:
                 grant_training_permission(self.project_dir, key=permission_key)
@@ -1518,7 +1622,7 @@ class Agent:
         if permission_key and permission_key.startswith("cloud_data_gen:"):
             if "do not" in response.lower():
                 return ToolResult(content="Cloud data-gen submission declined by user.")
-            if self.auto_mode or "don't ask again" in response:
+            if self.policy.auto_grant_permissions or "don't ask again" in response:
                 from lqh.tools.permissions import grant_cloud_data_gen_permission
                 grant_cloud_data_gen_permission(self.project_dir)
             # Re-invoke with both consents carried out-of-band so a

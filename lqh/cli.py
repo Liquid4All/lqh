@@ -22,8 +22,8 @@ for AI agents and harnesses (Claude Code, Codex, ...):
   If you are an AI agent driving lqh programmatically, first run:
       lqh hello
   It explains what LQH is, the full fine-tuning workflow, the headless
-  commands (`lqh tool ...`), their JSON contracts, and the project
-  conventions (NOTES.md, manifests, immutable outputs).
+  commands (`lqh run`, `lqh tool ...`), their JSON contracts, and the
+  project conventions (NOTES.md, manifests, immutable outputs).
 """
 
 
@@ -181,6 +181,66 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    run = sub.add_parser(
+        "run",
+        help="Run one delegated task headlessly; JSON result on stdout.",
+        description=(
+            "Headless sub-agent mode: lqh's agent performs one delegated "
+            "task with no user interaction, then exits with a structured "
+            "JSON result on stdout (NDJSON progress events on stderr). "
+            "Publishing tools (hf_push, push_to_production, "
+            "create_inference_key) are gated behind --allow-publish."
+        ),
+    )
+    run.add_argument(
+        "task", nargs="?", default=None,
+        help="The task prompt ('-' reads it from stdin).",
+    )
+    run.add_argument(
+        "--prompt-file", metavar="FILE", default=None,
+        help="Read the task prompt from FILE ('-' for stdin).",
+    )
+    run.add_argument(
+        "--resume", metavar="SESSION_ID", default=None,
+        help=(
+            "Contextual resume of a prior run's session: the task (or a "
+            "default continue instruction) is injected as a new message."
+        ),
+    )
+    run.add_argument(
+        "--allow-publish", action="store_true",
+        help="Permit outward-facing publishing tools in this run.",
+    )
+    run.add_argument(
+        "--max-turns", type=int, default=None, metavar="N",
+        help="Abort with limit_exceeded after N LLM calls.",
+    )
+    run.add_argument(
+        "--max-tool-calls", type=int, default=None, metavar="N",
+        help="Abort with limit_exceeded after N tool calls (total).",
+    )
+    run.add_argument(
+        "--save-secret", action="store_true",
+        help="Persist delivered secrets to .env instead of (only) the result payload.",
+    )
+    run.add_argument(
+        "--quiet", action="store_true",
+        help="Suppress NDJSON progress events on stderr.",
+    )
+    run.add_argument(
+        "--spec", metavar="STRING", default=None,
+        help="Extra sticky context appended to every agent turn.",
+    )
+
+    status = sub.add_parser(
+        "status",
+        help="Show run states and attention signals for this project.",
+    )
+    status.add_argument(
+        "--json", action="store_true", dest="json_out",
+        help="Machine-readable JSON output.",
+    )
+
     project = sub.add_parser(
         "project",
         help="Resolve a copied project: continue or fork identity.",
@@ -234,6 +294,14 @@ def _dispatch(args: argparse.Namespace) -> int:
         from lqh.cli_cmds.tool_cmd import cmd_tool
 
         return cmd_tool(args)
+    if args.command == "run":
+        from lqh.cli_cmds.run_cmd import cmd_run
+
+        return cmd_run(args)
+    if args.command == "status":
+        from lqh.cli_cmds.status_cmd import cmd_status
+
+        return cmd_status(args)
     if args.command == "project":
         from lqh.cli_cmds.project_cmd import cmd_project
 

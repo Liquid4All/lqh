@@ -2185,6 +2185,38 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                             "or the specific blocker when reporting failure."
                         ),
                     },
+                    "summary": {
+                        "type": "string",
+                        "description": (
+                            "Optional markdown summary of what was done and produced "
+                            "(headless runs: this is returned to the delegating "
+                            "harness — be concrete: artifact paths, run names, "
+                            "dataset names, metric values)."
+                        ),
+                    },
+                    "artifacts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string"},
+                                "path": {"type": "string"},
+                            },
+                            "required": ["kind", "path"],
+                        },
+                        "description": (
+                            "Optional project-relative artifact paths produced by "
+                            "this run (kind: dataset | run | checkpoint | eval | "
+                            "file)."
+                        ),
+                    },
+                    "metrics": {
+                        "type": "object",
+                        "description": (
+                            "Optional metric name → numeric value map (e.g. "
+                            "{\"baseline\": 0.42, \"post_sft\": 0.78})."
+                        ),
+                    },
                 },
                 "required": ["status", "reason"],
             },

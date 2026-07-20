@@ -6579,9 +6579,19 @@ async def handle_run_data_filter(
 
 
 async def handle_exit_auto_mode(
-    *, status: str, reason: str, **kwargs: Any,
+    *, status: str, reason: str,
+    summary: str | None = None,
+    artifacts: list[Any] | None = None,
+    metrics: dict[str, Any] | None = None,
+    **kwargs: Any,
 ) -> ToolResult:
-    """Terminate auto mode. Only meaningful when the agent runs in auto mode."""
+    """Terminate auto mode. Only meaningful when the agent runs in auto mode.
+
+    ``summary``/``artifacts``/``metrics`` are optional structured-exit
+    fields for headless runs (CLI_PLAN §4.6). They are model CLAIMS — the
+    run driver validates artifact paths and labels metrics "reported"
+    unless corroborated; its own deterministic ledger is authoritative.
+    """
     status_norm = (status or "").strip().lower()
     if status_norm not in ("success", "failure"):
         return ToolResult(
@@ -6590,11 +6600,19 @@ async def handle_exit_auto_mode(
                 "Call exit_auto_mode again with a valid status."
             ),
         )
+    details: dict[str, Any] = {}
+    if summary:
+        details["summary"] = str(summary)
+    if isinstance(artifacts, list):
+        details["artifacts"] = artifacts
+    if isinstance(metrics, dict):
+        details["metrics"] = metrics
     return ToolResult(
         content=f"Exiting auto mode: {status_norm} — {reason}",
         exit_auto_mode=True,
         auto_status=status_norm,
         auto_reason=reason,
+        details=details or None,
     )
 
 
