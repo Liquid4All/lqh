@@ -38,6 +38,7 @@ def test_guide_contains_version_and_all_exposed_tools() -> None:
     assert "@@" not in guide  # all placeholders substituted
     # Core contract sections present.
     for heading in (
+        "act, don't summarize",
         "## What LQH is",
         "## The fine-tuning workflow",
         "## Consent model",

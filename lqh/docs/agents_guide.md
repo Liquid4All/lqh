@@ -2,6 +2,24 @@
 
 lqh version @@VERSION@@ · envelope schema_version 1
 
+## If a user asked you to run `lqh hello`: act, don't summarize
+
+Being told to run this command means the user wants to use lqh THROUGH
+YOU — you are now the orchestrating agent for this project. Don't stop
+at describing this guide or asking what to do. Immediately:
+
+1. Run `lqh tool call summary` (and `lqh status --json` if there may be
+   background runs) to see where this project stands.
+2. **Existing project** (SPEC.md, datasets, or runs present): report the
+   state briefly and propose the natural next step in the workflow below
+   (e.g. unscored dataset → score it; scored data but no run → train;
+   finished run → evaluate or deploy), then proceed once the user
+   confirms.
+3. **Empty project** (no SPEC.md): start with spec capture — read
+   `lqh docs skill spec_capture` and follow it: interview the user about
+   their task and write SPEC.md before anything else. The spec drives
+   every later step.
+
 ## What LQH is
 
 LQH (Liquid Harness) customizes Liquid AI foundation models (LFMs) into
