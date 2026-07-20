@@ -178,19 +178,19 @@ def test_results_pending_requires_actionable_handoff(tmp_path) -> None:
     app = LqhApp(tmp_path)
 
     (run / "config.json").write_text(json.dumps({"type": "infer"}))
-    assert app._results_pending("eval") is False
+    assert app._supervisor.results_pending("eval") is False
 
     (run / "config.json").write_text(json.dumps({
         "type": "infer", "scorer": "evals/scorer.md",
     }))
-    assert app._results_pending("eval") is False
+    assert app._supervisor.results_pending("eval") is False
 
     (run / "eval_request.json").write_text("{}")
     (run / "predictions.parquet").write_bytes(b"predictions")
-    assert app._results_pending("eval") is True
+    assert app._supervisor.results_pending("eval") is True
 
     (run / "eval_error.json").write_text("{}")
-    assert app._results_pending("eval") is False
+    assert app._supervisor.results_pending("eval") is False
 
 
 def test_running_status_does_not_mask_dead_process(tmp_path) -> None:

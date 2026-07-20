@@ -161,6 +161,49 @@ def _boot_gate(tool_name: str, meta: dict, project_dir: Path) -> tuple[dict, int
     return None
 
 
+async def _execute_call(
+    tool_name: str,
+    call_args: dict,
+    project_dir: Path,
+    consent: dict,
+    *,
+    wait: bool,
+):
+    """Run the tool; with ``wait`` (training_status only), park on the
+    shared JobSupervisor until the run is terminal — scoring watchers and
+    cloud data-gen finalization run while parked, exactly as in the TUI."""
+    import asyncio
+    from contextlib import suppress
+
+    from lqh.tools.handlers import execute_tool
+
+    if not wait:
+        return await execute_tool(tool_name, call_args, project_dir, **consent)
+
+    from lqh.jobs import JobSupervisor
+
+    supervisor = JobSupervisor(project_dir, poll_interval=10.0)
+    loop_task = asyncio.create_task(supervisor.watch_loop())
+    try:
+        await supervisor.wait_primed()
+        run_name = call_args.get("run_name")
+        targets = [run_name] if run_name else None
+        if targets:
+            print(f"waiting for run {run_name} …", file=sys.stderr)
+        else:
+            print("waiting for running jobs …", file=sys.stderr)
+        notice = await supervisor.wait_for_runs(targets)
+        result = await execute_tool(tool_name, call_args, project_dir, **consent)
+        if notice:
+            result.content = f"{notice}\n\n{result.content}"
+        return result
+    finally:
+        loop_task.cancel()
+        with suppress(BaseException):
+            await loop_task
+        await supervisor.stop_watchers()
+
+
 def _cmd_call(ns: argparse.Namespace) -> int:
     tool_name = ns.name
     project_dir = Path.cwd()
@@ -177,6 +220,16 @@ def _cmd_call(ns: argparse.Namespace) -> int:
             tool_name,
             "validation",
             f"Unknown or unexposed tool '{tool_name}'. See `lqh tool list`.",
+        )
+        emit(envelope, pretty=ns.pretty)
+        return code
+
+    wait = getattr(ns, "wait", False)
+    if wait and tool_name != "training_status":
+        envelope, code = error_envelope(
+            tool_name,
+            "validation",
+            "--wait is only supported for training_status.",
         )
         emit(envelope, pretty=ns.pretty)
         return code
@@ -214,13 +267,13 @@ def _cmd_call(ns: argparse.Namespace) -> int:
 
     import asyncio
 
-    from lqh.tools.handlers import execute_tool
-
     start = time.monotonic()
     with stdout_to_stderr() as real_stdout:
         try:
             result = asyncio.run(
-                execute_tool(tool_name, call_args, project_dir, **consent)
+                _execute_call(
+                    tool_name, call_args, project_dir, consent, wait=wait
+                )
             )
         except KeyboardInterrupt:
             envelope, _ = error_envelope(

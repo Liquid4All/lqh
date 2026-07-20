@@ -172,6 +172,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Persist a delivered secret into the project's .env file.",
     )
+    tool_call.add_argument(
+        "--wait",
+        action="store_true",
+        help=(
+            "training_status only: park until the run reaches a terminal "
+            "state (scoring results included) before returning."
+        ),
+    )
 
     project = sub.add_parser(
         "project",

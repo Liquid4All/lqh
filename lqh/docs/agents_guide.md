@@ -109,6 +109,8 @@ lqh login [--no-browser]        # device-flow auth
 lqh tool list [--json]          # the tools below
 lqh tool schema <name>          # JSON schema for a tool's arguments
 lqh tool call <name> --args '<json>' [--args-file f|-] [--pretty] [--save-secret]
+lqh tool call training_status --args '{"run_name": "…"}' --wait
+                                # park until the run is terminal (results incl.)
 lqh project continue|fork       # resolve a copied project directory (see below)
 ```
 
@@ -148,8 +150,12 @@ lqh tool call start_training --args '{
   "eval_dataset": "datasets/val_v1",
   "scorer": "data_gen/scorer.md"
 }'
-lqh tool call training_status
+lqh tool call training_status --args '{"run_name": "<run>"}' --wait
 ```
+
+`--wait` blocks (LLM-free) until the run is terminal — including scoring
+results and cloud data-gen dataset downloads — then returns the final
+status. Prefer it over polling.
 
 ## Project conventions you must follow
 

@@ -101,18 +101,19 @@ _SHUTDOWN_SENTINEL = "\x00__lqh_shutdown__"
 class AgentInterrupted(Exception):
     """The user cancelled the in-flight agent turn (Esc / Ctrl+C)."""
 
-# Interval between background-job completion scans, in seconds.
-# Trades freshness against SSH/filesystem load when remote runs are active.
-JOB_POLL_INTERVAL_SEC = 60.0
+# Job-supervision cadence/grace constants live with the extracted
+# supervisor (lqh/jobs.py); re-exported here for existing importers.
+from lqh.jobs import (  # noqa: E402
+    JOB_POLL_INTERVAL_SEC,
+    SCORING_GRACE_SEC,
+    SLEEP_GAP_FACTOR,
+    JobSupervisor,
+    SupervisorHooks,
+)
+
 TELEMETRY_FLUSH_INTERVAL_SEC = 60.0
 TELEMETRY_HEARTBEAT_INTERVAL_SEC = 300.0
 RECONNECT_BACKOFF_SEC = (3.0, 20.0, 60.0)
-SLEEP_GAP_FACTOR = 2.0
-# After an eval/infer run goes terminal, the scoring watcher still needs to
-# judge predictions and write eval_result.json. Auto-mode parking gives that
-# a bounded grace period so the agent wakes once *results* are ready, not just
-# when the inference job finished. Bounded so a stuck/failed scorer can't hang.
-SCORING_GRACE_SEC = 180.0
 
 
 class LqhApp:
@@ -151,35 +152,36 @@ class LqhApp:
         self._agent: Agent | None = None
         self._spinner_task: asyncio.Task | None = None
         self._app: Application | None = None
-        # Background job watcher state: maps run_name → last observed state.
-        # First-time observations are normally silent. A terminal run with a
-        # persisted telemetry workflow is the exception: it completed while
-        # this TUI was closed and must be reconciled exactly once.
+        # Background-job supervision is owned by the shared headless
+        # JobSupervisor (lqh/jobs.py); the hooks route UI + telemetry side
+        # effects back here. The aliases below keep the rest of the TUI
+        # (status bar, progress refresh, shutdown) reading/writing the
+        # SAME underlying state, not copies.
         self._job_watcher_task: asyncio.Task | None = None
         self._progress_refresh_task: asyncio.Task | None = None
         self._update_check_task: asyncio.Task[None] | None = None
-        self._job_last_state: dict[str, str] = {}
-        # Completion notices keyed by run_name, recorded by _watch_jobs on a
-        # running -> terminal transition. Auto-mode _await_background pops the
-        # entry for the run it is waiting on, so a stale notice for an unrelated
-        # run can never be mis-delivered as another run's completion.
-        self._pending_completions: dict[str, str] = {}
-        # Data-gen runs whose dataset download exhausted its retries in
-        # THIS session. The finalization marker stays on disk, so a TUI
-        # restart clears this set and retries automatically.
-        self._data_gen_gave_up: set[str] = set()
+        self._supervisor = JobSupervisor(
+            project_dir,
+            hooks=SupervisorHooks(
+                on_registry_change=self._invalidate,
+                on_gap=self._on_watch_gap,
+                on_notice=self._on_job_notice,
+                on_running=self._on_job_running,
+                on_terminal=self._on_job_terminal,
+                has_job_record=self._has_telemetry_job_record,
+                on_record_completion=self._record_telemetry_completion,
+                on_data_gen_terminal=self._on_data_gen_terminal,
+            ),
+        )
+        self._job_last_state = self._supervisor.job_last_state
+        self._pending_completions = self._supervisor.pending_completions
+        self._data_gen_gave_up = self._supervisor.data_gen_gave_up
+        self._run_watchers = self._supervisor.run_watchers
+        self._tasks = self._supervisor.tasks
         # Live progress tracking for the status bar: the last step seen per run
         # and the wall time it last advanced (drives the "↑8s ago" freshness).
         self._job_last_step: dict[str, tuple[str, float]] = {}
         self._job_progress_at: dict[str, float] = {}
-        # Per-run scoring/sync watchers (RunWatcher / RemoteRunWatcher),
-        # keyed by run_name. Spawned lazily by _watch_jobs when a run is
-        # observed in the running state and culled when they finish.
-        self._run_watchers: dict[str, Any] = {}
-        # Display-state registry for the status bar — covers any background
-        # work that will later notify the agent (currently fed by _watch_jobs,
-        # but exposed via self._tasks for future producers).
-        self._tasks = BackgroundTaskRegistry(on_change=self._invalidate)
         self._ctrl_c_pressed = False
         self._ctrl_c_at = 0.0
         # The in-flight agent turn, wrapped in a task so Esc / Ctrl+C can
@@ -1403,7 +1405,7 @@ class LqhApp:
             from lqh.subprocess_manager import SubprocessManager
 
             await asyncio.wait_for(
-                self._scan_jobs(SubprocessManager()), timeout=20.0
+                self._supervisor.scan_jobs(SubprocessManager()), timeout=20.0
             )
         except Exception:
             # Stale run-state files will be read below; the signals must
@@ -1648,32 +1650,6 @@ class LqhApp:
             self._auto_history.append(line)
         self._invalidate()
 
-    def _ensure_task_registered(self, run_name: str, remote: str | None) -> None:
-        """Register a task for a live run if not already in the registry.
-
-        Used by ``_watch_jobs`` to recover the indicator after a TUI
-        restart, since handler-driven eager registration only fires on
-        the original submission.
-        """
-        if any(t.task_id == run_name for t in self._tasks.snapshot()):
-            return
-        config_path = self.project_dir / "runs" / run_name / "config.json"
-        kind = "train"
-        if config_path.exists():
-            try:
-                import json
-                run_type = json.loads(config_path.read_text()).get("type", "")
-                kind = "eval" if run_type in {"infer", "eval_hf"} else "train"
-            except Exception:
-                pass
-        self._tasks.register(BackgroundTask(
-            task_id=run_name,
-            kind=kind,
-            label=run_name,
-            state="running",
-            remote=remote,
-        ))
-
     def _update_task_progress(self, run_name: str) -> None:
         """Push the run's latest step/percent into the status-bar registry.
 
@@ -1769,20 +1745,7 @@ class LqhApp:
         self, task_id: str, kind: str, label: str, remote: str | None,
     ) -> None:
         """Handler hook: a tool just submitted a job that will notify later."""
-        self._tasks.register(BackgroundTask(
-            task_id=task_id,
-            kind=kind,
-            label=label,
-            state="running",
-            remote=remote,
-        ))
-        # Seed the watcher's last-known state so a short run that finishes
-        # before the first ~60s scan is still seen as a running -> terminal
-        # transition (otherwise no completion is recorded and auto-mode parks
-        # for the full safety interval). Also drop any stale completion left
-        # over from an earlier run that reused this name.
-        self._job_last_state[task_id] = "running"
-        self._pending_completions.pop(task_id, None)
+        self._supervisor.register_started(task_id, kind, label, remote)
         self._ensure_progress_refresh_task()
         enabled, consent_epoch, active_baseline, _account_key = self._telemetry.state_snapshot()
         if remote != "cloud" and enabled:
@@ -2292,968 +2255,118 @@ class LqhApp:
     async def _await_background(
         self, run_names: list[str] | None, timeout: float,
     ) -> str | None:
-        """Auto-mode: park the agent until a watched run reaches a terminal state.
-
-        Returns the ``[System: ...]`` completion notification once a run
-        finishes, or ``None`` when nothing relevant is running so the caller
-        should just use the status it already has.
-
-        The wake signal is the very same completion message that
-        ``_watch_jobs`` pushes into ``_input_queue`` on a ``running ->
-        terminal`` transition — so this reuses the existing watcher instead
-        of adding a second poller. In auto mode the interactive ``run()``
-        loop is not consuming ``_input_queue``, so there is no double-consumer
-        race. While parked here, the agent's inner loop is suspended at the
-        ``await`` for the tool call: **no LLM calls happen until the run is
-        terminal** — truly zero cycles spent waiting. The user sees live
-        progress in the status bar instead (step/percent + freshness), so
-        there's no need to wake the agent periodically just to show progress.
-
-        ``timeout`` is now only an internal safety re-check cadence (never
-        returned to the model). It re-verifies "is anything still running?"
-        in case a completion message was missed before we parked.
-        """
-        # NOTE (future): we deliberately do NOT surface a periodic heartbeat to
-        # the agent anymore — parking is silent until completion. If we ever
-        # want the agent to act on a *genuinely stuck* run (e.g. cancel after a
-        # few hours with no progress), re-introduce a long heartbeat here that
-        # returns a "[System: still running after Nh — no progress since …]"
-        # string so the agent can decide to intervene. Progress freshness is
-        # already tracked (see _update_task_progress / status_bar "↑Xm ago").
-        def _running_targets() -> list[str]:
-            # The registry is the authoritative "is it running" view: it is
-            # populated eagerly at launch (on_background_task_started) and
-            # cleared by _watch_jobs on a terminal transition.
-            running = [
-                t.label for t in self._tasks.snapshot() if t.state == "running"
-            ]
-            if run_names:
-                wanted = set(run_names)
-                running = [r for r in running if r in wanted]
-            return running
-
-        # The runs this call is responsible for: the explicit request, else
-        # everything currently running. Captured once so a completion is matched
-        # to the run even after it leaves the running set.
-        wanted = list(run_names) if run_names else _running_targets()
-
-        # A wanted run may have already finished — before we parked, or before
-        # the very first watcher scan for a fast run. Deliver its completion now
-        # rather than parking for the full safety interval.
-        done = self._take_pending_completion(wanted)
-        if done is not None:
-            await self._wait_for_results(wanted)
-            return done
-
-        if not _running_targets():
-            return None
-
-        while True:
-            try:
-                # The queue item is only a wake signal — its content is ignored.
-                # The authoritative "did a run I care about finish?" answer comes
-                # from _take_pending_completion, so a stale notice for an
-                # unrelated run can never be mis-delivered as ours. The timeout
-                # is just the still-running safety recheck (never sent to the
-                # model).
-                await asyncio.wait_for(self._input_queue.get(), timeout=timeout)
-            except asyncio.TimeoutError:
-                pass
-            done = self._take_pending_completion(wanted)
-            if done is not None:
-                # The job is terminal, but eval/infer runs still need their
-                # predictions scored before results are readable. Give the
-                # scoring watcher a bounded grace period so the agent wakes once
-                # results — not merely the job — are ready. Training runs return
-                # at once.
-                await self._wait_for_results(wanted)
-                return done
-            # No wanted run is done. Stop only if none of them is still running
-            # (its completion was missed before we parked); otherwise keep
-            # parking silently — no heartbeat to the LLM.
-            if not _running_targets():
-                return None
-
-    def _take_pending_completion(self, run_names: list[str]) -> str | None:
-        """Pop the recorded completion notice for the first finished wanted run.
-
-        Returns ``None`` if none of ``run_names`` has a pending completion.
-        Matching by run name keeps a stale notice for some other run from being
-        handed back as this run's completion.
-        """
-        for name in run_names:
-            text = self._pending_completions.pop(name, None)
-            if text is not None:
-                return text
-        return None
-
-    async def _wait_for_results(self, run_names: list[str]) -> None:
-        """Bounded wait for watcher-scored eval/infer runs to write results.
-
-        A ``type: infer`` run reaches a terminal state when inference finishes,
-        but ``eval_result.json`` is written afterwards by the scoring watcher
-        (see ``lqh/watcher.py``). Without this, the agent could wake and read a
-        completed-but-unscored run. Training runs (and runs with no pending
-        scoring) return immediately; the wait is capped by ``SCORING_GRACE_SEC``
-        so a failed/stuck scorer can never hang the agent.
-        """
-        import json
-
-        def _pending() -> list[str]:
-            out: list[str] = []
-            for name in run_names:
-                run_dir = self.project_dir / "runs" / name
-                config_path = run_dir / "config.json"
-                if not config_path.exists():
-                    continue
-                try:
-                    run_type = json.loads(config_path.read_text()).get("type", "")
-                except Exception:
-                    continue
-                # Training eval lands per-checkpoint during the run; only
-                # inference runs score after going terminal.
-                if run_type != "infer":
-                    continue
-                if (run_dir / "eval_result.json").exists():
-                    continue
-                # Only wait when scoring is actually in flight or pending —
-                # otherwise (e.g. a failed run with no predictions) return now.
-                scoring_possible = (
-                    name in self._run_watchers
-                    or (run_dir / "predictions.parquet").exists()
-                    or (run_dir / "eval_request.json").exists()
-                )
-                if scoring_possible:
-                    out.append(name)
-            return out
-
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + SCORING_GRACE_SEC
-        while _pending():
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            await asyncio.sleep(min(2.0, remaining))
+        """Auto-mode: park the agent until a watched run reaches a terminal
+        state. Delegates to the shared JobSupervisor (lqh/jobs.py); while
+        parked the agent's inner loop is suspended — no LLM calls happen
+        until the run is terminal. The user watches live progress in the
+        status bar meanwhile."""
+        return await self._supervisor.wait_for_runs(
+            run_names, recheck_interval=timeout,
+        )
 
     async def _watch_jobs(self) -> None:
-        """Periodically scan background runs and inject completion notifications.
-
-        Detects ``running → completed/failed`` transitions per run and pushes
-        a ``[System: ...]`` message into the input queue, where it is picked
-        up by the main loop just like typed input. The first observation of
-        any run is silent — already-terminal runs at startup don't fire.
-        """
-        from lqh.subprocess_manager import SubprocessManager
-
-        manager = SubprocessManager()
-        # CloudBackend maps backend "cancelled" → "failed" already;
-        # "cancelled" is listed defensively so a path that surfaces the
-        # raw status still finalizes (marker consumption, notification).
-        terminal_states = {"completed", "failed", "cancelled"}
-        last_wall_time = time.time()
-
-        first_scan = True
-        while True:
-            if not first_scan:
-                try:
-                    await asyncio.sleep(JOB_POLL_INTERVAL_SEC)
-                except asyncio.CancelledError:
-                    return
-            first_scan = False
-
-            now = time.time()
-            if now - last_wall_time > JOB_POLL_INTERVAL_SEC * SLEEP_GAP_FACTOR:
-                await self._emit(render_system_message(
-                    "Resuming background job monitoring after a connection/sleep gap."
-                ))
-            last_wall_time = now
-
-            try:
-                snapshots = await self._scan_jobs(manager)
-            except Exception:
-                # Never let scan errors kill the watcher.
-                continue
-
-            # Cull watchers whose runs have finished.
-            for name in [n for n, w in self._run_watchers.items() if not w.is_running]:
-                self._run_watchers.pop(name, None)
-                self._tasks.unregister(name)
-
-            for run_name, state, error, remote in snapshots:
-                if state == "unknown":
-                    # Transient SSH/FS hiccup — don't update last_state, retry next tick.
-                    continue
-                # Every terminal run gets a finalization manifest exactly
-                # once — INDEPENDENT of the notification gates below, so a
-                # run first observed terminal after a restart (no
-                # running→terminal transition, telemetry disabled) is
-                # still traceable.
-                if state in terminal_states:
-                    run_dir = self.project_dir / "runs" / run_name
-                    if not (run_dir / "manifest.json").exists():
-                        try:
-                            from lqh.manifest import write_run_manifest
-
-                            written = write_run_manifest(
-                                self.project_dir, run_dir,
-                                state=state, error=error,
-                            )
-                        except Exception:
-                            written = None
-                        if written is None:
-                            # Surfaced through the activity log — the run
-                            # is terminal but not traceable.
-                            try:
-                                from lqh.project_log import append_event
-
-                                append_event(
-                                    self.project_dir, "manifest_write_failed",
-                                    f"Provenance manifest could not be written for runs/{run_name}",
-                                    run_name=run_name,
-                                )
-                            except Exception:
-                                pass
-                if state == "completed" and self._results_pending(run_name):
-                    # The process has exited, but the user-facing job has not:
-                    # inference/judging still owes its final result artifact.
-                    state = "running"
-                prev = self._job_last_state.get(run_name)
-                pending_telemetry = (
-                    run_name in self._telemetry_jobs
-                    or (prev is None and self._load_telemetry_job(run_name) is not None)
-                )
-                # Cloud data-gen runs leave a durable marker at submit; it
-                # survives TUI restarts, so a job first observed already
-                # terminal still gets finalized (download + notification).
-                # Runs whose download gave up this session are excluded
-                # until a restart clears the set.
-                needs_finalize = (
-                    self._data_gen_pending(run_name)
-                    and run_name not in self._data_gen_gave_up
-                )
-                if state in terminal_states and (
-                    prev == "running" or pending_telemetry or needs_finalize
-                ):
-                    text: str | None
-                    if self._run_type(run_name) == "data_gen":
-                        # Cloud data-gen: pull the dataset artifact into
-                        # datasets/<name>/ before telling the agent, so
-                        # the follow-up (scoring) finds the file locally.
-                        # None = transient download failure; the marker is
-                        # kept and the next scan retries silently.
-                        text = await self._finalize_data_gen_run(
-                            run_name, state, error,
-                        )
-                    else:
-                        text = self._format_completion_message(
-                            run_name, state, error, remote,
-                        )
-                    if text is not None:
-                        # Record the notice keyed by run so auto-mode parking
-                        # delivers it only to the run actually being waited on;
-                        # the queue put is the wake signal (and the interactive
-                        # loop's notification source).
-                        self._pending_completions[run_name] = text
-                        self._input_queue.put_nowait(text)
-                        if self._run_type(run_name) != "data_gen":
-                            # data_gen writes its own project-log event +
-                            # telemetry in _finalize_data_gen_run; the generic
-                            # recorder would mislabel it training_completed.
-                            self._record_completion_event(run_name, state, error, remote)
-                        if state == "completed":
-                            self._status_bar.recent_completion = (run_name, time.time() + 10.0)
-                            self._ensure_spinner_task()
-                        self._tasks.unregister(run_name)
-                # Keep the registry in sync with live state. The handler
-                # eagerly registers on submission; this branch is the
-                # fallback for jobs discovered after a TUI restart.
-                if state == "running":
-                    if run_name not in self._telemetry_jobs:
-                        persisted_job = self._load_telemetry_job(run_name)
-                        if persisted_job is not None:
-                            self._telemetry_jobs[run_name] = persisted_job
-                    self._ensure_task_registered(run_name, remote)
-                    self._ensure_progress_refresh_task()
-                    self._update_task_progress(run_name)
-                elif state in terminal_states:
-                    self._tasks.unregister(run_name)
-                    self._job_last_step.pop(run_name, None)
-                    self._job_progress_at.pop(run_name, None)
-                self._job_last_state[run_name] = state
-
-                # Ensure a scoring/sync watcher is attached to runs that may
-                # still need work: live runs (rsync + score during run) AND
-                # finished runs that don't yet have eval_result.json (handles
-                # fast remote inferences that finish before our scan tick,
-                # and completed-but-unscored runs after a TUI restart).
-                if run_name in self._run_watchers:
-                    continue
-                if state in ("failed", "cancelled"):
-                    continue
-                if self._run_type(run_name) == "data_gen":
-                    # Data-gen runs have no predictions to score mid-run;
-                    # their only follow-up is the dataset download handled
-                    # in _finalize_data_gen_run above.
-                    continue
-                run_dir = self.project_dir / "runs" / run_name
-                if state == "completed" and (run_dir / "eval_result.json").exists():
-                    continue
-                try:
-                    await self._spawn_run_watcher(run_name, remote)
-                except Exception:
-                    pass
-
-            # Persist observed states so the next startup can report
-            # "finished while LQH was closed" (see lqh/signals.py).
-            try:
-                from lqh.signals import record_seen_states
-
-                record_seen_states(
-                    self.project_dir,
-                    {
-                        run: st
-                        for run, st, _, _ in snapshots
-                        if st != "unknown"
-                    },
-                )
-            except Exception:
-                pass
-
-    def _run_type(self, run_name: str) -> str:
-        """The run's config ``type`` ("sft", "data_gen", ...), "" if unknown."""
-        import json
-
-        try:
-            config = json.loads(
-                (self.project_dir / "runs" / run_name / "config.json").read_text()
-            )
-            return str(config.get("type", ""))
-        except Exception:
-            return ""
-
-    def _data_gen_pending(self, run_name: str) -> bool:
-        """Whether a cloud data-gen run still owes finalization.
-
-        The marker is written by the submit handler and removed by
-        ``_finalize_data_gen_run`` — durable across TUI restarts.
-        """
-        return (
-            self.project_dir / "runs" / run_name / ".lqh_data_gen.json"
-        ).exists()
-
-    async def _finalize_data_gen_run(
-        self, run_name: str, state: str, error: str | None,
-    ) -> str | None:
-        """Terminal handling for a cloud data-gen run.
-
-        On success, download the run's ``dataset`` artifact into
-        ``datasets/<output_dataset>/data.parquet`` so local flows
-        (scoring, training bundles) proceed exactly as after a local
-        run, then return the completion notice for the agent. The
-        submit-time marker is consumed on every outcome EXCEPT a
-        transient download failure — there it survives (with a retry
-        counter) so the next watcher scan retries automatically, and
-        ``None`` is returned to suppress a premature notification.
-        """
-        import json
-
-        run_dir = self.project_dir / "runs" / run_name
-        try:
-            config = json.loads((run_dir / "config.json").read_text())
-        except Exception:
-            config = {}
-
-        marker_path = run_dir / ".lqh_data_gen.json"
-        marker: dict[str, Any] = {}
-        try:
-            marker = json.loads(marker_path.read_text())
-        except Exception:
-            pass
-        workflow_id = str(marker.get("workflow_id") or uuid.uuid4())
-
-        def _consume_marker() -> None:
-            marker_path.unlink(missing_ok=True)
-
-        output_dataset = str(config.get("output_dataset") or run_name)
-        # The submit handler validates this, but the config file on disk
-        # is not trusted for path construction — a separator or ".."
-        # would escape datasets/.
-        if Path(output_dataset).name != output_dataset or output_dataset in (".", ".."):
-            output_dataset = run_name
-
-        def _emit_terminal(outcome: str) -> None:
-            # A give-up already closed the workflow; a post-restart retry
-            # must not close it a second time.
-            if marker.get("workflow_closed"):
-                return
-            enabled, _epoch, _baseline, _key = self._telemetry.state_snapshot()
-            if not enabled:
-                return
-            event_name = (
-                "data_generation_completed" if outcome == "succeeded"
-                else "data_generation_failed"
-            )
-            self._telemetry.defer(self._telemetry.event, event_name, {
-                "workflow_kind": "data_generation",
-                "execution_target": "cloud",
-                "outcome": outcome,
-            }, workflow_id)
-
-        recovered_note = ""
-        recovered_artifact_id: str | None = None
-        if state != "completed":
-            # A backend restart mid-job loses the event pump; the orphan
-            # reconciler used to label such jobs failed even when they
-            # finished and published. The backend now checks for the
-            # dataset before deciding, but stay defensive here too: if
-            # the dataset artifact exists, recover it instead of
-            # reporting a bogus failure.
-            try:
-                from lqh.artifacts import BackendArtifactStore as _Store
-
-                job_id = str(marker.get("job_id") or "")
-                if job_id:
-                    # Server-side job_id filter: a newest-N scan would
-                    # miss the artifact once the project accumulates
-                    # more datasets than one page.
-                    for handle in await _Store().list_for_project(
-                        _ckey(self.project_dir), kind="dataset", job_id=job_id,
-                    ):
-                        recovered_artifact_id = handle.id
-                        break
-            except Exception:
-                recovered_artifact_id = None
-            if recovered_artifact_id is None:
-                _consume_marker()
-                _emit_terminal("failed")
-                verb = "was cancelled" if state == "cancelled" else "failed"
-                err_part = f": {error}" if error else "."
-                return (
-                    f"[System: cloud data-gen run {run_name} {verb}{err_part} "
-                    f"Check runs/{run_name}/stderr.log (or the job's log artifacts) "
-                    "for the pipeline error, fix it, validate locally, and resubmit.]"
-                )
-            recovered_note = (
-                " (the job was reported failed — likely a backend restart — "
-                "but its dataset was published, so it was recovered)"
-            )
-
-        # A prior transient download failure schedules the next attempt;
-        # until then stay silent (no network work, no notification).
-        retry_after = marker.get("retry_after")
-        if isinstance(retry_after, (int, float)) and time.time() < float(retry_after):
-            return None
-
-        counts = ""
-        try:
-            status = json.loads((run_dir / "status.json").read_text())
-            if "succeeded" in status:
-                counts = f" ({status['succeeded']}/{status.get('total', '?')} samples ok)"
-        except Exception:
-            pass
-        if not counts:
-            # The SSE status mirror overwrites status.json with state-only
-            # payloads; the sandbox's summary progress row carries the
-            # real sample counts.
-            try:
-                lines = (run_dir / "progress.jsonl").read_text().splitlines()
-                for line in reversed(lines[-100:]):
-                    row = json.loads(line)
-                    if "succeeded" in row:
-                        counts = f" ({row['succeeded']}/{row.get('total', '?')} samples ok)"
-                        break
-            except Exception:
-                pass
-
-        # Preferred source: the artifact SSE event mirrored into
-        # artifacts.json by sync_progress. Fallback: list the project's
-        # dataset artifacts and match on this run's job id (covers a
-        # missed event after a long disconnect).
-        artifact_id: str | None = recovered_artifact_id
-        if artifact_id is None:
-            try:
-                manifest = json.loads((run_dir / "artifacts.json").read_text())
-                for entry in manifest.get("artifacts", []):
-                    if entry.get("kind") == "dataset" and entry.get("artifact_id"):
-                        artifact_id = str(entry["artifact_id"])
-                        break
-            except Exception:
-                pass
-
-        dest = self.project_dir / "datasets" / output_dataset / "data.parquet"
-        sidecar_path = dest.parent / ".lqh_source.json"
-        replaced = dest.exists()
-
-        # Overwrite policy: the NEWEST SUBMISSION wins among cloud jobs
-        # (a sidecar written on every download records which submission
-        # produced the local file), and anything the user generated
-        # locally after this submit is never clobbered (mtime check —
-        # applies only when no sidecar attributes the file to a job).
-        submitted_at = marker.get("submitted_at")
-        if replaced and isinstance(submitted_at, (int, float)):
-            sidecar: dict[str, Any] = {}
-            try:
-                loaded = json.loads(sidecar_path.read_text())
-                if isinstance(loaded, dict):
-                    sidecar = loaded
-            except Exception:
-                pass
-            prior_submitted = sidecar.get("submitted_at")
-            downloaded_at = sidecar.get("downloaded_at")
-            local_kept_msg = (
-                f"[System: cloud data-gen run {run_name} completed{counts}, but "
-                f"datasets/{output_dataset}/data.parquet was regenerated locally "
-                "after the job was submitted, so the local file was kept. The "
-                "cloud dataset remains available via the artifacts tool if you "
-                "want it instead.]"
-            )
-            if isinstance(prior_submitted, (int, float)):
-                if float(prior_submitted) > float(submitted_at):
-                    _consume_marker()
-                    _emit_terminal("succeeded")
-                    return (
-                        f"[System: cloud data-gen run {run_name} completed{counts}, "
-                        f"but datasets/{output_dataset}/data.parquet already holds "
-                        "the result of a NEWER submission, so it was kept. This "
-                        "run's dataset remains available via the artifacts tool.]"
-                    )
-                # We are the newer submission — but the file may have been
-                # modified/regenerated locally SINCE its cloud download
-                # (local runs also delete the sidecar, this is the belt for
-                # in-place edits): local work wins over any cloud job.
-                if (
-                    isinstance(downloaded_at, (int, float))
-                    and dest.stat().st_mtime > float(downloaded_at) + 2.0
-                ):
-                    _consume_marker()
-                    _emit_terminal("succeeded")
-                    return local_kept_msg
-                # else: overwrite below.
-            elif dest.stat().st_mtime > float(submitted_at):
-                _consume_marker()
-                _emit_terminal("succeeded")
-                return local_kept_msg
-
-        try:
-            from lqh.artifacts import BackendArtifactStore
-
-            store = BackendArtifactStore()
-            if artifact_id is None:
-                job_id = str(marker.get("job_id") or "")
-                if not job_id:
-                    meta_path = run_dir / "remote_job.json"
-                    if meta_path.exists():
-                        job_id = str(json.loads(meta_path.read_text()).get("job_id") or "")
-                if job_id:
-                    # Server-side job_id filter (see comment on the
-                    # recovery path above).
-                    for handle in await store.list_for_project(
-                        _ckey(self.project_dir), kind="dataset", job_id=job_id,
-                    ):
-                        artifact_id = handle.id
-                        break
-            if artifact_id is None:
-                raise RuntimeError("no dataset artifact registered for this job")
-            await store.download(artifact_id, dest)
-        except Exception as exc:
-            attempts = int(marker.get("download_attempts", 0) or 0) + 1
-            if attempts < 8 and marker_path.exists():
-                # Transient (network blip, brief API/R2 outage, listing
-                # lag): keep the marker with a bumped counter and an
-                # exponential backoff, and stay silent — a later watcher
-                # scan retries the whole finalization. Eight attempts
-                # with growing gaps ride out multi-minute outages that
-                # three back-to-back scans could not.
-                marker["download_attempts"] = attempts
-                marker["retry_after"] = time.time() + min(900.0, 60.0 * (2 ** min(attempts, 4)))
-                try:
-                    marker_path.write_text(json.dumps(marker, indent=2) + "\n")
-                except OSError:
-                    pass
-                return None
-            # Give up FOR THIS SESSION: notify once with the manual
-            # recovery path, park the run in _data_gen_gave_up, and keep
-            # the marker (attempts reset) so a TUI restart retries the
-            # download automatically. Generation itself succeeded — the
-            # workflow closes as such.
-            self._data_gen_gave_up.add(run_name)
-            _emit_terminal("succeeded")
-            if marker_path.exists():
-                marker["download_attempts"] = 0
-                marker.pop("retry_after", None)
-                marker["workflow_closed"] = True
-                try:
-                    marker_path.write_text(json.dumps(marker, indent=2) + "\n")
-                except OSError:
-                    pass
-            return (
-                f"[System: cloud data-gen run {run_name} completed{counts}, but "
-                f"downloading the dataset failed after {attempts} attempts: {exc}. "
-                f"Use the artifacts tool to locate the run's dataset artifact and "
-                f"download it to datasets/{output_dataset}/data.parquet, then "
-                "continue (a TUI restart will also retry the download).]"
-            )
-
-        # Attribute the local file to this submission so a concurrent
-        # job targeting the same dataset can apply newest-submission-wins.
-        try:
-            sidecar_path.write_text(json.dumps({
-                "job_id": marker.get("job_id"),
-                "run_name": run_name,
-                "submitted_at": submitted_at,
-                # Lets a later cloud completion detect that the file was
-                # modified locally AFTER this download (mtime check) and
-                # keep the local version.
-                "downloaded_at": time.time(),
-            }, indent=2) + "\n")
-        except OSError:
-            pass
-
-        # Finalization manifest for the downloaded dataset (provenance for
-        # summary, spec-drift signals, and future sessions). Spec/pipeline
-        # hashes come from the submission marker — the job ran the
-        # submitted revisions, not whatever is on disk now.
-        try:
-            from lqh.manifest import write_dataset_manifest
-
-            rows: int | None = None
-            try:
-                import pyarrow.parquet as _pq
-
-                rows = _pq.read_metadata(dest).num_rows
-            except Exception:
-                pass
-            manifest_ok = write_dataset_manifest(
-                self.project_dir,
-                dest.parent,
-                purpose=str(marker.get("purpose") or "unspecified"),
-                rows=rows,
-                pipeline_path=marker.get("script_path"),
-                pipeline_hash=marker.get("pipeline_hash"),
-                spec_sha256=marker.get("spec_sha256"),
-                run_name=run_name,
-                job_id=str(marker.get("job_id") or "") or None,
-                cloud_artifact_id=artifact_id,
-            ) is not None
-        except Exception:
-            manifest_ok = False
-        if not manifest_ok:
-            # Surface it: the artifact exists but is not traceable.
-            try:
-                from lqh.project_log import append_event
-
-                append_event(
-                    self.project_dir, "manifest_write_failed",
-                    f"Provenance manifest could not be written for datasets/{output_dataset}",
-                    run_name=run_name,
-                )
-            except Exception:
-                pass
-
-        try:
-            from lqh.project_log import append_event
-
-            append_event(
-                self.project_dir,
-                "data_gen_completed",
-                f"Cloud data gen {run_name} completed; dataset at datasets/{output_dataset}/",
-                run_name=run_name,
-                output_dataset=output_dataset,
-            )
-        except Exception:
-            pass
-        _consume_marker()
-        _emit_terminal("succeeded")
-
-        replaced_note = " (replaced the existing local file)" if replaced else ""
-        manifest_note = (
-            "" if manifest_ok else
-            " ⚠️ Its provenance manifest could not be written — the dataset "
-            "is not traceable to its spec/pipeline revision."
-        )
-        return (
-            f"[System: cloud data-gen run {run_name} completed{counts}{recovered_note}. "
-            f"The dataset was downloaded to datasets/{output_dataset}/data.parquet"
-            f"{replaced_note}{manifest_note} — continue with the natural next step "
-            "(e.g. scoring or training).]"
-        )
-
-    def _results_pending(self, run_name: str) -> bool:
-        """Whether a successful process still owes its useful eval result."""
-        import json
-
-        from lqh.progress import has_pending_final_result
-
-        run_dir = self.project_dir / "runs" / run_name
-        config_path = run_dir / "config.json"
-        try:
-            config = json.loads(config_path.read_text())
-        except Exception:
-            return False
-        return has_pending_final_result(run_dir, config)
-
-    async def _scan_jobs(
-        self, manager: "SubprocessManager",
-    ) -> list[tuple[str, str, str | None, str | None]]:
-        """Return ``(run_name, state, error, remote_name)`` for every run dir.
-
-        Local runs are queried via ``SubprocessManager.get_status`` (PID +
-        progress.jsonl). Remote runs (``remote_job.json`` present) are
-        probed over SSH via the backend's ``poll_status``.
-        """
-        import json
-
-        runs_dir = self.project_dir / "runs"
-        if not runs_dir.is_dir():
-            return []
-
-        results: list[tuple[str, str, str | None, str | None]] = []
-        for entry in sorted(runs_dir.iterdir()):
-            if not entry.is_dir() or not (entry / "config.json").exists():
-                continue
-
-            remote_meta = entry / "remote_job.json"
-            if remote_meta.exists():
-                try:
-                    meta = json.loads(remote_meta.read_text())
-                    from lqh.project_identity import marker_is_foreign
-
-                    if marker_is_foreign(self.project_dir, meta):
-                        # Run dir copied in from another project — never
-                        # poll/watch someone else's job from here.
-                        logger.warning(
-                            "runs/%s: remote_job.json belongs to another "
-                            "project identity; skipping", entry.name,
-                        )
-                        continue
-                    state, error = await self._poll_remote(entry, meta)
-                    results.append((entry.name, state, error, meta["remote_name"]))
-                except Exception:
-                    results.append((entry.name, "unknown", None, None))
-                continue
-
-            status = manager.get_status(entry)
-            results.append((entry.name, status.state, status.error, None))
-
-        return results
-
-    async def _poll_remote(self, run_dir: Path, meta: dict[str, Any]) -> tuple[str, str | None]:
-        """Sync and poll a remote/cloud job. Returns (state, error)."""
-        backend = self._make_remote_backend(meta)
-        if backend is None:
-            return ("unknown", None)
-        remote_run_dir = meta.get("remote_run_dir")
-        if remote_run_dir:
-            await backend.sync_progress(str(remote_run_dir), str(run_dir))
-        status = await backend.poll_status(str(meta["job_id"]))
-        return (status.state, status.error)
-
-    def _make_remote_backend(self, meta: dict[str, Any]) -> Any | None:
-        """Build the backend described by remote_job.json."""
-        remote_name = str(meta.get("remote_name", ""))
-        backend_name = str(meta.get("backend", ""))
-
-        try:
-            from lqh.remote.compute import is_cloud, ssh_remote_name
-            if backend_name == "cloud" or is_cloud(remote_name):
-                from lqh.remote.backend import RemoteConfig
-                from lqh.remote.cloud import CloudBackend
-
-                cfg = RemoteConfig(
-                    name="cloud",
-                    type="cloud",
-                    hostname="api.lqh.ai",
-                    remote_root="cloud:lqh",
-                )
-                return CloudBackend(cfg, self.project_dir)
-
-            from lqh.remote.config import get_remote
-            from lqh.remote.ssh_direct import SSHDirectBackend
-
-            ssh_name = ssh_remote_name(remote_name) or remote_name
-            remote_config = get_remote(self.project_dir, ssh_name)
-            if remote_config is None or remote_config.type != "ssh_direct":
-                return None
-            return SSHDirectBackend(remote_config, self.project_dir)
-        except Exception:
-            return None
-
-    async def _spawn_run_watcher(self, run_name: str, remote: str | None) -> None:
-        """Start a RunWatcher (or RemoteRunWatcher) for an active run.
-
-        The watcher rsyncs predictions back from the remote (when applicable),
-        invokes the API judge over predictions.parquet, writes eval_result.json,
-        and self-stops when the run reaches a terminal state.
-        """
-        import json
-
-        from lqh.auth import get_token
-        from lqh.config import load_config
-
-        run_dir = self.project_dir / "runs" / run_name
-        config_path = run_dir / "config.json"
-        if not config_path.exists():
-            return
-        try:
-            config = json.loads(config_path.read_text())
-        except Exception:
-            return
-
-        api_key = get_token() or ""
-        api_base_url = load_config().api_base_url
-
-        if remote:
-            from lqh.remote.watcher import RemoteRunWatcher
-
-            meta_file = run_dir / "remote_job.json"
-            if not meta_file.exists():
-                return
-            meta = json.loads(meta_file.read_text())
-            backend = self._make_remote_backend(meta)
-            if backend is None:
-                return
-
-            watcher = RemoteRunWatcher(
-                run_dir=run_dir,
-                config=config,
-                project_dir=self.project_dir,
-                api_key=api_key,
-                api_base_url=api_base_url,
-                backend=backend,
-                remote_run_dir=meta["remote_run_dir"],
-                job_id=str(meta["job_id"]),
-            )
-        else:
-            from lqh.watcher import RunWatcher
-
-            watcher = RunWatcher(
-                run_dir=run_dir,
-                config=config,
-                project_dir=self.project_dir,
-                api_key=api_key,
-                api_base_url=api_base_url,
-            )
-
-        await watcher.start()
-        self._run_watchers[run_name] = watcher
-
-    def _format_completion_message(
-        self, run_name: str, state: str, error: str | None, remote: str | None,
-    ) -> str:
-        location = f" on remote '{remote}'" if remote else ""
-        # status derives the remote from the run's remote_job.json, so the
-        # call never needs a remote argument.
-        status_call = f"training_status(run_name='{run_name}')"
+        """Run the shared supervisor scan loop (see lqh/jobs.py)."""
+        await self._supervisor.watch_loop()
+
+    # ------------------------------------------------------------------
+    # JobSupervisor hooks: UI + telemetry side effects of supervision.
+    # ------------------------------------------------------------------
+
+    async def _on_watch_gap(self) -> None:
+        await self._emit(render_system_message(
+            "Resuming background job monitoring after a connection/sleep gap."
+        ))
+
+    def _on_job_notice(self, run_name: str, text: str, state: str) -> None:
+        """A completion notice was recorded — wake/notify the main loop."""
+        self._input_queue.put_nowait(text)
         if state == "completed":
-            run_dir = self.project_dir / "runs" / run_name
-            scoring_failed = any(path.exists() for path in (
-                run_dir / "eval_error.json",
-                run_dir / "checkpoints" / "final" / "eval_error.json",
-            ))
-            if scoring_failed:
-                error_message = "final evaluation failed"
-                for marker in (
-                    run_dir / "eval_error.json",
-                    run_dir / "checkpoints" / "final" / "eval_error.json",
-                ):
-                    if marker.exists():
-                        try:
-                            import json
+            self._status_bar.recent_completion = (run_name, time.time() + 10.0)
+            self._ensure_spinner_task()
 
-                            payload = json.loads(marker.read_text())
-                            error_message = str(payload.get("error", error_message))
-                        except (OSError, json.JSONDecodeError):
-                            pass
-                        break
-                return (
-                    f"[System: run {run_name} finished{location}, but its final "
-                    f"evaluation failed: {error_message}. Call {status_call} to inspect "
-                    "the completed model and scoring error, then decide whether to retry.]"
-                )
-            return (
-                f"[System: training run {run_name} completed successfully{location}. "
-                f"Call {status_call} now to read final details, then continue with "
-                "the natural next step.]"
-            )
-        err_part = f": {error}" if error else "."
-        return (
-            f"[System: training run {run_name} failed{location}{err_part} "
-            f"Call {status_call} now to read final details, then explain the failure "
-            "and the natural recovery step.]"
+    def _on_job_running(self, run_name: str, remote: str | None) -> None:
+        """A run was observed running — rehydrate telemetry + progress UI."""
+        if run_name not in self._telemetry_jobs:
+            persisted_job = self._load_telemetry_job(run_name)
+            if persisted_job is not None:
+                self._telemetry_jobs[run_name] = persisted_job
+        self._ensure_progress_refresh_task()
+        self._update_task_progress(run_name)
+
+    def _on_job_terminal(self, run_name: str) -> None:
+        self._job_last_step.pop(run_name, None)
+        self._job_progress_at.pop(run_name, None)
+
+    def _has_telemetry_job_record(
+        self, run_name: str, first_observation: bool,
+    ) -> bool:
+        """Notification gate: a terminal run with a (persisted) telemetry
+        workflow completed while this TUI was closed and must be
+        reconciled exactly once."""
+        if run_name in self._telemetry_jobs:
+            return True
+        return first_observation and self._load_telemetry_job(run_name) is not None
+
+    def _on_data_gen_terminal(
+        self, outcome: str, workflow_id: str, marker: dict,
+    ) -> None:
+        """Telemetry mirror of a cloud data-gen terminal outcome."""
+        # A give-up already closed the workflow; a post-restart retry
+        # must not close it a second time.
+        if marker.get("workflow_closed"):
+            return
+        enabled, _epoch, _baseline, _key = self._telemetry.state_snapshot()
+        if not enabled:
+            return
+        event_name = (
+            "data_generation_completed" if outcome == "succeeded"
+            else "data_generation_failed"
         )
+        self._telemetry.defer(self._telemetry.event, event_name, {
+            "workflow_kind": "data_generation",
+            "execution_target": "cloud",
+            "outcome": outcome,
+        }, workflow_id)
 
-    def _record_completion_event(
+    def _record_telemetry_completion(
         self, run_name: str, state: str, error: str | None, remote: str | None,
     ) -> None:
-        """Mirror the transition in the project log so summary/restart see it."""
-        from lqh.project_log import append_event
-
-        # Finalization manifest for the run itself: traces checkpoints/
-        # eval results back to their spec revision, base model, and
-        # dataset composition. Best-effort.
-        try:
-            from lqh.manifest import write_run_manifest
-
-            write_run_manifest(
-                self.project_dir,
-                self.project_dir / "runs" / run_name,
-                state=state,
-                error=error,
-            )
-        except Exception:
-            pass
-
+        """Telemetry mirror of a run completion (the supervisor already
+        wrote the run manifest and the project-log event)."""
         telemetry_job = self._telemetry_jobs.pop(run_name, None) or self._load_telemetry_job(run_name)
-        if telemetry_job is not None:
-            workflow_id, started_mono, started_wall, prior_active, active_baseline, workflow_kind, target, consent_epoch = telemetry_job
-            elapsed_seconds = time.monotonic() - started_mono if started_mono is not None else time.time() - started_wall
-            elapsed_ms = int(max(elapsed_seconds, 0) * 1000)
-            active_seconds = self._telemetry.state_snapshot()[2]
-            active_ms = int((prior_active + max(active_seconds-active_baseline, 0)) * 1000)
-            outcome = "succeeded" if state == "completed" else "failed"
-            metadata: dict[str, Any] = {
-                "workflow_kind": workflow_kind, "execution_target": target,
-                "outcome": outcome, "wall_duration_ms": elapsed_ms,
-                "active_duration_ms": active_ms,
-            }
-            config_path = self.project_dir / "runs" / run_name / "config.json"
-            try:
-                config = __import__("json").loads(config_path.read_text())
-                config_type = str(config.get("type", ""))
-                base_type = str((config.get("base_config") or {}).get("type", "")) if isinstance(config.get("base_config"), dict) else ""
-                if workflow_kind == "zero_shot_evaluation":
-                    metadata["subtype"] = "zero_shot"
-                    metadata["sample_count"] = int(config.get("num_samples", 0) or 0)
-                elif config_type == "sweep":
-                    metadata["subtype"] = "dpo_sweep" if base_type in {"dpo", "on_policy_dpo"} else "sft_sweep"
-                else:
-                    metadata["subtype"] = "direct_dpo" if config_type in {"dpo", "on_policy_dpo"} else "direct_sft"
-            except (OSError, ValueError, TypeError):
-                if workflow_kind == "zero_shot_evaluation": metadata["subtype"] = "zero_shot"
-            event_name = ("zero_shot_evaluation_" if workflow_kind == "zero_shot_evaluation" else "fine_tuning_") + ("completed" if state == "completed" else "failed")
-            self._telemetry.defer(
-                self._finalize_telemetry_job,
-                event_name, metadata, workflow_id, consent_epoch,
-                self._telemetry_job_path(run_name),
-            )
-
-        event = "training_completed" if state == "completed" else "training_failed"
-        if state == "completed":
-            desc = f"Run {run_name} completed"
-            if remote:
-                desc += f" on remote '{remote}'"
-        else:
-            desc = f"Run {run_name} failed"
-            if remote:
-                desc += f" on remote '{remote}'"
-            if error:
-                desc += f": {error}"
-        kwargs: dict = {"run_name": run_name}
-        if remote:
-            kwargs["remote"] = remote
-        if error:
-            kwargs["error"] = error
-        append_event(self.project_dir, event, desc, **kwargs)
+        if telemetry_job is None:
+            return
+        workflow_id, started_mono, started_wall, prior_active, active_baseline, workflow_kind, target, consent_epoch = telemetry_job
+        elapsed_seconds = time.monotonic() - started_mono if started_mono is not None else time.time() - started_wall
+        elapsed_ms = int(max(elapsed_seconds, 0) * 1000)
+        active_seconds = self._telemetry.state_snapshot()[2]
+        active_ms = int((prior_active + max(active_seconds-active_baseline, 0)) * 1000)
+        outcome = "succeeded" if state == "completed" else "failed"
+        metadata: dict[str, Any] = {
+            "workflow_kind": workflow_kind, "execution_target": target,
+            "outcome": outcome, "wall_duration_ms": elapsed_ms,
+            "active_duration_ms": active_ms,
+        }
+        config_path = self.project_dir / "runs" / run_name / "config.json"
+        try:
+            config = __import__("json").loads(config_path.read_text())
+            config_type = str(config.get("type", ""))
+            base_type = str((config.get("base_config") or {}).get("type", "")) if isinstance(config.get("base_config"), dict) else ""
+            if workflow_kind == "zero_shot_evaluation":
+                metadata["subtype"] = "zero_shot"
+                metadata["sample_count"] = int(config.get("num_samples", 0) or 0)
+            elif config_type == "sweep":
+                metadata["subtype"] = "dpo_sweep" if base_type in {"dpo", "on_policy_dpo"} else "sft_sweep"
+            else:
+                metadata["subtype"] = "direct_dpo" if config_type in {"dpo", "on_policy_dpo"} else "direct_sft"
+        except (OSError, ValueError, TypeError):
+            if workflow_kind == "zero_shot_evaluation": metadata["subtype"] = "zero_shot"
+        event_name = ("zero_shot_evaluation_" if workflow_kind == "zero_shot_evaluation" else "fine_tuning_") + ("completed" if state == "completed" else "failed")
+        self._telemetry.defer(
+            self._finalize_telemetry_job,
+            event_name, metadata, workflow_id, consent_epoch,
+            self._telemetry_job_path(run_name),
+        )
 
     def _finalize_telemetry_job(
         self, event_name: str, metadata: dict[str, Any], workflow_id: str,

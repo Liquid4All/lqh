@@ -31,6 +31,7 @@ def _call_ns(name: str, args: str | None = None, **kw) -> argparse.Namespace:
         args_file=kw.get("args_file"),
         pretty=kw.get("pretty", False),
         save_secret=kw.get("save_secret", False),
+        wait=kw.get("wait", False),
     )
 
 
@@ -233,6 +234,24 @@ def test_explicit_overwrite_bypasses_guard(
     assert code != 5
     assert envelope["error"]["kind"] != "conflict"
     assert "does not exist" in envelope["error"]["message"]
+
+
+def test_wait_only_for_training_status(tmp_path: Path, monkeypatch, capfd) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert cmd_tool(_call_ns("summary", wait=True)) == 2
+    envelope, _ = _read_envelope(capfd)
+    assert "--wait" in envelope["error"]["message"]
+
+
+def test_wait_with_nothing_running_returns_status(
+    tmp_path: Path, monkeypatch, capfd
+) -> None:
+    """--wait with no running jobs must not park — it just reads status."""
+    monkeypatch.chdir(tmp_path)
+    code = cmd_tool(_call_ns("training_status", wait=True))
+    envelope, _ = _read_envelope(capfd)
+    assert code == 0
+    assert envelope["tool"] == "training_status"
 
 
 def test_full_consent_kwargs_overwrite_gating() -> None:

@@ -150,9 +150,9 @@ async def test_scan_jobs_syncs_cloud_remote_before_polling(tmp_path: Path) -> No
 
     backend = FakeBackend()
     app = LqhApp(project)
-    app._make_remote_backend = lambda _meta: backend  # type: ignore[method-assign]
+    app._supervisor.make_remote_backend = lambda _meta: backend  # type: ignore[method-assign]
 
-    snapshots = await app._scan_jobs(SimpleNamespace())
+    snapshots = await app._supervisor.scan_jobs(SimpleNamespace())
 
     assert snapshots == [("cloud_run", "completed", None, "cloud")]
     assert backend.synced == [("cloud:job-1", str(run_dir))]
@@ -162,7 +162,7 @@ async def test_scan_jobs_syncs_cloud_remote_before_polling(tmp_path: Path) -> No
 def test_completion_message_tells_agent_to_check_status(tmp_path: Path) -> None:
     app = LqhApp(tmp_path)
 
-    message = app._format_completion_message("run_1", "completed", None, "cloud")
+    message = app._supervisor.format_completion_message("run_1", "completed", None, "cloud")
 
     # The suggested call carries no remote arg — status derives it from
     # the run's remote_job.json. The remote still appears as readable
@@ -202,10 +202,10 @@ async def test_await_background_returns_none_when_target_not_running(tmp_path: P
 
 
 def _simulate_watch_completion(app: LqhApp, name: str, notice: str) -> None:
-    """Mirror what _watch_jobs does on a running -> terminal transition:
-    record the per-run notice, wake the park via the queue, unregister."""
-    app._pending_completions[name] = notice
-    app._input_queue.put_nowait(notice)
+    """Mirror what the supervisor's watch loop does on a running ->
+    terminal transition: record the per-run notice (which wakes the
+    park), unregister."""
+    app._supervisor.record_completion_notice(name, notice)
     app._tasks.unregister(name)
 
 
@@ -230,7 +230,7 @@ def test_local_workflow_telemetry_survives_cli_restart(tmp_path: Path) -> None:
     reopened._telemetry.enabled = True
     reopened._telemetry.account_key = "account-a"
     reopened._telemetry.event = lambda name, metadata, workflow_id=None: emitted.append((name, metadata, workflow_id))  # type: ignore[method-assign]
-    reopened._record_completion_event("run_1", "completed", None, None)
+    reopened._record_telemetry_completion("run_1", "completed", None, None)
     reopened._telemetry._work_queue.join()
 
     assert emitted and emitted[0][0] == "fine_tuning_completed"
@@ -348,14 +348,14 @@ async def test_wait_for_results_returns_immediately_for_training(tmp_path: Path)
     app = LqhApp(tmp_path)
     _make_run(tmp_path, "sft_v1", "sft")
     # Training runs never block here even without eval_result.json.
-    await asyncio.wait_for(app._wait_for_results(["sft_v1"]), timeout=1.0)
+    await asyncio.wait_for(app._supervisor.wait_for_results(["sft_v1"]), timeout=1.0)
 
 
 async def test_wait_for_results_skips_infer_with_no_pending_scoring(tmp_path: Path) -> None:
     app = LqhApp(tmp_path)
     # Infer run, no predictions / eval_request / watcher -> nothing to wait for.
     _make_run(tmp_path, "eval_1", "infer")
-    await asyncio.wait_for(app._wait_for_results(["eval_1"]), timeout=1.0)
+    await asyncio.wait_for(app._supervisor.wait_for_results(["eval_1"]), timeout=1.0)
 
 
 async def test_wait_for_results_waits_until_eval_result_written(
@@ -373,7 +373,7 @@ async def test_wait_for_results_waits_until_eval_result_written(
     writer = asyncio.create_task(_writer())
     # Grace window comfortably longer than the writer delay.
     monkeypatch.setattr("lqh.tui.app.SCORING_GRACE_SEC", 5.0)
-    await asyncio.wait_for(app._wait_for_results(["eval_1"]), timeout=3.0)
+    await asyncio.wait_for(app._supervisor.wait_for_results(["eval_1"]), timeout=3.0)
     await writer
     assert (run_dir / "eval_result.json").exists()
 
@@ -384,6 +384,6 @@ async def test_wait_for_results_respects_grace_timeout(
     app = LqhApp(tmp_path)
     # Pending scoring that never completes -> bounded by the grace window.
     _make_run(tmp_path, "eval_1", "infer", predictions__parquet="x")
-    monkeypatch.setattr("lqh.tui.app.SCORING_GRACE_SEC", 0.1)
+    monkeypatch.setattr("lqh.jobs.SCORING_GRACE_SEC", 0.1)
     # Must return despite eval_result.json never appearing.
-    await asyncio.wait_for(app._wait_for_results(["eval_1"]), timeout=1.0)
+    await asyncio.wait_for(app._supervisor.wait_for_results(["eval_1"]), timeout=1.0)

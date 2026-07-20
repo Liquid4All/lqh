@@ -229,7 +229,7 @@ async def test_startup_refresh_syncs_remote_state_before_signals(
         )
         return [("cloud_sft", "completed", None, "lqh-cloud")]
 
-    monkeypatch.setattr(app, "_scan_jobs", fake_scan)
+    monkeypatch.setattr(app._supervisor, "scan_jobs", fake_scan)
     monkeypatch.setattr("lqh.tui.app.get_token", lambda: None)
     app._agent = app._create_agent()
 
@@ -264,7 +264,7 @@ async def test_clear_and_resume_retain_one_shot_signals(
     async def fake_scan(manager):
         return []
 
-    monkeypatch.setattr(app, "_scan_jobs", fake_scan)
+    monkeypatch.setattr(app._supervisor, "scan_jobs", fake_scan)
     monkeypatch.setattr("lqh.tui.app.get_token", lambda: None)
     app._agent = app._create_agent()
     await app._refresh_startup_state()
@@ -295,7 +295,7 @@ async def test_failed_startup_refresh_is_flagged(
     async def failing_scan(manager):
         raise TimeoutError("remote unreachable")
 
-    monkeypatch.setattr(app, "_scan_jobs", failing_scan)
+    monkeypatch.setattr(app._supervisor, "scan_jobs", failing_scan)
     monkeypatch.setattr("lqh.tui.app.get_token", lambda: None)
     app._agent = app._create_agent()
     await app._refresh_startup_state()
