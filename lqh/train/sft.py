@@ -79,6 +79,12 @@ def _write_checkpoint_lineage(
         "hyperparams": hyperparams,
         "parent_ids": [],
     }
+    # Spec provenance (R6): submission injects the spec hash into the
+    # config so every published checkpoint records which spec revision
+    # it was trained against — including SSH-direct publications with
+    # no cloud job to inherit from.
+    if config.get("spec_sha256"):
+        lineage["spec_sha256"] = config["spec_sha256"]
     (model_dir / "lineage.json").write_text(json.dumps(lineage, indent=2) + "\n")
 
 

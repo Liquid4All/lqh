@@ -34,6 +34,8 @@ from typing import Any, AsyncIterator
 import httpx
 
 from lqh.auth import api_root, get_token, require_token
+from lqh.project_identity import cloud_project_key, project_uuid
+from lqh.project_meta import compute_spec_sha256
 from lqh.project_meta import gather_project_meta
 from lqh.remote.backend import JobStatus, RemoteBackend, RemoteConfig
 from lqh.remote.bundle import build_bundle_to_file
@@ -268,13 +270,25 @@ class CloudBackend(RemoteBackend):
         # key of a submit whose fate is unknown.
         idempotency_key = str(uuid.uuid4())
         intent_path = run_dir / "submit_intent.json"
+        # Resolve the cloud key and the owning identity EXACTLY ONCE for
+        # the whole submission — the submit meta and the staged-bundle
+        # upload must land in the same namespace even if a concurrent
+        # process migrates the identity mid-flight.
+        project_key = cloud_project_key(self.project_dir)
+        owner_project_id = project_uuid(self.project_dir)
         try:
+            # Spec provenance rides in the config so the sandbox-side
+            # lineage/manifest writers can record which spec revision
+            # this run was built against.
+            spec_hash = compute_spec_sha256(self.project_dir)
+            if spec_hash and not config.get("spec_sha256"):
+                config["spec_sha256"] = spec_hash
             # Build to disk so bring-your-own seed data (image folders on
             # data_gen submits) never sits fully in RAM.
             bundle_size = build_bundle_to_file(config, self.project_dir, bundle_tmp)
             meta = {
                 "kind": kind,
-                "project_id": self.project_dir.name,
+                "project_id": project_key,
                 "module": module,
                 "config": config,
                 "idempotency_key": idempotency_key,
@@ -286,6 +300,10 @@ class CloudBackend(RemoteBackend):
                         "kind": kind,
                         "module": module,
                         "name": self.config.name,
+                        # Which project identity this intent belongs to —
+                        # a marker copied into another project's tree is
+                        # recognizably foreign.
+                        "owner_project_id": owner_project_id,
                     },
                     indent=2,
                 )
@@ -314,7 +332,9 @@ class CloudBackend(RemoteBackend):
                 # endpoint enforces the server's size ceiling (default
                 # 2 GiB) AND the kind-level submit gates, so a gated
                 # data_gen submit fails before the upload, not after.
-                meta["bundle_key"] = await self._stage_bundle(bundle_tmp, bundle_size, kind)
+                meta["bundle_key"] = await self._stage_bundle(
+                    bundle_tmp, bundle_size, kind, project_key
+                )
                 files = [("meta", (None, json.dumps(meta), "application/json"))]
             else:
                 files.append(
@@ -388,6 +408,7 @@ class CloudBackend(RemoteBackend):
                         "module": module,
                         "kind": kind,
                         "backend": "cloud",
+                        "owner_project_id": owner_project_id,
                     },
                     indent=2,
                 )
@@ -429,7 +450,9 @@ class CloudBackend(RemoteBackend):
         logger.info("cloud job submitted: %s (kind=%s)", job_id, kind)
         return job_id
 
-    async def _stage_bundle(self, bundle_path: Path, size: int, kind: str) -> str:
+    async def _stage_bundle(
+        self, bundle_path: Path, size: int, kind: str, project_key: str
+    ) -> str:
         """Upload a large bundle via presigned PUT; return its R2 key.
 
         POST /v1/cloud/bundles/upload-url mints the target (and rejects
@@ -443,7 +466,9 @@ class CloudBackend(RemoteBackend):
             resp = await client.post(
                 "/v1/cloud/bundles/upload-url",
                 json={
-                    "project_id": self.project_dir.name,
+                    # Resolved once in submit_run — must match the meta's
+                    # project_id even if a concurrent migration runs.
+                    "project_id": project_key,
                     "size_bytes": size,
                     "kind": kind,
                 },

@@ -81,6 +81,13 @@ class SSHDirectBackend(RemoteBackend):
         remote_config = _rewrite_config_paths(
             config, self.project_dir, self._remote_root,
         )
+        # Spec provenance: the remote training process writes lineage.json
+        # from this config, so the spec revision must ride along.
+        from lqh.project_meta import compute_spec_sha256
+
+        spec_hash = compute_spec_sha256(self.project_dir)
+        if spec_hash and not remote_config.get("spec_sha256"):
+            remote_config["spec_sha256"] = spec_hash
 
         # 2. Create remote run directory
         await ssh_run(self._hostname, f"mkdir -p {remote_run_dir}", timeout=10.0)
@@ -138,7 +145,9 @@ class SSHDirectBackend(RemoteBackend):
         # still exits cleanly and the watcher continues to use the
         # pre-Phase-0 rsync path. The progress.jsonl already on disk is
         # the source of truth either way.
-        project_id = self.project_dir.name
+        from lqh.project_identity import cloud_project_key
+
+        project_id = cloud_project_key(self.project_dir)
         publish_cmd = (
             f"python -m lqh.remote.publish "
             f"--project-id {shlex.quote(project_id)} "
@@ -197,11 +206,16 @@ class SSHDirectBackend(RemoteBackend):
         )
 
         # Write job metadata locally for reconnection
+        from lqh.project_identity import project_uuid
+
         meta = {
             "job_id": pid,
             "remote_name": self.config.name,
             "remote_run_dir": remote_run_dir,
             "module": module,
+            # Which project identity owns this marker — a run dir copied
+            # into another project's tree is recognizably foreign.
+            "owner_project_id": project_uuid(self.project_dir),
         }
         (run_dir / "remote_job.json").write_text(
             json.dumps(meta, indent=2) + "\n"

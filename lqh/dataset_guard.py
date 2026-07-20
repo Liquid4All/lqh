@@ -57,7 +57,27 @@ def _pid_alive(pid: int | None) -> bool:
     return True
 
 
-def _pending_cloud_job(project_dir: Path, output_dataset: str) -> str | None:
+def existing_output(project_dir: Path, output_dataset: str) -> str | None:
+    """Name of the file that makes this LOGICAL output already exist.
+
+    Not just ``data.parquet``: a dataset directory holding ANY parquet
+    (train/validation splits, imports) or a ``manifest.json`` is spoken
+    for — generating into it would mix unrelated artifacts and replace
+    the directory's provenance.
+    """
+    dataset_dir = project_dir / "datasets" / output_dataset
+    try:
+        parquets = sorted(p.name for p in dataset_dir.glob("*.parquet"))
+    except OSError:
+        parquets = []
+    if parquets:
+        return parquets[0]
+    if (dataset_dir / "manifest.json").exists():
+        return "manifest.json"
+    return None
+
+
+def pending_cloud_job(project_dir: Path, output_dataset: str) -> str | None:
     """Run name of a pending cloud data-gen job targeting this dataset.
 
     The durable ``.lqh_data_gen.json`` marker exists from submission
@@ -77,6 +97,10 @@ def _pending_cloud_job(project_dir: Path, output_dataset: str) -> str | None:
     return None
 
 
+# Backwards-compatible alias (pre-round-6 internal name).
+_pending_cloud_job = pending_cloud_job
+
+
 def overwrite_refusal(
     project_dir: Path, output_dataset: str, *, overwrite: bool = False
 ) -> str | None:
@@ -84,19 +108,25 @@ def overwrite_refusal(
 
     Used for fast refusal before permission prompts; ``claim_output``
     re-checks the same conditions atomically under the lock.
+
+    ``overwrite=True`` here means the HANDLER already routed this
+    request through the human confirmation gate (which covers both an
+    existing logical output and a pending cloud job targeting it) —
+    the model's bare ``overwrite=true`` argument is never passed down
+    without that round-trip.
     """
-    dataset_dir = project_dir / "datasets" / output_dataset
-    if (dataset_dir / "data.parquet").exists() and not overwrite:
+    existing = existing_output(project_dir, output_dataset)
+    if existing and not overwrite:
         return (
-            f"datasets/{output_dataset}/data.parquet already exists — "
-            "refusing to overwrite a finalized dataset (generation is "
-            "expensive). Either use a new versioned name (e.g. "
+            f"datasets/{output_dataset}/{existing} already exists — "
+            "refusing to overwrite an existing dataset output (generation "
+            "is expensive). Either use a new versioned name (e.g. "
             f"'{output_dataset}_v2') to keep the old data, or — only "
             "after confirming with the user that the existing data "
             "should be destroyed — retry with overwrite=true."
         )
     if not overwrite:
-        pending_run = _pending_cloud_job(project_dir, output_dataset)
+        pending_run = pending_cloud_job(project_dir, output_dataset)
         if pending_run:
             return (
                 f"datasets/{output_dataset}/ is already the target of the "
@@ -159,14 +189,19 @@ def claim_output(
             with _LOCAL_CLAIMS_LOCK:
                 _LOCAL_CLAIMS.add(local_key)
             return None
-    except OSError:
-        # Locking infrastructure failure: fall back to the plain check
-        # rather than blocking the workflow. Deliberate fail-open — a
-        # broken lock file must not brick data generation; the loss is
-        # only the cross-process race protection, and the failure is
-        # logged.
-        logger.warning("dataset claim failed; falling back", exc_info=True)
-        return overwrite_refusal(project_dir, output_dataset, overwrite=overwrite)
+    except OSError as exc:
+        # Locking infrastructure failure: FAIL CLOSED. An unlocked
+        # fallback would restore the exact cross-process overwrite race
+        # this claim exists to remove — for immutable expensive outputs,
+        # refusing until the reservation can actually be established is
+        # the safe direction.
+        logger.warning("dataset claim infrastructure failed", exc_info=True)
+        return (
+            f"cannot reserve datasets/{output_dataset}/ — the claim lock "
+            f"is unavailable ({type(exc).__name__}: {exc}). Refusing to "
+            "generate without overwrite protection; fix the .lqh/ "
+            "directory permissions (or disk) and retry."
+        )
 
 
 def release_output(project_dir: Path, output_dataset: str) -> None:

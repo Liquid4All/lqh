@@ -143,6 +143,28 @@ def observe_run_states(project_dir: Path) -> dict[str, str]:
         # config.json here would hide the very state this exists to find.
         if not (has_config or has_remote or has_intent):
             continue
+        # A marker owned by a DIFFERENT project identity (run dir copied
+        # in by hand) must not be observed as this project's job.
+        try:
+            from lqh.project_identity import marker_is_foreign
+
+            foreign = False
+            for marker_name in ("remote_job.json", "submit_intent.json"):
+                marker_file = run_dir / marker_name
+                if not marker_file.exists():
+                    continue
+                marker = json.loads(marker_file.read_text(encoding="utf-8"))
+                if marker_is_foreign(project_dir, marker):
+                    logger.warning(
+                        "runs/%s: %s belongs to another project identity; skipping",
+                        name, marker_name,
+                    )
+                    foreign = True
+                    break
+            if foreign:
+                continue
+        except (OSError, ValueError):
+            pass
         try:
             if has_remote:
                 status = None

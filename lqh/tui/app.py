@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
@@ -24,6 +25,7 @@ from prompt_toolkit.styles import Style
 
 from lqh.agent import Agent, AgentCallbacks
 from lqh.auth import LoginExpired, get_token, login_device_code
+from lqh.project_identity import cloud_project_key as _ckey
 from lqh.session import Session
 from lqh.tui.commands import COMMANDS, SlashCommandCompleter, is_command, parse_command
 from lqh.tui.dataset_viewer import DatasetViewer
@@ -46,6 +48,8 @@ from lqh.telemetry import TelemetryClient, notice_needed, set_active_telemetry
 
 if TYPE_CHECKING:
     from lqh.subprocess_manager import SubprocessManager
+
+logger = logging.getLogger(__name__)
 
 
 TUI_STYLE = Style.from_dict({
@@ -1244,6 +1248,19 @@ class LqhApp:
             await self._telemetry.run_deferred(self._telemetry.refresh_account_binding)
             await self._telemetry.run_deferred(self._telemetry.start_session)
             self._start_telemetry_flush()
+            # Late login: startup may have run logged out, skipping the
+            # one-time cloud identity migration and the snapshot fetch.
+            # Run both now so this session stops using the legacy
+            # basename key and sees current cloud facts.
+            try:
+                from lqh.project_identity import migrate_cloud_identity
+
+                await migrate_cloud_identity(self.project_dir)
+            except Exception:
+                logger.warning(
+                    "post-login identity migration failed", exc_info=True
+                )
+            await self._refresh_cloud_snapshot()
         except LoginExpired:
             await self._emit(render_error("Device code expired. Run /login again."))
         except Exception as e:
@@ -1429,6 +1446,22 @@ class LqhApp:
         if self._agent:
             self._apply_startup_facts(self._agent)
 
+    async def _refresh_cloud_snapshot(self) -> None:
+        """Re-fetch the cloud snapshot outside the one-shot startup path
+        (e.g. after a late /login). Does NOT recompute the seen-jobs
+        diff — that baseline is consumed exactly once at startup."""
+        from lqh.snapshot import fetch_and_cache_snapshot
+
+        try:
+            self._cloud_snapshot, self._cloud_snapshot_fresh = (
+                await fetch_and_cache_snapshot(self.project_dir)
+            )
+        except Exception:
+            logger.warning("cloud snapshot refresh failed", exc_info=True)
+            self._cloud_snapshot_fresh = False
+        if self._agent:
+            self._apply_startup_facts(self._agent)
+
     def _apply_startup_facts(self, agent: Agent) -> None:
         agent.set_startup_facts(
             snapshot=getattr(self, "_cloud_snapshot", None),
@@ -1440,8 +1473,10 @@ class LqhApp:
     async def _prepare_agent_context(self) -> None:
         """Run the agent's ephemeral context preparation and announce it.
 
-        Called at startup and after /clear and /resume so every conversation
-        (re)start sees the current SPEC.md, NOTES.md, summary, and log.
+        Called at startup and after /clear and /resume so every
+        conversation (re)start sees the current SPEC.md, NOTES.md,
+        one-line inventory, and attention signals (R3: everything
+        deeper — summaries, logs — is pull-side via the agent's tools).
         """
         if not self._agent:
             return
@@ -1468,7 +1503,11 @@ class LqhApp:
             )
         else:
             await self._emit(
-                render_system_message("📂 Loaded SPEC.md and project summary into context. Ready to go.")
+                render_system_message(
+                    "📂 Loaded SPEC.md, notes, and project signals into "
+                    "context (the agent pulls full summaries with its "
+                    "tools). Ready to go."
+                )
             )
 
     async def _render_session_history(self, limit: int = 200) -> None:
@@ -2678,7 +2717,7 @@ class LqhApp:
                     # miss the artifact once the project accumulates
                     # more datasets than one page.
                     for handle in await _Store().list_for_project(
-                        self.project_dir.name, kind="dataset", job_id=job_id,
+                        _ckey(self.project_dir), kind="dataset", job_id=job_id,
                     ):
                         recovered_artifact_id = handle.id
                         break
@@ -2809,7 +2848,7 @@ class LqhApp:
                     # Server-side job_id filter (see comment on the
                     # recovery path above).
                     for handle in await store.list_for_project(
-                        self.project_dir.name, kind="dataset", job_id=job_id,
+                        _ckey(self.project_dir), kind="dataset", job_id=job_id,
                     ):
                         artifact_id = handle.id
                         break
@@ -2977,6 +3016,16 @@ class LqhApp:
             if remote_meta.exists():
                 try:
                     meta = json.loads(remote_meta.read_text())
+                    from lqh.project_identity import marker_is_foreign
+
+                    if marker_is_foreign(self.project_dir, meta):
+                        # Run dir copied in from another project — never
+                        # poll/watch someone else's job from here.
+                        logger.warning(
+                            "runs/%s: remote_job.json belongs to another "
+                            "project identity; skipping", entry.name,
+                        )
+                        continue
                     state, error = await self._poll_remote(entry, meta)
                     results.append((entry.name, state, error, meta["remote_name"]))
                 except Exception:
@@ -3221,6 +3270,20 @@ class LqhApp:
     async def run(self) -> None:
         """Run the persistent bottom application."""
         self._shutdown_requested = False
+        # Stable project identity is the FIRST unconditional startup step
+        # (R4) — before sessions, telemetry, welcome, or the login prompt,
+        # so quitting early can never leave a project without an identity.
+        # A corrupt identity file is surfaced (after the UI is up), never
+        # silently replaced: cloud key resolution fails closed on it.
+        identity_error: str | None = None
+        copy_status = "same"
+        try:
+            from lqh.project_identity import detect_copy, ensure_identity
+
+            ensure_identity(self.project_dir)
+            copy_status = detect_copy(self.project_dir)
+        except Exception as exc:
+            identity_error = f"{type(exc).__name__}: {exc}"
         # Sessions left "active" by a dead process become "interrupted" so
         # startup can offer to resume them.
         try:
@@ -3273,6 +3336,95 @@ class LqhApp:
             else:
                 await self._emit(render_system_message(
                     "Continuing without login. Run /login when you're ready."
+                ))
+
+        # Stable project identity (Phase 3), interactive half: the file
+        # itself was ensured at the very top of run(); here we surface a
+        # corrupt identity, resolve folder copies explicitly, and run the
+        # one-time basename→UUID cloud migration when authenticated.
+        if identity_error:
+            await self._emit(render_error(
+                f"⚠️ Project identity problem: {identity_error}\n"
+                "Cloud operations (jobs, artifacts, deployments) will fail "
+                "until .lqh/project.json is fixed — it is NOT auto-replaced "
+                "because that would disconnect this directory from its "
+                "cloud history."
+            ))
+        elif copy_status == "copied":
+            from lqh.project_identity import (
+                fork_identity,
+                record_continue_decision,
+            )
+
+            if self.auto_mode:
+                # A copy needs a human continue-vs-fork decision; silently
+                # continuing would share (and possibly bill against) the
+                # original project's cloud namespace.
+                await self._emit(render_error(
+                    "📁 This directory is a COPY of another project (or its "
+                    "original location cannot be verified), and --auto "
+                    "cannot decide continue-vs-fork on its own. Run lqh "
+                    "interactively once to choose, then re-run --auto."
+                ))
+                await self._stop_update_check()
+                self._exit_application()
+                await self._wait_for_app_task(app_task)
+                self._save_session()
+                if self._session is not None:
+                    self._session.mark_state("completed")
+                await self._finish_telemetry()
+                return
+            await self._emit(render_system_message(
+                "📁 This directory looks like a COPY of another project "
+                "(both share one identity), or its recorded location "
+                "cannot be verified. Continue as the same cloud project, "
+                "or fork into a new one?"
+            ))
+            choice = await self._wait_for_user_response(options=[
+                "Continue as the same project (shares cloud history/jobs)",
+                "Fork into a new project (fresh identity and cloud namespace)",
+            ])
+            try:
+                if choice.startswith("Fork"):
+                    fork_identity(self.project_dir)
+                    await self._emit(render_system_message(
+                        "🔀 Forked: new project identity minted "
+                        "(forked_from recorded; inherited cloud job "
+                        "markers were detached as *.pre-fork; the "
+                        "original keeps its cloud history)."
+                    ))
+                else:
+                    record_continue_decision(self.project_dir)
+            except Exception as exc:
+                # An unrecorded decision must STOP the session — running
+                # on anyway would observe (and possibly bill against)
+                # another project's cloud state, exactly what the prompt
+                # exists to prevent. A partially detached fork is safe
+                # to retry: the prompt reappears next start and already-
+                # renamed markers are skipped.
+                await self._emit(render_error(
+                    f"Could not record the copy decision: {type(exc).__name__}: "
+                    f"{exc}\nStopping. Fix the .lqh/ directory (permissions/"
+                    "disk) and restart — you will be asked again."
+                ))
+                await self._stop_update_check()
+                self._exit_application()
+                await self._wait_for_app_task(app_task)
+                self._save_session()
+                if self._session is not None:
+                    self._session.mark_state("completed")
+                await self._finish_telemetry()
+                return
+        if not identity_error and get_token():
+            try:
+                from lqh.project_identity import migrate_cloud_identity
+
+                await migrate_cloud_identity(self.project_dir)
+            except Exception as exc:
+                # migrate_cloud_identity defers ordinary failures itself;
+                # anything reaching here is identity-level and worth seeing.
+                await self._emit(render_error(
+                    f"Cloud identity migration failed: {type(exc).__name__}: {exc}"
                 ))
 
         await self._refresh_startup_state()

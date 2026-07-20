@@ -136,21 +136,57 @@ def _auth_headers(token: str | None) -> dict[str, str]:
 async def fetch_snapshot(
     project_id: str,
     *,
+    jobs_limit: int | None = None,
+    jobs_offset: int | None = None,
     api_base: str | None = None,
     token: str | None = None,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
     """GET /v1/projects/{project_id} → snapshot dict.
 
-    The snapshot includes project metadata, the most recent cloud
-    jobs, lifetime spend, and (optionally) the best checkpoint. Raises
-    httpx.HTTPStatusError on non-2xx; the caller decides how to handle
-    a 404 (probably "no cloud activity yet for this project").
+    The snapshot includes project metadata, a page of cloud jobs
+    (``jobs_limit``/``jobs_offset``, backend default 25; the response's
+    ``jobs_has_more`` says whether another page exists), lifetime spend,
+    and (optionally) the best checkpoint. Raises httpx.HTTPStatusError
+    on non-2xx; the caller decides how to handle a 404 (probably "no
+    cloud activity yet for this project").
     """
     base = (api_base or api_root()).rstrip("/")
+    params: dict[str, str] = {}
+    if jobs_limit is not None:
+        params["jobs_limit"] = str(jobs_limit)
+    if jobs_offset is not None:
+        params["jobs_offset"] = str(jobs_offset)
     async with httpx.AsyncClient(base_url=base, timeout=timeout) as client:
         r = await client.get(
             f"/v1/projects/{project_id}",
+            params=params,
+            headers=_auth_headers(token),
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def rename_project(
+    old_project_id: str,
+    new_project_id: str,
+    *,
+    api_base: str | None = None,
+    token: str | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """POST /v1/projects/{old}/rename → atomic backend id migration.
+
+    Moves the project row plus all cloud jobs, artifacts, deployments,
+    storage rows, and job tokens to the new id in one transaction. The
+    backend refuses (409) while the project has active jobs or when the
+    target id already exists.
+    """
+    base = (api_base or api_root()).rstrip("/")
+    async with httpx.AsyncClient(base_url=base, timeout=timeout) as client:
+        r = await client.post(
+            f"/v1/projects/{old_project_id}/rename",
+            json={"new_project_id": new_project_id},
             headers=_auth_headers(token),
         )
         r.raise_for_status()
@@ -160,17 +196,25 @@ async def fetch_snapshot(
 async def fetch_project_artifacts(
     project_id: str,
     *,
-    limit: int = 25,
+    limit: int = 100,
+    offset: int = 0,
     api_base: str | None = None,
     token: str | None = None,
     timeout: float = 30.0,
 ) -> list[dict[str, Any]]:
-    """GET /v1/projects/{project_id}/artifacts → newest-first raw items."""
+    """GET /v1/projects/{project_id}/artifacts → newest-first raw items.
+
+    ``offset`` pages through large projects; a page shorter than
+    ``limit`` means the listing is exhausted.
+    """
     base = (api_base or api_root()).rstrip("/")
+    params = {"limit": str(limit)}
+    if offset:
+        params["offset"] = str(offset)
     async with httpx.AsyncClient(base_url=base, timeout=timeout) as client:
         r = await client.get(
             f"/v1/projects/{project_id}/artifacts",
-            params={"limit": str(limit)},
+            params=params,
             headers=_auth_headers(token),
         )
         r.raise_for_status()

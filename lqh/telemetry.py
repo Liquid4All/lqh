@@ -28,6 +28,7 @@ from lqh.config import (
     save_credentials,
     telemetry_enabled,
 )
+from lqh.project_identity import ProjectIdentityError
 
 QUEUE_MAX_BYTES = 1_048_576
 QUEUE_TRIM_TARGET_BYTES = 786_432
@@ -149,51 +150,27 @@ def _meaningful_artifacts(project_dir: Path) -> bool:
 
 
 def ensure_project_identity(project_dir: Path) -> tuple[str, str]:
-    """Return (stable UUID, new|pre_existing|reopened), creating it if needed."""
+    """Return (stable UUID, new|pre_existing|reopened), creating it if needed.
+
+    Identity ownership moved to ``lqh.project_identity`` (Phase 3):
+    it is created unconditionally at startup, independent of telemetry
+    consent or authentication. Telemetry only consumes the same UUID.
+    """
     state_dir = project_dir / ".lqh"
-    path = state_dir / "project.json"
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         os.chmod(state_dir, 0o700)
     except OSError:
         pass
+    from lqh.project_identity import ensure_identity
+
     with _PROJECT_LOCK:
-        with _file_lock(path.with_suffix(".lock")):
-            return _ensure_project_identity_locked(project_dir, path)
-
-
-def _ensure_project_identity_locked(project_dir: Path, path: Path) -> tuple[str, str]:
-    if path.exists():
-        try:
-            value = json.loads(path.read_text())
-            project_id = str(uuid.UUID(value["project_id"]))
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-            return project_id, "reopened"
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-            pass
-    classification = "pre_existing" if _meaningful_artifacts(project_dir) else "new"
-    project_id = str(uuid.uuid4())
+        identity, classification = ensure_identity(project_dir)
     try:
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        tmp.write_text(json.dumps({"schema_version": 1, "project_id": project_id}) + "\n")
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, path)
+        os.chmod(state_dir / "project.json", 0o600)
     except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        # An unstable random identity is worse than no telemetry: it breaks
-        # project correlation on every launch. The client catches this and
-        # disables telemetry without affecting the workflow.
-        raise
-    return project_id, classification
+        pass
+    return str(uuid.UUID(identity["project_id"])), classification
 
 
 def get_project_id(project_dir: Path) -> str:
@@ -217,7 +194,7 @@ class TelemetryClient:
             config = load_config()
             self.enabled = telemetry_enabled(config)
             self.consent_epoch = config.telemetry_consent_epoch
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
             # Configuration/state storage is best-effort. A read-only home
             # must never prevent the CLI itself from starting.
             self.enabled = False
@@ -259,13 +236,13 @@ class TelemetryClient:
         try:
             auth = _telemetry_auth() if self.enabled else None
             self.account_key = _account_key(auth[0]) if auth else None
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
             self.account_key = None
             self.enabled = False
         if self.account_key is not None:
             try:
                 self.project_id, self.project_state = ensure_project_identity(project_dir)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
                 self.enabled = False
                 self._local_disabled = True
         self.queue_path = self._queue_path_for(self.account_key)
@@ -354,7 +331,7 @@ class TelemetryClient:
         try:
             auth = _telemetry_auth()
             current_key = _account_key(auth[0]) if auth else None
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
             return False
         if current_key is None:
             return False
@@ -367,7 +344,7 @@ class TelemetryClient:
         if self.project_id is None:
             try:
                 self.project_id, self.project_state = ensure_project_identity(self.project_dir)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
                 with self._state_lock:
                     self.enabled = False
                     self._local_disabled = True
@@ -401,7 +378,7 @@ class TelemetryClient:
         try:
             auth = _telemetry_auth()
             key = _account_key(auth[0]) if auth else None
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
             return
         if key is None or key == self.account_key:
             return
@@ -414,7 +391,7 @@ class TelemetryClient:
         if self.project_id is None:
             try:
                 self.project_id, self.project_state = ensure_project_identity(self.project_dir)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
                 with self._state_lock:
                     self.enabled = False
                     self._local_disabled = True
@@ -436,7 +413,7 @@ class TelemetryClient:
             config = load_config()
             enabled = telemetry_enabled(config)
             epoch = config.telemetry_consent_epoch
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
             # Consent cannot be proven while its durable state is unreadable.
             # Fail closed until a later sync observes a valid config again.
             with self._state_lock:
@@ -510,7 +487,7 @@ class TelemetryClient:
                     os.chmod(tmp, 0o600)
                     os.replace(tmp, path)
                     return initial, True
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
             return initial, True
 
     def _clear_workflow_state(self, name: str, workflow_id: str) -> None:
@@ -526,7 +503,7 @@ class TelemetryClient:
                         tmp.write_text(json.dumps(state, separators=(",", ":")) + "\n")
                         os.chmod(tmp, 0o600)
                         os.replace(tmp, path)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
             return
 
     def _save_workflow_state(self) -> None:
@@ -569,7 +546,7 @@ class TelemetryClient:
                     tmp.write_text(json.dumps(state, separators=(",", ":")) + "\n")
                     os.chmod(tmp, 0o600)
                     os.replace(tmp, path)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
             return
 
     def note_activity(self) -> None:
@@ -1098,5 +1075,5 @@ def notice_needed() -> bool:
         marker.write_text("shown\n")
         os.chmod(marker, 0o600)
         return True
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, ProjectIdentityError):
         return False

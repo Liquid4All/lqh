@@ -361,6 +361,39 @@ def test_partial_snapshot_refresh_is_signaled(project_dir: Path) -> None:
     assert "artifacts" in signals[0].text
 
 
+def test_foreign_owned_run_is_not_observed(project_dir: Path) -> None:
+    """A run dir copied in from ANOTHER project (marker records a
+    different owner identity) must not be watched, signaled, or
+    finalized as this project's job."""
+    import uuid as _uuid
+
+    from lqh.project_identity import ensure_identity, project_uuid
+    from lqh.signals import observe_run_states
+
+    ensure_identity(project_dir)
+    _make_run(
+        project_dir, "inherited",
+        remote_job={
+            "job_id": "j-parent", "remote_name": "cloud", "backend": "cloud",
+            "owner_project_id": str(_uuid.uuid4()),
+        },
+        cloud_state={"job_id": "j-parent", "status": "running"},
+    )
+    _make_run(
+        project_dir, "mine",
+        remote_job={
+            "job_id": "j-ours", "remote_name": "cloud", "backend": "cloud",
+            "owner_project_id": project_uuid(project_dir),
+        },
+        cloud_state={"job_id": "j-ours", "status": "running"},
+    )
+
+    states = observe_run_states(project_dir)
+
+    assert "inherited" not in states
+    assert states["mine"] == "running"
+
+
 def test_quiet_project_has_no_signals(project_dir: Path) -> None:
     signals = collect_signals(
         project_dir, snapshot=None, snapshot_fresh=True, run_states={}

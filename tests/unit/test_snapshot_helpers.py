@@ -137,13 +137,21 @@ async def test_fetch_and_cache_writes_wrapper(
 
     assert fresh is True
     assert wrapper["snapshot"] == _SNAPSHOT
-    assert wrapper["project_key"] == project_dir.name
+    # Phase 3: the wrapper records the RESOLVED cloud key (the stable
+    # UUID for fresh projects; the basename only for unmigrated legacy
+    # projects).
+    from lqh.project_identity import cloud_project_key
+
+    assert wrapper["project_key"] == cloud_project_key(project_dir)
     assert wrapper["fetched_at"]
     # Enrichment: project artifacts and deployment state ride along,
     # sanitized (no signed URLs in the cache) and deployment rows scoped
-    # to this project (foreign project_id rows dropped, unattributed kept).
+    # STRICTLY to this project — foreign project_id rows are dropped and
+    # unattributed rows land in their own clearly-separated bucket
+    # (never presented as this project's).
     assert wrapper["artifacts"] == [{"artifact_id": "art-1", "kind": "checkpoint"}]
-    assert wrapper["deployments"] == [_DEPLOYMENTS[0]]
+    assert wrapper["deployments"] == []
+    assert wrapper["unattributed_deployments"] == [_DEPLOYMENTS[0]]
     assert wrapper["stale_sections"] == []
     cached = json.loads((project_dir / ".lqh" / "snapshot.json").read_text())
     assert cached == wrapper
@@ -166,20 +174,44 @@ async def test_partial_refresh_keeps_cached_sections_and_labels_them(
     assert fresh is True  # the core snapshot IS fresh
     assert wrapper["artifacts"] == first["artifacts"]  # carried forward
     assert wrapper["stale_sections"] == ["artifacts"]
-    assert wrapper["deployments"] == [_DEPLOYMENTS[0]]  # this one succeeded
+    # The deployment refresh succeeded: dep-1 (unattributed) stays in its
+    # own bucket, never in this project's list.
+    assert wrapper["deployments"] == []
+    assert wrapper["unattributed_deployments"] == [_DEPLOYMENTS[0]]
 
 
 async def test_fetch_404_means_no_cloud_activity(
     project_dir: Path, fake_projects_api, snapshot_auth
 ) -> None:
+    """404 on the project AND nothing in the other sections → truly no
+    cloud activity: (None, True), no cache left behind."""
     from lqh.snapshot import fetch_and_cache_snapshot
 
-    fake_projects_api["status"] = 404
+    fake_projects_api["status"] = 404  # deployments follow
+    fake_projects_api["artifacts_status"] = 404
     wrapper, fresh = await fetch_and_cache_snapshot(project_dir)
 
     assert wrapper is None
     assert fresh is True
     assert not (project_dir / ".lqh" / "snapshot.json").exists()
+
+
+async def test_project_404_keeps_fetched_artifacts(
+    project_dir: Path, fake_projects_api, snapshot_auth
+) -> None:
+    """Artifacts can exist WITHOUT a projects row (row-less legacy
+    history, failed submit-time upsert) — a project 404 must not
+    discard an artifact list that WAS successfully fetched."""
+    from lqh.snapshot import fetch_and_cache_snapshot
+
+    fake_projects_api["status"] = 404
+    fake_projects_api["deployments_status"] = 404
+    wrapper, fresh = await fetch_and_cache_snapshot(project_dir)
+
+    assert fresh is True
+    assert wrapper is not None
+    assert wrapper["snapshot"] == {}  # jobs/spend authoritatively absent
+    assert wrapper["artifacts"] == [{"artifact_id": "art-1", "kind": "checkpoint"}]
 
 
 async def test_authoritative_404_clears_jobs_but_keeps_deployment_state(
@@ -199,11 +231,17 @@ async def test_authoritative_404_clears_jobs_but_keeps_deployment_state(
 
     assert fresh is True
     assert wrapper["snapshot"] == {}  # obsolete jobs/spend are gone
-    assert wrapper["deployments"] == [_DEPLOYMENTS[0]]  # carried forward
+    # Artifacts were still fetched fresh (they can exist row-less);
+    # deployments carried forward from the previous cache, still in the
+    # unattributed bucket, marked stale.
+    assert wrapper["artifacts"] == [{"artifact_id": "art-1", "kind": "checkpoint"}]
+    assert wrapper["deployments"] == []
+    assert wrapper["unattributed_deployments"] == [_DEPLOYMENTS[0]]
     assert wrapper["stale_sections"] == ["deployments"]
 
-    # With no previously known deployments either, 404 clears everything.
+    # With nothing in ANY section (and no cache), 404 clears everything.
     (project_dir / ".lqh" / "snapshot.json").unlink()
+    fake_projects_api["artifacts_status"] = 404
     wrapper, fresh = await fetch_and_cache_snapshot(project_dir)
     assert (wrapper, fresh) == (None, True)
     assert read_cached_snapshot(project_dir) is None
@@ -311,7 +349,8 @@ async def test_core_404_keeps_fetched_deployments(
     assert fresh is True
     assert wrapper is not None
     assert wrapper["snapshot"] == {}
-    assert wrapper["deployments"] == [_DEPLOYMENTS[0]]  # project-scoped
+    assert wrapper["deployments"] == []  # nothing attributed to this project
+    assert wrapper["unattributed_deployments"] == [_DEPLOYMENTS[0]]
 
 
 def test_read_cached_snapshot_wraps_legacy_format(project_dir: Path) -> None:
@@ -323,6 +362,116 @@ def test_read_cached_snapshot_wraps_legacy_format(project_dir: Path) -> None:
     assert wrapper is not None
     assert wrapper["snapshot"] == _SNAPSHOT
     assert wrapper["fetched_at"] is None  # unknown freshness → treated stale
+
+
+def test_cached_snapshot_for_another_key_is_ignored(project_dir: Path) -> None:
+    """A cache written for a different project key (pre-fork, pre-
+    migration, or copied in) must never resurface as this project's
+    cloud state."""
+    from lqh.snapshot import read_cached_snapshot
+
+    (project_dir / ".lqh").mkdir(exist_ok=True)
+    (project_dir / ".lqh" / "snapshot.json").write_text(json.dumps({
+        "schema_version": 1,
+        "fetched_at": "2026-07-17T00:00:00+00:00",
+        "project_key": "someone-elses-project",
+        "snapshot": {"jobs": [{"job_id": "foreign"}]},
+    }))
+
+    assert read_cached_snapshot(project_dir) is None
+
+
+async def test_jobs_are_paged_until_exhausted(
+    project_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """More jobs than one page → the client follows jobs_has_more and
+    aggregates, recording jobs_truncated=False when it got everything."""
+    from lqh.snapshot import fetch_and_cache_snapshot
+
+    calls: list[int] = []
+
+    async def fake_snapshot(pid, *, jobs_limit=None, jobs_offset=None, **kwargs):
+        calls.append(jobs_offset)
+        if jobs_offset == 0:
+            return {
+                "jobs": [{"job_id": f"j{i}"} for i in range(jobs_limit)],
+                "jobs_has_more": True,
+            }
+        return {"jobs": [{"job_id": "j-last"}], "jobs_has_more": False}
+
+    async def fake_artifacts(pid, **kwargs):
+        return []
+
+    async def fake_deployments(**kwargs):
+        return []
+
+    monkeypatch.setattr("lqh.snapshot.fetch_snapshot", fake_snapshot)
+    monkeypatch.setattr("lqh.snapshot.fetch_project_artifacts", fake_artifacts)
+    monkeypatch.setattr("lqh.snapshot.fetch_deployments", fake_deployments)
+
+    wrapper, fresh = await fetch_and_cache_snapshot(project_dir)
+
+    assert fresh is True
+    jobs = wrapper["snapshot"]["jobs"]
+    assert len(jobs) == 101  # one full page + the final short page
+    assert jobs[-1] == {"job_id": "j-last"}
+    assert calls == [0, 100]
+    assert wrapper["jobs_truncated"] is False
+
+
+async def test_artifact_paging_caps_and_reports_truncation(
+    project_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A project with more artifacts than the client cap gets the cap,
+    with an explicit truncation flag — never a silent 25-item slice."""
+    from lqh.snapshot import fetch_and_cache_snapshot
+
+    async def fake_snapshot(pid, **kwargs):
+        return {"jobs": [], "jobs_has_more": False}
+
+    async def fake_artifacts(pid, *, limit=100, offset=0, **kwargs):
+        # Endless supply: always a full page.
+        return [{"artifact_id": f"a{offset + i}"} for i in range(limit)]
+
+    async def fake_deployments(**kwargs):
+        return []
+
+    monkeypatch.setattr("lqh.snapshot.fetch_snapshot", fake_snapshot)
+    monkeypatch.setattr("lqh.snapshot.fetch_project_artifacts", fake_artifacts)
+    monkeypatch.setattr("lqh.snapshot.fetch_deployments", fake_deployments)
+
+    wrapper, fresh = await fetch_and_cache_snapshot(project_dir)
+
+    assert fresh is True
+    assert len(wrapper["artifacts"]) == 500  # the documented client cap
+    assert wrapper["artifacts_truncated"] is True
+
+
+async def test_exactly_at_cap_is_not_flagged_truncated(
+    project_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exactly 500 artifacts (cap) with nothing beyond → the client
+    probes one page further and does NOT claim more exist."""
+    from lqh.snapshot import fetch_and_cache_snapshot
+
+    async def fake_snapshot(pid, **kwargs):
+        return {"jobs": [], "jobs_has_more": False}
+
+    async def fake_artifacts(pid, *, limit=100, offset=0, **kwargs):
+        remaining = max(0, 500 - offset)
+        return [{"artifact_id": f"a{offset + i}"} for i in range(min(limit, remaining))]
+
+    async def fake_deployments(**kwargs):
+        return []
+
+    monkeypatch.setattr("lqh.snapshot.fetch_snapshot", fake_snapshot)
+    monkeypatch.setattr("lqh.snapshot.fetch_project_artifacts", fake_artifacts)
+    monkeypatch.setattr("lqh.snapshot.fetch_deployments", fake_deployments)
+
+    wrapper, _ = await fetch_and_cache_snapshot(project_dir)
+
+    assert len(wrapper["artifacts"]) == 500
+    assert wrapper["artifacts_truncated"] is False
 
 
 def test_compute_spec_sha256(project_dir: Path) -> None:

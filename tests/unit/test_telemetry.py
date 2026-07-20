@@ -103,7 +103,10 @@ def test_project_identity_failure_disables_telemetry_without_blocking_startup(mo
 
 def test_project_identity_does_not_require_chmod_support(monkeypatch, tmp_path: Path):
     project = tmp_path / "non-posix-project"; project.mkdir()
-    monkeypatch.setattr("lqh.telemetry.os.chmod", lambda *_args: (_ for _ in ()).throw(OSError("unsupported")))
+    monkeypatch.setattr(
+        "lqh.telemetry.os.chmod",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unsupported")),
+    )
 
     project_id, state = ensure_project_identity(project)
     reopened_id, reopened_state = ensure_project_identity(project)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from lqh.project_identity import cloud_project_key
 from lqh.tools.handlers import handle_summary
 
 
@@ -296,7 +297,7 @@ async def test_cloud_section_renders_wrapper_deployments_without_core(
     (project_dir / ".lqh" / "snapshot.json").write_text(json.dumps({
         "schema_version": 1,
         "fetched_at": "2026-07-17T00:00:00+00:00",
-        "project_key": project_dir.name,
+        "project_key": cloud_project_key(project_dir),
         "snapshot": {},
         "artifacts": [{"artifact_id": "a1", "kind": "checkpoint"}],
         "deployments": [{"id": "d1", "name": "triage-prod", "status": "running"}],
@@ -361,7 +362,7 @@ async def test_cloud_section_renders_from_cached_snapshot(
             {
                 "schema_version": 1,
                 "fetched_at": "2026-07-15T18:02:00+00:00",
-                "project_key": project_dir.name,
+                "project_key": cloud_project_key(project_dir),
                 "snapshot": {
                     "jobs": [
                         {"job_id": "j-123", "status": "completed", "kind": "sft"}

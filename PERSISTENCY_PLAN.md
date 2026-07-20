@@ -2,6 +2,16 @@
 
 Date: 2026-07-17 (revised same day after design review)
 
+**Status (2026-07-19): Phases 0–4 are implemented** — durable session
+storage, non-destructive compaction, startup signals + snapshot cache,
+stable project identity (Python + backend), and provenance manifests
+with overwrite guards — verified by the unit suite, smoke scripts, and
+`go build`/`vet`/`test`. Not yet rolled out: commits/release of both
+repos, backend migrations 0045/0046 in prod, and one run of the
+env-gated rename DB integration test. **Phase 5 (cloud sessions) is
+postponed to the future and not yet scoped** — the sketch below is a
+direction, not a plan.
+
 ## Executive summary
 
 LQH already has good low-level durability for files and long-running jobs. It can preserve a conversation, rediscover local runs after a restart, reconnect to SSH and cloud jobs, replay missed cloud events, download completed cloud data-generation output, and retain cloud artifacts plus partial lineage. This is substantially more than the `remote_jobs.json` mechanism anticipated in `PERSISTENCY.md`.
@@ -272,7 +282,7 @@ When an existing handler finalizes a dataset, eval, or filtered output, it write
 - producing run/job ID and cloud artifact ID, if any;
 - parent dataset, if this is a supplement.
 
-Run directories keep `config.json` as-is, extended with the spec hash and a finalized result summary. Multi-source training records the exact dataset composition and repeats it trained on.
+Run directories keep `config.json` **immutable as submitted** (it carries the spec hash from submission; its content hash is recorded in the manifest, so post-hoc edits would break provenance) — the finalized result summary lives in the run's `manifest.json` instead. Multi-source training records the exact dataset composition and repeats it trained on.
 
 Manifests exist to be `read_file`'d by the agent (and humans), not parsed by a reconciler. Missing manifests on legacy artifacts are acceptable; absence of provenance is shown as absence, never invented from filenames.
 
@@ -317,7 +327,7 @@ All three scenarios are handled with conventions and skill guidance over the pri
 
 ## Delivery plan
 
-### Phase 0: characterization and safety tests
+### Phase 0: characterization and safety tests — DONE
 
 - Session round-trip, ordering, malformed header/line, partial final line, concurrent append, kill-during-write simulation.
 - Compaction of a >20-message conversation proving all raw messages survive (currently fails — that's the point).
@@ -325,7 +335,7 @@ All three scenarios are handled with conventions and skill guidance over the pri
 - `handle_summary()` coverage and truncation honesty.
 - Snapshot helper tests: offline cache, 404, auth failure, drift comparison.
 
-### Phase 1: durable conversations
+### Phase 1: durable conversations — DONE
 
 1. Directory-per-conversation format with append-only `messages.jsonl`, locked appends, atomic `meta.json`; lazy migration of legacy files with backup.
 2. Compaction becomes derived: write a coverage-aware checkpoint, build API context from checkpoint + tail, never mutate stored messages. Compaction failure leaves everything intact and is logged.
@@ -335,30 +345,31 @@ All three scenarios are handled with conventions and skill guidance over the pri
 
 Fixes Scenarios 1 and 2 with no backend changes and no new tools.
 
-### Phase 2: honest signals and cloud wiring
+### Phase 2: honest signals and cloud wiring — DONE
 
 1. `summary` overhaul (prompts, semantic run status, deployments, truncation honesty).
 2. Startup signal line: running/terminal-while-away jobs, orphan submit intents, spec-hash drift, snapshot staleness.
 3. Wire `fetch_snapshot`/`write_local_snapshot` into startup; fold snapshot facts into `summary`.
 4. Minimal project-log hardening (session ID, lock, observable failures).
 
-### Phase 3: stable identity (coordinated Python + backend)
+### Phase 3: stable identity (coordinated Python + backend) — DONE
 
-1. Project identity independent of telemetry; used for every cloud project/artifact/deployment operation.
-2. Migration/alias from existing `(user, directory-basename)` projects so current cloud history stays reachable.
-3. Detect folder copies; explicit continue/fork choice recorded in `project.json`.
-4. Include deployments and paginated jobs/artifacts in the snapshot; retain submitted spec hash per job/artifact rather than only the latest.
+1. Project identity independent of telemetry; used for every cloud project/artifact/deployment operation. A corrupt identity file is an error that fails cloud operations closed — never silently replaced (that would rotate the stable ID and orphan the cloud history).
+2. Migration from existing `(user, directory-basename)` projects so current cloud history stays reachable. The basename in use is recorded ONCE (`legacy_cloud_name`) when the identity first covers cloud keying, so renaming an unmigrated folder keeps addressing its original namespace. Migration is a destructive backend rename, not an alias: an *older* lqh version running after the rename would re-create a fresh project under the basename (accepted risk — single-user beta, CLI self-updates; revisit with an alias table if it bites).
+3. Detect folder copies (path + hostname; an unverifiable original — other machine, unreadable — also asks); explicit continue/fork choice recorded in `project.json`. Auto mode refuses to start on an unresolved copy. Forking detaches inherited cloud state (snapshot/seen caches deleted, per-run job markers renamed `*.pre-fork`); job/submit markers record their owning identity so hand-copied run dirs are recognizably foreign.
+4. Include deployments (strictly project-scoped; unattributed rows in a separate labeled bucket) and paginated jobs/artifacts in the snapshot, with explicit truncation flags at the client cap; retain submitted spec hash per job and per artifact-lineage row rather than only the latest.
 
-### Phase 4: immutable provenance
+### Phase 4: immutable provenance — DONE
 
 1. Manifests written at finalization for datasets, filtered outputs, and evals; run `config.json` extended with spec hash and result summary.
 2. No-overwrite guard in local generation and filtering, with explicit version allocation (`_v2` style) and confirmed-overwrite escape hatch.
 3. Multi-source training composition recorded in the run config.
 4. `feedback/` convention documented in skills; `get_eval_failures` output saveable into it.
 
-### Phase 5: future cloud sessions
+### Phase 5: future cloud sessions — POSTPONED (not scoped)
 
-Only after the local model is reliable: sync project identity, session metadata, `NOTES.md`, and explicitly selected transcript data into Modal Sandbox sessions; lease/ownership semantics so two active agents don't fight; manifests and metadata sync, not whole project trees; conflicts preserved on both sides.
+Deliberately deferred; no design or scoping has been done. Direction
+sketch only: sync project identity, session metadata, `NOTES.md`, and explicitly selected transcript data into Modal Sandbox sessions; lease/ownership semantics so two active agents don't fight; manifests and metadata sync, not whole project trees; conflicts preserved on both sides. To be scoped as its own plan when picked up.
 
 ## Acceptance criteria
 

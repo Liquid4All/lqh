@@ -1603,10 +1603,13 @@ class Agent:
         """Rebuild the ephemeral project context without any LLM calls.
 
         Populates ``self.context_messages`` (replacing any previous
-        content) from the current on-disk state: SPEC.md, NOTES.md, the
-        project summary, and the activity log. Nothing is persisted into
-        the conversation — this runs on every open (startup, /clear,
-        /resume) and always reflects the present filesystem state.
+        content) from the current on-disk state: SPEC.md, NOTES.md, a
+        one-line artifact inventory, and the attention-signal block.
+        Deeper state (full summaries, logs) is deliberately pull-side —
+        the agent fetches it with its tools (R3). Nothing is persisted
+        into the conversation — this runs on every open (startup,
+        /clear, /resume) and always reflects the present filesystem
+        state.
 
         Returns a mode string indicating what was loaded:
         - "new_project" if no SPEC.md exists (spec_capture skill loaded)

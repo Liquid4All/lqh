@@ -415,6 +415,40 @@ def test_torn_checkpoint_tail_is_quarantined(project_dir: Path) -> None:
     assert reloaded.latest_checkpoint()["covers_to_seq"] == 6
 
 
+def test_malformed_checkpoint_never_blocks_loading(project_dir: Path) -> None:
+    """Checkpoints are a DERIVED cache: a structurally malformed record
+    (hand-edited, corrupted) is skipped — it must never make the intact
+    raw transcript unresumable."""
+    session = _make_session(project_dir, n_messages=6)
+    ckpt_path = sessions_dir(project_dir) / session.id / "checkpoints.jsonl"
+    ckpt_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "covers_to_seq": "not-an-int",
+            "carried_seqs": [],
+            "summary": "bogus",
+        }) + "\n"
+    )
+
+    loaded = Session.load(project_dir, session.id)
+
+    # The full raw transcript loads; the corrupt checkpoint is ignored.
+    assert len(loaded.messages) == 6
+    assert loaded.latest_checkpoint() is None
+
+    # A malformed carried_seqs list is equally non-fatal.
+    ckpt_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "covers_to_seq": 3,
+            "carried_seqs": ["x", {}],
+            "summary": "bogus",
+        }) + "\n"
+    )
+    reloaded = Session.load(project_dir, session.id)
+    assert len(reloaded.messages) == 6
+
+
 # ---------------------------------------------------------------------------
 # Legacy (v1 single-file) migration
 # ---------------------------------------------------------------------------

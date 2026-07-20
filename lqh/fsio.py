@@ -98,7 +98,12 @@ def atomic_write_json(path: Path, obj: Any, *, mode: int | None = 0o600) -> None
             handle.flush()
             os.fsync(handle.fileno())
         if mode is not None:
-            tmp.chmod(mode)
+            try:
+                tmp.chmod(mode)
+            except OSError:
+                # Non-POSIX/sandboxed filesystems may not support chmod;
+                # the write itself must still succeed.
+                pass
         os.replace(tmp, path)
         try:
             directory_fd = os.open(path.parent, os.O_RDONLY)

@@ -142,6 +142,9 @@ def _write_lineage_sidecar(
     }
     if config["training_method"] == "lora":
         lineage["hyperparams"]["lora_base"] = config["base_model"]
+    # Spec provenance (R6): recorded when the submitted config carries it.
+    if config.get("spec_sha256"):
+        lineage["spec_sha256"] = config["spec_sha256"]
     sidecar = pred_path.with_suffix(pred_path.suffix + ".lineage.json")
     sidecar.write_text(json.dumps(lineage, indent=2) + "\n")
     logger.info("wrote lineage sidecar at %s", sidecar)

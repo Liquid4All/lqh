@@ -374,11 +374,34 @@ class Session:
                 continue
             try:
                 record = json.loads(line)
-                if isinstance(record, dict) and "covers_to_seq" in record:
-                    latest = record
             except json.JSONDecodeError:
                 continue
+            if self._valid_checkpoint(record):
+                latest = record
         return latest
+
+    @staticmethod
+    def _valid_checkpoint(record: Any) -> bool:
+        """Structural validation of a checkpoint record.
+
+        Checkpoints are a DERIVED cache over the raw log — a malformed
+        one (hand-edited, torn write) must be skipped, never allowed to
+        make the intact transcript unloadable.
+        """
+        if not isinstance(record, dict):
+            return False
+        try:
+            int(record["covers_to_seq"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        carried = record.get("carried_seqs", [])
+        if not isinstance(carried, list):
+            return False
+        try:
+            [int(seq) for seq in carried]
+        except (TypeError, ValueError):
+            return False
+        return isinstance(record.get("summary", ""), str)
 
     @staticmethod
     def _summary_message(covers_to_seq: int, summary: str) -> dict:
@@ -457,11 +480,18 @@ class Session:
         checkpoint = self.latest_checkpoint()
         if checkpoint is None:
             return [msg for _, msg in entries]
-        covers_to_seq = int(checkpoint.get("covers_to_seq", 0))
-        carried_seqs = set(checkpoint.get("carried_seqs", []))
+        try:
+            covers_to_seq = int(checkpoint.get("covers_to_seq", 0))
+            carried_seqs = {int(s) for s in checkpoint.get("carried_seqs", [])}
+            summary = str(checkpoint.get("summary", ""))
+        except (TypeError, ValueError):
+            # Belt-and-braces (latest_checkpoint already validates): a
+            # corrupt derived cache must never make the intact raw log
+            # unresumable — fall back to the full transcript.
+            logger.warning("malformed checkpoint ignored; using full log")
+            return [msg for _, msg in entries]
         carried = [msg for seq, msg in entries if seq in carried_seqs]
         tail = [msg for seq, msg in entries if seq > covers_to_seq]
-        summary = str(checkpoint.get("summary", ""))
         return carried + [self._summary_message(covers_to_seq, summary)] + tail
 
     # ------------------------------------------------------------------

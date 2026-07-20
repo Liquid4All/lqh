@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from lqh.project_identity import cloud_project_key as _ckey
 from typing import Any, Callable, Awaitable
 
 from lqh.skills import list_available_skills, load_skill_content
+
+logger = logging.getLogger(__name__)
 
 
 # Truncation threshold: ~40,000 chars (~10k tokens)
@@ -657,6 +662,11 @@ def _summarize_cloud(project_dir: Path) -> list[str]:
             lines.append(f"    - {job_id}{kind_label}: {status}")
         if len(jobs) > 5:
             lines.append(f"    …{len(jobs) - 5} more not shown")
+        if wrapper.get("jobs_truncated"):
+            lines.append(
+                "    …job list incomplete (client cap reached or paging "
+                "interrupted) — older jobs are not shown here"
+            )
 
     spend = snap.get("lifetime_spend_micros")
     if isinstance(spend, (int, float)) and spend > 0:
@@ -694,6 +704,11 @@ def _summarize_cloud(project_dir: Path) -> list[str]:
             lines.append(f"    - {art_id} [{kind}]{name_label}")
         if len(artifacts) > 5:
             lines.append(f"    …{len(artifacts) - 5} more not shown (use the artifacts tool)")
+        if wrapper.get("artifacts_truncated"):
+            lines.append(
+                "    …artifact list incomplete (client cap reached or "
+                "paging interrupted) — older artifacts are not shown here"
+            )
 
     # Deployments live at the wrapper top level (fetched separately from
     # the project snapshot); the in-snapshot key is a fallback.
@@ -721,6 +736,25 @@ def _summarize_cloud(project_dir: Path) -> list[str]:
             lines.append(
                 f"    …{len(deployments) - 5} more not shown (use list_deployments)"
             )
+
+    unattributed = wrapper.get("unattributed_deployments")
+    if isinstance(unattributed, list) and unattributed:
+        # These rows carry no project attribution at all — they may or
+        # may not belong here, so they are never presented as this
+        # project's deployments.
+        lines.append(
+            f"  - {len(unattributed)} deployment(s) NOT attributed to any "
+            "project (may belong to another project; verify with "
+            "list_deployments before redeploying):"
+        )
+        for dep in unattributed[:3]:
+            if not isinstance(dep, dict):
+                continue
+            name = dep.get("name") or dep.get("deployment_id") or dep.get("id") or "?"
+            status = dep.get("status") or "?"
+            lines.append(f"    - {name}: {status}")
+        if len(unattributed) > 3:
+            lines.append(f"    …{len(unattributed) - 3} more not shown")
 
     if len(lines) == 1:
         return []  # nothing beyond the header — omit the section
@@ -1162,24 +1196,41 @@ async def handle_run_data_gen_pipeline(
     # data.partial.jsonl does NOT bypass this — resume only applies while
     # no data.parquet exists) and when another live process is currently
     # generating into the same name.
-    from lqh.dataset_guard import claim_output, release_output
+    from lqh.dataset_guard import (
+        claim_output,
+        existing_output,
+        pending_cloud_job,
+        release_output,
+    )
 
-    existing = project_dir / "datasets" / output_dataset / "data.parquet"
-    if overwrite and existing.exists() and not _overwrite_consent:
+    dataset_dir = project_dir / "datasets" / output_dataset
+    existing_name = existing_output(project_dir, output_dataset)
+    pending_run = pending_cloud_job(project_dir, output_dataset)
+    if overwrite and (existing_name or pending_run) and not _overwrite_consent:
         # overwrite=true from the model is a REQUEST, not consent —
-        # destroying data needs an explicit human yes (the agent loop
-        # relays this prompt and re-invokes with the consent flag).
+        # destroying data (or racing a pending cloud job's output slot)
+        # needs an explicit human yes (the agent loop relays this prompt
+        # and re-invokes with the consent flag).
+        if existing_name:
+            question = (
+                f"The agent wants to OVERWRITE datasets/{output_dataset}/ — "
+                f"the existing {existing_name} (and any other files in the "
+                "dataset directory) will be destroyed and regenerated. Data "
+                "generation is expensive and this cannot be undone. Allow?"
+            )
+        else:
+            question = (
+                f"datasets/{output_dataset}/ is the pending output of cloud "
+                f"data-gen job '{pending_run}'. The agent wants to start "
+                "ANOTHER writer for the same dataset name — the two outputs "
+                "will race (newest submission wins). Allow anyway?"
+            )
         return ToolResult(
             content="OVERWRITE_CONFIRMATION_REQUIRED",
             requires_user_input=True,
-            question=(
-                f"The agent wants to OVERWRITE datasets/{output_dataset}/ — "
-                "the existing data.parquet (and its scores/summaries) will "
-                "be destroyed and regenerated. Data generation is expensive "
-                "and this cannot be undone. Allow?"
-            ),
+            question=question,
             options=[
-                "Yes, destroy and regenerate this dataset",
+                "Yes, destroy/replace and regenerate this dataset",
                 "No, keep the existing data",
             ],
         )
@@ -1188,12 +1239,21 @@ async def handle_run_data_gen_pipeline(
     if refusal:
         return ToolResult(content=f"Error: {refusal}")
 
-    if overwrite and existing.exists():
-        # Confirmed overwrite: also drop co-located artifacts describing
-        # the OLD contents, so summary can't report stale scores/filters.
-        for stale in ("scores.parquet", "summary.json", ".lqh_source.json"):
+    if overwrite and existing_name:
+        # Confirmed overwrite: drop EVERY artifact describing the OLD
+        # contents — all parquet splits plus provenance/score sidecars —
+        # so the regenerated dataset can't mix with or misdescribe them.
+        try:
+            stale_files = list(dataset_dir.glob("*.parquet"))
+        except OSError:
+            stale_files = []
+        stale_files += [
+            dataset_dir / name
+            for name in ("manifest.json", "summary.json", ".lqh_source.json")
+        ]
+        for stale in stale_files:
             try:
-                (existing.parent / stale).unlink(missing_ok=True)
+                stale.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -1480,6 +1540,20 @@ async def _submit_cloud_data_gen(
         hf_token_configured=record.needs_hf,
     )
     backend = CloudBackend(cfg, project_dir)
+    # Provenance captured BEFORE submission — these are the revisions the
+    # bundle is built from. Re-hashing after the network round-trip would
+    # attribute the job to whatever the files contain at completion of
+    # the POST, not what was uploaded (an external edit during bundle
+    # construction/upload would poison the marker and every manifest
+    # derived from it). The spec hash additionally rides in the config
+    # itself so the sandbox records the same revision.
+    from lqh.project_log import file_hash_prefix as _hash_prefix
+    from lqh.project_meta import compute_spec_sha256 as _spec_hash
+
+    pre_submit_pipeline_hash = _hash_prefix(project_dir / script_path, n=12)
+    pre_submit_spec_sha256 = _spec_hash(project_dir)
+    if pre_submit_spec_sha256 and not config.get("spec_sha256"):
+        config["spec_sha256"] = pre_submit_spec_sha256
     try:
         job_id = await backend.submit_run(
             str(run_dir), config,
@@ -1510,20 +1584,22 @@ async def _submit_cloud_data_gen(
     # after a TUI restart where the running→terminal transition was
     # never observed. Also carries the workflow id so the completion
     # telemetry closes the workflow opened above.
-    # Provenance captured AT SUBMISSION: the job runs the submitted
-    # pipeline against the submitted spec, regardless of local edits made
-    # while it executes.
-    from lqh.project_log import file_hash_prefix as _hash_prefix
-    from lqh.project_meta import compute_spec_sha256 as _spec_hash
+    # Provenance uses the PRE-SUBMISSION captures above: the job runs
+    # the submitted pipeline against the submitted spec, regardless of
+    # local edits made during the upload or while it executes.
+    from lqh.project_identity import project_uuid as _project_uuid
 
     marker = {
         "workflow_id": workflow_id,
         "output_dataset": output_dataset,
         "purpose": purpose,
         "script_path": script_path,
-        "pipeline_hash": _hash_prefix(project_dir / script_path, n=12),
-        "spec_sha256": _spec_hash(project_dir),
+        "pipeline_hash": pre_submit_pipeline_hash,
+        "spec_sha256": pre_submit_spec_sha256,
         "job_id": job_id,
+        # Owning project identity — a marker copied into another
+        # project's tree is recognizably foreign.
+        "owner_project_id": _project_uuid(project_dir),
         # Lets the finalizer refuse to clobber a dataset regenerated
         # locally AFTER this submit (older job finishing later).
         "submitted_at": time.time(),
@@ -2441,11 +2517,24 @@ async def handle_run_scoring(
             from lqh.scoring import JUDGE_MODELS, run_scoring
 
             output_dir = project_dir / "evals" / "runs" / run_name
-            if output_dir.exists():
+            try:
+                # Atomic claim — a bare exists() check races a second CLI.
+                output_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
                 return ToolResult(
                     content=f"Error: eval run '{run_name}' already exists. Use a different name."
                 )
+            except OSError as exc:
+                return ToolResult(
+                    content=f"Error: cannot create evals/runs/{run_name}: {exc}"
+                )
 
+            # Spec provenance is captured BEFORE the eval runs: a spec
+            # edit during a long evaluation must not attribute the
+            # output to the completion-time spec it never ran under.
+            from lqh.project_meta import compute_spec_sha256 as _spec_hash2
+
+            pre_eval_spec_sha256 = _spec_hash2(project_dir)
             debug_mode = os.environ.get("LQH_DEBUG", "").lower() in ("1", "true", "yes")
             result = await run_scoring(
                 dataset_path=data_path,
@@ -2463,13 +2552,12 @@ async def handle_run_scoring(
 
             # Write config.json
             scoring_model = JUDGE_MODELS.get(model_size, f"judge:{model_size}")
-            from lqh.project_meta import compute_spec_sha256 as _spec_hash2
 
             config_data: dict[str, Any] = {
                 "eval_dataset": dataset,
                 "scorer": scorer,
                 "mode": mode,
-                "spec_sha256": _spec_hash2(project_dir),
+                "spec_sha256": pre_eval_spec_sha256,
                 "scoring_model": scoring_model,
                 "inference_model": inference_model,
             }
@@ -2496,10 +2584,19 @@ async def handle_run_scoring(
             )
 
             # Finalization manifest for the eval run (reads the config.json
-            # and summary.json just written above).
+            # and summary.json just written above). A write failure is
+            # surfaced in the result — silently missing provenance would
+            # read as "this eval predates manifests".
             from lqh.manifest import write_run_manifest
 
-            write_run_manifest(project_dir, output_dir, state="completed")
+            _eval_manifest = write_run_manifest(
+                project_dir, output_dir, state="completed"
+            )
+            _eval_manifest_warn = (
+                "\n⚠️ Provenance manifest could not be written for this eval "
+                "run (check disk/logs)."
+                if _eval_manifest is None else ""
+            )
             reporter.update(
                 phase="completed",
                 phase_label=(
@@ -2525,6 +2622,7 @@ async def handle_run_scoring(
                     f"\n  Median score: {result.median_score:.1f}/10"
                     + (f"\n{distribution}" if distribution else "")
                     + f"\n  Results: evals/runs/{run_name}/"
+                    + _eval_manifest_warn
                 )
             )
         else:
@@ -2783,7 +2881,7 @@ async def _push_lqh_to_hf(
 
     try:
         job_id = await submit_transfer(
-            project_id=project_dir.name,
+            project_id=_ckey(project_dir),
             source_artifact_id=artifact_id,
             target_hf_repo=target_repo,
             private=private,
@@ -2821,7 +2919,7 @@ async def handle_gguf_convert(
 
     try:
         job_id = await submit_gguf(
-            project_id=project_dir.name,
+            project_id=_ckey(project_dir),
             source_artifact_id=artifact_id,
             quant_types=quant_types,
             target_hf_repo=target_hf_repo,
@@ -2864,7 +2962,7 @@ async def handle_artifacts(
     try:
         if act == "list":
             handles = await store.list_for_project(
-                project_dir.name, kind=kind, limit=limit,
+                _ckey(project_dir), kind=kind, limit=limit,
             )
             if not handles:
                 return ToolResult(content="No artifacts registered for this project.")
@@ -3003,11 +3101,20 @@ async def handle_push_to_production(
     **kwargs: Any,
 ) -> ToolResult:
     """Deploy a checkpoint artifact as a serving endpoint on LQH Cloud."""
+    # Deployment attribution ALWAYS uses the resolved stable key — a
+    # model-supplied project_id (e.g. a stale basename) would create the
+    # deployment outside this project's namespace. The parameter is no
+    # longer on the tool surface; a stray value is ignored.
+    if project_id and project_id != _ckey(project_dir):
+        logger.warning(
+            "push_to_production: ignoring supplied project_id %r (using %r)",
+            project_id, _ckey(project_dir),
+        )
     body: dict[str, Any] = {
         "name": name,
         "artifact_id": artifact_id,
         "tier": tier,
-        "project_id": project_id or project_dir.name,
+        "project_id": _ckey(project_dir),
     }
     if gpu_type:
         body["gpu_type"] = gpu_type
@@ -3401,12 +3508,16 @@ async def handle_hf_pull(
 
     target = _validate_path(project_dir, local_path)
     # Dataset immutability applies to imports too: refuse to clobber an
-    # existing local dataset's parquet files without explicit overwrite.
-    if repo_type == "dataset" and not overwrite:
+    # existing local dataset's parquet files. Recursive — a requested
+    # nested file like data/train.parquet must not slip past a top-level
+    # glob. overwrite=true from the model is a REQUEST, not consent:
+    # replacing existing data goes through the same human confirmation
+    # round-trip as data generation (auto mode always declines).
+    if repo_type == "dataset":
         existing_parquet = sorted(
-            p.name for p in target.glob("*.parquet")
+            str(p.relative_to(target)) for p in target.rglob("*.parquet")
         ) if target.is_dir() else []
-        if existing_parquet:
+        if existing_parquet and not overwrite:
             return ToolResult(content=(
                 f"Error: {local_path}/ already contains "
                 f"{', '.join(existing_parquet[:3])} — refusing to overwrite "
@@ -3414,6 +3525,21 @@ async def handle_hf_pull(
                 "(e.g. a versioned name), or pass overwrite=true only "
                 "after the user confirmed replacing it."
             ))
+        if existing_parquet and overwrite and not kwargs.get("_overwrite_consent"):
+            return ToolResult(
+                content="OVERWRITE_CONFIRMATION_REQUIRED",
+                requires_user_input=True,
+                question=(
+                    f"The agent wants to pull {repo_id} into {local_path}/, "
+                    f"which already contains {', '.join(existing_parquet[:3])}"
+                    f"{'…' if len(existing_parquet) > 3 else ''}. Existing "
+                    "files may be replaced and this cannot be undone. Allow?"
+                ),
+                options=[
+                    "Yes, replace the existing dataset files",
+                    "No, keep the existing data",
+                ],
+            )
     target.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -3920,6 +4046,42 @@ def _check_torch_available() -> str | None:
         )
 
 
+def _claim_run_name(
+    project_dir: Path, run_name: str | None, prefix: str
+) -> tuple[str | None, str | None]:
+    """Atomically reserve ``runs/<name>`` for a new run.
+
+    check-then-create races: two CLIs can both pass an existence check
+    and then truncate each other's config/logs via ``exist_ok=True``.
+    The claim here is the mkdir itself (``exist_ok=False`` — atomic at
+    the filesystem level). Auto-generated names retry on collision (the
+    other CLI took the next number first); explicit names surface an
+    error instead.
+
+    Returns ``(claimed_name, None)`` on success, ``(None, error)`` on
+    failure. On success the (empty) run directory exists — downstream
+    ``mkdir(exist_ok=True)`` calls are then benign.
+    """
+    explicit = run_name is not None
+    for _ in range(50):
+        name = run_name if explicit else _next_run_name(project_dir, prefix)
+        try:
+            (project_dir / "runs" / name).mkdir(parents=True, exist_ok=False)
+            return name, None
+        except FileExistsError:
+            if explicit:
+                return None, (
+                    f"run '{name}' already exists — run names must be "
+                    "unique (an existing run's config/logs would be "
+                    "overwritten). Pick a different run_name or omit it "
+                    "for an auto-generated one."
+                )
+            continue  # racing CLI claimed this number; take the next
+        except OSError as exc:
+            return None, f"cannot create runs/{name}: {exc}"
+    return None, f"could not allocate a unique '{prefix}_*' run name"
+
+
 def _next_run_name(project_dir: Path, prefix: str) -> str:
     """Generate the next sequential run name (e.g. sft_001, sft_002)."""
     runs_dir = project_dir / "runs"
@@ -4226,15 +4388,15 @@ async def handle_start_training(
             )
         )
 
-    # Generate run name
-    if not run_name:
-        prefix = "sft" if type == "sft" else "dpo"
-        run_name = _next_run_name(project_dir, prefix)
+    # Atomically claim the run name (auto-generated names retry on a
+    # collision with a racing CLI; explicit names error out).
+    run_name, claim_err = _claim_run_name(
+        project_dir, run_name or None, "sft" if type == "sft" else "dpo"
+    )
+    if claim_err:
+        return ToolResult(content=f"Error: {claim_err}")
 
     run_dir = project_dir / "runs" / run_name
-
-    if run_dir.exists() and (run_dir / "config.json").exists():
-        return ToolResult(content=f"Error: run '{run_name}' already exists")
 
     # Build config
     default_lr = 2e-5 if type == "sft" else 5e-6
@@ -5388,17 +5550,11 @@ async def handle_start_local_eval(
     except FileNotFoundError as e:
         return ToolResult(content=f"Error: {e}")
 
-    # Generate run name
-    if not run_name:
-        run_name = _next_run_name(project_dir, "local_eval")
+    run_name, claim_err = _claim_run_name(project_dir, run_name or None, "local_eval")
+    if claim_err:
+        return ToolResult(content=f"Error: {claim_err}")
 
     eval_run_dir = project_dir / "runs" / run_name
-    if eval_run_dir.exists():
-        return ToolResult(content=(
-            f"Error: run '{run_name}' already exists — run names must be "
-            "unique (an existing run's config/logs would be overwritten). "
-            "Pick a different run_name or omit it for an auto-generated one."
-        ))
 
     # Build infer config
     config: dict[str, Any] = {
@@ -5500,16 +5656,10 @@ async def handle_eval_hf_model(
     except FileNotFoundError as e:
         return ToolResult(content=f"Error: {e}")
 
-    if not run_name:
-        run_name = _next_run_name(project_dir, "eval_hf")
+    run_name, claim_err = _claim_run_name(project_dir, run_name or None, "eval_hf")
+    if claim_err:
+        return ToolResult(content=f"Error: {claim_err}")
     run_dir = project_dir / "runs" / run_name
-    if run_dir.exists():
-        return ToolResult(content=(
-            f"Error: run '{run_name}' already exists — run names must be "
-            "unique (an existing run's config/logs would be overwritten). "
-            "Pick a different run_name or omit it for an auto-generated one."
-        ))
-    run_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Build sandbox config ---
     # The sandbox cd's to the bundle root, so the dataset / scorer
@@ -5647,16 +5797,11 @@ async def _start_local_eval_remote(
     except FileNotFoundError as e:
         return ToolResult(content=f"Error: {e}")
 
-    if not run_name:
-        run_name = _next_run_name(project_dir, "remote_eval")
+    run_name, claim_err = _claim_run_name(project_dir, run_name or None, "remote_eval")
+    if claim_err:
+        return ToolResult(content=f"Error: {claim_err}")
 
     run_dir = project_dir / "runs" / run_name
-    if run_dir.exists():
-        return ToolResult(content=(
-            f"Error: run '{run_name}' already exists — run names must be "
-            "unique (an existing run's config/logs would be overwritten). "
-            "Pick a different run_name or omit it for an auto-generated one."
-        ))
     config: dict[str, Any] = {
         "type": "infer",
         "spec_sha256": _eval_spec_hash(project_dir),

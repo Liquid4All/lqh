@@ -1144,13 +1144,6 @@ def get_all_tools(*, auto_mode: bool = False) -> list[dict]:
                             "Omit for the default."
                         ),
                     },
-                    "project_id": {
-                        "type": "string",
-                        "description": (
-                            "Project to attribute the deployment to. Defaults to "
-                            "the current project."
-                        ),
-                    },
                     "artifact_format": {
                         "type": "string",
                         "enum": ["lora", "full"],

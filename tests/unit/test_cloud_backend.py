@@ -61,6 +61,7 @@ class _FakeCloudBackend:
         self.events: dict[str, list[dict]] = {}  # job_id -> list of SSE events
         self.cancelled: set[str] = set()
         self.idempotency: dict[str, str] = {}  # idempotency_key -> job_id
+        self.last_submit_meta: dict | None = None
         self._next_id = 1
 
     def add_events(self, job_id: str, events: list[dict]) -> None:
@@ -81,9 +82,10 @@ class _FakeCloudBackend:
         method = request.method
 
         if path == "/v1/cloud/jobs" and method == "POST":
+            self.last_submit_meta = _extract_submit_meta(request)
             # Mirror the real backend's idempotency: a key that already
             # resolved to a job returns that job with 200.
-            key = (_extract_submit_meta(request) or {}).get("idempotency_key")
+            key = (self.last_submit_meta or {}).get("idempotency_key")
             if key and key in self.idempotency:
                 jid = self.idempotency[key]
                 return httpx.Response(
@@ -200,6 +202,35 @@ def test_submit_writes_state_and_run_metadata(tmp_path, fake_cloud):
     from lqh.signals import load_seen_states
 
     assert load_seen_states(project) == {"run_001": "running"}
+
+
+def test_submit_carries_stable_key_and_owner(tmp_path, fake_cloud):
+    """End-to-end through CloudBackend.submit_run: the submitted meta
+    carries the RESOLVED cloud key (stable UUID), the local markers
+    record the owning identity, and the config gains the spec hash."""
+    from lqh.project_identity import ensure_identity, project_uuid
+    from lqh.project_meta import compute_spec_sha256
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    identity, classification = ensure_identity(project)  # fresh → UUID key
+    assert classification == "new"
+    (project / "SPEC.md").write_text("# the spec\n")
+    run_dir = project / "runs" / "run_001"
+    backend = _make_backend(project)
+
+    config = {"manifest": [], "type": "sft"}
+    asyncio.run(backend.submit_run(str(run_dir), config, module="lqh.train"))
+
+    meta = fake_cloud.last_submit_meta
+    assert meta["project_id"] == identity["project_id"]  # UUID, not "proj"
+    # Spec provenance rides in the submitted config for the sandbox-side
+    # lineage/manifest writers.
+    assert meta["config"]["spec_sha256"] == compute_spec_sha256(project)
+    # Local markers record their owning identity so a copied run dir is
+    # recognizably foreign in another project.
+    remote_job = json.loads((run_dir / "remote_job.json").read_text())
+    assert remote_job["owner_project_id"] == project_uuid(project)
 
 
 def test_submit_failure_closes_client_workflow(tmp_path, monkeypatch):
