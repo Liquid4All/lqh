@@ -53,6 +53,30 @@ its own judgment.
 Iteration is the norm, not the exception: poor data quality sends you
 back to 3–6, a model that doesn't learn sends you back to 5–8.
 
+### Read the stage skill BEFORE doing the stage's work
+
+The skills are the authoritative playbooks (and API references) lqh's
+own agent follows — as the orchestrating agent, you follow them too.
+Pull the relevant one with `lqh docs skill <name>` before starting:
+
+| Doing | Read first |
+|---|---|
+| Writing/refining SPEC.md (steps 1–2) | `spec_capture` |
+| Authoring a data-gen pipeline or scorer (steps 2–5) | `data_generation` — the ONLY complete `lqh.pipeline` API reference |
+| Image/VLM datasets | `vision_data_generation` |
+| Scoring criteria for generated data | `data_validation` |
+| Filtering user-brought data (step 6) | `data_filtering` |
+| Baseline/model evaluation (steps 7, 11) | `evaluation` |
+| Training runs (steps 8–9) | `train` |
+| System-prompt optimization | `prompt_optimization` |
+
+Skills are written for lqh's built-in agent, so they reference its
+internal tools — substitute your own: where a skill says `create_file` /
+`edit_file` / `read_file`, use your file tools; `show_file` + `ask_user`
+means "show the samples to your user and collect feedback"; tools from
+the table below (`run_data_gen_pipeline`, `run_scoring`,
+`start_training`, …) are invoked as `lqh tool call <name>`.
+
 ## Integration modes
 
 - **`lqh tool …`**: call individual pipeline steps and get a JSON
@@ -193,7 +217,11 @@ Delegate a whole step to lqh's agent:
 lqh run "Generate a 200-sample draft training set for the spec, score it, and report the quality distribution."
 ```
 
-Run a data-generation pipeline (smoke test, 3 samples):
+Author and run a data-generation pipeline — read
+`lqh docs skill data_generation` FIRST (it is the authoritative
+`lqh.pipeline` API contract; pipelines written without it usually fail
+the import/interface validation), write `data_gen/<name>.py` with your
+own file tools, then smoke-test with 3 samples:
 
 ```
 lqh tool call run_data_gen_pipeline --args '{

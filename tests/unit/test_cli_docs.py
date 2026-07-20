@@ -39,6 +39,8 @@ def test_guide_contains_version_and_all_exposed_tools() -> None:
     # Core contract sections present.
     for heading in (
         "act, don't summarize",
+        "### Read the stage skill BEFORE doing the stage's work",
+        "docs skill data_generation",
         "## What LQH is",
         "## The fine-tuning workflow",
         "## Consent model",
