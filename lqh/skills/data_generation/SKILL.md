@@ -32,6 +32,7 @@ This is why data generation and eval criteria creation are in the same skill.
 8. **NO system messages in generated data.** Pipelines must only generate user + assistant turns. System prompts are managed separately (via `prompts/` files) and injected at eval time. This allows prompt optimization to test different system prompts on the same data.
 9. **Break out of failure loops.** If three consecutive `run_data_gen_pipeline` calls fail with the **same error message**, STOP retrying. Use `ask_user` to describe what you've tried and what the error says — the user may spot something you missed. Do not keep editing until you have a new hypothesis.
 
+<!-- lqh-docs-data:start -->
 ## Pipeline Interface
 
 ⚠️ **CRITICAL: Import correctly!** Every pipeline MUST start with `from lqh.pipeline import ...`.
@@ -646,6 +647,7 @@ Rules:
   assume the dataset exists before that call returns). Scoring/filtering of
   the downloaded dataset then proceeds exactly as after a local run.
 
+<!-- lqh-docs-data:end -->
 ## Workflow
 
 ### Phase 1: Draft Iteration (Human-in-the-Loop)
@@ -1152,6 +1154,7 @@ Do not endlessly tune learning rates. The marginal gain is small;
 the cost is large; an honest "DPO doesn't help here" is more useful
 than five hours of wishful experiments.
 
+<!-- lqh-docs-data:start -->
 ## Pipeline Troubleshooting
 
 ### Root-cause discipline for data quality issues
@@ -1199,6 +1202,7 @@ Do not rely on "it should work now" reasoning without evidence.
 - Recurring `GenerationError` with the same message across 3+ retries — see
   Rule 9: stop, call `ask_user`, describe what you tried.
 
+<!-- lqh-docs-data:end -->
 ## Next Steps
 
 After the validation set is generated and scored, the recommended path is **validate → scale → polish**:
@@ -1211,6 +1215,7 @@ After the validation set is generated and scored, the recommended path is **vali
 
 When the user chooses to train, generate a **training dataset** (separate from the validation set) using the same pipeline. Start with 200-500 samples for the pilot, then scale to thousands once improvement is confirmed. Load the `train` skill for the full training workflow.
 
+<!-- lqh-docs-data:start -->
 ## Common Mistakes to Avoid
 
 1. **Forgetting `liquidrandom`**: Every pipeline should use at least one `liquidrandom` category. Without it, the data will be monotonous.
@@ -1249,3 +1254,4 @@ explicitly confirmed the existing data should be destroyed. Every finalized
 dataset gets a `manifest.json` (purpose, pipeline, sources, spec revision)
 written automatically — when SPEC.md changes later, these manifests let lqh
 flag which datasets were built against the older spec.
+<!-- lqh-docs-data:end -->

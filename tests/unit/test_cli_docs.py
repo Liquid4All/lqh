@@ -40,7 +40,7 @@ def test_guide_contains_version_and_all_exposed_tools() -> None:
     for heading in (
         "act, don't summarize",
         "### Read the stage skill BEFORE doing the stage's work",
-        "docs skill data_generation",
+        "lqh docs data",
         "## What LQH is",
         "## The fine-tuning workflow",
         "## Consent model",
@@ -58,12 +58,53 @@ def test_docs_skills_lists_skills(monkeypatch, capsys) -> None:
     assert "spec_capture" in out
 
 
-def test_docs_skill_prints_verbatim(monkeypatch, capsys) -> None:
+def test_docs_skill_raw_prints_verbatim(monkeypatch, capsys) -> None:
     from lqh.skills import load_skill_content
 
-    assert _run(["lqh", "docs", "skill", "auto"], monkeypatch) == 0
+    assert _run(["lqh", "docs", "skill", "auto", "--raw"], monkeypatch) == 0
     out = capsys.readouterr().out
     assert out == load_skill_content("auto")  # verbatim, no extra newline
+
+
+def test_docs_skill_default_is_harness_rendered(monkeypatch, capsys) -> None:
+    assert _run(["lqh", "docs", "skill", "data_generation"], monkeypatch) == 0
+    out = capsys.readouterr().out
+    assert "Rendered for external harnesses" in out
+    # Internal tool names generalized in prose...
+    assert "[your file-edit tool]" in out
+    assert "[ask your user]" in out
+    # ...but the executable pipeline tool names stay literal.
+    assert "run_data_gen_pipeline" in out
+
+
+def test_render_for_harness_skips_code_fences() -> None:
+    from lqh.cli_cmds.docs_cmd import render_for_harness
+
+    content = (
+        "Use `create_file` to make it.\n"
+        "```python\n"
+        "# create_file stays literal inside code\n"
+        "```\n"
+        "Then `ask_user` for feedback.\n"
+    )
+    rendered = render_for_harness(content)
+    assert "[your file-create tool]" in rendered
+    assert "[ask your user]" in rendered
+    assert "# create_file stays literal inside code" in rendered
+
+
+def test_docs_data_reference(monkeypatch, capsys) -> None:
+    assert _run(["lqh", "docs", "data"], monkeypatch) == 0
+    out = capsys.readouterr().out
+    # The single-sourced technical blocks are present...
+    assert "## Pipeline Interface" in out
+    assert "from lqh.pipeline import" in out
+    assert "## Common Mistakes to Avoid" in out
+    # ...the internal-agent workflow phases are not...
+    assert "Phase 1: Draft Iteration" not in out
+    # ...markers don't leak, and execution goes through lqh.
+    assert "lqh-docs-data" not in out
+    assert "lqh tool call run_data_gen_pipeline" in out
 
 
 def test_docs_unknown_skill_exit_2(monkeypatch, capsys) -> None:

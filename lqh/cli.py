@@ -194,8 +194,25 @@ def _build_parser() -> argparse.ArgumentParser:
     docs_sub.required = True
     docs_sub.add_parser("agents", help="Full harness-facing guide (markdown).")
     docs_sub.add_parser("skills", help="List available skills.")
-    docs_skill = docs_sub.add_parser("skill", help="Print a skill's SKILL.md verbatim.")
+    docs_sub.add_parser(
+        "data",
+        help=(
+            "The lqh.pipeline reference for authoring a data-gen pipeline "
+            "as an external agent."
+        ),
+    )
+    docs_skill = docs_sub.add_parser(
+        "skill",
+        help=(
+            "Print a skill playbook (internal tool names generalized for "
+            "external agents; --raw for verbatim)."
+        ),
+    )
     docs_skill.add_argument("name", help="Skill name (see `lqh docs skills`).")
+    docs_skill.add_argument(
+        "--raw", action="store_true",
+        help="Print the SKILL.md byte-verbatim (as lqh's own agent sees it).",
+    )
 
     tool = sub.add_parser(
         "tool",

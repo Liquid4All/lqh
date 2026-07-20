@@ -62,7 +62,8 @@ Pull the relevant one with `lqh docs skill <name>` before starting:
 | Doing | Read first |
 |---|---|
 | Writing/refining SPEC.md (steps 1–2) | `spec_capture` |
-| Authoring a data-gen pipeline or scorer (steps 2–5) | `data_generation` — the ONLY complete `lqh.pipeline` API reference |
+| Authoring a data-gen pipeline (steps 3–5) | **`lqh docs data`** — the focused `lqh.pipeline` API reference |
+| The full data-gen workflow incl. scorer creation | `data_generation` |
 | Image/VLM datasets | `vision_data_generation` |
 | Scoring criteria for generated data | `data_validation` |
 | Filtering user-brought data (step 6) | `data_filtering` |
@@ -70,12 +71,12 @@ Pull the relevant one with `lqh docs skill <name>` before starting:
 | Training runs (steps 8–9) | `train` |
 | System-prompt optimization | `prompt_optimization` |
 
-Skills are written for lqh's built-in agent, so they reference its
-internal tools — substitute your own: where a skill says `create_file` /
-`edit_file` / `read_file`, use your file tools; `show_file` + `ask_user`
-means "show the samples to your user and collect feedback"; tools from
-the table below (`run_data_gen_pipeline`, `run_scoring`,
-`start_training`, …) are invoked as `lqh tool call <name>`.
+Skills are written for lqh's built-in agent; `lqh docs skill` renders
+them for you by generalizing internal tool names into bracketed
+phrases ("[your file-edit tool]", "[ask your user]") — use your own
+equivalents there (`--raw` shows the verbatim text). Tools from the
+table below (`run_data_gen_pipeline`, `run_scoring`, `start_training`,
+…) are real and invoked as `lqh tool call <name>`.
 
 ## Integration modes
 
@@ -182,7 +183,9 @@ works offline/locally.
 ```
 lqh hello                       # this guide (alias: lqh docs agents)
 lqh docs skills                 # list built-in skills
-lqh docs skill <name>           # print a skill's SKILL.md (workflow playbooks)
+lqh docs skill <name> [--raw]   # print a skill playbook (harness-rendered)
+lqh docs data                   # the lqh.pipeline API reference for authoring
+                                # data-gen pipelines as an external agent
 lqh login [--no-browser]        # device-flow auth
 lqh run "<task>" [--project DIR] [--allow-publish] [--resume ID]
         [--max-turns N] [--max-tool-calls N] [--timeout SECONDS]
@@ -217,11 +220,11 @@ Delegate a whole step to lqh's agent:
 lqh run "Generate a 200-sample draft training set for the spec, score it, and report the quality distribution."
 ```
 
-Author and run a data-generation pipeline — read
-`lqh docs skill data_generation` FIRST (it is the authoritative
-`lqh.pipeline` API contract; pipelines written without it usually fail
-the import/interface validation), write `data_gen/<name>.py` with your
-own file tools, then smoke-test with 3 samples:
+Author and run a data-generation pipeline — read `lqh docs data` FIRST
+(the authoritative `lqh.pipeline` API contract; pipelines written
+without it usually fail the import/interface validation), write
+`data_gen/<name>.py` with your own file tools, then smoke-test with 3
+samples:
 
 ```
 lqh tool call run_data_gen_pipeline --args '{
