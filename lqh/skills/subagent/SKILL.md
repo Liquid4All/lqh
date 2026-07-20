@@ -40,10 +40,13 @@ sit on top of it.
    their rationale, and anything the next session (human, TUI agent, or
    another sub-agent) must know. Read it (and SPEC.md) before acting —
    verify its claims with tools rather than trusting them blindly.
-7. **Respect output immutability.** Never pass `overwrite: true` on your
-   own judgment — allocate a versioned name (`train_v2`) instead. The
-   only exception is when the delegated task explicitly names an existing
-   output to replace.
+7. **Respect output immutability.** Never pass `overwrite: true` —
+   destructive overwrites are always declined in sub-agent runs, even
+   when the task names an output to replace. Allocate a versioned name
+   (`train_v2`) instead, and note in your summary that the old output
+   was kept; the delegating harness can replace it explicitly with
+   `lqh tool call … --args '{…, "overwrite": true}'` if that is truly
+   intended.
 8. **Investigate signals before spending.** Your startup context includes
    attention signals (jobs finished while away, orphan submit intents,
    spec drift). If one affects your task, resolve or account for it

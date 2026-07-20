@@ -54,6 +54,13 @@ def _configure_logging(project_dir: Path) -> None:
     logging.lastResort = None
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lqh",
@@ -212,12 +219,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Permit outward-facing publishing tools in this run.",
     )
     run.add_argument(
-        "--max-turns", type=int, default=None, metavar="N",
+        "--project", metavar="DIR", default=None,
+        help="Project directory (defaults to the current directory).",
+    )
+    run.add_argument(
+        "--max-turns", type=_positive_int, default=None, metavar="N",
         help="Abort with limit_exceeded after N LLM calls.",
     )
     run.add_argument(
-        "--max-tool-calls", type=int, default=None, metavar="N",
+        "--max-tool-calls", type=_positive_int, default=None, metavar="N",
         help="Abort with limit_exceeded after N tool calls (total).",
+    )
+    run.add_argument(
+        "--timeout", type=_positive_int, default=None, metavar="SECONDS",
+        help="Abort with timed_out after SECONDS of wall clock.",
     )
     run.add_argument(
         "--save-secret", action="store_true",

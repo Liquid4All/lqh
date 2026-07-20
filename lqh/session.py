@@ -311,6 +311,32 @@ class Session:
         self.state = state
         return self.save()
 
+    def claim_active(self) -> bool:
+        """Atomically claim run ownership of this session.
+
+        Check-and-mark under the session lock: refuses when the on-disk
+        meta says another LIVE process owns the session (state "active"
+        with an alive pid ≠ ours, pid-start checked against reuse);
+        otherwise marks it active with our pid. This is the run-loop
+        exclusivity guard (CLI_PLAN §7) — a plain "read state, then
+        mark_state" would let two resuming processes both pass the check.
+        """
+        with file_lock(self._lock_path):
+            try:
+                meta = json.loads(self._meta_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                meta = {}
+            owner_pid = meta.get("pid")
+            if (
+                meta.get("state") == STATE_ACTIVE
+                and owner_pid != os.getpid()
+                and _pid_alive(owner_pid, meta.get("pid_start"))
+            ):
+                return False
+            self.state = STATE_ACTIVE
+            self.updated_at = _now()
+            return self._write_meta_unlocked()
+
     # ------------------------------------------------------------------
     # Log access and compaction
     # ------------------------------------------------------------------

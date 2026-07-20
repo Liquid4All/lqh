@@ -25,6 +25,8 @@ def _ns(task: str | None = None, **kw) -> argparse.Namespace:
         save_secret=kw.get("save_secret", False),
         quiet=kw.get("quiet", False),
         spec=kw.get("spec"),
+        project=kw.get("project"),
+        timeout=kw.get("timeout"),
     )
 
 
@@ -41,6 +43,7 @@ class _FakeAgent:
     auto_exit_details: dict = {}
     policy_halt: tuple[str, str] | None = None
     script: list | None = None  # optional list of (tool, args, result_content)
+    delay: float = 0.0  # simulated work duration
 
     def __init__(self, project_dir, session, callbacks=None, *, policy=None,
                  extra_spec=None, **_kw) -> None:
@@ -54,6 +57,8 @@ class _FakeAgent:
         self.delivered_secrets: list = []
         self._total_prompt_tokens = 11
         self._total_completion_tokens = 7
+        self._run_prompt_tokens = 11
+        self._run_completion_tokens = 7
         self._handle_tool_call = self._handle  # driver wraps this attribute
 
     async def _handle(self, tool_name, arguments, **kw):
@@ -67,10 +72,14 @@ class _FakeAgent:
     def abort_turn(self) -> None: ...
 
     async def process_user_input(self, text: str) -> None:
+        import asyncio
+
         # Mirror the real agent: the user message lands in the session
         # (which materializes the lazy session dir on disk).
         self.session.add_message({"role": "user", "content": text})
         cls = type(self)
+        if cls.delay:
+            await asyncio.sleep(cls.delay)
         if self.callbacks and self.callbacks.on_tool_call:
             for tool, args, content in cls.script or []:
                 await self.callbacks.on_tool_call(tool, args)
@@ -92,10 +101,12 @@ def run_project(tmp_path, monkeypatch):
         raise RuntimeError("offline")
 
     monkeypatch.setattr("lqh.snapshot.fetch_and_cache_snapshot", _no_fetch)
+    monkeypatch.setattr("lqh.cli_cmds.run_cmd._maybe_start_telemetry", lambda p: None)
     _FakeAgent.auto_exit = ("success", "did the thing")
     _FakeAgent.auto_exit_details = {}
     _FakeAgent.policy_halt = None
     _FakeAgent.script = None
+    _FakeAgent.delay = 0.0
     return tmp_path
 
 
@@ -103,7 +114,10 @@ def test_no_task_is_usage_error(tmp_path, monkeypatch, capfd) -> None:
     monkeypatch.chdir(tmp_path)
     assert cmd_run(_ns()) == 2
     out, err = capfd.readouterr()
-    assert out == ""  # no result JSON for usage errors
+    # Even usage errors keep the one-JSON-document contract (audit #2).
+    payload = json.loads(out)
+    assert payload["status"] == "failure"
+    assert "task is required" in payload["reason"]
     assert "task is required" in err
 
 
@@ -250,18 +264,41 @@ def test_resume_completed_session(run_project, capfd) -> None:
 
 
 def test_resume_active_session_refused(run_project, capfd, monkeypatch) -> None:
-    from lqh.session import Session
+    from lqh.session import sessions_dir
 
     cmd_run(_ns("first task"))
     first, _ = _read_result(capfd)
     session_id = first["session_id"]
-    # Simulate a live owner: state active + our (alive) pid.
-    session = Session.load(run_project, session_id)
-    session.state = "active"
-    session._write_meta()
+    # Simulate a live FOREIGN owner: state active + pid 1 (alive, not us,
+    # no pid_start so the reuse check is skipped).
+    meta_path = sessions_dir(run_project) / session_id / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta.update(state="active", pid=1, pid_start=None)
+    meta_path.write_text(json.dumps(meta))
     assert cmd_run(_ns(None, resume=session_id)) == 2
-    _, err = capfd.readouterr()
+    out, err = capfd.readouterr()
     assert "active in another process" in err
+    # Usage errors still emit the JSON result document.
+    assert json.loads(out)["status"] == "failure"
+
+
+def test_timeout_maps_to_timed_out(run_project, capfd) -> None:
+    _FakeAgent.delay = 10.0
+    assert cmd_run(_ns("x", timeout=1)) == 6
+    result, _ = _read_result(capfd)
+    assert result["status"] == "timed_out"
+
+
+def test_project_flag_selects_directory(run_project, tmp_path, monkeypatch, capfd) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    code = cmd_run(_ns("x", project=str(run_project)))
+    result, _ = _read_result(capfd)
+    assert code == 0
+    # The session landed in the --project directory, not the cwd.
+    assert (run_project / ".lqh" / "conversations").exists()
+    assert not (elsewhere / ".lqh" / "conversations").exists()
 
 
 def test_artifact_ledger_rules(tmp_path: Path) -> None:

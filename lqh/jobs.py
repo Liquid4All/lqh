@@ -22,12 +22,12 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from lqh.project_identity import cloud_project_key as _ckey
-from lqh.tui.background_tasks import BackgroundTask, BackgroundTaskRegistry
+from lqh.background_tasks import BackgroundTask, BackgroundTaskRegistry
 
 if TYPE_CHECKING:
     from lqh.subprocess_manager import SubprocessManager

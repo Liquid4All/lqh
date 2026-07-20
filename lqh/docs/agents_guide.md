@@ -138,13 +138,15 @@ lqh hello                       # this guide (alias: lqh docs agents)
 lqh docs skills                 # list built-in skills
 lqh docs skill <name>           # print a skill's SKILL.md (workflow playbooks)
 lqh login [--no-browser]        # device-flow auth
-lqh run "<task>" [--allow-publish] [--resume ID] [--max-turns N]
-        [--max-tool-calls N] [--prompt-file f|-] [--quiet] [--save-secret]
+lqh run "<task>" [--project DIR] [--allow-publish] [--resume ID]
+        [--max-turns N] [--max-tool-calls N] [--timeout SECONDS]
+        [--prompt-file f|-] [--quiet] [--save-secret]
 lqh tool list [--json]          # the tools below
 lqh tool schema <name>          # JSON schema for a tool's arguments
 lqh tool call <name> --args '<json>' [--args-file f|-] [--pretty] [--save-secret]
 lqh tool call training_status --args '{"run_name": "…"}' --wait
                                 # park until the run is terminal (results incl.)
+lqh status [--json]             # run states + attention signals at a glance
 lqh project continue|fork       # resolve a copied project directory (see below)
 ```
 

@@ -111,7 +111,9 @@ def _load_args(ns: argparse.Namespace) -> tuple[dict | None, str | None]:
     return parsed, None
 
 
-def _boot_gate(tool_name: str, meta: dict, project_dir: Path) -> tuple[dict, int] | None:
+def _boot_gate(
+    tool_name: str, meta: dict, project_dir: Path, call_args: dict,
+) -> tuple[dict, int] | None:
     """Identity/copy contract before a mutating or cloud call (CLI_PLAN §4.8).
 
     Read-only local tools skip all writes: only a passive copy check when
@@ -119,6 +121,11 @@ def _boot_gate(tool_name: str, meta: dict, project_dir: Path) -> tuple[dict, int
     calls run the full headless boot and fail closed (exit 5).
     """
     read_only_local = not meta["mutating"] and not meta["needs_auth"]
+    # compute_set without a value is a query ("show current target") —
+    # treat it as read-only so it neither creates identity state nor gets
+    # blocked in an unresolved copy.
+    if tool_name == "compute_set" and not call_args.get("value"):
+        read_only_local = True
 
     if read_only_local:
         from lqh.project_identity import detect_copy
@@ -136,7 +143,18 @@ def _boot_gate(tool_name: str, meta: dict, project_dir: Path) -> tuple[dict, int
                 print(f"warning: project identity unreadable: {e}", file=sys.stderr)
         return None
 
-    from lqh.headless import headless_boot
+    from lqh.headless import headless_boot, live_loop_owner
+
+    # Advisory (CLI_PLAN §7): mutating calls beside a live agent loop are
+    # unsupported — warn, don't block.
+    other_loop = live_loop_owner(project_dir)
+    if other_loop is not None:
+        print(
+            f"warning: another lqh agent loop (pid {other_loop}) appears to "
+            "be running in this project; a concurrent mutating call may "
+            "interleave with its work.",
+            file=sys.stderr,
+        )
 
     boot = headless_boot(project_dir)
     if boot.identity_error:
@@ -144,8 +162,9 @@ def _boot_gate(tool_name: str, meta: dict, project_dir: Path) -> tuple[dict, int
             tool_name,
             "config",
             "Project identity file is corrupt and will NOT be auto-replaced: "
-            f"{boot.identity_error}\nFix or remove .lqh/project.json "
-            "(this affects cloud-side project attribution), then retry.",
+            f"{boot.identity_error}\nRestore .lqh/project.json (e.g. from a "
+            "backup or the original project directory) — do NOT delete it; "
+            "a fresh identity would disconnect this project's cloud history.",
         )
     if boot.copy_status == "copied":
         return error_envelope(
@@ -257,7 +276,7 @@ def _cmd_call(ns: argparse.Namespace) -> int:
             emit(envelope, pretty=ns.pretty)
             return code
 
-    gate = _boot_gate(tool_name, meta, project_dir)
+    gate = _boot_gate(tool_name, meta, project_dir, call_args)
     if gate is not None:
         envelope, code = gate
         emit(envelope, pretty=ns.pretty)

@@ -645,6 +645,11 @@ class LqhApp:
 
     def _exit_application(self) -> None:
         """Exit the prompt_toolkit app only if it is still actively running."""
+        # Drop the advisory agent-loop marker (owned-by-us only, so an
+        # accidental double call or a foreign owner is never affected).
+        from lqh.headless import release_loop
+
+        release_loop(self.project_dir)
         if self._app and self._app.is_running:
             self._app.exit()
 
@@ -2388,7 +2393,7 @@ class LqhApp:
         # so quitting early can never leave a project without an identity.
         # A corrupt identity file is surfaced (after the UI is up), never
         # silently replaced: cloud key resolution fails closed on it.
-        from lqh.headless import headless_boot
+        from lqh.headless import claim_loop, headless_boot
 
         # Shared with the headless CLI (lqh/headless.py): identity, copy
         # detection, and repairing sessions left "active" by a dead
@@ -2396,6 +2401,10 @@ class LqhApp:
         boot = headless_boot(self.project_dir)
         identity_error = boot.identity_error
         copy_status = boot.copy_status
+        # Advisory loop marker (CLI_PLAN §7): lets a concurrent headless
+        # `lqh run` / mutating `lqh tool call` warn that an agent loop is
+        # already working here. Best-effort; released on shutdown.
+        claim_loop(self.project_dir)
         self._session = Session.create(self.project_dir)
         from lqh.project_log import set_log_session
         set_log_session(self._session.id)

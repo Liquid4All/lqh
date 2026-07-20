@@ -447,6 +447,8 @@ class Agent:
         self._client = None
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
+        self._run_prompt_tokens = 0
+        self._run_completion_tokens = 0
         self._turn_number = 0
         self._active_skill: str | None = None
         self._spec_edit_logged: dict[str, bool] = {}
@@ -829,6 +831,14 @@ class Agent:
                 # Handle 401 specifically
                 from openai import AuthenticationError
                 if isinstance(e, AuthenticationError):
+                    if self.policy.no_user:
+                        # Headless: classify instead of prose — the run
+                        # driver maps this to status auth_required / exit 4.
+                        self._policy_halt = (
+                            "auth_required",
+                            "Authentication failed: the API key is invalid "
+                            "or expired. Run `lqh login` and retry.",
+                        )
                     if self.callbacks.on_agent_message:
                         await self.callbacks.on_agent_message(
                             "❌ Authentication failed. Your API key is invalid or expired. "
@@ -851,6 +861,10 @@ class Agent:
                 # context footprint. Summing across turns double-counts the history.
                 self._total_prompt_tokens = prompt_tok
                 self._total_completion_tokens = completion_tok
+                # Run-wide BILLED usage (what every API call consumed in
+                # total) — this one sums; the headless driver reports it.
+                self._run_prompt_tokens += prompt_tok
+                self._run_completion_tokens += completion_tok
                 self.session.prompt_tokens = self._total_prompt_tokens
                 self.session.completion_tokens = self._total_completion_tokens
                 if self.callbacks.on_token_update:
@@ -986,6 +1000,22 @@ class Agent:
                 tool_calls_this_turn += len(message.tool_calls)
                 for tc in message.tool_calls:
                     tool_name = tc.function.name if tc.function else "unknown"
+                    # Terminal state (exit_auto_mode or a policy halt) set by
+                    # an EARLIER call in this same batch: do not execute the
+                    # remaining calls — they could mutate state or spend
+                    # compute after the run has terminated. Each still gets a
+                    # synthetic tool result so the transcript stays valid for
+                    # a later resume (every tool_call id must be answered).
+                    if self._auto_exit is not None or self._policy_halt is not None:
+                        self.session.add_message({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": (
+                                "[Skipped: the run reached a terminal state "
+                                "before this call executed.]"
+                            ),
+                        })
+                        continue
                     try:
                         arguments = json.loads(tc.function.arguments) if tc.function and tc.function.arguments else {}
                     except json.JSONDecodeError:
@@ -1166,24 +1196,65 @@ class Agent:
         """
         arguments = {k: v for k, v in arguments.items() if not k.startswith("_")}
         # Sub-agent publish gate (CLI_PLAN §3.3): outward-facing publishing
-        # is denied unless the caller passed --allow-publish. The denial is
-        # TERMINAL — the run ends with needs_permission and the exact
-        # re-invocation hint, so the model must not retry or work around it.
+        # is denied unless the caller passed --allow-publish OR a prior
+        # durable grant covers it (grants made in the TUI count — the CLI
+        # policy sits ABOVE the store, it does not shadow it). The denial
+        # is TERMINAL — the run ends with needs_permission and the exact
+        # resumable re-invocation, so the model must not retry or work
+        # around it.
         from lqh.agent_policy import PUBLISH_TOOLS
 
         if tool_name in PUBLISH_TOOLS and not self.policy.allow_publish:
-            hint = (
-                f"The '{tool_name}' capability is gated on this surface. "
-                "Re-invoke with `lqh run --allow-publish ...` (or grant it "
-                "in the TUI) to enable publishing."
-            )
-            self._policy_halt = ("needs_permission", hint)
-            return ToolResult(
-                content=(
-                    f"[Policy] {hint} This run will now terminate with "
-                    "status needs_permission; do not retry the tool."
-                ),
-            )
+            durably_granted = False
+            if tool_name == "hf_push":
+                from lqh.tools.permissions import load_permissions
+
+                store = load_permissions(self.project_dir)
+                repo_id = str(arguments.get("repo_id") or "")
+                durably_granted = store.hf_push_allow_all or (
+                    bool(repo_id) and repo_id in store.hf_allowed_repos
+                )
+            if not durably_granted:
+                hint = (
+                    f"The '{tool_name}' capability is gated on this surface. "
+                    "Re-invoke with:\n"
+                    f"  lqh run --resume {self.session.id} --allow-publish\n"
+                    "(or grant it in the TUI) to enable publishing."
+                )
+                self._policy_halt = ("needs_permission", hint)
+                return ToolResult(
+                    content=(
+                        f"[Policy] {hint} This run will now terminate with "
+                        "status needs_permission; do not retry the tool."
+                    ),
+                )
+        # Sub-agent compute gate (CLI_PLAN §4.2): launching compute without
+        # ANY configured target must not silently default to billable cloud
+        # — the picker only fires when a local alternative exists, so a
+        # fresh project would otherwise resolve to cloud unprompted.
+        if (
+            self.policy.require_compute_config
+            and tool_name in ("start_training", "start_local_eval")
+        ):
+            from lqh.remote.compute import load_global_default, load_project_default
+
+            if (
+                load_project_default(self.project_dir) is None
+                and load_global_default() is None
+            ):
+                hint = (
+                    "No compute target is configured for this project. Set "
+                    "one first, e.g.: `lqh tool call compute_set --args "
+                    "'{\"value\": \"cloud\", \"scope\": \"project\"}'`, "
+                    "then re-run."
+                )
+                self._policy_halt = ("needs_configuration", hint)
+                return ToolResult(
+                    content=(
+                        f"[Policy] {hint} This run will now terminate with "
+                        "status needs_configuration."
+                    ),
+                )
         # No user attached: show_file has no audience. Nudge the agent toward
         # read_file instead of running the handler (which would set
         # show_file_path and trigger the blocking TUI viewer callback at the
@@ -1319,10 +1390,10 @@ class Agent:
                     save_project_default(self.project_dir, self.policy.compute_default)
                     return await self._reinvoke_tool(tool_name, arguments)
                 hint = (
-                    "No compute target is configured for this project. Set one "
-                    "first: `lqh tool call compute_set --args "
-                    "'{\"target\": \"cloud\"}'` (or pick one in the TUI), "
-                    "then re-run."
+                    "No compute target is configured for this project. Set "
+                    "one first: `lqh tool call compute_set --args "
+                    "'{\"value\": \"cloud\", \"scope\": \"project\"}'` (or "
+                    "pick one in the TUI), then re-run."
                 )
                 self._policy_halt = ("needs_configuration", hint)
                 return ToolResult(

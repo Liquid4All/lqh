@@ -43,11 +43,14 @@ def test_subagent_policy_shape() -> None:
     assert policy.granted_domains == {"script", "cloud_data_gen", "training"}
     assert policy.allow_publish is False
     assert policy.compute_default is None
+    # Secrets always ride the result payload; .env persistence is the run
+    # driver's --save-secret addition, not a policy mode.
     assert policy.secret_delivery == "result"
+    # Launching compute must never silently pick the billable cloud default.
+    assert policy.require_compute_config is True
 
     publishing = subagent_policy(allow_publish=True)
     assert "hf_push" in publishing.granted_domains
-    assert subagent_policy(save_secrets=True).secret_delivery == "env"
 
 
 def test_subagent_gets_subagent_skill(tmp_path: Path) -> None:
@@ -82,24 +85,60 @@ async def test_ask_user_intercepted_for_subagent(tmp_path: Path) -> None:
     assert agent._policy_halt is None
 
 
-async def test_compute_pick_without_default_halts(tmp_path: Path, monkeypatch) -> None:
-    from lqh.tools.handlers import COMPUTE_PICK_REQUIRED, ToolResult
-
+async def test_unconfigured_compute_halts_before_launch(tmp_path: Path) -> None:
+    """A fresh project has no configured target: the launch must halt with
+    needs_configuration BEFORE the tool runs — the implicit product
+    default is billable cloud and a delegated run must never pick it
+    silently (audit major #1)."""
     agent = _agent(tmp_path, policy=subagent_policy())
-
-    async def fake_execute(tool, args, project_dir, **kw):
-        return ToolResult(
-            content=COMPUTE_PICK_REQUIRED,
-            requires_user_input=True,
-            question="pick",
-            options=["cloud", "local"],
-        )
-
-    monkeypatch.setattr("lqh.agent.execute_tool", fake_execute)
     result = await agent._handle_tool_call("start_training", {"type": "sft"})
     assert agent._policy_halt is not None
     assert agent._policy_halt[0] == "needs_configuration"
-    assert "compute_set" in result.content
+    assert '"value"' in result.content and "compute_set" in result.content
+
+
+async def test_configured_compute_passes_gate(tmp_path: Path, monkeypatch) -> None:
+    from lqh.remote.compute import save_project_default
+    from lqh.tools.handlers import ToolResult
+
+    save_project_default(tmp_path, "cloud")
+    seen: dict = {}
+
+    async def fake_execute(tool, args, project_dir, **kw):
+        seen["tool"] = tool
+        return ToolResult(content="ok", ok=True)
+
+    monkeypatch.setattr("lqh.agent.execute_tool", fake_execute)
+    agent = _agent(tmp_path, policy=subagent_policy())
+    await agent._handle_tool_call("start_training", {"type": "sft"})
+    assert seen["tool"] == "start_training"
+    assert agent._policy_halt is None
+
+
+async def test_publish_gate_respects_durable_grant(tmp_path: Path, monkeypatch) -> None:
+    """A prior TUI grant (durable store) must enable hf_push even without
+    --allow-publish — the CLI policy sits above the store, it does not
+    shadow it (audit medium #9)."""
+    from lqh.tools.permissions import grant_hf_permission
+    from lqh.tools.handlers import ToolResult
+
+    grant_hf_permission(tmp_path, project_wide=True)
+
+    async def fake_execute(tool, args, project_dir, **kw):
+        return ToolResult(content="pushed", ok=True)
+
+    monkeypatch.setattr("lqh.agent.execute_tool", fake_execute)
+    agent = _agent(tmp_path, policy=subagent_policy())
+    result = await agent._handle_tool_call("hf_push", {"local_path": "x"})
+    assert agent._policy_halt is None
+    assert result.content == "pushed"
+
+
+async def test_publish_denial_hint_is_resumable(tmp_path: Path) -> None:
+    agent = _agent(tmp_path, policy=subagent_policy())
+    await agent._handle_tool_call("push_to_production", {})
+    _, hint = agent._policy_halt
+    assert f"--resume {agent.session.id}" in hint
 
 
 async def test_granted_domains_flow_to_handlers(tmp_path: Path, monkeypatch) -> None:

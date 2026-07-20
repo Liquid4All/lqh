@@ -103,6 +103,15 @@ def test_help_mentions_harness_bootstrap(capsys, monkeypatch) -> None:
         assert command in out
 
 
+def test_negative_limits_rejected(monkeypatch, capsys) -> None:
+    for flag in ("--max-turns", "--max-tool-calls", "--timeout"):
+        monkeypatch.setattr(sys, "argv", ["lqh", "run", "x", flag, "-3"])
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 2
+        capsys.readouterr()
+
+
 def test_parser_import_hygiene() -> None:
     """Building the parser must not pull the TUI, handlers, or telemetry.
 

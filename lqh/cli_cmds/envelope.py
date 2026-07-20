@@ -187,7 +187,8 @@ def interpret_result(
         options = result.options or []
         hint = (
             "No compute target is pinned for this project. Pick one with:\n"
-            "  lqh tool call compute_set --args '{\"target\": \"<target>\"}'\n"
+            "  lqh tool call compute_set --args "
+            "'{\"value\": \"<cloud|local|ssh:name>\", \"scope\": \"project\"}'\n"
             + (f"Options: {', '.join(options)}" if options else "")
         )
         message = f"{result.question or 'Compute target required.'}\n{hint}"

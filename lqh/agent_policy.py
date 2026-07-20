@@ -46,6 +46,11 @@ class AgentPolicy:
     secret_delivery: str = "prompt"
     # Expose set_auto_stage / exit_auto_mode and honor exit_auto_mode.
     terminal_tools: bool = False
+    # Refuse to LAUNCH compute (start_training / start_local_eval) unless a
+    # compute target is explicitly configured (project or global) — the
+    # implicit product default is billable cloud, which a delegated run
+    # must never pick silently (needs_configuration instead).
+    require_compute_config: bool = False
 
 
 TUI_INTERACTIVE = AgentPolicy()
@@ -61,15 +66,13 @@ TUI_AUTO = AgentPolicy(
 )
 
 
-def subagent_policy(
-    *, allow_publish: bool = False, save_secrets: bool = False,
-) -> AgentPolicy:
+def subagent_policy(*, allow_publish: bool = False) -> AgentPolicy:
     """Policy for `lqh run` (CLI_PLAN §3.3, §4.2).
 
     Task-implied work (scripts, cloud data-gen, training) is auto-granted
     for the invocation; publishing is gated behind ``allow_publish``.
-    Secrets ride the result payload unless ``save_secrets`` opts into the
-    .env append.
+    Secrets always ride the result payload; the run driver additionally
+    persists them to .env when the caller passed --save-secret.
     """
     domains = {"script", "cloud_data_gen", "training"}
     if allow_publish:
@@ -81,6 +84,7 @@ def subagent_policy(
         granted_domains=frozenset(domains),
         allow_publish=allow_publish,
         compute_default=None,
-        secret_delivery="env" if save_secrets else "result",
+        secret_delivery="result",
         terminal_tools=True,
+        require_compute_config=True,
     )

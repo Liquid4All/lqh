@@ -390,7 +390,7 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
         # ------------------------------------------------------------------
         _tool(
             name="run_data_filter",
-            cli=True, mutating=True, needs_loop=True,
+            cli=True, mutating=True, needs_auth=True, needs_loop=True,
             description=(
                 "Score a user-brought dataset and emit a filtered subset for "
                 "training. Input parquet must follow the ChatML schema (messages "
