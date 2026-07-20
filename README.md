@@ -210,6 +210,8 @@ Things we're actively building. Open an issue if you want to weigh in.
 
 ## 🤝 Contributing
 
+Use the `/feedback` command in the TUI to send feedback directly to the team.
+
 Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening a pull request. **Random PRs will be rejected** — open an issue first and agree on the approach with a maintainer; security hot fixes are the one exception. See the contribution policy for details.
 
 ---
