@@ -3275,21 +3275,14 @@ class LqhApp:
         # so quitting early can never leave a project without an identity.
         # A corrupt identity file is surfaced (after the UI is up), never
         # silently replaced: cloud key resolution fails closed on it.
-        identity_error: str | None = None
-        copy_status = "same"
-        try:
-            from lqh.project_identity import detect_copy, ensure_identity
+        from lqh.headless import headless_boot
 
-            ensure_identity(self.project_dir)
-            copy_status = detect_copy(self.project_dir)
-        except Exception as exc:
-            identity_error = f"{type(exc).__name__}: {exc}"
-        # Sessions left "active" by a dead process become "interrupted" so
-        # startup can offer to resume them.
-        try:
-            Session.repair_states(self.project_dir)
-        except Exception:
-            pass
+        # Shared with the headless CLI (lqh/headless.py): identity, copy
+        # detection, and repairing sessions left "active" by a dead
+        # process so startup can offer to resume them.
+        boot = headless_boot(self.project_dir)
+        identity_error = boot.identity_error
+        copy_status = boot.copy_status
         self._session = Session.create(self.project_dir)
         from lqh.project_log import set_log_session
         set_log_session(self._session.id)
