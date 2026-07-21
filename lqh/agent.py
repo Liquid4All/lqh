@@ -1732,7 +1732,22 @@ class Agent:
                 grant_training_permission(self.project_dir, project_wide=True)
             else:
                 grant_training_permission(self.project_dir, key=permission_key)
-            return await self._reinvoke_tool(tool_name, tool_args)
+
+            # start_training may have selected an automatic run name for the
+            # permission prompt. Pin that exact approved name on re-invocation
+            # so a concurrent claimant cannot make the retry drift to a new,
+            # unapproved name (and so its per-run grant still matches).
+            reinvoke_args = dict(tool_args)
+            if (
+                tool_name == "start_training"
+                and not reinvoke_args.get("run_name")
+                and permission_key
+                and permission_key.startswith("training:")
+            ):
+                approved_run_name = permission_key.split(":", 1)[1]
+                if approved_run_name:
+                    reinvoke_args["run_name"] = approved_run_name
+            return await self._reinvoke_tool(tool_name, reinvoke_args)
 
         # Cloud data-gen consent (run_data_gen_pipeline execution="cloud").
         # Dispatch on the permission_key, not the response text — auto mode

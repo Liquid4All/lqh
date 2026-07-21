@@ -853,6 +853,98 @@ class TestTrainingToolValidation:
         )
         assert "must be different from dataset" in result.content
 
+    async def test_training_permission_does_not_claim_explicit_name_before_approval(
+        self, training_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The permission round-trip must not collide with its own run dir."""
+        from lqh.tools import handlers
+        from lqh.tools.handlers import ToolResult
+        from lqh.tools.permissions import grant_training_permission
+
+        (training_workspace / ".lqh" / "permissions.json").write_text(json.dumps({
+            "project_allow_all": True,
+            "training_allow_all": False,
+        }))
+        args = {
+            "type": "sft",
+            "base_model": "test-model",
+            "dataset": "datasets/test_ds",
+            "eval_dataset": "datasets/test_eval",
+            "scorer": "evals/scorers/test.md",
+            "run_name": "approved_run",
+        }
+
+        first = await handlers.handle_start_training(training_workspace, **args)
+        run_dir = training_workspace / "runs" / "approved_run"
+        assert first.content == "PERMISSION_REQUIRED"
+        assert first.permission_key == "training:approved_run"
+        assert not run_dir.exists()
+
+        grant_training_permission(training_workspace, key=first.permission_key)
+
+        async def fake_remote(
+            project_dir, claimed_dir, config, run_name, remote_name, api_key,
+            **kwargs,
+        ):
+            assert project_dir == training_workspace
+            assert claimed_dir == run_dir
+            assert claimed_dir.is_dir()
+            assert run_name == "approved_run"
+            return ToolResult(content="launched", workflow_launched=True)
+
+        monkeypatch.setattr(handlers, "_execute_start_training_remote", fake_remote)
+        second = await handlers.handle_start_training(training_workspace, **args)
+
+        assert second.content == "launched"
+        assert second.workflow_launched
+        assert run_dir.is_dir()
+
+    async def test_training_permission_pins_auto_name_without_ghost_directory(
+        self, training_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An approved automatic name is claimed once and does not drift."""
+        from lqh.tools import handlers
+        from lqh.tools.handlers import ToolResult
+        from lqh.tools.permissions import grant_training_permission
+
+        (training_workspace / ".lqh" / "permissions.json").write_text(json.dumps({
+            "project_allow_all": True,
+            "training_allow_all": False,
+        }))
+        args = {
+            "type": "sft",
+            "base_model": "test-model",
+            "dataset": "datasets/test_ds",
+            "eval_dataset": "datasets/test_eval",
+            "scorer": "evals/scorers/test.md",
+        }
+
+        first = await handlers.handle_start_training(training_workspace, **args)
+        assert first.content == "PERMISSION_REQUIRED"
+        assert first.permission_key == "training:sft_001"
+        assert not (training_workspace / "runs" / "sft_001").exists()
+
+        grant_training_permission(training_workspace, key=first.permission_key)
+        approved_args = dict(args, run_name="sft_001")
+
+        async def fake_remote(
+            project_dir, claimed_dir, config, run_name, remote_name, api_key,
+            **kwargs,
+        ):
+            assert claimed_dir.is_dir()
+            assert run_name == "sft_001"
+            return ToolResult(content="launched", workflow_launched=True)
+
+        monkeypatch.setattr(handlers, "_execute_start_training_remote", fake_remote)
+        second = await handlers.handle_start_training(
+            training_workspace, **approved_args
+        )
+
+        assert second.content == "launched"
+        assert sorted(p.name for p in (training_workspace / "runs").iterdir()) == [
+            "sft_001"
+        ]
+
     async def test_training_status_no_runs(self, training_workspace: Path) -> None:
         from lqh.tools.handlers import handle_training_status
 

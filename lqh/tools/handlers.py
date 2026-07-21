@@ -4468,15 +4468,28 @@ async def handle_start_training(
             ),
         )
 
-    # Atomically claim the run name (auto-generated names retry on a
-    # collision with a racing CLI; explicit names error out).
-    run_name, claim_err = _claim_run_name(
-        project_dir, run_name or None, "sft" if type == "sft" else "dpo"
-    )
-    if claim_err:
-        return ToolResult.fail("conflict", f"Error: {claim_err}")
-
+    # Select the name used in the permission prompt without claiming it yet.
+    # The agent re-invokes this handler after the user approves the launch; a
+    # pre-consent mkdir would make that second invocation collide with its own
+    # empty directory. The approved auto-generated name is pinned by the agent
+    # on re-invocation, then atomically claimed immediately before submission.
+    run_prefix = "sft" if type == "sft" else "dpo"
+    requested_run_name = run_name or None
+    run_name = requested_run_name or _next_run_name(project_dir, run_prefix)
     run_dir = project_dir / "runs" / run_name
+
+    # Reject an already-taken explicit name before asking the user to approve a
+    # launch that cannot succeed. The later atomic claim remains authoritative
+    # and closes the check-then-create race.
+    if requested_run_name and run_dir.exists():
+        return ToolResult.fail(
+            "conflict",
+            (
+                f"Error: run '{run_name}' already exists — run names must be "
+                "unique (an existing run's config/logs would be overwritten). "
+                "Pick a different run_name or omit it for an auto-generated one."
+            ),
+        )
 
     # Build config
     default_lr = 2e-5 if type == "sft" else 5e-6
@@ -4640,6 +4653,18 @@ async def handle_start_training(
                 "Do not start training",
             ],
         )
+
+    # Consent has been established for this exact name. Reserve it atomically
+    # only now, so permission prompts and declines never leave ghost run
+    # directories. Passing the selected name explicitly also makes a race fail
+    # closed instead of silently launching a different, unapproved name.
+    claimed_run_name, claim_err = _claim_run_name(
+        project_dir, run_name, run_prefix
+    )
+    if claim_err:
+        return ToolResult.fail("conflict", f"Error: {claim_err}")
+    run_name = claimed_run_name
+    run_dir = project_dir / "runs" / run_name
 
     on_bg_started = kwargs.get("on_background_task_started")
 

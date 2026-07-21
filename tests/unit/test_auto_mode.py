@@ -622,7 +622,9 @@ class TestTrainingPermissionScope:
                 permission_key="training:sft_1",
             )
 
-        reinvoke.assert_awaited_once()
+        reinvoke.assert_awaited_once_with(
+            "start_training", {"run_name": "sft_1"}
+        )
         # Exactly the approved run is granted...
         assert check_training_permission(agent.project_dir, "sft_1") is True
         assert check_training_permission(agent.project_dir, "sft_2") is False
