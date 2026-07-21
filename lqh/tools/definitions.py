@@ -509,10 +509,14 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
             description=(
                 "Display a file's contents to the user in a formatted, scrollable TUI "
                 "view. The user sees the full file, but only a truncated summary is "
-                "returned to the agent's context. For .parquet dataset files, opens an "
-                "interactive dataset viewer where the user can browse individual samples "
-                "with keyboard navigation. Combine with ask_user to get feedback on "
-                "generated data (e.g. show_file + ask_user in the same response)."
+                "returned to the agent's context. For .parquet/.jsonl/.json dataset "
+                "files, opens a full-screen interactive viewer where the user can "
+                "browse and scroll individual samples with keyboard navigation. If a "
+                "sibling scores.parquet exists, judge scores and reasoning are shown "
+                "on each sample automatically. Pass `message` to tell the user why "
+                "they are looking at the data and what feedback you need. Combine "
+                "with ask_user to get feedback on generated data (e.g. show_file + "
+                "ask_user in the same response)."
             ),
             parameters={
                 "type": "object",
@@ -520,6 +524,14 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     "path": {
                         "type": "string",
                         "description": "Relative path to the file within the project.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": (
+                            "Optional short instruction shown to the user above the "
+                            "dataset viewer, e.g. 'Review these samples for "
+                            "tool-call correctness'."
+                        ),
                     },
                 },
                 "required": ["path"],

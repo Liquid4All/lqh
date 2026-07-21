@@ -69,6 +69,9 @@ class ToolResult:
     # specific action the user approved instead of a project-wide flag.
     permission_key: str | None = None
     show_file_path: str | None = None
+    # Optional instruction the agent attaches to the dataset viewer, shown
+    # as a banner above the data (e.g. "Review these samples for tone").
+    show_file_message: str | None = None
     skill_content: str | None = None
     # Set with content==SECRET_DELIVERY_REQUIRED to hand a one-time secret to
     # the user out-of-band. Never serialized into the conversation.
@@ -2160,17 +2163,20 @@ async def handle_compute_set(
     return ToolResult(content=f"✅ Default compute set to '{value}' for this project.")
 
 
-async def handle_show_file(project_dir: Path, *, path: str, **kwargs: Any) -> ToolResult:
+async def handle_show_file(
+    project_dir: Path, *, path: str, message: str | None = None, **kwargs: Any,
+) -> ToolResult:
     """Show a file to the user in scrollable view. Returns truncated version to agent."""
     target = _validate_path(project_dir, path)
     if not target.exists():
         return ToolResult(content=f"Error: file '{path}' does not exist")
 
-    # Parquet files: open interactive dataset viewer via TUI callback
-    if target.suffix == ".parquet":
+    # Dataset files: open interactive dataset viewer via TUI callback
+    if target.suffix.lower() in (".parquet", ".jsonl", ".json"):
         return ToolResult(
             content=f"[Opening interactive dataset viewer for {path}]",
             show_file_path=path,
+            show_file_message=message,
         )
 
     try:

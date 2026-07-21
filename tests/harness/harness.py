@@ -340,8 +340,9 @@ class E2EHarness:
         async def on_ask_user(question: str, options: list[str] | None, multi_select: bool = False) -> str:
             return await self._simulated_human(question, options, multi_select)
 
-        async def on_show_file(path: str) -> str | None:
-            self._record("tool_result", f"[show_file: {path}]", tool_name="show_file")
+        async def on_show_file(path: str, message: str | None = None) -> str | None:
+            note = f" message={message!r}" if message else ""
+            self._record("tool_result", f"[show_file: {path}{note}]", tool_name="show_file")
             return None
 
         async def on_skill_loaded(skill_name: str) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -348,6 +349,36 @@ SUBMISSION_INTERRUPT_GRACE_SEC = 60.0
 DISCARD_THINKING = os.environ.get("LQH_DISCARD_THINKING", "").lower() in ("1", "true", "yes")
 
 
+async def _call_show_file(
+    callback: Callable[..., Awaitable[str | None]],
+    path: str,
+    message: str | None,
+) -> str | None:
+    """Invoke on_show_file, tolerating older callbacks that take only (path).
+
+    The optional message parameter was added later; external harnesses may
+    still register single-argument callbacks, so the signature is inspected
+    rather than risking a TypeError (or a double invocation of a blocking,
+    side-effecting callback via try/retry).
+    """
+    try:
+        params = list(inspect.signature(callback).parameters.values())
+    except (TypeError, ValueError):
+        return await callback(path, message)
+    positional = sum(
+        p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params
+    )
+    if positional >= 2 or any(p.kind == p.VAR_POSITIONAL for p in params):
+        return await callback(path, message)
+    if any(
+        (p.kind == p.KEYWORD_ONLY and p.name == "message")
+        or p.kind == p.VAR_KEYWORD
+        for p in params
+    ):
+        return await callback(path, message=message)
+    return await callback(path)
+
+
 @dataclass
 class AgentCallbacks:
     """Callbacks for TUI integration."""
@@ -355,7 +386,8 @@ class AgentCallbacks:
     on_tool_call: Callable[[str, dict], Awaitable[None]] | None = None
     on_tool_result: Callable[[str, str], Awaitable[None]] | None = None
     on_ask_user: Callable[..., Awaitable[str]] | None = None
-    on_show_file: Callable[[str], Awaitable[str | None]] | None = None
+    # (path, optional instruction message shown above the dataset viewer)
+    on_show_file: Callable[[str, str | None], Awaitable[str | None]] | None = None
     # Show a one-time secret to the user out-of-band (e.g. a freshly minted
     # inference key). Renders in a distinct panel; never enters the conversation.
     on_show_secret: Callable[[str], Awaitable[None]] | None = None
@@ -1581,7 +1613,11 @@ class Agent:
 
         # Handle show_file
         if result.show_file_path and self.callbacks.on_show_file:
-            viewer_summary = await self.callbacks.on_show_file(result.show_file_path)
+            viewer_summary = await _call_show_file(
+                self.callbacks.on_show_file,
+                result.show_file_path,
+                result.show_file_message,
+            )
             if viewer_summary:
                 return ToolResult(content=viewer_summary)
 

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from prompt_toolkit import Application
-from prompt_toolkit.application import run_in_terminal
+from prompt_toolkit.application import in_terminal, run_in_terminal
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, FormattedText
@@ -145,8 +145,6 @@ class LqhApp:
         self._ask_user_multi_select = False
         self._ask_user_checked: set[int] = set()
         self._ask_user_confirm_none = False
-        self._dataset_viewer: DatasetViewer | None = None
-        self._dataset_viewer_future: asyncio.Future[str] | None = None
         self._input_queue: asyncio.Queue[str] = asyncio.Queue()
         self._session: Session | None = None
         self._agent: Agent | None = None
@@ -227,9 +225,7 @@ class LqhApp:
         self._input_buffer = Buffer(
             name="input",
             completer=SlashCommandCompleter(
-                enabled=lambda: (
-                    self._ask_user_future is None and self._dataset_viewer is None
-                ),
+                enabled=lambda: self._ask_user_future is None,
             ),
             complete_while_typing=True,
             multiline=False,
@@ -303,8 +299,6 @@ class LqhApp:
         is_ask_mode = Condition(
             lambda: self._ask_user_future is not None and self._ask_user_options is not None
         )
-        is_dataset_mode = Condition(lambda: self._dataset_viewer is not None)
-
         @kb.add("escape", "enter")
         @kb.add("c-j")
         def _newline(event):
@@ -361,7 +355,7 @@ class LqhApp:
                 event.app.invalidate()
 
         # Slash-command autocomplete. The completer only fires on a
-        # single-line "/word" prefix (and never in ask/dataset mode), so
+        # single-line "/word" prefix (and never in ask mode), so
         # these bindings cannot collide with the ask-mode arrows above.
         has_completion_menu = Condition(self._completion_menu_active)
         completion_selected = Condition(
@@ -400,15 +394,15 @@ class LqhApp:
             event.app.current_buffer.cancel_completion()
 
         # Esc interrupts the in-flight agent turn, like a single Ctrl+C.
-        # Excluded while another overlay owns Esc (completion menu, dataset
-        # viewer). `eager` means Esc no longer waits to disambiguate from
+        # Excluded while another overlay owns Esc (completion menu).
+        # `eager` means Esc no longer waits to disambiguate from
         # Alt+Enter while the agent is busy — acceptable, since composing a
         # multiline message mid-turn is far rarer than wanting to interrupt.
         is_agent_busy = Condition(self._agent_busy)
 
         @kb.add(
             "escape",
-            filter=is_agent_busy & ~has_completion_menu & ~is_dataset_mode,
+            filter=is_agent_busy & ~has_completion_menu,
             eager=True,
         )
         def _esc_interrupt(event):
@@ -436,32 +430,6 @@ class LqhApp:
             self._render_ask_user_options()
             event.app.invalidate()
 
-        @kb.add("n", filter=is_dataset_mode, eager=True)
-        def _dataset_next(event):
-            if self._dataset_viewer:
-                self._dataset_viewer.go_next()
-                asyncio.get_event_loop().create_task(self._render_dataset_viewer())
-
-        @kb.add("p", filter=is_dataset_mode, eager=True)
-        def _dataset_prev(event):
-            if self._dataset_viewer:
-                self._dataset_viewer.go_prev()
-                asyncio.get_event_loop().create_task(self._render_dataset_viewer())
-
-        @kb.add("r", filter=is_dataset_mode, eager=True)
-        def _dataset_random(event):
-            if self._dataset_viewer:
-                self._dataset_viewer.go_random()
-                asyncio.get_event_loop().create_task(self._render_dataset_viewer())
-
-        @kb.add("q", filter=is_dataset_mode, eager=True)
-        def _dataset_close(event):
-            asyncio.get_event_loop().create_task(self._close_dataset_viewer())
-
-        @kb.add("escape", filter=is_dataset_mode, eager=True)
-        def _dataset_escape(event):
-            asyncio.get_event_loop().create_task(self._close_dataset_viewer())
-
         return kb
 
     def _create_application(self) -> Application:
@@ -477,9 +445,7 @@ class LqhApp:
 
     def _get_prompt_label(self) -> FormattedText:
         """Return the current prompt label."""
-        if self._dataset_viewer is not None:
-            label = " ds> "
-        elif self._ask_user_future is not None:
+        if self._ask_user_future is not None:
             label = " ? "
         else:
             label = " > "
@@ -523,7 +489,6 @@ class LqhApp:
 
         composing_multiline = (
             self._ask_user_options is None
-            and self._dataset_viewer is None
             and self._input_buffer is not None
             and "\n" in self._input_buffer.text
         )
@@ -553,12 +518,6 @@ class LqhApp:
                     ("class:status", "Enter select"),
                 ])
 
-        if self._dataset_viewer is not None:
-            parts.extend([
-                ("class:status.separator", " │ "),
-                ("class:status.spinner", "n/p/r/q dataset"),
-            ])
-
         if self._auto_paused:
             parts.extend([
                 ("class:status.separator", " │ "),
@@ -566,11 +525,7 @@ class LqhApp:
                 ("class:status.separator", " │ "),
                 ("class:status", "Enter continue"),
             ])
-        elif (
-            self._agent_busy()
-            and self._ask_user_future is None
-            and self._dataset_viewer is None
-        ):
+        elif self._agent_busy() and self._ask_user_future is None:
             hint = "Ctrl+C interrupt" if self.auto_mode else "Esc interrupt"
             parts.extend([
                 ("class:status.separator", " │ "),
@@ -615,17 +570,6 @@ class LqhApp:
                 warn_empty=self._ask_user_confirm_none,
                 allow_other=self._ask_user_allow_other,
             )
-        )
-
-    def _dataset_view_text(self, prefix: str = "") -> str:
-        """Build the managed dataset viewer content."""
-        if self._dataset_viewer is None:
-            return prefix
-
-        return (
-            prefix
-            + self._dataset_viewer.render_sample()
-            + self._dataset_viewer.render_nav_bar()
         )
 
     def _lock_input(self) -> None:
@@ -726,11 +670,6 @@ class LqhApp:
         """Handle Enter in the bottom input area."""
         self._ctrl_c_pressed = False
         text = buff.text.strip()
-
-        if self._dataset_viewer is not None:
-            buff.reset()
-            asyncio.get_event_loop().create_task(self._handle_dataset_input(text))
-            return False
 
         if self._processing and self._ask_user_future is None:
             asyncio.get_event_loop().create_task(
@@ -1939,87 +1878,54 @@ class LqhApp:
         """
         await self._emit(render_secret(text))
 
-    async def _on_show_file(self, path: str) -> str | None:
-        """Display a file to the user. Returns viewer summary for parquet files."""
+    async def _on_show_file(self, path: str, message: str | None = None) -> str | None:
+        """Display a file to the user. Returns viewer summary for dataset files."""
         full_path = self.project_dir / path
         try:
-            if full_path.suffix == ".parquet":
-                return await self._open_dataset_viewer(full_path)
+            if full_path.suffix.lower() in (".parquet", ".jsonl", ".json"):
+                return await self._open_dataset_viewer(full_path, message)
 
             content = full_path.read_text(encoding="utf-8")
             await self._emit(render_file_view(path, content))
             return None
         except Exception as e:
             await self._emit(render_error(f"Cannot display {path}: {e}"))
-            return None
-
-    async def _open_dataset_viewer(self, parquet_path: Path) -> str:
-        """Open the interactive dataset viewer."""
-        viewer = DatasetViewer(parquet_path)
-
-        if viewer.empty:
-            await self._emit(render_system_message(f"Dataset {parquet_path.name} is empty (0 rows)."))
-            return viewer.get_summary()
-
-        self._dataset_viewer = viewer
-        self._dataset_viewer_future = asyncio.get_event_loop().create_future()
-        self._invalidate()
-        self._unlock_input()
-
-        await self._render_dataset_viewer()
-
-        try:
-            return await self._dataset_viewer_future
-        finally:
-            self._dataset_viewer = None
-            self._dataset_viewer_future = None
-            self._set_managed_text("")
-            self._lock_input()
-            self._invalidate()
-
-    async def _render_dataset_viewer(self) -> None:
-        """Render the current dataset sample and nav help in the managed area."""
-        if self._dataset_viewer is None:
-            return
-
-        self._set_managed_text(self._dataset_view_text())
-
-    async def _handle_dataset_input(self, text: str) -> None:
-        """Handle typed dataset viewer commands."""
-        command = text.lower() if text else "n"
-        if command in {"n", "next"} and self._dataset_viewer:
-            self._dataset_viewer.go_next()
-            await self._render_dataset_viewer()
-        elif command in {"p", "prev", "previous"} and self._dataset_viewer:
-            self._dataset_viewer.go_prev()
-            await self._render_dataset_viewer()
-        elif command in {"r", "random"} and self._dataset_viewer:
-            self._dataset_viewer.go_random()
-            await self._render_dataset_viewer()
-        elif command in {"q", "quit", "exit"}:
-            await self._close_dataset_viewer()
-        else:
-            self._set_managed_text(
-                self._dataset_view_text(
-                    render_system_message(
-                        "Dataset viewer commands: n, p, r, q.",
-                        separated=False,
-                    )
-                )
+            # Returned as the tool result so the agent knows the viewer
+            # never opened (None would leave the optimistic "[Opening…]").
+            return (
+                f"Error: could not display {path} to the user: "
+                f"{type(e).__name__}: {e}"
             )
 
-    async def _close_dataset_viewer(self) -> None:
-        """Close the dataset viewer and resolve the pending future."""
-        if self._dataset_viewer is None or self._dataset_viewer_future is None:
-            return
+    async def _open_dataset_viewer(
+        self, data_path: Path, message: str | None = None
+    ) -> str:
+        """Open the full-screen dataset viewer, suspending the bottom app."""
+        from lqh.tui.dataset_viewer_app import run_dataset_viewer
+
+        # Parquet load + row parsing is synchronous and can be slow for big
+        # datasets — keep the TUI event loop responsive while it happens.
+        viewer = await asyncio.to_thread(
+            lambda: DatasetViewer(data_path, agent_message=message)
+        )
+
+        if viewer.empty:
+            await self._emit(render_system_message(f"Dataset {data_path.name} is empty (0 rows)."))
+            return viewer.get_summary()
+
+        # in_terminal() suspends the bottom-docked app's renderer and input,
+        # hands the terminal to the nested full-screen viewer application,
+        # and repaints the chat UI when the context exits.
+        async with in_terminal():
+            summary = await run_dataset_viewer(viewer)
 
         await self._emit(
             render_system_message(
-                f"Closed dataset viewer (viewed {len(self._dataset_viewer.viewed_indices)} sample(s))"
+                f"Closed dataset viewer (viewed {len(viewer.viewed_indices)} sample(s))"
             )
         )
-        if not self._dataset_viewer_future.done():
-            self._dataset_viewer_future.set_result(self._dataset_viewer.get_summary())
+        self._invalidate()
+        return summary
 
     def _ensure_spinner_task(self) -> None:
         """Run one shared spinner loop for both thinking and pipeline updates."""
