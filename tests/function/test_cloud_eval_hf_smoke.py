@@ -37,6 +37,7 @@ import httpx
 from lqh.auth import api_root, get_token
 from lqh.config import default_api_base_url
 from lqh.tools.handlers import handle_eval_hf_model
+from lqh.tools.permissions import PermissionContext
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,10 @@ class TestCloudEvalHFSmoke(unittest.TestCase):
             scorer="scorers/translation.md",
             judge_size="small",
             max_new_tokens=64,
+            # Non-interactive test: carry the GPU-spend consent the TUI
+            # would collect via the cloud_eval_hf PERMISSION_REQUIRED
+            # prompt.
+            _permissions=PermissionContext.granting("cloud_eval_hf"),
         ))
         # The handler returns a ToolResult with the job id embedded
         # in its content; ugly to parse but our test only needs to
