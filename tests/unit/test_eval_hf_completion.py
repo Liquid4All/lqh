@@ -209,11 +209,13 @@ def test_eval_hf_keeps_existing_eval_error_marker(tmp_path, monkeypatch) -> None
 def test_run_inference_writes_completed_without_defer_flag(tmp_path) -> None:
     # Plain infer runs keep the historical unconditional status write —
     # asserted at the source so the eval_hf gate can't leak onto them.
+    # Both engines finish through _finalize_predictions, so the gate
+    # lives (only) there.
     import inspect
 
-    from lqh.infer.__main__ import _run_inference
+    from lqh.infer.__main__ import _finalize_predictions
 
-    src = inspect.getsource(_run_inference)
+    src = inspect.getsource(_finalize_predictions)
     assert 'if not config.get("defer_terminal_status")' in src
 
 

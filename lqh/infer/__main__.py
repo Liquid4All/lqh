@@ -131,7 +131,121 @@ def _init_prediction_partial(
     return {}
 
 
+def _normalize_inner_schema(response_format: Any) -> Any:
+    """Unwrap a ``response_format`` config value to the bare JSON schema.
+
+    Accepts either the bare schema or the OpenAI-style envelope
+    ({"type":"json_schema","json_schema":{"schema": {...}}}) so the same
+    prompts/<task>.schema.json file works for both API and local eval.
+    Shared by both engines: the HF loop feeds it to lm-format-enforcer,
+    the sglang engine re-wraps it into the server's json_schema
+    response_format.
+    """
+    inner_schema: Any = response_format
+    if isinstance(response_format, dict):
+        if "json_schema" in response_format:
+            js = response_format["json_schema"]
+            if isinstance(js, dict) and "schema" in js:
+                inner_schema = js["schema"]
+            else:
+                inner_schema = js
+    return inner_schema
+
+
+def _prompt_messages(conv: list[dict], system_prompt: str | None) -> list[dict]:
+    """Prompt-side messages for one eval sample: the trailing assistant
+    turn (the reference answer, when present) is stripped, and the
+    configured system prompt is prepended unless the conversation
+    already opens with one. Shared by the HF and sglang engines so the
+    prompts they judge are identical.
+    """
+    prompt_msgs = list(conv)
+    if prompt_msgs and prompt_msgs[-1].get("role") == "assistant":
+        prompt_msgs = prompt_msgs[:-1]
+    if system_prompt and (not prompt_msgs or prompt_msgs[0].get("role") != "system"):
+        prompt_msgs = [{"role": "system", "content": system_prompt}] + prompt_msgs
+    return prompt_msgs
+
+
+def _finalize_predictions(
+    run_dir: Path,
+    results: list[dict | None],
+    config: dict,
+    reporter: Any,
+    progress_end: float,
+) -> None:
+    """Assemble predictions.parquet from per-sample results, signal
+    scoring readiness, and (unless the caller owns terminal status via
+    ``defer_terminal_status``) clean up the partial and write completed.
+    Shared by both generation engines — the parquet schema here IS the
+    scoring contract (sample_index/messages/source[/tools]).
+    """
+    from lqh.train.progress import write_eval_request, write_status
+
+    predictions = [r for r in results if r is not None]
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    has_tools_col = any("tools" in p for p in predictions)
+    columns: dict[str, list] = {
+        "sample_index": [p["sample_index"] for p in predictions],
+        "messages": [p["messages"] for p in predictions],
+        "source": [p["source"] for p in predictions],
+    }
+    fields = [
+        pa.field("sample_index", pa.int64()),
+        pa.field("messages", pa.string()),
+        pa.field("source", pa.string()),
+    ]
+    if has_tools_col:
+        columns["tools"] = [p.get("tools") for p in predictions]
+        fields.append(pa.field("tools", pa.string()))
+
+    table = pa.table(columns, schema=pa.schema(fields))
+    pq.write_table(table, run_dir / "predictions.parquet")
+    # The partial has served its purpose once the canonical parquet
+    # exists (delete only after the write succeeds) — EXCEPT when a
+    # scoring step still follows (defer_terminal_status): a sandbox
+    # killed mid-scoring would then find neither partial nor resume
+    # state and regenerate every sample. The status-owning caller
+    # (eval_hf) deletes it after scoring succeeds instead.
+    if not config.get("defer_terminal_status"):
+        (run_dir / PREDICTIONS_PARTIAL).unlink(missing_ok=True)
+
+    # Signal for scoring
+    write_eval_request(run_dir)
+    if progress_end >= 1.0:
+        reporter.update(
+            phase="completed", phase_label="predictions ready",
+            completed=len(predictions), total=len(predictions), unit="samples",
+            overall_fraction=1.0, result_ready=True, force=True,
+        )
+    # eval_hf sets defer_terminal_status: its inline scoring step is
+    # load-bearing, so the caller owns the terminal status and writes
+    # completed/failed only after scoring resolves. Plain infer runs
+    # never set the flag and keep the historical behavior.
+    if not config.get("defer_terminal_status"):
+        write_status(run_dir, "completed")
+    print(f"Inference complete: {len(predictions)} predictions written")
+
+
 def _run_inference(run_dir: Path, config: dict) -> None:
+    """Engine dispatcher. The sglang engine is used when the sglang
+    package is importable (i.e. the sandbox runs the gpu_eval image);
+    everywhere else — training images, dev machines — this stays the
+    historical HF transformers loop. ``force_hf_engine`` is the debug /
+    parity-run escape hatch. Both engines share the partial-file format
+    and digest, so a continuation may switch engines mid-run safely.
+    """
+    from lqh.infer.engine_sglang import run_inference_sglang, sglang_available
+
+    if not config.get("force_hf_engine") and sglang_available():
+        run_inference_sglang(run_dir, config)
+        return
+    _run_inference_hf(run_dir, config)
+
+
+def _run_inference_hf(run_dir: Path, config: dict) -> None:
     import torch
 
     from lqh.progress import ProgressReporter
@@ -228,9 +342,6 @@ def _run_inference(run_dir: Path, config: dict) -> None:
         print(f"System prompt: {system_prompt[:80]}...")
 
     # JSON-schema constrained decoding via lm-format-enforcer.
-    # We accept either the bare JSON schema or the OpenAI-style envelope
-    # ({"type":"json_schema","json_schema":{"schema": {...}}}) so the same
-    # prompts/<task>.schema.json file works for both API and local eval.
     #
     # If ``response_format`` is set in the config, we hard-fail on setup
     # errors rather than silently falling back to free-form decoding —
@@ -238,14 +349,7 @@ def _run_inference(run_dir: Path, config: dict) -> None:
     # constrained eval before anyone noticed.
     schema_prefix_fn = None
     if response_format:
-        inner_schema: Any = response_format
-        if isinstance(response_format, dict):
-            if "json_schema" in response_format:
-                js = response_format["json_schema"]
-                if isinstance(js, dict) and "schema" in js:
-                    inner_schema = js["schema"]
-                else:
-                    inner_schema = js
+        inner_schema = _normalize_inner_schema(response_format)
 
         # lm-format-enforcer ≤0.11.3 imports ``PreTrainedTokenizerBase`` from
         # ``transformers.tokenization_utils`` (the v4 path). In transformers
@@ -283,15 +387,7 @@ def _run_inference(run_dir: Path, config: dict) -> None:
         if i in resumed:
             continue
         sample_tools = tools_per_sample[i]
-
-        # Strip trailing assistant turn
-        prompt_msgs = list(conv)
-        if prompt_msgs and prompt_msgs[-1].get("role") == "assistant":
-            prompt_msgs = prompt_msgs[:-1]
-
-        # Prepend system prompt if configured and not already present
-        if system_prompt and (not prompt_msgs or prompt_msgs[0].get("role") != "system"):
-            prompt_msgs = [{"role": "system", "content": system_prompt}] + prompt_msgs
+        prompt_msgs = _prompt_messages(conv, system_prompt)
 
         try:
             if is_vision:
@@ -395,52 +491,7 @@ def _run_inference(run_dir: Path, config: dict) -> None:
                 force=completed_count == len(conversations),
             )
 
-    # Write predictions
-    predictions = [r for r in results if r is not None]
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    has_tools_col = any("tools" in p for p in predictions)
-    columns: dict[str, list] = {
-        "sample_index": [p["sample_index"] for p in predictions],
-        "messages": [p["messages"] for p in predictions],
-        "source": [p["source"] for p in predictions],
-    }
-    fields = [
-        pa.field("sample_index", pa.int64()),
-        pa.field("messages", pa.string()),
-        pa.field("source", pa.string()),
-    ]
-    if has_tools_col:
-        columns["tools"] = [p.get("tools") for p in predictions]
-        fields.append(pa.field("tools", pa.string()))
-
-    table = pa.table(columns, schema=pa.schema(fields))
-    pq.write_table(table, run_dir / "predictions.parquet")
-    # The partial has served its purpose once the canonical parquet
-    # exists (delete only after the write succeeds) — EXCEPT when a
-    # scoring step still follows (defer_terminal_status): a sandbox
-    # killed mid-scoring would then find neither partial nor resume
-    # state and regenerate every sample. The status-owning caller
-    # (eval_hf) deletes it after scoring succeeds instead.
-    if not config.get("defer_terminal_status"):
-        partial_path.unlink(missing_ok=True)
-
-    # Signal for scoring
-    write_eval_request(run_dir)
-    if progress_end >= 1.0:
-        reporter.update(
-            phase="completed", phase_label="predictions ready",
-            completed=len(predictions), total=len(predictions), unit="samples",
-            overall_fraction=1.0, result_ready=True, force=True,
-        )
-    # eval_hf sets defer_terminal_status: its inline scoring step is
-    # load-bearing, so the caller owns the terminal status and writes
-    # completed/failed only after scoring resolves. Plain infer runs
-    # never set the flag and keep the historical behavior.
-    if not config.get("defer_terminal_status"):
-        write_status(run_dir, "completed")
-    print(f"Inference complete: {len(predictions)} predictions written")
+    _finalize_predictions(run_dir, results, config, reporter, progress_end)
 
 
 if __name__ == "__main__":

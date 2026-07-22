@@ -338,6 +338,11 @@ def main() -> None:
         # same resolution rule the DPO / sweep paths use.
         if scorer := config.get("scorer"):
             infer_config["scorer"] = scorer
+        # sglang-engine knobs (ISSUE 4 P1). None participates in the
+        # resume digest, so tuning them between attempts keeps resume.
+        for knob in ("generation_concurrency", "sglang_extra_args", "force_hf_engine"):
+            if (v := config.get(knob)) is not None:
+                infer_config[knob] = v
 
         # 3. Delegate to the regular infer loop. It writes
         # predictions.parquet + eval_request.json + status sentinels
