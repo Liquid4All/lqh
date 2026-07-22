@@ -103,6 +103,10 @@ class JobSupervisor:
         self.run_watchers: dict[str, Any] = {}
         # Cloud data-gen runs whose download gave up this session.
         self.data_gen_gave_up: set[str] = set()
+        # Per-run verdict from finalize_eval_hf_run, consumed by the
+        # watch loop to keep the recorded state consistent with the
+        # notice: "ok" | "missing_result" | "unverified".
+        self.eval_hf_verdicts: dict[str, str] = {}
         # Wake signal for wait_for_runs; set on every recorded completion.
         self._completion_signal = asyncio.Event()
         # Set after the first scan so a fresh process can wait for the
@@ -402,6 +406,30 @@ class JobSupervisor:
                         text = await self.finalize_data_gen_run(
                             run_name, state, error,
                         )
+                    elif self.run_type(run_name) == "eval_hf":
+                        # Cloud HF eval: completion is only real when the
+                        # sandbox published eval_result.json — gate the
+                        # success notice on the artifact manifest and
+                        # pull the result file down for local reads.
+                        text = await self.finalize_eval_hf_run(
+                            run_name, state, error, remote,
+                        )
+                        if (
+                            state == "completed"
+                            and self.eval_hf_verdicts.pop(run_name, "ok")
+                            == "missing_result"
+                        ):
+                            # Keep the recorded state (manifest, project
+                            # log, telemetry hooks) consistent with the
+                            # failure-styled notice — a completed-without-
+                            # result eval is a failure everywhere, not
+                            # just in the message text. "unverified"
+                            # (artifact API unreachable) deliberately
+                            # stays completed: absence wasn't proven.
+                            state = "failed"
+                            error = error or "no eval_result.json artifact was published"
+                        else:
+                            self.eval_hf_verdicts.pop(run_name, None)
                     else:
                         text = self.format_completion_message(
                             run_name, state, error, remote,
@@ -521,6 +549,163 @@ class JobSupervisor:
             f"[System: training run {run_name} failed{location}{err_part} "
             f"Call {status_call} now to read final details, then explain the failure "
             "and the natural recovery step.]"
+        )
+
+    def eval_hf_result_artifact(self, run_name: str) -> dict | None:
+        """The artifacts.json entry for the run's eval_result.json, or
+        None. The manifest is appended from the sandbox publisher's
+        artifact events (remote/cloud.py), so an entry here means the
+        result actually made it to storage.
+        """
+        path = self.project_dir / "runs" / run_name / "artifacts.json"
+        try:
+            manifest = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        entries = manifest.get("artifacts") if isinstance(manifest, dict) else None
+        if not isinstance(entries, list):
+            return None
+        for entry in entries:
+            if (
+                isinstance(entry, dict)
+                and entry.get("kind") == "eval_result"
+                and entry.get("relpath") == "eval_result.json"
+                and entry.get("artifact_id")
+            ):
+                return entry
+        return None
+
+    def _cloud_job_id(self, run_name: str) -> str:
+        """The backend job UUID for a run, from remote_job.json ('' if absent)."""
+        meta_path = self.project_dir / "runs" / run_name / "remote_job.json"
+        try:
+            return str(json.loads(meta_path.read_text()).get("job_id") or "")
+        except (OSError, json.JSONDecodeError):
+            return ""
+
+    async def resolve_eval_hf_result_artifact(
+        self, run_name: str,
+    ) -> tuple[dict | None, bool]:
+        """(entry, verified) for the run's eval_result.json artifact.
+
+        The local artifacts.json manifest only sees artifact events that
+        were streamed over SSE — after a backend restart the reattached
+        pump never replays them (Modal reattach doesn't re-stream
+        stdout), so a missing local entry is NOT proof of failure. When
+        the manifest has no entry, ask the backend artifact API before
+        rendering a verdict. verified=False means the API couldn't be
+        reached and the absence is inconclusive.
+        """
+        entry = self.eval_hf_result_artifact(run_name)
+        if entry is not None:
+            return entry, True
+        job_id = self._cloud_job_id(run_name)
+        if not job_id:
+            # Never reached the backend → nothing can have been published.
+            return None, True
+        try:
+            from lqh.artifacts import BackendArtifactStore
+
+            handles = await BackendArtifactStore().list_for_project(
+                _ckey(self.project_dir), kind="eval_result", job_id=job_id,
+            )
+        except Exception:
+            return None, False
+        for handle in handles:
+            if handle.r2_key.endswith("eval_result.json"):
+                entry = {
+                    "artifact_id": handle.id,
+                    "kind": "eval_result",
+                    "relpath": "eval_result.json",
+                }
+                # Backfill the manifest so later checks stay local.
+                try:
+                    from lqh.remote.cloud import _append_artifact_manifest
+
+                    _append_artifact_manifest(
+                        self.project_dir / "runs" / run_name / "artifacts.json",
+                        entry,
+                    )
+                except Exception:
+                    pass
+                return entry, True
+        return None, True
+
+    async def finalize_eval_hf_run(
+        self, run_name: str, state: str, error: str | None, remote: str | None,
+    ) -> str | None:
+        """Completion notice for a cloud eval_hf run.
+
+        Unlike training runs, an eval_hf run's only real output is
+        eval_result.json — a "completed" state without that artifact is
+        a failure and must be reported as one (belt-and-braces: the
+        backend's completion gate should already have flipped such jobs
+        to failed). When the artifact exists, best-effort download it so
+        training_status and follow-up reads find the file locally.
+        Records the verdict in self.eval_hf_verdicts so the watch loop
+        keeps the recorded state consistent with the notice.
+        """
+        if state != "completed":
+            self.eval_hf_verdicts[run_name] = "ok"
+            return self.format_completion_message(run_name, state, error, remote)
+
+        location = f" on remote '{remote}'" if remote else ""
+        status_call = f"training_status(run_name='{run_name}')"
+        run_dir = self.project_dir / "runs" / run_name
+        entry, verified = await self.resolve_eval_hf_result_artifact(run_name)
+        if entry is None and not verified:
+            # Inconclusive: the backend says completed and we couldn't
+            # reach the artifact API to double-check. Don't claim
+            # failure on a network blip — keep completed with a caveat.
+            self.eval_hf_verdicts[run_name] = "unverified"
+            return (
+                f"[System: eval run {run_name} completed{location}, but the "
+                "result artifact could not be verified (artifact API "
+                f"unreachable). Call {status_call} to confirm and fetch "
+                f"runs/{run_name}/eval_result.json via the artifacts tool.]"
+            )
+        if entry is None:
+            self.eval_hf_verdicts[run_name] = "missing_result"
+            return (
+                f"[System: eval run {run_name} reported completed{location}, but "
+                "no eval_result.json artifact was published — treat it as failed. "
+                f"Call {status_call} and check stdout.log / eval_error.json for "
+                "the scoring or publish error, then decide whether to retry.]"
+            )
+        self.eval_hf_verdicts[run_name] = "ok"
+
+        result_path = run_dir / "eval_result.json"
+        score_part = ""
+        if not result_path.exists():
+            try:
+                from lqh.artifacts import BackendArtifactStore
+
+                await BackendArtifactStore().download(
+                    str(entry["artifact_id"]), result_path,
+                )
+            except Exception:
+                # The result exists in storage; only the local copy is
+                # missing. Not worth a failure-styled notice.
+                return (
+                    f"[System: eval run {run_name} completed{location}. "
+                    "Downloading eval_result.json failed; use the artifacts "
+                    f"tool or {status_call} to read the scores.]"
+                )
+        try:
+            summary = json.loads(result_path.read_text())
+            scores = summary.get("scores") if isinstance(summary, dict) else None
+            mean = scores.get("mean") if isinstance(scores, dict) else None
+            if mean is not None:
+                score_part = (
+                    f" Judge mean {float(mean):.3f} over "
+                    f"{int(summary.get('num_scored') or 0)} scored samples."
+                )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return (
+            f"[System: eval run {run_name} completed{location}.{score_part} "
+            f"Results in runs/{run_name}/eval_result.json; call {status_call} "
+            "for details, then continue with the natural next step.]"
         )
 
     def record_completion(
@@ -1016,10 +1201,19 @@ class JobSupervisor:
                 except Exception:
                     continue
                 # Training eval lands per-checkpoint during the run; only
-                # inference runs score after going terminal.
-                if run_type != "infer":
+                # inference-style runs score after going terminal.
+                if run_type not in ("infer", "eval_hf"):
                     continue
                 if (run_dir / "eval_result.json").exists():
+                    continue
+                if run_type == "eval_hf":
+                    # Cloud eval_hf scores sandbox-side; the local file
+                    # arrives via the finalize download. Wait only while
+                    # a published result artifact makes that download
+                    # possible — a run that never published one won't
+                    # produce the file no matter how long we park.
+                    if self.eval_hf_result_artifact(name) is not None:
+                        out.append(name)
                     continue
                 # Only wait when scoring is actually in flight or pending —
                 # otherwise (e.g. a failed run with no predictions) return

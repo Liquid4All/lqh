@@ -1798,6 +1798,7 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
         _tool(
             name="eval_hf_model",
             cli=True, mutating=True, needs_auth=True,
+            permission_domain="cloud_eval_hf",
             description=(
                 "Evaluate any HuggingFace checkpoint on a project's eval set "
                 "via LQH Cloud. Use this to score a public/private HF model "
@@ -1899,6 +1900,20 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "type": "integer",
                         "description": "Token cap per generation. Default 4096.",
                         "default": 4096,
+                    },
+                    "timeout_minutes": {
+                        "type": "integer",
+                        "description": (
+                            "Wall-clock cap for the cloud job in minutes "
+                            "(clamped to 10–1440). Compute bills by "
+                            "wall-clock on the GPU, so this is also the "
+                            "hard compute-cost cap. Raise above the "
+                            "2-hour default for large models or big "
+                            "eval sets; unfinished samples are resumed "
+                            "on continuation, but the job fails once "
+                            "the cap is reached."
+                        ),
+                        "default": 120,
                     },
                 },
                 "required": ["repo", "eval_dataset", "scorer"],

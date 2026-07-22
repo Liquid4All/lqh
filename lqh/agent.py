@@ -1785,6 +1785,23 @@ class Agent:
                     reinvoke_args["run_name"] = approved_run_name
             return await self._reinvoke_tool(tool_name, reinvoke_args)
 
+        # Cloud HF-eval consent (eval_hf_model). Same shape as the
+        # data-gen consent below: dispatch on the key, grant durably
+        # only on "don't ask again" / auto mode, and carry a
+        # this-time-only grant out-of-band on re-invocation.
+        if permission_key and permission_key.startswith("cloud_eval_hf:"):
+            if "do not" in response.lower():
+                return ToolResult(content="Cloud HF-eval submission declined by user.")
+            if self.policy.auto_grant_permissions or "don't ask again" in response:
+                from lqh.tools.permissions import grant_cloud_eval_hf_permission
+                grant_cloud_eval_hf_permission(self.project_dir)
+            return await self._reinvoke_tool(
+                tool_name, tool_args,
+                internal_kwargs={
+                    "_permissions": PermissionContext.granting("cloud_eval_hf"),
+                },
+            )
+
         # Cloud data-gen consent (run_data_gen_pipeline execution="cloud").
         # Dispatch on the permission_key, not the response text — auto mode
         # synthesizes a fixed grant string that isn't among these options.

@@ -157,6 +157,10 @@ class CloudBackend(RemoteBackend):
         # Token resolved lazily so tests can inject; production uses
         # the logged-in user's token from ~/.config/lqh/credentials.
         self._token = token
+        # Run dirs already stamped with a stale-progress marker this
+        # session (see _append_stale_progress_marker) — one note per
+        # backend restart is enough.
+        self._stale_marked_runs: set[str] = set()
 
     # ------------------------------------------------------------------
     # Auth
@@ -554,6 +558,44 @@ class CloudBackend(RemoteBackend):
         status = snap.get("status", "")
         return status not in {"completed", "failed", "cancelled"}
 
+    async def plan_job(
+        self,
+        kind: str,
+        *,
+        base_model: str | None = None,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Dry-run the backend resource planner (POST /v1/cloud/jobs/plan).
+
+        Returns the planner's ACTUAL selection — gpu_type,
+        timeout_minutes, worst_case_cost_billed_micros, or fits=false
+        with no_fit_reason — so consent prompts can show the real hard
+        cap instead of a default-GPU estimate. Creates nothing.
+        """
+        async with httpx.AsyncClient(base_url=self._api_base, timeout=10.0) as client:
+            resp = await client.post(
+                "/v1/cloud/jobs/plan",
+                json={
+                    "kind": kind,
+                    "base_model": base_model or "",
+                    "config": config or {},
+                },
+                headers=self._auth_headers(),
+            )
+            _raise_for_cloud_error(resp)
+            return resp.json()
+
+    async def job_snapshot(self, job_id: str) -> dict[str, Any]:
+        """Public snapshot fetch — the raw GET /v1/cloud/jobs/{id} JSON.
+
+        Used right after submit to read the planner's ACTUAL resource
+        selection (``resource.gpu_type`` / ``timeout_minutes`` /
+        ``worst_case_cost_billed_micros``), which can differ from the
+        default the consent prompt estimated against when the planner
+        upsized the GPU for a large model. Raises CloudError on non-2xx.
+        """
+        return await self._get_snapshot(job_id)
+
     async def _get_snapshot(self, job_id: str) -> dict[str, Any]:
         async with httpx.AsyncClient(base_url=self._api_base, timeout=30.0) as client:
             resp = await client.get(
@@ -758,6 +800,14 @@ class CloudBackend(RemoteBackend):
             target = run_dir / ("stderr.log" if stream == "stderr" else "stdout.log")
             with target.open("a") as fh:
                 fh.write(line + "\n")
+            # After a backend restart the reattached pump never re-streams
+            # trainer stdout, so sample-progress freezes at the last
+            # pre-restart value until the job terminates. The backend
+            # marks the reattach with this synthetic system log line —
+            # surface it in the progress display so a frozen count isn't
+            # read as "the job stopped here".
+            if stream == "system" and "job pump reattached" in line:
+                self._append_stale_progress_marker(run_dir, ts)
 
         elif kind == "progress":
             entry = dict(payload)
@@ -770,6 +820,39 @@ class CloudBackend(RemoteBackend):
             if ts and "timestamp" not in entry:
                 entry["timestamp"] = ts
             _append_artifact_manifest(run_dir / "artifacts.json", entry)
+
+    def _append_stale_progress_marker(self, run_dir: Path, ts: Any) -> None:
+        """Append a copy of the last real progress row with a staleness
+        note in ``detail``.
+
+        Copying the row (same ``overall_fraction`` / ``attempt_id`` /
+        counts) matters: the TUI's display selection only considers rows
+        with a finite fraction and breaks fraction-ties by position, so
+        an appended copy wins and renders the note, while a fraction-less
+        synthetic row would be invisible. No row with a fraction yet →
+        nothing meaningful was on screen, skip. One marker per run per
+        session.
+        """
+        key = str(run_dir)
+        if key in self._stale_marked_runs:
+            return
+        from lqh.progress import read_jsonl_tail
+
+        last: dict[str, Any] | None = None
+        for row in read_jsonl_tail(run_dir / "progress.jsonl", last_n=256):
+            if isinstance(row.get("overall_fraction"), (int, float)):
+                last = row
+        if last is None:
+            return
+        self._stale_marked_runs.add(key)
+        entry = dict(last)
+        entry["detail"] = (
+            "progress may be stale — backend restarted mid-run; sample "
+            "counts freeze until the job finishes"
+        )
+        if ts:
+            entry["timestamp"] = ts
+        _append_jsonl(run_dir / "progress.jsonl", entry)
 
 
 # ---------------------------------------------------------------------

@@ -41,9 +41,11 @@ Flow:
      method / judge / hyperparams. The HF repo is recorded as
      ``base_model``; ``parent_ids`` is empty because the parent is
      external (not an LQH artifact UUID).
-  5. Inline-score the predictions via ``lqh.train.cloud_score``
-     (no-op outside a cloud sandbox) so the published
-     ``eval_result.json`` artifact carries the judge summary.
+  5. Inline-score the predictions via ``lqh.train.cloud_score`` so the
+     published ``eval_result.json`` artifact carries the judge summary.
+     Scoring is load-bearing: a scoring failure (exception, no summary,
+     or no ``eval_result.json`` on disk) marks the run failed and exits
+     non-zero — an eval without a result must never report completed.
 """
 
 from __future__ import annotations
@@ -150,6 +152,129 @@ def _write_lineage_sidecar(
     logger.info("wrote lineage sidecar at %s", sidecar)
 
 
+def _stamp_real_metric(run_dir: Path, summary: Any) -> None:
+    """Surface the judge summary on the rollout lineage as real_metric —
+    this is the row the backend's BestCheckpointForProject query sorts
+    by. The lqh.scoring.run_scoring contract puts the stats under
+    summary["scores"] = {mean, median, std, min, max} (see
+    lqh/scoring.py:563), NOT at the top level — early versions of this
+    code looked for `summary["mean"]` and silently no-op'd.
+    """
+    scores_block = summary.get("scores") if isinstance(summary, dict) else None
+    mean = scores_block.get("mean") if isinstance(scores_block, dict) else None
+    n_scored = summary.get("num_scored") if isinstance(summary, dict) else None
+    pred_lineage = run_dir / "predictions.parquet.lineage.json"
+    if not pred_lineage.exists():
+        print(
+            "eval_hf: WARNING — no lineage sidecar at "
+            f"{pred_lineage}; can't stamp real_metric.",
+            flush=True,
+        )
+        return
+    payload = json.loads(pred_lineage.read_text())
+    if mean is not None:
+        payload["real_metric"] = {
+            "name": "judge_score_mean",
+            "value": float(mean),
+            "n": int(n_scored or 0),
+        }
+        print(
+            f"eval_hf: real_metric stamped "
+            f"(mean={float(mean):.3f}, n={int(n_scored or 0)})",
+            flush=True,
+        )
+    else:
+        print(
+            "eval_hf: WARNING — summary has no scores.mean; "
+            f"lineage real_metric NOT stamped. summary={summary!r}",
+            flush=True,
+        )
+    pred_lineage.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _run_inline_scoring(run_dir: Path, infer_config: dict[str, Any]) -> str | None:
+    """Run the inline judge-scoring step. Returns None on success, or a
+    human-readable error string on failure — the caller turns that into
+    a failed status + non-zero exit, because an eval_hf run without an
+    ``eval_result.json`` must never report completed.
+
+    Success requires score_run_eval_inline to return a summary AND
+    ``eval_result.json`` to exist in run_dir. The real_metric lineage
+    stamp is best-effort: its failure never fails the eval.
+
+    We deliberately use print() rather than logger.* here so the
+    diagnostic shows up in the published stdout.log without needing a
+    logging.basicConfig — the eval_hf sandbox runs without any logging
+    handler so logger.warning is invisible.
+    """
+    print("eval_hf: starting inline scoring step", flush=True)
+    try:
+        from lqh.train.cloud_score import is_cloud_mode, score_run_eval_inline
+
+        if not is_cloud_mode():
+            # eval_hf is a cloud-only entrypoint: without the scoped
+            # token there is no judge, hence no result — a failure, not
+            # a skip (a completed eval without a result is exactly the
+            # false-success bug this guards against).
+            return (
+                "inline scoring impossible: is_cloud_mode() is False "
+                f"(LQH_API_TOKEN set={'LQH_API_TOKEN' in os.environ}, "
+                f"LQH_BASE_URL set={'LQH_BASE_URL' in os.environ})"
+            )
+        summary = score_run_eval_inline(run_dir, infer_config)
+    except Exception as exc:  # noqa: BLE001
+        # Surface the exception type + message + traceback to stdout so
+        # the published log captures what went wrong.
+        import traceback
+        print(
+            f"eval_hf: ERROR in inline scoring: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        traceback.print_exc()
+        return f"{type(exc).__name__}: {exc}"
+
+    if summary is None:
+        return (
+            "inline scoring returned no summary — scorer path didn't "
+            f"resolve under cwd={Path.cwd()} (config.scorer="
+            f"{infer_config.get('scorer')!r}), predictions.parquet is "
+            "missing, or all judge scoring attempts failed"
+        )
+    result_path = run_dir / "eval_result.json"
+    if not result_path.exists():
+        return "scoring produced a summary but no eval_result.json on disk"
+    # Validate the file that will actually be published — existence is
+    # not enough. The scoring contract (lqh/scoring.py
+    # score_predictions_by_source) puts the headline under scores.mean
+    # and the sample count under num_scored; a result that can't be
+    # parsed or carries no usable score is a failed eval, not a success.
+    try:
+        result = json.loads(result_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"eval_result.json is unreadable or invalid JSON: {exc}"
+    scores = result.get("scores") if isinstance(result, dict) else None
+    mean = scores.get("mean") if isinstance(scores, dict) else None
+    if not isinstance(mean, (int, float)):
+        return "eval_result.json has no numeric scores.mean — invalid result"
+    if int(result.get("num_scored") or 0) < 1:
+        return "eval_result.json reports zero scored samples"
+
+    print(
+        f"eval_hf: inline scoring summary keys="
+        f"{sorted(summary.keys()) if isinstance(summary, dict) else type(summary).__name__}",
+        flush=True,
+    )
+    try:
+        _stamp_real_metric(run_dir, summary)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"eval_hf: WARNING — real_metric stamping failed: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+    return None
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: python -m lqh.infer.eval_hf <config.json>", file=sys.stderr)
@@ -189,7 +314,15 @@ def main() -> None:
             "dataset": config["eval_dataset"],
             "max_new_tokens": int(config.get("max_new_tokens", 4096)),
             "progress_label": "HF model evaluation",
+            # Scoring is load-bearing for eval_hf: _run_inference must
+            # not write a terminal "completed" status — this entrypoint
+            # owns it and writes completed/failed after scoring.
+            "defer_terminal_status": True,
         }
+        if spec_sha := config.get("spec_sha256"):
+            # Rides into the predictions-partial resume digest so a
+            # continuation only resumes against the identical spec.
+            infer_config["spec_sha256"] = spec_sha
         if config["training_method"] == "lora":
             # _run_inference forwards `base_override` to
             # load_for_inference, which uses it instead of the
@@ -221,99 +354,36 @@ def main() -> None:
         # 5. Inline scoring — same scoped LQH_API_TOKEN path as the
         # DPO + SFT-sweep eval-of-best uses. Writes eval_result.json
         # next to predictions so the publisher classifies it
-        # accordingly.
-        #
-        # We deliberately use print() rather than logger.* here so the
-        # diagnostic shows up in the published stdout.log without
-        # needing a logging.basicConfig — the eval_hf sandbox runs
-        # without any logging handler so logger.warning is invisible.
-        print("eval_hf: starting inline scoring step", flush=True)
-        try:
-            from lqh.train.cloud_score import is_cloud_mode, score_run_eval_inline
+        # accordingly. Load-bearing: this entrypoint owns the terminal
+        # status (see defer_terminal_status above), so a scoring
+        # failure marks the run failed and exits non-zero — the exit
+        # code is what the backend treats as terminal truth.
+        err = _run_inline_scoring(run_dir, infer_config)
+        if err is not None:
+            from lqh.progress import write_error_marker
 
-            if not is_cloud_mode():
-                print(
-                    "eval_hf: SKIPPED inline scoring — is_cloud_mode() is "
-                    f"False (LQH_API_TOKEN set={'LQH_API_TOKEN' in os.environ}, "
-                    f"LQH_BASE_URL set={'LQH_BASE_URL' in os.environ}).",
-                    flush=True,
-                )
-            else:
-                summary = score_run_eval_inline(run_dir, infer_config)
-                if summary is None:
-                    print(
-                        "eval_hf: WARNING — inline scoring returned None. "
-                        "Likely cause: scorer path didn't resolve under "
-                        f"cwd={Path.cwd()} (config.scorer="
-                        f"{infer_config.get('scorer')!r}) "
-                        "or predictions.parquet missing.",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"eval_hf: inline scoring summary keys="
-                        f"{sorted(summary.keys()) if isinstance(summary, dict) else type(summary).__name__}",
-                        flush=True,
-                    )
-                    # Surface the judge summary on the rollout lineage
-                    # as real_metric — this is the row the backend's
-                    # BestCheckpointForProject query sorts by. The
-                    # lqh.scoring.run_scoring contract puts the stats
-                    # under summary["scores"] = {mean, median, std,
-                    # min, max} (see lqh/scoring.py:563), NOT at the
-                    # top level — early versions of this code looked
-                    # for `summary["mean"]` and silently no-op'd.
-                    scores_block = (
-                        summary.get("scores")
-                        if isinstance(summary, dict) else None
-                    )
-                    mean = (
-                        scores_block.get("mean")
-                        if isinstance(scores_block, dict) else None
-                    )
-                    n_scored = (
-                        summary.get("num_scored")
-                        if isinstance(summary, dict) else None
-                    )
-                    pred_lineage = run_dir / "predictions.parquet.lineage.json"
-                    if pred_lineage.exists():
-                        payload = json.loads(pred_lineage.read_text())
-                        if mean is not None:
-                            payload["real_metric"] = {
-                                "name": "judge_score_mean",
-                                "value": float(mean),
-                                "n": int(n_scored or 0),
-                            }
-                            print(
-                                f"eval_hf: real_metric stamped "
-                                f"(mean={float(mean):.3f}, n={int(n_scored or 0)})",
-                                flush=True,
-                            )
-                        else:
-                            print(
-                                "eval_hf: WARNING — summary has no scores.mean; "
-                                f"lineage real_metric NOT stamped. summary={summary!r}",
-                                flush=True,
-                            )
-                        pred_lineage.write_text(
-                            json.dumps(payload, indent=2) + "\n"
-                        )
-                    else:
-                        print(
-                            "eval_hf: WARNING — no lineage sidecar at "
-                            f"{pred_lineage}; can't stamp real_metric.",
-                            flush=True,
-                        )
-        except Exception as exc:  # noqa: BLE001
-            # Surface the exception type + message + traceback to
-            # stdout so the published log captures what went wrong.
-            # The publisher uploads stdout.log → operator can grep.
-            import traceback
-            print(
-                f"eval_hf: ERROR in inline scoring: {type(exc).__name__}: {exc}",
-                flush=True,
-            )
-            traceback.print_exc()
+            marker = run_dir / "eval_error.json"
+            if not marker.exists():
+                # cloud_score may already have written a more specific
+                # marker (e.g. "all judge scoring attempts failed").
+                write_error_marker(marker, err)
+            write_status(run_dir, "failed", error=f"inline scoring failed: {err}")
+            print(f"eval_hf: FAILED — inline scoring: {err}", flush=True)
+            # Distinct from the launcher's publish-gate exit 3 and
+            # SIGKILL 137. SystemExit doesn't inherit Exception, so the
+            # outer handler below won't double-write the status.
+            # predictions.partial.jsonl is deliberately left in place:
+            # a retry/continuation resumes generation for free and only
+            # redoes scoring.
+            sys.exit(4)
+        # Only now — generation, scoring, and validation all done — is
+        # the resume scratch obsolete (_run_inference defers this
+        # deletion when defer_terminal_status is set, so a sandbox
+        # killed mid-scoring keeps its resume state).
+        from lqh.infer.__main__ import PREDICTIONS_PARTIAL
+
+        (run_dir / PREDICTIONS_PARTIAL).unlink(missing_ok=True)
+        write_status(run_dir, "completed")
     except Exception as exc:
         write_status(run_dir, "failed", error=str(exc))
         raise

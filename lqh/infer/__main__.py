@@ -37,6 +37,100 @@ def main() -> None:
         raise
 
 
+# Incremental predictions: each completed sample is appended to this
+# JSONL in the run dir (the durable Modal volume for cloud jobs), so a
+# worker continuation after a SIGKILL/timeout resumes from the last
+# completed sample instead of regenerating everything. Mirrors the
+# data_gen partial pattern in lqh/engine.py. Deleted once the canonical
+# predictions.parquet is written; never published (publish.py allowlist).
+PREDICTIONS_PARTIAL = "predictions.partial.jsonl"
+
+
+def _predictions_digest(config: dict) -> str:
+    """Identity hash binding a partial file to the exact model, dataset,
+    and decoding settings that produced it. Resume only happens on an
+    exact match; anything else restarts clean rather than absorbing
+    predictions from a different configuration.
+    """
+    import hashlib
+
+    ident = {
+        k: config.get(k)
+        for k in (
+            "base_model", "base_override", "dataset", "max_new_tokens",
+            "system_prompt", "response_format", "spec_sha256",
+        )
+    }
+    blob = json.dumps(ident, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _append_prediction_partial(path: Path, index: int, row: dict) -> None:
+    line = json.dumps({"index": index, **row}, ensure_ascii=False)
+    with open(path, "a") as f:
+        f.write(line + "\n")
+        f.flush()
+
+
+def _load_prediction_partial(
+    path: Path, total: int, digest: str,
+) -> dict[int, dict] | None:
+    """Parse a partial file into ``{index: pred_entry}``.
+
+    Returns None (→ full restart) when the header is missing or bound to
+    a different total/digest. A truncated final line (killed mid-write)
+    is tolerated; out-of-range indices are ignored; duplicate indices
+    keep the last write.
+    """
+    rows: dict[int, dict] = {}
+    header_ok = False
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("_meta"):
+                    if obj.get("total") != total or obj.get("digest") != digest:
+                        return None
+                    header_ok = True
+                    continue
+                idx = obj.pop("index", None)
+                if isinstance(idx, int) and 0 <= idx < total:
+                    rows[idx] = obj
+    except OSError:
+        return None
+    return rows if header_ok else None
+
+
+def _init_prediction_partial(
+    run_dir: Path, total: int, digest: str,
+) -> dict[int, dict]:
+    """Load resumable predictions from a prior attempt, or start a fresh
+    partial file. A file bound to a different run identity is preserved
+    as ``predictions.partial.stale.jsonl`` (already-paid-for GPU output,
+    kept for the operator) and excluded from this run.
+    """
+    path = run_dir / PREDICTIONS_PARTIAL
+    if path.exists():
+        rows = _load_prediction_partial(path, total, digest)
+        if rows is not None:
+            return rows
+        try:
+            path.replace(run_dir / "predictions.partial.stale.jsonl")
+        except OSError:
+            path.unlink(missing_ok=True)
+    with open(path, "w") as f:
+        f.write(json.dumps({"_meta": True, "total": total, "digest": digest}) + "\n")
+    return {}
+
+
 def _run_inference(run_dir: Path, config: dict) -> None:
     import torch
 
@@ -101,7 +195,31 @@ def _run_inference(run_dir: Path, config: dict) -> None:
     max_new_tokens = config.get("max_new_tokens", 4096)
     system_prompt = config.get("system_prompt")
     response_format = config.get("response_format")
-    predictions: list[dict] = []
+
+    partial_path = run_dir / PREDICTIONS_PARTIAL
+    resumed = _init_prediction_partial(
+        run_dir, len(conversations), _predictions_digest(config),
+    )
+    results: list[dict | None] = [None] * len(conversations)
+    for idx, entry in resumed.items():
+        results[idx] = entry
+    completed_count = len(resumed)
+    if resumed:
+        print(
+            f"Resuming: {completed_count}/{len(conversations)} "
+            "predictions already done"
+        )
+        reporter.update(
+            phase="inference", phase_label="running inference",
+            completed=completed_count, total=len(conversations),
+            unit="samples",
+            overall_fraction=(
+                progress_start
+                + (progress_end - progress_start)
+                * completed_count / max(len(conversations), 1)
+            ),
+            force=True,
+        )
 
     # Get the tool formatter for this model (if applicable)
     tool_formatter = get_tool_formatter(base_model)
@@ -162,6 +280,8 @@ def _run_inference(run_dir: Path, config: dict) -> None:
 
     model.eval()
     for i, conv in enumerate(conversations):
+        if i in resumed:
+            continue
         sample_tools = tools_per_sample[i]
 
         # Strip trailing assistant turn
@@ -251,29 +371,32 @@ def _run_inference(run_dir: Path, config: dict) -> None:
         }
         if sample_tools is not None:
             pred_entry["tools"] = json.dumps(sample_tools)
-        predictions.append(pred_entry)
+        results[i] = pred_entry
+        _append_prediction_partial(partial_path, i, pred_entry)
+        completed_count += 1
 
-        if (i + 1) % 10 == 0 or i == len(conversations) - 1:
-            print(f"  {i + 1}/{len(conversations)} samples done")
+        if completed_count % 10 == 0 or completed_count == len(conversations):
+            print(f"  {completed_count}/{len(conversations)} samples done")
             write_progress(
                 run_dir,
-                step=i + 1,
+                step=completed_count,
                 extra={"phase": "inference", "total": len(conversations)},
                 emit_cloud=False,
             )
-            completed = i + 1
             reporter.update(
                 phase="inference", phase_label="running inference",
-                completed=completed, total=len(conversations), unit="samples",
+                completed=completed_count, total=len(conversations),
+                unit="samples",
                 overall_fraction=(
                     progress_start
                     + (progress_end - progress_start)
-                    * completed / max(len(conversations), 1)
+                    * completed_count / max(len(conversations), 1)
                 ),
-                force=completed == len(conversations),
+                force=completed_count == len(conversations),
             )
 
     # Write predictions
+    predictions = [r for r in results if r is not None]
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -294,6 +417,14 @@ def _run_inference(run_dir: Path, config: dict) -> None:
 
     table = pa.table(columns, schema=pa.schema(fields))
     pq.write_table(table, run_dir / "predictions.parquet")
+    # The partial has served its purpose once the canonical parquet
+    # exists (delete only after the write succeeds) — EXCEPT when a
+    # scoring step still follows (defer_terminal_status): a sandbox
+    # killed mid-scoring would then find neither partial nor resume
+    # state and regenerate every sample. The status-owning caller
+    # (eval_hf) deletes it after scoring succeeds instead.
+    if not config.get("defer_terminal_status"):
+        partial_path.unlink(missing_ok=True)
 
     # Signal for scoring
     write_eval_request(run_dir)
@@ -303,7 +434,12 @@ def _run_inference(run_dir: Path, config: dict) -> None:
             completed=len(predictions), total=len(predictions), unit="samples",
             overall_fraction=1.0, result_ready=True, force=True,
         )
-    write_status(run_dir, "completed")
+    # eval_hf sets defer_terminal_status: its inline scoring step is
+    # load-bearing, so the caller owns the terminal status and writes
+    # completed/failed only after scoring resolves. Plain infer runs
+    # never set the flag and keep the historical behavior.
+    if not config.get("defer_terminal_status"):
+        write_status(run_dir, "completed")
     print(f"Inference complete: {len(predictions)} predictions written")
 
 

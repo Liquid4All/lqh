@@ -27,6 +27,9 @@ class PermissionStore:
     # Separate domain again: local script-exec approval must not imply
     # spending cloud compute, and vice versa.
     cloud_data_gen_allow_all: bool = False
+    # Cloud HF-eval submission (eval_hf_model). Its own domain: GPU
+    # wall-clock spend, gated by the same consent shape as data_gen.
+    cloud_eval_hf_allow_all: bool = False
 
 
 def _permissions_lock(project_dir: Path):
@@ -47,6 +50,7 @@ def load_permissions(project_dir: Path) -> PermissionStore:
             training_allow_all=data.get("training_allow_all", False),
             allowed_training=data.get("allowed_training", []),
             cloud_data_gen_allow_all=data.get("cloud_data_gen_allow_all", False),
+            cloud_eval_hf_allow_all=data.get("cloud_eval_hf_allow_all", False),
         )
     except (json.JSONDecodeError, OSError):
         return PermissionStore()
@@ -119,6 +123,19 @@ def grant_cloud_data_gen_permission(project_dir: Path) -> None:
         save_permissions(project_dir, perms)
 
 
+def check_cloud_eval_hf_permission(project_dir: Path) -> bool:
+    """Whether cloud HF-eval submits may proceed without a prompt."""
+    return load_permissions(project_dir).cloud_eval_hf_allow_all
+
+
+def grant_cloud_eval_hf_permission(project_dir: Path) -> None:
+    """Project-wide grant — used by "don't ask again" and by auto mode."""
+    with _permissions_lock(project_dir):
+        perms = load_permissions(project_dir)
+        perms.cloud_eval_hf_allow_all = True
+        save_permissions(project_dir, perms)
+
+
 def check_hf_permission(project_dir: Path, repo_id: str) -> bool:
     perms = load_permissions(project_dir)
     return perms.hf_push_allow_all or repo_id in perms.hf_allowed_repos
@@ -144,7 +161,9 @@ def grant_hf_permission(
 
 # Consent domain names. Keep aligned with the `permission_domain` tool
 # metadata in lqh/tools/definitions.py.
-PERMISSION_DOMAINS = frozenset({"script", "cloud_data_gen", "training", "hf_push"})
+PERMISSION_DOMAINS = frozenset(
+    {"script", "cloud_data_gen", "cloud_eval_hf", "training", "hf_push"}
+)
 
 
 @dataclass(frozen=True)
@@ -189,6 +208,13 @@ class PermissionContext:
             self.full_consent
             or "cloud_data_gen" in self.grants
             or check_cloud_data_gen_permission(project_dir)
+        )
+
+    def allows_cloud_eval_hf(self, project_dir: Path) -> bool:
+        return (
+            self.full_consent
+            or "cloud_eval_hf" in self.grants
+            or check_cloud_eval_hf_permission(project_dir)
         )
 
     def allows_training(self, project_dir: Path, run_name: str) -> bool:

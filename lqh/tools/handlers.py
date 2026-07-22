@@ -1340,12 +1340,13 @@ async def handle_run_data_gen_pipeline(
         release_output(project_dir, output_dataset)
 
 
-async def _fetch_data_gen_rate_usd() -> float | None:
-    """Billed data_gen $/hr from GET /v1/cloud/pricing; None if unreachable.
+async def _fetch_billed_rate_usd(field: str) -> float | None:
+    """A billed $/hr rate field from GET /v1/cloud/pricing; None if
+    unreachable or absent (e.g. an older backend without the field).
 
-    Fetched live so the consent prompt can't drift from operator
-    overrides of the rate or margin envvars; callers fall back to the
-    defaults with an explicit "at default rates" caveat.
+    Fetched live so consent prompts can't drift from operator overrides
+    of the rate or margin envvars; callers fall back to the defaults
+    with an explicit "at default rates" caveat.
     """
     try:
         import httpx
@@ -1362,12 +1363,22 @@ async def _fetch_data_gen_rate_usd() -> float | None:
             )
             if resp.status_code != 200:
                 return None
-            micros = resp.json().get("data_gen_cpu_rate_billed_micros_per_hour")
+            micros = resp.json().get(field)
             if isinstance(micros, (int, float)) and micros > 0:
                 return float(micros) / 1e6
             return None
     except Exception:
         return None
+
+
+async def _fetch_data_gen_rate_usd() -> float | None:
+    """Billed data_gen $/hr; None if unreachable."""
+    return await _fetch_billed_rate_usd("data_gen_cpu_rate_billed_micros_per_hour")
+
+
+async def _fetch_eval_hf_rate_usd() -> float | None:
+    """Billed eval_hf GPU $/hr; None if unreachable."""
+    return await _fetch_billed_rate_usd("eval_hf_gpu_rate_billed_micros_per_hour")
 
 
 async def _submit_cloud_data_gen(
@@ -5012,6 +5023,15 @@ async def _training_status_remote(
     if status.error:
         lines.append(f"  Error: {status.error}")
 
+    # Cloud jobs: show the selected GPU, elapsed vs. the wall-clock
+    # limit, and the billed hard cap — best-effort, never fails status.
+    if display_remote == "LQH Cloud":
+        try:
+            snap = await backend.job_snapshot(job_id)
+            lines.extend(_format_cloud_resource_lines(snap))
+        except Exception:  # noqa: BLE001
+            pass
+
     # Also show local mirror progress if available
     from lqh.train.progress import read_latest_metrics
     latest = read_latest_metrics(run_dir)
@@ -5060,6 +5080,42 @@ async def _training_status_remote(
         lines.extend(sweep_lines)
 
     return ToolResult(content="\n".join(lines))
+
+
+def _format_cloud_resource_lines(snap: dict[str, Any]) -> list[str]:
+    """One 'Compute:' line from a cloud job snapshot: GPU, elapsed vs.
+    the wall-clock limit, and the billed hard cap. Tolerates any field
+    being absent (older backends)."""
+    resource = snap.get("resource") or {}
+    parts: list[str] = []
+    if gpu := resource.get("gpu_type"):
+        parts.append(f"{gpu} GPU")
+    timeout = resource.get("timeout_minutes")
+    elapsed_min: int | None = None
+    started = snap.get("started_at")
+    if isinstance(started, str) and started:
+        try:
+            from datetime import datetime, timezone
+
+            t0 = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            ended = snap.get("ended_at")
+            t1 = (
+                datetime.fromisoformat(ended.replace("Z", "+00:00"))
+                if isinstance(ended, str) and ended
+                else datetime.now(timezone.utc)
+            )
+            elapsed_min = max(0, int((t1 - t0).total_seconds() // 60))
+        except ValueError:
+            pass
+    if isinstance(timeout, (int, float)) and timeout > 0:
+        if elapsed_min is not None:
+            parts.append(f"{elapsed_min}/{int(timeout)} min used")
+        else:
+            parts.append(f"{int(timeout)} min limit")
+    cap = resource.get("worst_case_cost_billed_micros")
+    if isinstance(cap, (int, float)) and cap > 0:
+        parts.append(f"hard cap ≈ ${float(cap) / 1e6:.2f}")
+    return [f"  Compute: {' · '.join(parts)}"] if parts else []
 
 
 _TRAINING_STATUS_RATE_LIMIT_HINT = (
@@ -5718,6 +5774,8 @@ async def handle_eval_hf_model(
     judge_size: str = "small",
     run_name: str | None = None,
     max_new_tokens: int = 4096,
+    timeout_minutes: int = 120,
+    _permissions: PermissionContext | None = None,
     **kwargs: Any,
 ) -> ToolResult:
     """Submit an eval_hf cloud job — runs ``lqh.infer.eval_hf`` in a
@@ -5749,6 +5807,9 @@ async def handle_eval_hf_model(
             "validation",
             f"Error: judge_size must be small/medium/large, got {judge_size!r}",
         )
+    # Same clamp the backend picker applies ([10, Modal's 24h sandbox
+    # max]) so the consent prompt and the submitted job agree.
+    timeout_minutes = max(10, min(int(timeout_minutes or 120), 1440))
 
     # Eval dataset(s) — one path or a list of held-out sources, scored
     # separately and macro-averaged sandbox-side.
@@ -5771,6 +5832,105 @@ async def handle_eval_hf_model(
     except FileNotFoundError as e:
         return ToolResult.fail("not_found", f"Error: {e}")
 
+    num_samples = sum((_parquet_metadata(path)[0] or 0) for path in eval_resolved)
+
+    from lqh.remote.backend import RemoteConfig
+    from lqh.remote.cloud import CloudBackend
+
+    cfg = RemoteConfig(
+        name="cloud",
+        type="cloud",
+        hostname="api.lqh.ai",
+        remote_root="cloud:lqh",
+    )
+    backend = CloudBackend(cfg, project_dir)
+
+    # Dry-run the backend planner so consent covers the ACTUAL worst
+    # case: large models get upsized off the default L4 to a pricier
+    # GPU, and consenting to an L4-rate "hard cap" that the planner then
+    # exceeds is not consent. Also fails fast on known no-fit models —
+    # the real submit would reject them anyway.
+    plan: dict[str, Any] | None = None
+    try:
+        plan_config: dict[str, Any] = {
+            "hf_repo": repo,
+            "timeout_minutes": timeout_minutes,
+        }
+        plan = await backend.plan_job(
+            "eval_hf",
+            base_model=base_model if training_method == "lora" else None,
+            config=plan_config,
+        )
+    except Exception:  # noqa: BLE001 — older backend / network: estimate instead
+        plan = None
+    if plan is not None and plan.get("fits") is False:
+        return ToolResult.fail(
+            "validation",
+            f"Error: this model fits no supported GPU — "
+            f"{plan.get('no_fit_reason') or 'no fitting GPU available'}",
+        )
+
+    # Consent gate — GPU wall-clock spend needs the user's sign-off
+    # (same shape as the cloud data-gen consent).
+    if not (_permissions or PermissionContext()).allows_cloud_eval_hf(project_dir):
+        hours = timeout_minutes / 60
+        if plan is not None and plan.get("gpu_type"):
+            cap_micros = plan.get("worst_case_cost_billed_micros")
+            cap_part = (
+                f"hard cap ≈ ${float(cap_micros) / 1e6:.2f} at the "
+                f"{hours:g}-hour timeout"
+                if isinstance(cap_micros, (int, float)) and cap_micros > 0
+                else f"capped by the {hours:g}-hour timeout"
+            )
+            size_caveat = (
+                " Model size is unknown, so the GPU choice is not "
+                "size-validated."
+                if "not size-validated" in str(plan.get("selection_reason") or "")
+                else ""
+            )
+            compute_line = (
+                f"  Compute: {plan['gpu_type']} GPU billed by wall-clock — "
+                f"{cap_part}.{size_caveat} Judge LLM tokens are billed as "
+                "usual.\n\n"
+            )
+        else:
+            # Planner preview unavailable (older backend, network): fall
+            # back to the default-GPU rate with an explicit caveat.
+            rate_usd = await _fetch_eval_hf_rate_usd()
+            if rate_usd is not None:
+                rate_note = f"≈ ${rate_usd:.2f}/hr"
+            else:
+                rate_usd = 2.4
+                rate_note = "≈ $2.40/hr at default rates"
+            compute_line = (
+                f"  Compute: single GPU billed by wall-clock, {rate_note} — "
+                f"hard cap ≈ ${hours * rate_usd:.0f} at the {hours:g}-hour "
+                f"timeout, assuming the default GPU. Large models may be "
+                f"placed on a bigger (pricier) GPU; the actual GPU and cap "
+                f"appear in the job status. Judge LLM tokens are billed as "
+                f"usual.\n\n"
+            )
+        return ToolResult(
+            content="PERMISSION_REQUIRED",
+            requires_user_input=True,
+            permission_key=f"cloud_eval_hf:{repo}",
+            question=(
+                f"The agent wants to evaluate an HF checkpoint on LQH Cloud:\n"
+                f"  Model:   {repo}@{revision} ({training_method}"
+                + (f", base {base_model}" if training_method == "lora" else "")
+                + ")\n"
+                f"  Eval:    {num_samples} samples, judge:{judge_size}, "
+                f"max {max_new_tokens} tokens/sample\n"
+                + compute_line
+                + "Submit the cloud eval?"
+            ),
+            options=[
+                "Submit to cloud (this time)",
+                "Submit and don't ask again for this project",
+                "Do not submit",
+            ],
+        )
+
     run_name, claim_err = _claim_run_name(project_dir, run_name or None, "eval_hf")
     if claim_err:
         return ToolResult.fail("conflict", f"Error: {claim_err}")
@@ -5792,7 +5952,10 @@ async def handle_eval_hf_model(
         "scorer": scorer,
         "judge_size": judge_size,
         "max_new_tokens": max_new_tokens,
-        "num_samples": sum((_parquet_metadata(path)[0] or 0) for path in eval_resolved),
+        # Read by the backend picker (clamped there too) — the job's
+        # wall-clock and hard compute-cost cap.
+        "timeout_minutes": timeout_minutes,
+        "num_samples": num_samples,
         # manifest tells lqh.remote.bundle.resolve_manifest which keys
         # in this config name files to include in the bundle. The hf
         # repo itself is downloaded sandbox-side via snapshot_download
@@ -5812,17 +5975,7 @@ async def handle_eval_hf_model(
         config["system_prompt_path"] = system_prompt_path
         config["manifest"].append("system_prompt_path")
 
-    # --- Submit to LQH Cloud ---
-    from lqh.remote.backend import RemoteConfig
-    from lqh.remote.cloud import CloudBackend
-
-    cfg = RemoteConfig(
-        name="cloud",
-        type="cloud",
-        hostname="api.lqh.ai",
-        remote_root="cloud:lqh",
-    )
-    backend = CloudBackend(cfg, project_dir)
+    # --- Submit to LQH Cloud (backend constructed above, pre-consent) ---
     try:
         job_id = await backend.submit_run(
             str(run_dir), config, module="lqh.infer.eval_hf",
@@ -5845,6 +5998,27 @@ async def handle_eval_hf_model(
         remote="cloud",
     )
 
+    # The consent prompt estimated the cap against the default GPU; the
+    # backend planner may have upsized for a large model. Read back the
+    # ACTUAL selected resource so the confirmation shows the real hard
+    # cap, not the estimate. Best-effort: on any error fall back to the
+    # requested timeout alone.
+    compute_line = f"  Timeout: {timeout_minutes} min (hard compute-cost cap)\n"
+    try:
+        resource = (await backend.job_snapshot(job_id)).get("resource") or {}
+        gpu = resource.get("gpu_type") or "?"
+        actual_timeout = int(resource.get("timeout_minutes") or timeout_minutes)
+        cap_micros = resource.get("worst_case_cost_billed_micros")
+        cap_part = (
+            f", hard cap ≈ ${float(cap_micros) / 1e6:.2f}"
+            if isinstance(cap_micros, (int, float)) and cap_micros > 0 else ""
+        )
+        compute_line = (
+            f"  Compute: {gpu} GPU, {actual_timeout} min timeout{cap_part}\n"
+        )
+    except Exception:  # noqa: BLE001 — display nicety, never fail the submit
+        pass
+
     return ToolResult(
         content=(
             f"🧪 HF eval submitted\n"
@@ -5854,7 +6028,8 @@ async def handle_eval_hf_model(
             + (f" (base {base_model})" if training_method == 'lora' else "")
             + f"\n"
             f"  Judge:   judge:{judge_size}\n"
-            f"  Job ID:  {job_id}\n\n"
+            + compute_line
+            + f"  Job ID:  {job_id}\n\n"
             f"Use training_status to monitor; eval_result.json lands "
             f"under runs/{run_name}/ when done."
         ),

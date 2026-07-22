@@ -218,10 +218,15 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
         "stderr.log": "logs",
         "config.json": "other",
         "eval_history.json": "metrics",
+        # Scoring-failure diagnostic (eval_hf / watcher scoring) — small
+        # and load-bearing for debugging failed evals off-volume.
+        "eval_error.json": "metrics",
         # data_gen sandbox output (lqh.remote.data_gen). Train run dirs
         # never carry a root-level data.parquet, so no collision.
         # data.partial.jsonl is deliberately NOT published — it's the
-        # engine's resume scratch and stays on the volume.
+        # engine's resume scratch and stays on the volume. Same for the
+        # infer loop's predictions.partial.jsonl (allowlist: neither is
+        # ever matched).
         "data.parquet": "dataset",
     }
     for name, kind in smalls.items():
@@ -589,6 +594,21 @@ def main(argv: Iterable[str] | None = None) -> int:
         if any(h.kind == "dataset" for h in result.artifacts):
             return 0
         print("publish: no dataset artifact was published", file=sys.stderr)
+        return 1
+    # eval_hf jobs (the launcher likewise fails them on publish error):
+    # only eval_result.json is load-bearing — a failed log upload must
+    # not flip a scored eval to failed, but a missing/failed
+    # eval_result.json upload must. NOTE kind alone is not enough:
+    # eval_request.json shares kind "eval_result" (smalls map above) and
+    # is published even when scoring failed, so match the r2_key
+    # basename suffix ("<hex>-<name>", minted by the backend).
+    if os.environ.get("LQH_KIND") == "eval_hf":
+        if any(
+            h.kind == "eval_result" and h.r2_key.endswith("eval_result.json")
+            for h in result.artifacts
+        ):
+            return 0
+        print("publish: no eval_result artifact was published", file=sys.stderr)
         return 1
     # Surface a non-zero exit if anything failed so the launcher's
     # caller can decide whether to mark the run partially successful.
