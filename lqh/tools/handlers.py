@@ -5968,6 +5968,13 @@ async def handle_eval_hf_model(
         config["system_prompt"] = system_prompt
     if schema_dict is not None:
         config["response_format"] = schema_dict
+    # sglang-engine debug/tuning knobs (ISSUE 4 P1) — not in the tool
+    # schema, but forwardable programmatically (parity tests, ad-hoc
+    # ops). eval_hf.py passes them through to the engine dispatcher;
+    # none participate in the resume digest.
+    for knob in ("generation_concurrency", "sglang_extra_args", "force_hf_engine"):
+        if (v := kwargs.get(knob)) is not None:
+            config[knob] = v
     if system_prompt_path:
         # Also include the source file in the bundle so the
         # artifact_lineage row can pin it (the publisher records the

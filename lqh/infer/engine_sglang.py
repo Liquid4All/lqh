@@ -87,11 +87,15 @@ def _prepare_model_path(config: dict) -> tuple[str, tempfile.TemporaryDirectory 
     tmp = tempfile.TemporaryDirectory(prefix="lqh-merged-")
     out_dir = Path(tmp.name) / "merged"
     out_dir.mkdir()
-    print(f"Merging LoRA adapter onto {base} (cpu child process) ...")
+    # prefer_gpu: the eval sandbox's host RAM (24 GiB) can't hold a
+    # large bf16 base, but the planner-selected GPU fits it by
+    # construction. The child process exits before the server starts,
+    # so the GPU is clean when sglang claims it.
+    print(f"Merging LoRA adapter onto {base} (gpu child process) ...")
     code = (
         "import sys; from pathlib import Path; "
         "from lqh.remote.merge_lora import _merge; "
-        "_merge(sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]))"
+        "_merge(sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]), prefer_gpu=True)"
     )
     proc = subprocess.run(
         [sys.executable, "-c", code, str(base), base_model, str(out_dir)],
@@ -113,7 +117,13 @@ class _SglangServer:
     per-request logging would drown it.
     """
 
-    def __init__(self, model_path: str, run_dir: Path, extra_args: str = "") -> None:
+    def __init__(
+        self,
+        model_path: str,
+        run_dir: Path,
+        extra_args: str = "",
+        tool_call_parser: str | None = None,
+    ) -> None:
         log_dir = run_dir / "logs"
         log_dir.mkdir(exist_ok=True)
         self.log_path = log_dir / "sglang_server.log"
@@ -123,8 +133,14 @@ class _SglangServer:
             "--host", "127.0.0.1",
             "--port", str(SGLANG_PORT),
             "--served-model-name", SERVED_MODEL_NAME,
-            "--tool-call-parser", "lfm2",
         ]
+        # Parser only for model families we know how to parse — same
+        # decision the HF loop makes via get_tool_formatter. A non-LFM
+        # checkpoint (eval_hf accepts any HF repo) gets no parser: its
+        # tool markers stay in content verbatim, matching the HF
+        # engine's formatter-less behavior.
+        if tool_call_parser:
+            cmd += ["--tool-call-parser", tool_call_parser]
         if extra_args:
             cmd += shlex.split(extra_args)
         print(f"Starting sglang server: {' '.join(cmd)}")
@@ -345,9 +361,15 @@ def run_inference_sglang(run_dir: Path, config: dict) -> None:
         _finalize_predictions(run_dir, results, config, reporter, progress_end)
         return
 
+    from lqh.train.tool_format import get_tool_formatter
+
     model_path, merged_tmp = _prepare_model_path(config)
     server = _SglangServer(
-        model_path, run_dir, extra_args=str(config.get("sglang_extra_args", "")),
+        model_path, run_dir,
+        extra_args=str(config.get("sglang_extra_args", "")),
+        tool_call_parser=(
+            "lfm2" if get_tool_formatter(str(base_model)) is not None else None
+        ),
     )
     try:
         server.wait_healthy()

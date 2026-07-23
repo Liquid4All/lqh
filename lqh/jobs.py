@@ -657,6 +657,11 @@ class JobSupervisor:
             # Inconclusive: the backend says completed and we couldn't
             # reach the artifact API to double-check. Don't claim
             # failure on a network blip — keep completed with a caveat.
+            # Deliberate trade-off: against a pre-gate backend this
+            # leaves a false-completion window, but flipping to failed
+            # here would manufacture false FAILURES on every transient
+            # API hiccup against gated backends — the far more common
+            # case. The caveat text routes the user to verify.
             self.eval_hf_verdicts[run_name] = "unverified"
             return (
                 f"[System: eval run {run_name} completed{location}, but the "

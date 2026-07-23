@@ -61,7 +61,28 @@ def _extract_flat(tar_path: Path, dest: Path) -> Path:
     raise RuntimeError("extracted adapter contains no adapter_config.json")
 
 
-def _merge(base_model: str, adapter_dir: Path, out_dir: Path) -> None:
+def _tokenizer_source(base_model: str, adapter_dir: Path, modality: str) -> str:
+    """Where the merged checkpoint's tokenizer/processor comes from.
+
+    Prefer files shipped WITH the adapter — a fine-tune may carry an
+    updated tokenizer or chat template, and evaluating/serving with the
+    base's would silently change behavior. Falls back to the base. Same
+    rule the inference pod applies (modal_inference_pod.py, kind=merge).
+    """
+    marker = ("preprocessor_config.json" if modality == "vision"
+              else "tokenizer_config.json")
+    if (adapter_dir / marker).exists():
+        return str(adapter_dir)
+    return base_model
+
+
+def _merge(
+    base_model: str,
+    adapter_dir: Path,
+    out_dir: Path,
+    *,
+    prefer_gpu: bool = False,
+) -> None:
     import torch
     from peft import PeftModel
 
@@ -73,8 +94,20 @@ def _merge(base_model: str, adapter_dir: Path, out_dir: Path) -> None:
     modality = detect_modality(base_model)
     model_cls = _model_cls(modality)
 
-    print(f"merge: loading base {base_model} (bf16, cpu, {modality}) ...", flush=True)
-    model = model_cls.from_pretrained(base_model, torch_dtype=torch.bfloat16)
+    # The merge_lora cloud job runs on CPU sandboxes (memory-bound, no
+    # GPU to spare). The eval engine passes prefer_gpu=True: its sandbox
+    # host RAM is sized for serving (24 GiB), far too small to hold a
+    # large bf16 base on CPU, while the planner-selected GPU fits it by
+    # construction — and the merge child exits before sglang claims the
+    # card. Mirrors the pod's device pick.
+    device = "cuda" if prefer_gpu and torch.cuda.is_available() else None
+    load_kwargs: dict = {"torch_dtype": torch.bfloat16}
+    if device:
+        load_kwargs["device_map"] = device
+
+    print(f"merge: loading base {base_model} (bf16, {device or 'cpu'}, {modality}) ...",
+          flush=True)
+    model = model_cls.from_pretrained(base_model, **load_kwargs)
     print("merge: applying adapter ...", flush=True)
     model = PeftModel.from_pretrained(model, str(adapter_dir))
     merged = model.merge_and_unload()
@@ -85,14 +118,15 @@ def _merge(base_model: str, adapter_dir: Path, out_dir: Path) -> None:
     # the serving pod renders prompts wrong or not at all. For vision
     # bases the same applies to the image preprocessor config, so the
     # full AutoProcessor is saved instead.
+    tok_src = _tokenizer_source(base_model, adapter_dir, modality)
     if modality == "vision":
         from transformers import AutoProcessor
 
-        AutoProcessor.from_pretrained(base_model).save_pretrained(str(out_dir))
+        AutoProcessor.from_pretrained(tok_src).save_pretrained(str(out_dir))
     else:
         from transformers import AutoTokenizer
 
-        AutoTokenizer.from_pretrained(base_model).save_pretrained(str(out_dir))
+        AutoTokenizer.from_pretrained(tok_src).save_pretrained(str(out_dir))
 
 
 def main() -> int:

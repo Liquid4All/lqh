@@ -55,9 +55,11 @@ def _make_dataset(tmp_path: Path, n: int, *, with_tools: bool = False) -> str:
 class _FakeServer:
     instances: list["_FakeServer"] = []
 
-    def __init__(self, model_path: str, run_dir: Path, extra_args: str = "") -> None:
+    def __init__(self, model_path: str, run_dir: Path, extra_args: str = "",
+                 tool_call_parser: str | None = None) -> None:
         self.model_path = model_path
         self.extra_args = extra_args
+        self.tool_call_parser = tool_call_parser
         _FakeServer.instances.append(self)
 
     def wait_healthy(self, timeout: float = 0) -> None:
@@ -388,6 +390,24 @@ def test_run_engine_tools_forwarded_and_stored(tmp_path, monkeypatch) -> None:
     assert "tools" in table.column_names
 
 
+def test_run_engine_parser_only_for_lfm_models(tmp_path, monkeypatch) -> None:
+    # Same decision rule as the HF loop's get_tool_formatter: LFM
+    # checkpoints get the lfm2 parser, anything else gets none (tool
+    # markers stay in content, matching the formatter-less HF path).
+    dataset = _make_dataset(tmp_path, 2)
+
+    cfg = _engine_config(dataset)
+    cfg["base_model"] = "/runs/x/hf_checkpoints/LiquidAI_LFM2.5-1.2B@main"
+    _run_engine(tmp_path, monkeypatch, cfg)
+    assert _FakeServer.instances[-1].tool_call_parser == "lfm2"
+
+    (tmp_path / "run" / "predictions.parquet").unlink()
+    cfg2 = _engine_config(dataset)
+    cfg2["base_model"] = "/runs/x/hf_checkpoints/Qwen_Qwen3-0.6B@main"
+    _run_engine(tmp_path, monkeypatch, cfg2)
+    assert _FakeServer.instances[-1].tool_call_parser is None
+
+
 def test_run_engine_fatal_error_fails_run_keeps_partial(tmp_path, monkeypatch) -> None:
     dataset = _make_dataset(tmp_path, 4)
 
@@ -442,7 +462,11 @@ def test_prepare_model_path_merges_adapter(tmp_path, monkeypatch) -> None:
     try:
         assert "org/override-base" in recorded["cmd"]
         assert str(adapter) in recorded["cmd"]
-        assert "merge_lora" in " ".join(recorded["cmd"])
+        joined = " ".join(recorded["cmd"])
+        assert "merge_lora" in joined
+        # The eval-side merge must run on the GPU: sandbox host RAM is
+        # serving-sized (24 GiB) and can't hold a large bf16 base.
+        assert "prefer_gpu=True" in joined
         assert path.endswith("/merged") and Path(path).exists()
     finally:
         assert tmp is not None
@@ -517,6 +541,7 @@ def test_server_command_shape(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(engine_sglang.subprocess, "Popen", FakeProc)
     server = engine_sglang._SglangServer(
         "/weights/m", tmp_path, extra_args="--mem-fraction-static 0.8",
+        tool_call_parser="lfm2",
     )
     cmd = captured["cmd"]
     assert cmd[1:3] == ["-m", "sglang.launch_server"]
@@ -525,3 +550,30 @@ def test_server_command_shape(tmp_path, monkeypatch) -> None:
     assert cmd[-2:] == ["--mem-fraction-static", "0.8"]
     server.terminate()
     assert captured.get("terminated") is True
+
+    # No parser requested → flag absent entirely.
+    engine_sglang._SglangServer("/weights/m", tmp_path)
+    assert "--tool-call-parser" not in captured["cmd"]
+
+
+# ---------------------------------------------------------------------------
+# Merged-checkpoint tokenizer source (adapter-preferred, pod parity)
+# ---------------------------------------------------------------------------
+
+
+def test_tokenizer_source_prefers_adapter_files(tmp_path) -> None:
+    from lqh.remote.merge_lora import _tokenizer_source
+
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    # Bare adapter → base supplies tokenizer/processor.
+    assert _tokenizer_source("org/base", adapter, "text") == "org/base"
+    assert _tokenizer_source("org/base", adapter, "vision") == "org/base"
+
+    # Adapter shipping an updated tokenizer/template wins (text marker).
+    (adapter / "tokenizer_config.json").write_text("{}")
+    assert _tokenizer_source("org/base", adapter, "text") == str(adapter)
+    # Vision keys off the preprocessor config, not the tokenizer.
+    assert _tokenizer_source("org/base", adapter, "vision") == "org/base"
+    (adapter / "preprocessor_config.json").write_text("{}")
+    assert _tokenizer_source("org/base", adapter, "vision") == str(adapter)
