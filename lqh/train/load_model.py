@@ -236,6 +236,7 @@ def load_for_training(
     device_map: "str | dict | None" = "auto",
     base_override: str | None = None,
     merge_before_attach: bool = True,
+    adapter_trainable: bool = False,
     modality: Modality | None = None,
     max_image_tokens: int | None = None,
 ) -> "tuple[PreTrainedModel, PreTrainedTokenizerBase, str]":
@@ -249,7 +250,15 @@ def load_for_training(
     underlying base. When ``merge_before_attach=True`` (the default and
     only sensible choice for current callers), the returned model is the
     fully-merged result and the caller can attach a fresh ``LoraConfig``
-    on top without PEFT-on-PEFT awkwardness.
+    on top without PEFT-on-PEFT awkwardness. When
+    ``merge_before_attach=False``, ``adapter_trainable=True`` loads the
+    existing adapter as the trainable policy instead. That is the preferred
+    continuation path: it preserves an adapter-only deployable artifact and
+    avoids stacking a second adapter on an already-adapted model.
+
+    ``adapter_trainable=True`` is incompatible with
+    ``merge_before_attach=True`` because merging removes the adapter
+    parameters that would be trained.
     """
     import torch
 
@@ -266,6 +275,10 @@ def load_for_training(
 
     kind = detect_kind(path_or_id)
     if kind in ("hub", "merged"):
+        if adapter_trainable:
+            raise ValueError(
+                "adapter_trainable=True requires an adapter directory"
+            )
         model = model_cls.from_pretrained(
             path_or_id, dtype=dtype, device_map=device_map,
         )
@@ -279,7 +292,15 @@ def load_for_training(
     base_model = model_cls.from_pretrained(
         base, dtype=dtype, device_map=device_map,
     )
-    wrapped = PeftModel.from_pretrained(base_model, path_or_id)
+    if merge_before_attach and adapter_trainable:
+        raise ValueError(
+            "adapter_trainable=True requires merge_before_attach=False"
+        )
+    wrapped = PeftModel.from_pretrained(
+        base_model,
+        path_or_id,
+        is_trainable=adapter_trainable,
+    )
     if merge_before_attach:
         model = wrapped.merge_and_unload()
     else:

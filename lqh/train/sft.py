@@ -14,8 +14,6 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig
 from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
     TrainerCallback,
     TrainerControl,
     TrainerState,
@@ -387,30 +385,40 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # Symptom: training "runs" but at ~100× CPU speed.
     device_map = "auto" if torch.cuda.is_available() else None
 
-    # Load model. Vision models (LFM2.5-VL) use the image-text-to-text
-    # class and an AutoProcessor (tokenizer + image processor + chat
-    # template); text models keep the exact pre-existing path.
-    processor = None
-    if is_vision:
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+    # Continue an adapter by updating its existing weights. Stacking a new
+    # LoRA on an adapter-loaded model is ambiguous in PEFT and can save only
+    # the outer adapter, silently losing the SFT starting point. Updating the
+    # existing adapter preserves an adapter-only, multi-tenant deployable
+    # artifact. Callers can opt out with continue_existing_adapter=false,
+    # which merges the old adapter before attaching a fresh one.
+    from lqh.train.load_model import detect_kind, load_for_training
 
-        model = AutoModelForImageTextToText.from_pretrained(
-            base_model,
-            dtype=dtype,
-            device_map=device_map,
+    lora_enabled = lora_cfg.get("enabled", True)
+    base_model_kind = detect_kind(base_model)
+    continuing_adapter = bool(
+        lora_enabled
+        and base_model_kind == "adapter"
+        and lora_cfg.get("continue_existing_adapter", True)
+    )
+    fresh_adapter_on_merged_parent = bool(
+        lora_enabled and base_model_kind == "adapter" and not continuing_adapter
+    )
+    model, processing, _effective_base = load_for_training(
+        base_model,
+        dtype=dtype,
+        device_map=device_map,
+        merge_before_attach=not continuing_adapter,
+        adapter_trainable=continuing_adapter,
+        modality=modality,
+        max_image_tokens=int(training_cfg.get("max_image_tokens", 256)),
+    )
+    processor = processing if is_vision else None
+    tokenizer = processing.tokenizer if is_vision else processing
+    if continuing_adapter:
+        print(
+            "Continuing the existing LoRA adapter in place "
+            "(adapter-only output remains deployable)."
         )
-        processor = AutoProcessor.from_pretrained(
-            base_model,
-            max_image_tokens=int(training_cfg.get("max_image_tokens", 256)),
-        )
-        tokenizer = processor.tokenizer
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            dtype=dtype,
-            device_map=device_map,
-        )
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -441,7 +449,7 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
             ],
         }
     peft_config = None
-    if lora_cfg.get("enabled", True):
+    if lora_enabled and not continuing_adapter:
         peft_config = LoraConfig(
             r=lora_cfg.get("r", _lora_defaults["r"]),
             lora_alpha=lora_cfg.get("alpha", _lora_defaults["alpha"]),
@@ -525,7 +533,6 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # ~10x too small (GPU_TYPE_2.md).
     from lqh.train.calibrate import ensure_batch_defaults, maybe_autotune_batch_size
 
-    _lora_enabled = lora_cfg.get("enabled", True)
     if is_vision:
         # The calibration probe builds synthetic TEXT batches, which would
         # under-measure the vision encoder's activation peak — skip it and
@@ -540,8 +547,8 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     else:
         ensure_batch_defaults(
             training_cfg,
-            default_micro_batch=256 if _lora_enabled else 1,
-            default_effective_batch=256 if _lora_enabled else 16,
+            default_micro_batch=256 if lora_enabled else 1,
+            default_effective_batch=256 if lora_enabled else 16,
         )
         probe_model = model
         if peft_config is not None:
@@ -553,11 +560,18 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
             model=probe_model,
             tokenizer=tokenizer,
             base_model=base_model,
-            method="lora" if _lora_enabled else "full",
-            lora_rank=int(lora_cfg.get("r", 32)) if _lora_enabled else 0,
+            method="lora" if lora_enabled else "full",
+            lora_rank=int(lora_cfg.get("r", 32)) if lora_enabled else 0,
         )
         if probe_model is not model:
             model = probe_model.unload()
+            # PEFT leaves these markers on some transformers versions after
+            # unload(), causing the real trainer wrap to be treated as a
+            # second adapter attachment.
+            if hasattr(model, "peft_config"):
+                delattr(model, "peft_config")
+            if hasattr(model, "_hf_peft_config_loaded"):
+                model._hf_peft_config_loaded = False
 
     # Checkpoints dir
     checkpoint_output = str(run_dir / "checkpoints")
@@ -707,13 +721,20 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # distinct from a merged checkpoint (``model.tar.gz``). Downstream
     # consumers go through :func:`lqh.train.load_model.load_for_inference`
     # which transparently handles both layouts.
-    merge_lora = lora_cfg.get("merge", False)
-    saving_adapter = peft_config is not None and not merge_lora
+    # A new adapter trained on top of an in-memory merged parent cannot be
+    # loaded later from the original hub base by itself. Force a merged
+    # artifact for that explicit opt-out path; the default continuation path
+    # remains adapter-only.
+    merge_lora = bool(
+        lora_cfg.get("merge", False) or fresh_adapter_on_merged_parent
+    )
+    has_lora_model = peft_config is not None or continuing_adapter
+    saving_adapter = has_lora_model and not merge_lora
     final_dir_name = "model-lora" if saving_adapter else "model"
     final_model_dir = run_dir / final_dir_name
     final_model_dir.mkdir(parents=True, exist_ok=True)
 
-    if peft_config is not None and merge_lora:
+    if has_lora_model and merge_lora:
         merged_model = trainer.model.merge_and_unload()
         merged_model.save_pretrained(str(final_model_dir))
     else:

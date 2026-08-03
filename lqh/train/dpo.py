@@ -35,7 +35,12 @@ from lqh.train.data_utils import (
     load_preferences_parquet,
     split_train_eval,
 )
-from lqh.train.dpo_metrics import find_best_held_out_iter
+from lqh.train.dpo_metrics import (
+    derive_effective_batch,
+    find_best_held_out_iter,
+    has_no_train_signal,
+    held_out_stop_reason,
+)
 from lqh.train.progress import (
     wait_for_file,
     write_eval_request,
@@ -497,18 +502,35 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # change). Symptom: training "runs" but at ~100× CPU speed.
     device_map = "auto" if torch.cuda.is_available() else None
 
-    # Load model and tokenizer through the unified loader. When
-    # base_model is an adapter dir (e.g. a SFT-with-merge=False output
-    # used as the continued-FT starting point), this transparently
-    # loads the underlying base, applies the adapter, and merges it
-    # into the weights so DPO can attach a fresh LoRA on top. For a
-    # hub id or merged dir it's just a straight AutoModel load.
-    from lqh.train.load_model import load_for_training
+    # Prefer updating an existing SFT adapter in place. It starts from the
+    # exact same policy, preserves an adapter-only deployable artifact, and
+    # avoids PEFT-on-PEFT nesting. The explicit opt-out path merges the SFT
+    # adapter and attaches a fresh DPO LoRA, which must ultimately be saved as
+    # a full model because the new delta depends on that custom merged base.
+    from lqh.train.load_model import detect_kind, load_for_training
 
-    model, tokenizer, effective_base = load_for_training(
-        base_model, dtype=dtype, device_map=device_map,
-        merge_before_attach=True,
+    lora_enabled = lora_cfg.get("enabled", True)
+    base_model_kind = detect_kind(base_model)
+    continuing_adapter = bool(
+        lora_enabled
+        and base_model_kind == "adapter"
+        and lora_cfg.get("continue_existing_adapter", True)
     )
+    fresh_adapter_on_merged_parent = bool(
+        lora_enabled and base_model_kind == "adapter" and not continuing_adapter
+    )
+    model, tokenizer, _effective_base = load_for_training(
+        base_model,
+        dtype=dtype,
+        device_map=device_map,
+        merge_before_attach=not continuing_adapter,
+        adapter_trainable=continuing_adapter,
+    )
+    if continuing_adapter:
+        print(
+            "Continuing the existing LoRA adapter in place "
+            "(adapter-only output remains deployable)."
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -519,13 +541,16 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # load_for_training again produces a deterministic second copy of
     # the same merged weights.
     ref_model, _, _ = load_for_training(
-        base_model, dtype=dtype, device_map=device_map,
-        merge_before_attach=True,
+        base_model,
+        dtype=dtype,
+        device_map=device_map,
+        merge_before_attach=not continuing_adapter,
+        adapter_trainable=False,
     )
 
     # LoRA config
     peft_config = None
-    if lora_cfg.get("enabled", True):
+    if lora_enabled and not continuing_adapter:
         peft_config = LoraConfig(
             r=lora_cfg.get("r", 32),
             lora_alpha=lora_cfg.get("alpha", 64),
@@ -565,29 +590,113 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             held_out_convos = None
 
     iterations_dir = run_dir / "iterations"
+    strategy_filename = "lqh_adapter_strategy.json"
+
+    def _checkpoint_strategy(checkpoint_dir: Path) -> str | None:
+        path = checkpoint_dir / strategy_filename
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text()).get("strategy")
+        except (OSError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, str) else None
+
+    last_completed = (
+        _find_last_completed_iteration(iterations_dir)
+        if iterations_dir.exists()
+        else None
+    )
+    legacy_merged_parent = False
+    if continuing_adapter and last_completed is not None:
+        last_checkpoint = (
+            iterations_dir
+            / f"iter_{last_completed:03d}"
+            / "checkpoint"
+        )
+        # Checkpoints created before the continuation marker contain only the
+        # DPO delta trained on an in-memory merged SFT parent. Loading such an
+        # adapter directly on the hub base would drop the SFT weights.
+        legacy_merged_parent = (
+            _checkpoint_strategy(last_checkpoint) != "continue_existing"
+        )
+        if legacy_merged_parent:
+            fresh_adapter_on_merged_parent = True
+            print(
+                "Resuming a legacy DPO adapter-over-merged-SFT checkpoint; "
+                "the final artifact will be saved as a full merged model."
+            )
+
+    def _load_policy_checkpoint(
+        checkpoint_dir: Path,
+        *,
+        trainable: bool,
+    ) -> tuple[Any, Any]:
+        """Reconstruct a policy checkpoint without nesting adapters."""
+        if not lora_enabled:
+            checkpoint_model, checkpoint_tokenizer, _ = load_for_training(
+                str(checkpoint_dir),
+                dtype=dtype,
+                device_map=device_map,
+                merge_before_attach=True,
+            )
+            return checkpoint_model, checkpoint_tokenizer
+        if (
+            continuing_adapter
+            and _checkpoint_strategy(checkpoint_dir) == "continue_existing"
+        ):
+            checkpoint_model, checkpoint_tokenizer, _ = load_for_training(
+                str(checkpoint_dir),
+                dtype=dtype,
+                device_map=device_map,
+                merge_before_attach=False,
+                adapter_trainable=trainable,
+            )
+            return checkpoint_model, checkpoint_tokenizer
+
+        # A newly attached adapter is relative to the exact starting policy.
+        # Rebuild that policy first; this matters when the configured base was
+        # itself an adapter that we explicitly merged before attaching DPO.
+        checkpoint_base, checkpoint_tokenizer, _ = load_for_training(
+            base_model,
+            dtype=dtype,
+            device_map=device_map,
+            merge_before_attach=True,
+        )
+        checkpoint_model = PeftModel.from_pretrained(
+            checkpoint_base,
+            str(checkpoint_dir),
+            is_trainable=trainable,
+        )
+        return checkpoint_model, checkpoint_tokenizer
 
     # --- Resume logic: check for completed iterations from a previous run ---
     start_iteration = 0
-    model_has_peft = False
+    model_has_peft = continuing_adapter
 
-    if iterations_dir.exists():
-        last_completed = _find_last_completed_iteration(iterations_dir)
-        if last_completed is not None:
-            if last_completed >= num_iterations - 1:
-                print(f"All {num_iterations} iterations already completed. Saving final model.")
-                # Load the last checkpoint for final merge-and-save
-                ckpt_dir = iterations_dir / f"iter_{last_completed:03d}" / "checkpoint"
-                model = PeftModel.from_pretrained(model, str(ckpt_dir))
-                model_has_peft = True
-                start_iteration = num_iterations  # skip the loop entirely
-            else:
-                ckpt_dir = iterations_dir / f"iter_{last_completed:03d}" / "checkpoint"
-                print(f"Resuming from iteration {last_completed + 1}, loading checkpoint from {ckpt_dir}")
-                model = PeftModel.from_pretrained(model, str(ckpt_dir))
-                model_has_peft = True
-                start_iteration = last_completed + 1
+    if last_completed is not None:
+        if last_completed >= num_iterations - 1:
+            print(f"All {num_iterations} iterations already completed. Saving final model.")
+            ckpt_dir = iterations_dir / f"iter_{last_completed:03d}" / "checkpoint"
+            model, tokenizer = _load_policy_checkpoint(
+                ckpt_dir, trainable=True,
+            )
+            model_has_peft = True
+            start_iteration = num_iterations  # skip the loop entirely
+        else:
+            ckpt_dir = iterations_dir / f"iter_{last_completed:03d}" / "checkpoint"
+            print(
+                f"Resuming from iteration {last_completed + 1}, "
+                f"loading checkpoint from {ckpt_dir}"
+            )
+            model, tokenizer = _load_policy_checkpoint(
+                ckpt_dir, trainable=True,
+            )
+            model_has_peft = True
+            start_iteration = last_completed + 1
 
     interrupted = False
+    early_stopped = False
     interruption_error: str | None = None
 
     completed_iterations = start_iteration
@@ -788,11 +897,37 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         # are part of the measured footprint.
         from lqh.train.calibrate import ensure_batch_defaults, maybe_autotune_batch_size
 
-        _dpo_lora_enabled = lora_cfg.get("enabled", True)
+        if training_cfg.get("dpo_step_aware_batch", True):
+            target_steps = int(
+                training_cfg.get("dpo_target_optimizer_steps_per_iter", 30)
+            )
+            derived_effective = derive_effective_batch(
+                pair_count=len(train_raw),
+                epochs=int(training_cfg.get("dpo_num_epochs", 1)),
+                target_optimizer_steps=target_steps,
+            )
+            training_cfg["effective_batch_size"] = derived_effective
+            configured_micro = int(
+                training_cfg.get("per_device_batch_size", derived_effective)
+            )
+            training_cfg["per_device_batch_size"] = min(
+                max(1, configured_micro), derived_effective,
+            )
+            training_cfg["gradient_accumulation_steps"] = max(
+                1,
+                derived_effective
+                // int(training_cfg["per_device_batch_size"]),
+            )
+            print(
+                "  step-aware batch: "
+                f"effective={derived_effective} for {len(train_raw)} pairs "
+                f"(target >= {target_steps} optimizer steps)"
+            )
+
         ensure_batch_defaults(
             training_cfg,
-            default_micro_batch=16 if _dpo_lora_enabled else 1,
-            default_effective_batch=16 if _dpo_lora_enabled else 2,
+            default_micro_batch=16 if lora_enabled else 1,
+            default_effective_batch=16 if lora_enabled else 2,
         )
         _probe_model = model
         if peft_config is not None and not model_has_peft:
@@ -804,11 +939,15 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             model=_probe_model,
             tokenizer=tokenizer,
             base_model=base_model,
-            method="dpo_lora" if _dpo_lora_enabled else "dpo_full",
-            lora_rank=int(lora_cfg.get("r", 32)) if _dpo_lora_enabled else 0,
+            method="dpo_lora" if lora_enabled else "dpo_full",
+            lora_rank=int(lora_cfg.get("r", 32)) if lora_enabled else 0,
         )
         if _probe_model is not model:
             model = _probe_model.unload()
+            if hasattr(model, "peft_config"):
+                delattr(model, "peft_config")
+            if hasattr(model, "_hf_peft_config_loaded"):
+                model._hf_peft_config_loaded = False
 
         # DPO training config
         dpo_kwargs: dict[str, Any] = dict(
@@ -816,7 +955,7 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             num_train_epochs=training_cfg.get("dpo_num_epochs", 1),
             per_device_train_batch_size=training_cfg.get("per_device_batch_size", 2),
             gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 1),
-            learning_rate=training_cfg.get("learning_rate", 5e-6),
+            learning_rate=training_cfg.get("learning_rate", 1e-6),
             beta=dpo_beta,
             gradient_checkpointing=training_cfg.get("gradient_checkpointing", True),
             bf16=training_cfg.get("bf16", True),
@@ -1048,6 +1187,14 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         # Record DPO step metrics
         optimizer_steps = int(getattr(trainer.state, "global_step", 0) or 0)
         cumulative_optimizer_steps += optimizer_steps
+        chosen_ce_delta_ref = final_chosen_ce.get(
+            "eval_ce_chosen_delta_ref"
+        )
+        train_loss = (
+            train_result.training_loss
+            if hasattr(train_result, "training_loss")
+            else None
+        )
         dpo_metrics = {
             "iteration": iteration,
             "num_preferences": len(preferences),
@@ -1063,7 +1210,16 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             "projected_run_optimizer_steps": projected_run_steps,
             "optimizer_steps": optimizer_steps,
             "cumulative_optimizer_steps": cumulative_optimizer_steps,
-            "train_loss": train_result.training_loss if hasattr(train_result, "training_loss") else None,
+            "train_loss": train_loss,
+            "no_train_signal": has_no_train_signal(
+                optimizer_steps=optimizer_steps,
+                train_loss=train_loss,
+                chosen_ce_delta_ref=(
+                    float(chosen_ce_delta_ref)
+                    if isinstance(chosen_ce_delta_ref, (int, float))
+                    else None
+                ),
+            ),
             "final_eval": final_eval,
             "final_chosen_ce": final_chosen_ce,
         }
@@ -1129,6 +1285,18 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         ckpt_dir = iter_dir / "checkpoint"
         model.save_pretrained(str(ckpt_dir))
         tokenizer.save_pretrained(str(ckpt_dir))
+        (ckpt_dir / strategy_filename).write_text(
+            json.dumps({
+                "strategy": (
+                    "fresh_on_merged_parent"
+                    if legacy_merged_parent or fresh_adapter_on_merged_parent
+                    else "continue_existing"
+                    if continuing_adapter
+                    else "fresh_adapter"
+                ),
+                "base_model": base_model,
+            }, indent=2) + "\n"
+        )
         (iter_dir / "iter_complete.json").write_text(
             json.dumps({
                 "iteration": iteration,
@@ -1242,18 +1410,39 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             except Exception as exc:
                 print(f"  WARNING: held-out eval inference failed: {exc}")
 
+        # Stop expensive on-policy rerolls when task quality has clearly
+        # regressed or stopped improving. The best-checkpoint restore below
+        # still selects the peak observed iteration.
+        abort_signal = run_dir / "early_abort.json"
+        if held_out_convos and not abort_signal.exists():
+            quality_stop = held_out_stop_reason(
+                iterations_dir,
+                regression_delta=float(
+                    config.get("dpo_early_abort_delta", 0.5)
+                ),
+                plateau_patience=int(
+                    config.get("dpo_plateau_patience", 2)
+                ),
+                min_improvement=float(
+                    config.get("dpo_min_held_out_improvement", 0.05)
+                ),
+            )
+            if quality_stop is not None:
+                abort_signal.write_text(
+                    json.dumps(quality_stop, indent=2) + "\n"
+                )
+
         # Check for early-abort signal from the harness. The harness
         # writes run_dir/early_abort.json if the per-iter eval shows a
         # regression past --dpo-early-abort-delta. We respect it before
         # starting the next iter's expensive prediction run.
-        abort_signal = run_dir / "early_abort.json"
         if abort_signal.exists():
             try:
                 payload = json.loads(abort_signal.read_text())
             except Exception:
                 payload = {"reason": "unparseable"}
             print(f"Early abort signaled by harness at iter {iteration}: {payload}")
-            interrupted = True
+            early_stopped = True
             break
 
     # Restore the best-scoring iter before the final save. Without
@@ -1283,17 +1472,10 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                 )
                 del model
                 torch.cuda.empty_cache()
-                # Reconstruct the exact SFT starting policy before applying
-                # the selected DPO adapter. ``base_model`` may itself be an
-                # adapter-only SFT result; loading it with AutoModel directly
-                # either fails or silently drops the SFT adapter.
-                model, _, _ = load_for_training(
-                    base_model,
-                    dtype=dtype,
-                    device_map=device_map,
-                    merge_before_attach=True,
+                model, tokenizer = _load_policy_checkpoint(
+                    best_ckpt,
+                    trainable=True,
                 )
-                model = PeftModel.from_pretrained(model, str(best_ckpt))
                 model_has_peft = True
             else:
                 print(
@@ -1305,11 +1487,20 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                 f"Best iter is {best_iter} (current weights); no reload needed."
             )
 
-    # Save final model
-    final_model_dir = run_dir / "model"
+    # Save LoRA policies as adapters by default so one shared base model can
+    # serve many tenants. The explicit fresh-adapter-on-merged-parent path
+    # cannot be reconstructed from the original base alone, so it is forced
+    # to a full merged artifact.
+    merge_lora = bool(
+        lora_cfg.get("merge", False) or fresh_adapter_on_merged_parent
+    )
+    saving_adapter = bool(model_has_peft and not merge_lora)
+    final_model_dir = run_dir / ("model-lora" if saving_adapter else "model")
     final_model_dir.mkdir(parents=True, exist_ok=True)
 
-    if model_has_peft or peft_config is not None:
+    if saving_adapter:
+        model.save_pretrained(str(final_model_dir))
+    elif model_has_peft:
         try:
             merged = model.merge_and_unload()
             merged.save_pretrained(str(final_model_dir))
@@ -1365,10 +1556,16 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             "interrupted",
             error=(
                 f"{interruption_error or 'Preference handoff interrupted'}; "
-                "partial model saved to model/"
+                f"partial model saved to {final_model_dir.name}/"
             ),
         )
         print(f"DPO training interrupted. Partial model saved to {final_model_dir}")
+    elif early_stopped:
+        write_status(run_dir, "completed")
+        print(
+            "DPO training stopped early on held-out quality and restored the "
+            f"best checkpoint. Model saved to {final_model_dir}"
+        )
     elif final_eval_failed:
         write_status(run_dir, "completed")
         print(

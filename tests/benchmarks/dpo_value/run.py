@@ -43,6 +43,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sft-train-size", type=int, default=10_000)
     parser.add_argument("--dpo-train-size", type=int, default=2_000)
     parser.add_argument("--validation-size", type=int, default=200)
+    parser.add_argument("--confirmation-size", type=int, default=400)
     parser.add_argument("--test-size", type=int, default=400)
     parser.add_argument("--seeds", default="17,29,41")
     parser.add_argument("--grid-size", choices=["tiny", "small"], default="small")
@@ -54,11 +55,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sweep-timeout", type=float, default=48 * 3600)
     parser.add_argument("--eval-timeout", type=float, default=3600)
     parser.add_argument("--bootstrap-samples", type=int, default=10_000)
+    parser.add_argument("--min-held-out-gain", type=float, default=0.1)
+    parser.add_argument("--min-confirmation-gain", type=float, default=0.1)
     parser.add_argument("--workdir", default="")
     parser.add_argument("--run-name", default="")
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args(argv)
-    for name in ("sft_train_size", "dpo_train_size", "validation_size", "test_size"):
+    for name in (
+        "sft_train_size",
+        "dpo_train_size",
+        "validation_size",
+        "confirmation_size",
+        "test_size",
+    ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     try:
@@ -172,12 +181,13 @@ async def _evaluate(
     scorer_rel: str,
     client: Any,
     args: argparse.Namespace,
+    split: str = "test",
 ) -> tuple[float | None, dict[int, float], dict[str, float | int]]:
     result = await eval_local(
         workdir=workdir,
         run_name=name,
         model_path=str(model.resolve()),
-        eval_parquet=workdir / paths["test"],
+        eval_parquet=workdir / paths[split],
         scorer_path=workdir / scorer_rel,
         client=client,
         judge_size=args.judge_size,
@@ -186,8 +196,8 @@ async def _evaluate(
         resume=not args.no_resume,
     )
     task_metrics = (
-        voice_metrics(result.predictions_path, workdir / paths["test"])
-        if args.task == "voice_satisfaction" else {}
+        voice_metrics(result.predictions_path, workdir / paths[split])
+        if args.task == "voice_satisfaction" and split == "test" else {}
     )
     return result.mean, _score_vector(result.scores_dir), task_metrics
 
@@ -233,6 +243,18 @@ async def _run_seed(
         client=client,
         args=args,
     )
+    sft_validation_mean, _, _ = await _evaluate(
+        workdir=workdir,
+        name=f"{prefix}__sft_validation",
+        model=sft_model,
+        paths=paths,
+        scorer_rel=scorer_rel,
+        client=client,
+        args=args,
+        split="validation",
+    )
+    if sft_validation_mean is None:
+        raise RuntimeError("SFT validation baseline produced no judge mean")
 
     continued_config = _base_config(
         run_type="sft",
@@ -243,9 +265,23 @@ async def _run_seed(
         train_size=args.dpo_train_size,
     )
     continued_config["training"]["seed"] = seed
+    continued_grid = [
+        {
+            "id": f"continued_sft_lr{lr:g}_e{epochs}",
+            "overrides": {
+                "training": {
+                    "learning_rate": lr,
+                    "num_epochs": epochs,
+                },
+            },
+        }
+        for lr in (5e-6, 1e-5, 2e-5)
+        for epochs in (1, 2)
+    ]
     continued_model, _ = await _run_sweep(
         run_name=f"{prefix}__continued_sft",
         base_config=continued_config,
+        grid_override=continued_grid,
         **common,
     )
     continued_mean, continued_scores, continued_metrics = await _evaluate(
@@ -273,6 +309,8 @@ async def _run_seed(
         item for item in dpo_config["manifest"] if item != "eval_dataset"
     ]
     dpo_config["held_out_eval_dataset"] = paths["validation"]
+    dpo_config["held_out_baseline_mean"] = sft_validation_mean
+    dpo_config["dpo_min_held_out_gain"] = args.min_held_out_gain
     if "held_out_eval_dataset" not in dpo_config["manifest"]:
         dpo_config["manifest"].append("held_out_eval_dataset")
     dpo_config["preference_judge_size"] = args.judge_size
@@ -282,18 +320,83 @@ async def _run_seed(
         "data_seed": seed,
         "dpo_min_optimizer_steps": 50,
     })
-    dpo_model, _ = await _run_sweep(
-        run_name=f"{prefix}__dpo", base_config=dpo_config, **common,
-    )
-    dpo_mean, dpo_scores, dpo_metrics = await _evaluate(
-        workdir=workdir,
-        name=f"{prefix}__dpo_test",
-        model=dpo_model,
-        paths=paths,
-        scorer_rel=scorer_rel,
-        client=client,
-        args=args,
-    )
+    validation_selected_dpo = True
+    try:
+        dpo_model, _ = await _run_sweep(
+            run_name=f"{prefix}__dpo", base_config=dpo_config, **common,
+        )
+    except RuntimeError:
+        # A baseline-aware DPO sweep is allowed to select no model. In that
+        # case the unchanged SFT checkpoint wins without another noisy judge
+        # pass over the final test.
+        summary_path = (
+            workdir / "runs" / f"{prefix}__dpo" / "sweep_summary.json"
+        )
+        try:
+            no_winner = json.loads(summary_path.read_text()).get("winner") is None
+        except (OSError, json.JSONDecodeError):
+            no_winner = False
+        if not no_winner:
+            raise
+        logger.info("seed %d: DPO did not beat its validation baseline", seed)
+        validation_selected_dpo = False
+        dpo_model = sft_model
+    confirmation: dict[str, Any] | None = None
+    dpo_selected = validation_selected_dpo
+    if validation_selected_dpo:
+        _, sft_confirmation_scores, _ = await _evaluate(
+            workdir=workdir,
+            name=f"{prefix}__sft_confirmation",
+            model=sft_model,
+            paths=paths,
+            scorer_rel=scorer_rel,
+            client=client,
+            args=args,
+            split="confirmation",
+        )
+        _, dpo_confirmation_scores, _ = await _evaluate(
+            workdir=workdir,
+            name=f"{prefix}__dpo_confirmation",
+            model=dpo_model,
+            paths=paths,
+            scorer_rel=scorer_rel,
+            client=client,
+            args=args,
+            split="confirmation",
+        )
+        confirmation = _comparison(
+            dpo_confirmation_scores,
+            sft_confirmation_scores,
+            args,
+            seed=seed + 10_000,
+        )
+        dpo_selected = bool(
+            confirmation["mean"] >= args.min_confirmation_gain
+            and confirmation["ci_low"] > 0
+        )
+        if not dpo_selected:
+            logger.info(
+                "seed %d: DPO candidate failed independent confirmation "
+                "(delta=%+.3f, ci_low=%+.3f)",
+                seed,
+                confirmation["mean"],
+                confirmation["ci_low"],
+            )
+            dpo_model = sft_model
+    if dpo_selected:
+        dpo_mean, dpo_scores, dpo_metrics = await _evaluate(
+            workdir=workdir,
+            name=f"{prefix}__dpo_test",
+            model=dpo_model,
+            paths=paths,
+            scorer_rel=scorer_rel,
+            client=client,
+            args=args,
+        )
+    else:
+        dpo_mean, dpo_scores, dpo_metrics = (
+            sft_mean, dict(sft_scores), dict(sft_metrics),
+        )
 
     comparisons = {
         "dpo_minus_sft": _comparison(dpo_scores, sft_scores, args, seed=seed),
@@ -306,6 +409,14 @@ async def _run_seed(
     }
     return {
         "seed": seed,
+        "selection": {
+            "sft_validation_mean": sft_validation_mean,
+            "min_held_out_gain": args.min_held_out_gain,
+            "validation_selected_dpo": validation_selected_dpo,
+            "confirmation": confirmation,
+            "min_confirmation_gain": args.min_confirmation_gain,
+            "selected": "dpo" if dpo_selected else "sft_baseline",
+        },
         "means": {
             "sft": sft_mean,
             "continued_sft": continued_mean,
@@ -349,6 +460,23 @@ def _render_report(meta: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         for row in rows
     ]
     lines.extend([
+        "",
+        "Selection: "
+        + "; ".join(
+            f"seed {row['seed']} → {row['selection']['selected']} "
+            f"(SFT baseline {row['selection']['sft_validation_mean']:.2f}, "
+            f"tuning gain required {row['selection']['min_held_out_gain']:+.2f}"
+            + (
+                f", confirmation {row['selection']['confirmation']['mean']:+.2f} "
+                f"[{row['selection']['confirmation']['ci_low']:+.2f}, "
+                f"{row['selection']['confirmation']['ci_high']:+.2f}]"
+                if row["selection"]["confirmation"] is not None
+                else ", no DPO candidate reached confirmation"
+            )
+            + ")"
+            for row in rows
+        )
+        + ".",
         "",
         f"Mean DPO-SFT delta across training seeds: `{sum(gains) / len(gains):+.2f}`.",
         "",
@@ -400,6 +528,7 @@ async def _main(args: argparse.Namespace) -> int:
         "sft_train": args.sft_train_size,
         "dpo_train": args.dpo_train_size,
         "validation": args.validation_size,
+        "confirmation": args.confirmation_size,
         "test": args.test_size,
     }
     paths, scorer_rel = await _ensure_splits(
@@ -438,7 +567,14 @@ async def _main(args: argparse.Namespace) -> int:
                 "min_gap": 1.0,
                 "min_pairs_per_iter": 50,
             },
-            "dpo_effective_batch": 16,
+            "dpo_batch_policy": {
+                "step_aware": True,
+                "target_optimizer_steps_per_iter": 30,
+                "minimum_effective_batch": 8,
+                "maximum_effective_batch": 128,
+            },
+            "dpo_min_held_out_gain": args.min_held_out_gain,
+            "dpo_min_confirmation_gain": args.min_confirmation_gain,
         }
         (workdir / "results.json").write_text(
             json.dumps({"meta": meta, "seeds": rows}, indent=2) + "\n"

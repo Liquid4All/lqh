@@ -377,7 +377,7 @@ def _base_config(
     """Build the SFT/DPO base config the sweep wraps. The grid overrides
     learning_rate / num_epochs (SFT) or learning_rate / dpo_beta (DPO)."""
     training: dict = {
-        "learning_rate": 2e-5 if run_type == "sft" else 5e-6,
+        "learning_rate": 2e-5 if run_type == "sft" else 1e-6,
         "max_seq_length": 2048,
     }
     cfg: dict = {
@@ -401,6 +401,9 @@ def _base_config(
     else:  # on_policy_dpo
         cfg["num_iterations"] = 5
         cfg["dpo_beta"] = 0.1
+        cfg["dpo_early_abort_delta"] = 0.5
+        cfg["dpo_plateau_patience"] = 2
+        cfg["dpo_min_held_out_improvement"] = 0.05
         cfg["golden_source"] = "dataset"
         cfg["held_out_eval_dataset"] = eval_rel
         cfg["manifest"].append("held_out_eval_dataset")
@@ -414,10 +417,11 @@ def _base_config(
             "gradient_accumulation_steps": _DPO_GRAD_ACCUM,
             "effective_batch_size": _DPO_PER_DEVICE_BATCH * _DPO_GRAD_ACCUM,
             "auto_batch": True,
+            "dpo_step_aware_batch": True,
+            "dpo_target_optimizer_steps_per_iter": 30,
         })
-        # The DPO sweep selects on `eval_ce_chosen_mean`, computed over a
-        # held-out split of the per-iteration PREFERENCE pairs — and the sweep
-        # reads ITER_000 specifically. split_train_eval has a hard floor
+        # The trainer still needs a preference-pair eval split for CE safety
+        # diagnostics. split_train_eval has a hard floor
         # (min_eval=10): if round(n_pairs * ratio) < 10 the eval split is EMPTY
         # → no chosen-CE summary → proxy null → no winner. On-policy yield is as
         # low as ~0.13 pairs per train prompt for a strong model (its greedy
@@ -439,6 +443,7 @@ async def _run_sweep(
     grid_size: str,
     timeout: float,
     resume: bool,
+    grid_override: list[dict] | None = None,
 ) -> tuple[Path, dict]:
     """Launch a local sweep subprocess, wait for completion, return winner dir."""
     run_dir = workdir / "runs" / run_name
@@ -467,6 +472,8 @@ async def _run_sweep(
         # validated in-training proxy (eval_loss / eval_ce_chosen_mean).
         "eval_best": False,
     }
+    if grid_override is not None:
+        launch["grid_override"] = grid_override
     SubprocessManager().start(run_dir, launch, module="lqh.train.sweep", project_dir=workdir)
     await _await_run(SubprocessManager(), run_dir, timeout=timeout, label=f"sweep:{run_name}")
     model_dir = _winner_model_dir()

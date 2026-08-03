@@ -358,8 +358,56 @@ def test_load_for_training_vision_adapter(stub_torch_transformers_peft, tmp_path
 
     assert effective_base == "fake/vl-base"
     assert s.AutoModelForImageTextToText.from_pretrained.call_args.args[0] == "fake/vl-base"
-    s.PeftModel.from_pretrained.assert_called_once_with(base_obj, str(tmp_path))
+    s.PeftModel.from_pretrained.assert_called_once_with(
+        base_obj, str(tmp_path), is_trainable=False,
+    )
     wrapped.merge_and_unload.assert_called_once()
+
+
+def test_load_for_training_adapter_can_continue_existing_weights(
+    stub_torch_transformers_peft,
+    tmp_path: Path,
+):
+    from lqh.train.load_model import load_for_training
+
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps({"base_model_name_or_path": "fake/base"})
+    )
+    s = stub_torch_transformers_peft
+    base_obj = MagicMock(name="base_model_instance")
+    s.AutoModelForCausalLM.from_pretrained.return_value = base_obj
+    wrapped = MagicMock(name="trainable_peft")
+    s.PeftModel.from_pretrained.return_value = wrapped
+
+    model, _, effective_base = load_for_training(
+        str(tmp_path),
+        merge_before_attach=False,
+        adapter_trainable=True,
+    )
+
+    assert model is wrapped
+    assert effective_base == "fake/base"
+    s.PeftModel.from_pretrained.assert_called_once_with(
+        base_obj, str(tmp_path), is_trainable=True,
+    )
+    wrapped.merge_and_unload.assert_not_called()
+
+
+def test_load_for_training_rejects_trainable_adapter_merge(
+    stub_torch_transformers_peft,
+    tmp_path: Path,
+):
+    from lqh.train.load_model import load_for_training
+
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps({"base_model_name_or_path": "fake/base"})
+    )
+    with pytest.raises(ValueError, match="merge_before_attach=False"):
+        load_for_training(
+            str(tmp_path),
+            merge_before_attach=True,
+            adapter_trainable=True,
+        )
 
 
 def test_explicit_modality_skips_detection(stub_torch_transformers_peft):

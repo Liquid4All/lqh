@@ -140,14 +140,15 @@ def sft_grid_small() -> list[SweepPoint]:
 
 
 def dpo_grid_small() -> list[SweepPoint]:
-    """DPO grid: lr ∈ {3e-7, 1e-6, 3e-6} × β ∈ {0.05, 0.10} = 6 configs.
+    """DPO grid: lr ∈ {3e-7, 1e-6, 2e-6} × β ∈ {0.05, 0.10} = 6 configs.
 
-    Brackets the calm/collapse boundary observed on ar_to_de
-    (calm at lr=1e-6, full collapse at lr=5e-6). 3e-6 may collapse but
-    the chosen-CE proxy detects it and excludes from the winner pool.
+    Fresh-data voice-satisfaction runs showed 3e-6 peaking after two
+    iterations and then oscillating by more than a judge point while the
+    catastrophic CE guard remained below threshold. Keep DPO substantially
+    below SFT learning rates and use 2e-6 as the upper stability probe.
     """
     points: list[SweepPoint] = []
-    for lr in (3e-7, 1e-6, 3e-6):
+    for lr in (3e-7, 1e-6, 2e-6):
         for beta in (0.05, 0.10):
             points.append(
                 SweepPoint(
@@ -227,7 +228,11 @@ def _read_sft_proxy(sub_run_dir: Path) -> dict[str, Any]:
     return {}
 
 
-def _read_dpo_proxy(sub_run_dir: Path) -> dict[str, Any]:
+def _read_dpo_proxy(
+    sub_run_dir: Path,
+    *,
+    held_out_baseline_mean: float | None = None,
+) -> dict[str, Any]:
     """Read DPO quality and safety metrics across every iteration.
 
     Quality is the best fixed held-out judge mean.  CE is aggregated only for
@@ -242,6 +247,7 @@ def _read_dpo_proxy(sub_run_dir: Path) -> dict[str, Any]:
     out: dict[str, Any] = {}
     ce_rows: list[dict[str, Any]] = []
     held_out: list[tuple[int, float]] = []
+    train_signal_flags: list[bool] = []
     for iter_dir in sorted(iter_root.glob("iter_*")):
         try:
             iteration = int(iter_dir.name.rsplit("_", 1)[-1])
@@ -256,6 +262,17 @@ def _read_dpo_proxy(sub_run_dir: Path) -> dict[str, Any]:
         mean = read_held_out_mean(iter_dir)
         if mean is not None:
             held_out.append((iteration, mean))
+        result_path = iter_dir / "dpo_result.json"
+        if result_path.exists():
+            try:
+                result = json.loads(result_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                result = {}
+            if isinstance(result.get("no_train_signal"), bool):
+                train_signal_flags.append(result["no_train_signal"])
+
+    if train_signal_flags:
+        out["no_train_signal"] = all(train_signal_flags)
 
     if ce_rows:
         deltas = [
@@ -290,6 +307,11 @@ def _read_dpo_proxy(sub_run_dir: Path) -> dict[str, Any]:
                 for iteration, mean in held_out
             ],
         })
+        if held_out_baseline_mean is not None:
+            out["held_out_baseline_mean"] = held_out_baseline_mean
+            out["held_out_delta_vs_baseline"] = (
+                best_mean - held_out_baseline_mean
+            )
     else:
         # Backward-compatible fallback only. Raw CE is comparable only when
         # every config uses the same frozen preference validation examples.
@@ -322,7 +344,12 @@ def _pick_winner(
     """Pick the row with the lowest proxy value that is NOT collapsed."""
     candidates = [
         r for r in rows
-        if r.get("primary") is not None and not r.get("collapsed", False)
+        if (
+            r.get("primary") is not None
+            and not r.get("collapsed", False)
+            and not r.get("no_train_signal", False)
+            and not r.get("below_baseline", False)
+        )
     ]
     if not candidates:
         return None
@@ -825,7 +852,12 @@ def _dpo_no_proxy_message(run_dir: Path, rows: list[dict[str, Any]]) -> str | No
 
     completed_without_proxy = [
         r for r in rows
-        if r.get("rc") == 0 and r.get("primary") is None and not r.get("collapsed")
+        if (
+            r.get("rc") == 0
+            and r.get("primary") is None
+            and not r.get("collapsed")
+            and not r.get("no_train_signal")
+        )
     ]
     if len(completed_without_proxy) != len(rows):
         return None
@@ -879,10 +911,25 @@ def _no_winner_message(run_dir: Path, rows: list[dict[str, Any]]) -> str:
 
     crashed = [r for r in rows if r.get("rc") not in (0, None)]
     collapsed = [r for r in rows if r.get("rc") in (0, None) and r.get("collapsed")]
+    no_signal = [
+        r for r in rows
+        if r.get("rc") in (0, None)
+        and not r.get("collapsed")
+        and r.get("no_train_signal")
+    ]
+    below_baseline = [
+        r for r in rows
+        if r.get("rc") in (0, None)
+        and not r.get("collapsed")
+        and not r.get("no_train_signal")
+        and r.get("below_baseline")
+    ]
     no_proxy = [
         r for r in rows
         if r.get("rc") in (0, None)
         and not r.get("collapsed")
+        and not r.get("no_train_signal")
+        and not r.get("below_baseline")
         and r.get("primary") is None
     ]
 
@@ -911,6 +958,16 @@ def _no_winner_message(run_dir: Path, rows: list[dict[str, Any]]) -> str:
             f"{len(collapsed)} collapsed "
             f"(proxy past the {COLLAPSE_DELTA_REF_THRESHOLD} threshold): "
             f"{_ids(collapsed)}"
+        )
+    if no_signal:
+        parts.append(
+            f"{len(no_signal)} completed but DPO was a no-op at this "
+            f"batch/lr/pair count: {_ids(no_signal)}"
+        )
+    if below_baseline:
+        parts.append(
+            f"{len(below_baseline)} did not beat the frozen starting policy "
+            f"by the required held-out gain: {_ids(below_baseline)}"
         )
     if no_proxy:
         parts.append(
@@ -1007,6 +1064,21 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
 
         if point.id in completed_rows:
             row = dict(completed_rows[point.id])
+            if run_type in ("dpo", "on_policy_dpo"):
+                baseline_mean = base.get("held_out_baseline_mean")
+                held_out_mean = row.get("held_out_judge_mean")
+                if (
+                    isinstance(baseline_mean, (int, float))
+                    and isinstance(held_out_mean, (int, float))
+                ):
+                    delta = float(held_out_mean) - float(baseline_mean)
+                    min_gain = float(base.get("dpo_min_held_out_gain", 0.0))
+                    row.update({
+                        "held_out_baseline_mean": float(baseline_mean),
+                        "held_out_delta_vs_baseline": delta,
+                        "dpo_min_held_out_gain": min_gain,
+                        "below_baseline": delta < min_gain,
+                    })
             rows.append(row)
             print(
                 f"\n[{i+1}/{len(grid)}] {point.id} already completed; skipping",
@@ -1082,7 +1154,20 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
         if run_type == "sft":
             proxy = _read_sft_proxy(sub_run_dir)
         else:
-            proxy = _read_dpo_proxy(sub_run_dir)
+            baseline_mean = base.get("held_out_baseline_mean")
+            proxy = _read_dpo_proxy(
+                sub_run_dir,
+                held_out_baseline_mean=(
+                    float(baseline_mean)
+                    if isinstance(baseline_mean, (int, float))
+                    else None
+                ),
+            )
+            min_gain = float(base.get("dpo_min_held_out_gain", 0.0))
+            delta_vs_baseline = proxy.get("held_out_delta_vs_baseline")
+            if isinstance(delta_vs_baseline, (int, float)):
+                proxy["dpo_min_held_out_gain"] = min_gain
+                proxy["below_baseline"] = delta_vs_baseline < min_gain
         collapsed = _is_collapsed(proxy, run_type)
 
         row: dict[str, Any] = {

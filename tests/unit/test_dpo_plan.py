@@ -154,6 +154,81 @@ def test_best_iteration_reader_supports_inline_scoring_artifacts(
     assert find_best_held_out_iter(tmp_path / "iterations") == (1, 6.0)
 
 
+def test_step_aware_batch_preserves_optimizer_updates() -> None:
+    from lqh.train.dpo_metrics import derive_effective_batch
+
+    assert derive_effective_batch(
+        pair_count=1_200, epochs=1, target_optimizer_steps=30,
+    ) == 32
+    assert derive_effective_batch(
+        pair_count=300, epochs=1, target_optimizer_steps=30,
+    ) == 8
+    assert derive_effective_batch(
+        pair_count=10_000, epochs=1, target_optimizer_steps=30,
+    ) == 128
+
+
+def test_no_train_signal_detects_update_starvation_and_ln2_plateau() -> None:
+    from lqh.train.dpo_metrics import has_no_train_signal
+
+    assert has_no_train_signal(
+        optimizer_steps=2, train_loss=0.4, chosen_ce_delta_ref=0.1,
+    )
+    assert has_no_train_signal(
+        optimizer_steps=50, train_loss=0.693, chosen_ce_delta_ref=0.0001,
+    )
+    assert not has_no_train_signal(
+        optimizer_steps=50, train_loss=0.4, chosen_ce_delta_ref=0.02,
+    )
+
+
+def test_held_out_quality_stop_detects_regression_and_plateau(
+    tmp_path: Path,
+) -> None:
+    from lqh.train.dpo_metrics import held_out_stop_reason
+
+    regression = tmp_path / "regression"
+    _write_iteration(regression, 0, judge_mean=6.7, ce_delta=0.1)
+    _write_iteration(regression, 1, judge_mean=5.8, ce_delta=0.2)
+    reason = held_out_stop_reason(regression / "iterations")
+    assert reason is not None
+    assert reason["source"] == "held_out_regression"
+
+    plateau = tmp_path / "plateau"
+    _write_iteration(plateau, 0, judge_mean=6.4, ce_delta=0.0)
+    _write_iteration(plateau, 1, judge_mean=6.42, ce_delta=0.0)
+    _write_iteration(plateau, 2, judge_mean=6.41, ce_delta=0.0)
+    reason = held_out_stop_reason(plateau / "iterations")
+    assert reason is not None
+    assert reason["source"] == "held_out_plateau"
+
+
+def test_dpo_proxy_records_baseline_gain_and_rejects_below_baseline(
+    tmp_path: Path,
+) -> None:
+    from lqh.train.sweep import _pick_winner, _read_dpo_proxy
+
+    _write_iteration(tmp_path, 0, judge_mean=6.2, ce_delta=0.01)
+    proxy = _read_dpo_proxy(tmp_path, held_out_baseline_mean=6.3)
+    assert proxy["held_out_delta_vs_baseline"] == pytest.approx(-0.1)
+    row = {
+        "primary": proxy["primary"],
+        "collapsed": False,
+        "below_baseline": True,
+    }
+    assert _pick_winner([row], "on_policy_dpo") is None
+
+
+def test_dpo_grid_stays_below_unstable_three_e_minus_six() -> None:
+    from lqh.train.sweep import dpo_grid_small
+
+    learning_rates = {
+        point.overrides["training"]["learning_rate"]
+        for point in dpo_grid_small()
+    }
+    assert learning_rates == {3e-7, 1e-6, 2e-6}
+
+
 def test_paired_bootstrap_detects_consistent_gain() -> None:
     from tests.benchmarks.dpo_value.stats import paired_bootstrap
 
