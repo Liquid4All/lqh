@@ -280,47 +280,36 @@ def _format_score_distribution(scores_path: Path) -> str:
         return ""
     if not scores_path.exists():
         return ""
+    from lqh.scoring import (
+        format_score_distribution_text,
+        is_scoring_error,
+        score_distribution_stats,
+    )
+
     try:
         table = pq.read_table(str(scores_path))
         if "score" not in table.column_names:
             return ""
-        scores = [s for s in table.column("score").to_pylist() if s is not None and s > 0]
+        raw_scores = table.column("score").to_pylist()
+        if "reasoning" in table.column_names:
+            # 0 is the rubric's worst grade, not an error marker — exclude
+            # only samples the judge actually failed to score.
+            reasons = table.column("reasoning").to_pylist()
+            scores = [
+                s for s, r in zip(raw_scores, reasons)
+                if s is not None and not is_scoring_error(r)
+            ]
+        else:
+            # No reasoning column to tell errors apart — fall back to the
+            # legacy proxy of dropping the 0.0 error placeholders.
+            scores = [s for s in raw_scores if s is not None and s > 0]
     except Exception:
         return ""
-    if not scores:
+
+    dist = score_distribution_stats(scores)
+    if dist is None:
         return ""
-
-    scores = sorted(scores)
-    n = len(scores)
-
-    def _q(p: float) -> float:
-        idx = max(0, min(n - 1, int(round(p * (n - 1)))))
-        return scores[idx]
-
-    # Coarse histogram: scores are integers 1-10. We bucket by floor.
-    buckets = {b: 0 for b in range(1, 11)}
-    for s in scores:
-        b = max(1, min(10, int(s)))
-        buckets[b] += 1
-
-    # Render as a horizontal mini-histogram. Width scales to max bucket.
-    max_count = max(buckets.values()) if buckets else 1
-    bar_width = 24
-    lines: list[str] = []
-    lines.append("  Score distribution (n={}):".format(n))
-    lines.append(
-        "    p10={:.1f}  p25={:.1f}  p50={:.1f}  p75={:.1f}  p90={:.1f}".format(
-            _q(0.10), _q(0.25), _q(0.50), _q(0.75), _q(0.90)
-        )
-    )
-    for b in range(10, 0, -1):
-        c = buckets[b]
-        if c == 0:
-            continue
-        bar = "█" * max(1, int(round(c / max_count * bar_width)))
-        pct = 100.0 * c / n
-        lines.append(f"    {b:>2} | {bar:<{bar_width}}  {c:>5}  ({pct:4.1f}%)")
-    return "\n".join(lines)
+    return format_score_distribution_text(dist)
 
 
 def _fmt_size(size: int) -> str:
@@ -1581,7 +1570,7 @@ async def _submit_cloud_data_gen(
     from lqh.telemetry import active_telemetry
     telemetry = active_telemetry()
     workflow_id = str(__import__("uuid").uuid4())
-    if purpose not in {"smoke", "inspection", "validation", "training", "failures", "imported", "unspecified"}:
+    if purpose not in {"smoke", "inspection", "validation", "training", "failures", "probe", "imported", "unspecified"}:
         purpose = "unspecified"
     if telemetry:
         await telemetry.run_deferred(telemetry.record_generation_attempt)
@@ -1760,7 +1749,7 @@ async def _execute_pipeline(
     telemetry_started = bool(
         telemetry and telemetry.cached_consent_active(consent_epoch)
     )
-    if purpose not in {"smoke", "inspection", "validation", "training", "failures", "imported", "unspecified"}:
+    if purpose not in {"smoke", "inspection", "validation", "training", "failures", "probe", "imported", "unspecified"}:
         purpose = "unspecified"
     if telemetry_started and telemetry:
         await telemetry.run_deferred(telemetry.record_generation_attempt)
@@ -2211,6 +2200,123 @@ async def handle_show_file(
     return ToolResult(content=summary, show_file_path=path)
 
 
+def _render_message_content(content: Any, max_chars: int) -> str:
+    """Render a ChatML message's content for tool output, truncated.
+
+    String content is clamped to *max_chars*. Multimodal list content (VLM
+    samples) renders text parts and replaces image parts with a size
+    placeholder — a base64 data-URL must never be interpolated into agent
+    context, where a single image would blow the advertised char cap by
+    orders of magnitude. The final clamp applies to the joined text either
+    way.
+    """
+    if isinstance(content, str):
+        rendered = content
+    elif isinstance(content, list):
+        pieces: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                pieces.append(str(part))
+                continue
+            ptype = part.get("type")
+            if ptype == "text":
+                pieces.append(str(part.get("text") or ""))
+            elif ptype == "image_url":
+                image = part.get("image_url")
+                url = image.get("url") if isinstance(image, dict) else image
+                pieces.append(f"[image: {len(str(url or '')):,} chars]")
+            else:
+                pieces.append(f"[{ptype or 'part'}]")
+        rendered = " ".join(p for p in pieces if p)
+    elif content is None:
+        rendered = ""
+    else:
+        rendered = str(content)
+    if len(rendered) > max_chars:
+        return rendered[:max_chars] + "..."
+    return rendered
+
+
+def _find_artifact_manifest(start_dir: Path) -> tuple[Path, Path] | None:
+    """Locate the run's artifacts.json for *start_dir*.
+
+    ``start_dir`` may be the run root or a nested eval dir inside it
+    (``runs/<name>/checkpoints/final``) — the manifest always lives at the
+    run root, so walk up a few levels. Returns ``(manifest_path, run_root)``
+    or None.
+    """
+    d = start_dir
+    for _ in range(4):
+        manifest = d / "artifacts.json"
+        if manifest.exists():
+            return manifest, d
+        if d.parent == d:
+            break
+        d = d.parent
+    return None
+
+
+async def _fetch_run_artifact(target: Path) -> bool:
+    """Best-effort download of one published run file from the artifact
+    store, keyed by the run's artifacts.json manifest (relpath relative to
+    the run root, so nested files like checkpoints/final/results.parquet
+    resolve too). Returns True when the file exists locally afterwards;
+    never raises."""
+    if target.exists():
+        return True
+    found = _find_artifact_manifest(target.parent)
+    if found is None:
+        return False
+    manifest_path, run_root = found
+    try:
+        relpath = target.relative_to(run_root).as_posix()
+        manifest = json.loads(manifest_path.read_text())
+        entries = manifest.get("artifacts") if isinstance(manifest, dict) else None
+        artifact_id = next(
+            (
+                e.get("artifact_id")
+                for e in (entries or [])
+                if isinstance(e, dict)
+                and e.get("relpath") == relpath
+                and e.get("artifact_id")
+            ),
+            None,
+        )
+        if not artifact_id:
+            return False
+        from lqh.artifacts import BackendArtifactStore
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        await BackendArtifactStore().download(str(artifact_id), target)
+    except Exception:
+        return False
+    return target.exists()
+
+
+async def _fetch_results_parquet_artifact(run_dir: Path) -> bool:
+    """Best-effort download of *run_dir*'s results.parquet (per-sample
+    scores + judge reasoning) from the artifact store."""
+    return await _fetch_run_artifact(run_dir / "results.parquet")
+
+
+async def _hydrate_run_eval_artifacts(run_dir: Path) -> None:
+    """Pull a completed cloud run's eval outputs into the local mirror.
+
+    Cloud sync records artifact descriptors, not contents — without this,
+    a finished cloud sweep can have its results published while
+    training_status still shows no final score. Covers both layouts:
+    run-root (sweep eval-of-best, standalone evals) and checkpoints/final/
+    (non-sweep SFT). Best-effort; never raises.
+    """
+    for rel in (
+        "eval_result.json",
+        "results.parquet",
+        "checkpoints/final/eval_result.json",
+        "checkpoints/final/results.parquet",
+    ):
+        await _fetch_run_artifact(run_dir / rel)
+
+
 async def handle_get_eval_failures(
     project_dir: Path,
     *,
@@ -2218,24 +2324,86 @@ async def handle_get_eval_failures(
     threshold: float = 6.0,
     min_failures: int = 5,
     max_failures: int = 15,
+    score_min: float | None = None,
+    score_max: float | None = None,
+    sort: str | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
+    seed: int | None = None,
+    sample_indices: list[int] | None = None,
+    max_chars_per_message: int | None = None,
     export_path: str | None = None,
     **kwargs: Any,
 ) -> ToolResult:
-    """Extract and format failure cases from an eval run."""
+    """Inspect scored samples of an eval run.
+
+    Default mode extracts failures (below-threshold + bottom-N padding);
+    passing any browse parameter (score_min/score_max/sort/limit/offset/
+    sample_indices) switches to browse mode — a filtered, paged slice of
+    the scored samples. The legacy contract is byte-identical when no
+    browse parameter is given.
+    """
     run_dir = _validate_path(project_dir, eval_run)
     results_path = run_dir / "results.parquet"
     if not results_path.exists():
-        return ToolResult.fail("not_found", f"Error: no results.parquet in '{eval_run}'")
+        # Cloud runs publish results.parquet as an artifact; sessions that
+        # missed the completion download (or predate it) can still fetch
+        # it on demand from the run's artifacts.json manifest.
+        await _fetch_results_parquet_artifact(run_dir)
+    if not results_path.exists():
+        hint = ""
+        if (run_dir / "remote_job.json").exists():
+            hint = (
+                " This is a cloud run — its per-sample results may not have "
+                "been published (older lqh versions did not publish "
+                "results.parquet). Check the `artifacts` tool for this run."
+            )
+        return ToolResult.fail(
+            "not_found", f"Error: no results.parquet in '{eval_run}'.{hint}"
+        )
 
-    from lqh.scoring import extract_failures
-
-    failures, scoring_errors = extract_failures(
-        results_path,
-        threshold=threshold,
-        min_failures=min_failures,
-        max_failures=max_failures,
+    browse_mode = any(
+        v is not None
+        for v in (score_min, score_max, sort, limit, offset, sample_indices)
     )
+    # Truncation limit applies in both modes; clamp to keep tool output sane.
+    max_chars = max(50, min(int(max_chars_per_message or 500), 4000))
 
+    total_matching = 0
+    if browse_mode:
+        from lqh.scoring import browse_results
+
+        eff_limit = max(1, min(int(limit or 15), 25))
+        eff_offset = max(0, int(offset or 0))
+        eff_sort = sort if sort in ("asc", "desc", "random") else "asc"
+        failures, scoring_errors, total_matching = browse_results(
+            results_path,
+            score_min=score_min,
+            score_max=score_max,
+            sort=eff_sort,
+            limit=eff_limit,
+            offset=eff_offset,
+            seed=int(seed or 0),
+            sample_indices=sample_indices,
+        )
+    else:
+        from lqh.scoring import extract_failures
+
+        failures, scoring_errors = extract_failures(
+            results_path,
+            threshold=threshold,
+            min_failures=min_failures,
+            max_failures=max_failures,
+        )
+
+    if browse_mode and not failures:
+        note = ""
+        if scoring_errors:
+            note = (
+                f"\nℹ️ {len(scoring_errors)} sample(s) hit judge/scoring errors "
+                "and are excluded — call without browse filters to list them."
+            )
+        return ToolResult(content="No samples match the given filters." + note)
     if not failures and not scoring_errors:
         return ToolResult(content="No failure cases found. All samples scored above threshold.")
 
@@ -2273,6 +2441,22 @@ async def handle_get_eval_failures(
             }
         except Exception:
             pass
+        # Legacy exports carry the threshold; browse exports carry the
+        # filter that produced the selection instead.
+        if browse_mode:
+            selection_meta: dict[str, Any] = {"filter": {
+                k: v for k, v in (
+                    ("score_min", score_min),
+                    ("score_max", score_max),
+                    ("sort", sort),
+                    ("limit", limit),
+                    ("offset", offset),
+                    ("seed", seed),
+                    ("sample_indices", sample_indices),
+                ) if v is not None
+            }}
+        else:
+            selection_meta = {"threshold": threshold}
         try:
             export_abs.parent.mkdir(parents=True, exist_ok=True)
             from datetime import datetime as _dt, timezone as _tz
@@ -2287,24 +2471,28 @@ async def handle_get_eval_failures(
                         "messages": failure["messages"],
                         "eval_run": eval_run,
                         "model": model_origin,
-                        "threshold": threshold,
+                        **selection_meta,
                         "exported_at": exported_at,
                         "scoring_error": False,
                     }, ensure_ascii=False) + "\n")
-                for err in scoring_errors:
-                    f.write(json.dumps({
-                        "sample_index": err["sample_index"],
-                        "score": None,
-                        "reasoning": err["reasoning"],
-                        "messages": err.get("messages"),
-                        "eval_run": eval_run,
-                        "model": model_origin,
-                        "exported_at": exported_at,
-                        "scoring_error": True,
-                    }, ensure_ascii=False) + "\n")
+                # Scoring errors are part of the legacy failure export only;
+                # a browse export is exactly the browsed selection.
+                if not browse_mode:
+                    for err in scoring_errors:
+                        f.write(json.dumps({
+                            "sample_index": err["sample_index"],
+                            "score": None,
+                            "reasoning": err["reasoning"],
+                            "messages": err.get("messages"),
+                            "eval_run": eval_run,
+                            "model": model_origin,
+                            "exported_at": exported_at,
+                            "scoring_error": True,
+                        }, ensure_ascii=False) + "\n")
+            exported_errors = 0 if browse_mode else len(scoring_errors)
             export_note = (
-                f"\n💾 Exported {len(failures)} failure(s)"
-                + (f" + {len(scoring_errors)} scoring error(s)" if scoring_errors else "")
+                f"\n💾 Exported {len(failures)} sample(s)"
+                + (f" + {exported_errors} scoring error(s)" if exported_errors else "")
                 + f" (full, untruncated) to {export_path}"
             )
         except OSError as exc:
@@ -2316,26 +2504,60 @@ async def handle_get_eval_failures(
 
     parts: list[str] = []
 
-    if failures:
+    if browse_mode:
+        if sample_indices is not None:
+            parts.append(
+                f"## Samples ({len(failures)} of {len(sample_indices)} "
+                f"requested indices found)\n"
+            )
+        else:
+            filter_bits: list[str] = []
+            if score_min is not None and score_max is not None:
+                filter_bits.append(f"score in [{score_min:g}, {score_max:g}]")
+            elif score_min is not None:
+                filter_bits.append(f"score ≥ {score_min:g}")
+            elif score_max is not None:
+                filter_bits.append(f"score ≤ {score_max:g}")
+            else:
+                filter_bits.append("all scores")
+            filter_bits.append(f"sort={eff_sort}")
+            first = eff_offset + 1
+            last = eff_offset + len(failures)
+            parts.append(
+                f"## Samples {first}–{last} of {total_matching} matching "
+                f"({', '.join(filter_bits)})\n"
+            )
+    elif failures:
         parts.append(
             f"## Failure Cases ({len(failures)} of {total} samples, threshold < {threshold})\n"
         )
-        for f in failures:
-            parts.append(f"### Sample {f['sample_index']} — Score: {f['score']:.1f}/10")
-            parts.append(f"**Judge reasoning:** {f['reasoning']}")
-            for msg in f["messages"]:
-                role = msg.get("role", "?")
-                content = msg.get("content", "")
-                if isinstance(content, str) and len(content) > 500:
-                    content = content[:500] + "..."
-                parts.append(f"**{role}:** {content}")
-            parts.append("")
     else:
         parts.append(
             f"## Failure Cases (0 of {total} samples below threshold {threshold})\n"
         )
 
-    if scoring_errors:
+    for f in failures:
+        parts.append(f"### Sample {f['sample_index']} — Score: {f['score']:.1f}/10")
+        parts.append(f"**Judge reasoning:** {f['reasoning']}")
+        for msg in f["messages"]:
+            role = msg.get("role", "?")
+            rendered = _render_message_content(msg.get("content", ""), max_chars)
+            parts.append(f"**{role}:** {rendered}")
+        parts.append("")
+
+    if browse_mode:
+        if sample_indices is None and eff_offset + len(failures) < total_matching:
+            remaining = total_matching - (eff_offset + len(failures))
+            parts.append(
+                f"[{remaining} more matching — use "
+                f"offset={eff_offset + len(failures)} to continue]"
+            )
+        if scoring_errors:
+            parts.append(
+                f"ℹ️ {len(scoring_errors)} sample(s) hit judge/scoring errors and "
+                "are excluded here — call without browse filters to list them."
+            )
+    elif scoring_errors:
         parts.append("")
         parts.append(
             f"## Scoring Errors ({len(scoring_errors)} samples — could NOT be scored, "
@@ -4264,6 +4486,66 @@ def _resolve_compute_target(project_dir: Path) -> str | None:
     return None if target == "local" else target
 
 
+def _budget_base_model(project_dir: Path, name: str) -> str:
+    """Resolve a local checkpoint path to its underlying base model for
+    the inference-budget check.
+
+    Follows ``lineage.json`` (written by the trainers) or
+    ``adapter_config.json``, then falls back to the owning run's
+    config.json (sweep-unwrapped), up to 4 hops — lineage may chain
+    through several continuation runs. Non-path names and unresolvable
+    paths return unchanged; :func:`lqh.models.check_budget_for_model`
+    then applies its own parse rules (unparsable names fail open).
+    """
+    current = name
+    for _ in range(4):
+        try:
+            path = project_dir / current
+            if not path.is_dir():
+                return current
+        except (OSError, ValueError):
+            return current
+        nxt: str | None = None
+        for fname, key in (
+            ("lineage.json", "base_model"),
+            ("adapter_config.json", "base_model_name_or_path"),
+        ):
+            try:
+                value = json.loads(
+                    (path / fname).read_text(encoding="utf-8")
+                ).get(key)
+            except (OSError, ValueError):
+                continue
+            if isinstance(value, str) and value:
+                nxt = value
+                break
+        if nxt is None:
+            # model[-lora]/ and checkpoints/<n>/ dirs sit one or two
+            # levels below the run root that holds config.json.
+            for parent in (path.parent, path.parent.parent):
+                try:
+                    cfg = json.loads(
+                        (parent / "config.json").read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(cfg, dict):
+                    continue
+                inner = (
+                    cfg.get("base_config", cfg)
+                    if cfg.get("type") == "sweep"
+                    else cfg
+                )
+                value = inner.get("base_model") if isinstance(inner, dict) else None
+                if isinstance(value, str) and value:
+                    nxt = value
+                    break
+        if nxt is None or nxt == current:
+            return current
+        current = nxt
+    return current
+
+
 async def handle_start_training(
     project_dir: Path,
     *,
@@ -4282,6 +4564,7 @@ async def handle_start_training(
     golden_source: str = "dataset",
     enable_sweep: bool = True,
     grid_size: str = "small",
+    override_budget: bool = False,
     _permissions: PermissionContext | None = None,
     **kwargs: Any,
 ) -> ToolResult:
@@ -4373,6 +4656,43 @@ async def handle_start_training(
             gpu_info = "unknown"
     else:
         gpu_info = f"remote ({remote})"
+
+    # Inference-budget guard (SPEC.md `**Budget**:` line). Enforced here —
+    # not just in skill prose — so a direct CLI call or an agent slip can't
+    # silently train past a pin or cap. `override_budget=True` is the
+    # explicit escape hatch and must only be passed after the user agreed.
+    # Zero-shot *evaluation* of larger models stays unrestricted: gauging
+    # headroom above the budget is part of the routing playbook.
+    budget_violation = None
+    try:
+        from lqh.models import check_budget_for_model
+
+        spec_text = (project_dir / "SPEC.md").read_text(encoding="utf-8")
+        # Continuation runs (e.g. DPO on runs/sft_001/model-lora) pass a
+        # checkpoint PATH — the budget constrains the underlying model,
+        # so resolve the lineage before checking. A pinned budget must
+        # not reject continuing from a checkpoint OF the pinned model,
+        # and a size cap must see through the path to the real size.
+        effective_base = _budget_base_model(project_dir, base_model)
+        budget_violation = check_budget_for_model(spec_text, effective_base)
+        if budget_violation and effective_base != base_model:
+            budget_violation += (
+                f" (base_model '{base_model}' resolves to '{effective_base}' "
+                "via its checkpoint lineage.)"
+            )
+    except OSError:
+        pass
+    if budget_violation and not override_budget:
+        return ToolResult.fail(
+            "permission",
+            (
+                f"Error: {budget_violation} Training past the budget needs the "
+                "user's explicit consent: ask_user first, and only on a yes "
+                "re-call start_training with override_budget=true. To change "
+                "the budget itself, update the '**Budget**:' line in SPEC.md "
+                "with the user."
+            ),
+        )
 
     # Validate dataset source(s). A single string or a list of sources to
     # combine; train sources may carry an integer `repeat` over-sampling
@@ -4509,8 +4829,8 @@ async def handle_start_training(
         )
 
     # Build config
-    default_lr = 2e-5 if type == "sft" else 5e-6
-    if is_vision:
+    default_lr = 2e-5 if type == "sft" else 1e-6
+    if is_vision and type == "sft":
         default_lr = 5e-4  # Liquid VLM LoRA recipe
     lr = learning_rate if learning_rate is not None else default_lr
     if is_vision:
@@ -4565,10 +4885,30 @@ async def handle_start_training(
 
     from lqh.project_meta import compute_spec_sha256
 
+    # Dataset scale is a first-class input for post-eval routing (the
+    # failure_analysis skill decides "scale data vs model" from it), so
+    # record row counts in the run config where training_status can
+    # surface them. Parquet metadata only — no data is loaded.
+    train_rows = 0
+    train_rows_effective = 0
+    for src_entry, src_path in zip(dataset_sources, train_resolved):
+        rows = _parquet_metadata(src_path)[0] or 0
+        train_rows += rows
+        train_rows_effective += rows * (src_entry.get("repeat") or 1)
+    eval_rows = sum((_parquet_metadata(p)[0] or 0) for p in eval_resolved)
+
     config: dict[str, Any] = {
         "type": type,
         "base_model": base_model,
         "dataset": _sources_to_config(dataset_sources),
+        "dataset_rows": {
+            "train": train_rows,
+            "train_effective": train_rows_effective,
+            "eval": eval_rows,
+        },
+        # num_samples doubles as the manifest's sample count (see
+        # write_run_manifest, which copies it only when present).
+        "num_samples": train_rows,
         # Spec revision at submission time: checkpoints trained from this
         # config stay traceable to the spec they were built against even
         # after SPEC.md changes mid-run (PERSISTENCY_PLAN.md R6).
@@ -4610,6 +4950,11 @@ async def handle_start_training(
         config["num_iterations"] = num_iterations
         config["dpo_beta"] = dpo_beta
         config["golden_source"] = golden_source
+        config["dpo_early_abort_delta"] = 0.5
+        config["dpo_plateau_patience"] = 2
+        config["dpo_min_held_out_improvement"] = 0.05
+        config["training"]["dpo_step_aware_batch"] = True
+        config["training"]["dpo_target_optimizer_steps_per_iter"] = 30
         # Dataset gold is useful only when it is verified to beat the policy
         # rollout under the same judge.  The scoring paths cache chosen scores
         # once and activate the gap selector when this block is present.
@@ -4764,12 +5109,14 @@ async def _execute_start_training_remote(
             base_model=inner.get("base_model", ""),
             remote="cloud",
         )
+        data_line = _training_data_line(config)
         return ToolResult(
             content=(
                 f"🚀 Cloud training submitted\n"
                 f"  Run:     {run_name}\n"
                 f"  Type:    {config.get('type', 'unknown')}\n"
-                f"  Job ID:  {job_id}\n\n"
+                + (f"  Data:    {data_line}\n" if data_line else "")
+                + f"  Job ID:  {job_id}\n\n"
                 f"Backend: LQH Cloud (api.lqh.ai). Use training_status to monitor progress."
             ),
             workflow_launched=True,
@@ -4818,12 +5165,14 @@ async def _execute_start_training_remote(
         remote=ssh_name,
     )
 
+    data_line = _training_data_line(config)
     return ToolResult(
         content=(
             f"🚀 Remote training started on '{ssh_name}'\n"
             f"  Run:      {run_name}\n"
             f"  Type:     {config['type']}\n"
-            f"  Job ID:   {job_id}\n"
+            + (f"  Data:     {data_line}\n" if data_line else "")
+            + f"  Job ID:   {job_id}\n"
             f"  Host:     {remote_config.hostname}\n"
             f"  Dir:      {remote_run_dir}\n\n"
             f"Use training_status(run_name='{run_name}') to monitor progress."
@@ -4870,12 +5219,14 @@ async def _execute_start_training(
         base_model=inner.get("base_model", ""),
     )
 
+    data_line = _training_data_line(config)
     return ToolResult(
         content=(
             f"🚀 Training started\n"
             f"  Run:    {run_name}\n"
             f"  Type:   {config.get('type', 'unknown')}\n"
-            f"  PID:    {pid}\n"
+            + (f"  Data:   {data_line}\n" if data_line else "")
+            + f"  PID:    {pid}\n"
             f"  Dir:    runs/{run_name}/\n\n"
             f"Use training_status to monitor progress."
         ),
@@ -5045,6 +5396,17 @@ async def _training_status_remote(
             lines.append(f"  LR:   {latest['lr']:.2e}")
     if progress_line := _unified_progress_line(run_dir):
         lines.append(f"  Progress: {progress_line}")
+    if data_line := _run_config_data_line(run_dir):
+        lines.append(f"  Data: {data_line}")
+
+    # Cloud sync only records artifact descriptors — on a finished run,
+    # pull the eval outputs (aggregates + per-sample results) into the
+    # local mirror so the final-eval block and get_eval_failures work.
+    if status.state == "completed":
+        await _hydrate_run_eval_artifacts(run_dir)
+
+    # Final eval from the local mirror (empty until eval_result.json syncs).
+    lines.extend(_format_final_eval_block(run_dir))
 
     chosen_summary = run_dir / "chosen_pool_summary.json"
     if chosen_summary.exists():
@@ -5142,6 +5504,99 @@ def _format_training_status_error(exc: Exception) -> str:
     return content
 
 
+def _training_data_line(config: dict[str, Any]) -> str:
+    """``train 2,000 rows (eff. 6,000) · eval 300 rows`` from a run config's
+    ``dataset_rows`` (absent in configs written before it existed → "")."""
+    inner = (
+        config.get("base_config", config)
+        if config.get("type") == "sweep"
+        else config
+    )
+    rows = inner.get("dataset_rows") or {}
+    train = rows.get("train")
+    if not train:
+        return ""
+    line = f"train {train:,} rows"
+    eff = rows.get("train_effective") or train
+    if eff != train:
+        line += f" (eff. {eff:,})"
+    if rows.get("eval"):
+        line += f" · eval {rows['eval']:,} rows"
+    return line
+
+
+def _run_config_data_line(run_dir: Path) -> str:
+    """The :func:`_training_data_line` for a run directory's config.json."""
+    try:
+        cfg = json.loads((run_dir / "config.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(cfg, dict):
+        return ""
+    return _training_data_line(cfg)
+
+
+def _format_final_eval_block(run_dir: Path) -> list[str]:
+    """Render the run-root ``eval_result.json`` — the eval-of-best result of a
+    training run, or the headline of a standalone eval run (``eval_hf_model`` /
+    ``start_local_eval``); both live under ``runs/<name>/``.
+
+    Includes the score distribution when the file carries one. Older files
+    (and cloud workers on an older lqh) lack ``score_distribution`` — render
+    whatever is present, never fail status over it.
+    """
+    result_file = run_dir / "eval_result.json"
+    if not result_file.exists():
+        # Non-sweep SFT writes its final eval under checkpoints/final/
+        # instead of the run root — fall back so single-run training
+        # still gets the full final-eval block.
+        result_file = run_dir / "checkpoints" / "final" / "eval_result.json"
+    if not result_file.exists():
+        return []
+    try:
+        result = json.loads(result_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    scores = result.get("scores") or {}
+    mean = scores.get("mean")
+    if mean is None:
+        return []
+
+    per_source = result.get("per_source") or {}
+    parts = [f"mean={mean:.2f}"]
+    if len(per_source) > 1:
+        parts[0] = f"mean={mean:.2f} (macro)"
+        weighted = result.get("scores_weighted_mean")
+        if weighted is not None:
+            parts.append(f"weighted={weighted:.2f}")
+    num_scored = result.get("num_scored")
+    if num_scored is not None:
+        scored_part = f"scored={num_scored}"
+        if result.get("num_failed"):
+            scored_part += f" ({result['num_failed']} failed)"
+        parts.append(scored_part)
+
+    lines = [f"  Final eval: {', '.join(parts)}"]
+    if len(per_source) > 1:
+        for label in sorted(per_source):
+            src_mean = per_source[label].get("scores", {}).get("mean")
+            if src_mean is not None:
+                lines.append(f"    {label}: mean={src_mean:.2f}")
+
+    dist = result.get("score_distribution")
+    if isinstance(dist, dict):
+        try:
+            from lqh.scoring import format_score_distribution_text
+
+            lines.extend(
+                "  " + ln
+                for ln in format_score_distribution_text(dist).splitlines()
+            )
+        except Exception:  # noqa: BLE001 — malformed dist must not break status
+            pass
+    return lines
+
+
 def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
     """Format a RunStatus as a readable string."""
     state_emoji = {
@@ -5171,6 +5626,8 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
         lines.append(f"  Error: {status.error}")
     if progress_line := _unified_progress_line(run_dir):
         lines.append(f"  Progress: {progress_line}")
+    if data_line := _run_config_data_line(run_dir):
+        lines.append(f"  Data: {data_line}")
 
     # SFT/checkpoint eval results
     checkpoints_dir = run_dir / "checkpoints"
@@ -5183,7 +5640,22 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
                     result = json.loads(result_file.read_text())
                     mean_score = result.get("scores", {}).get("mean")
                     if mean_score is not None:
-                        eval_results.append(f"    {cp_dir.name}: mean={mean_score:.2f}")
+                        line = f"    {cp_dir.name}: mean={mean_score:.2f}"
+                        # Compact distribution hint per checkpoint (the full
+                        # histogram is reserved for the final-eval block).
+                        dist = result.get("score_distribution")
+                        pct = (
+                            dist.get("percentiles")
+                            if isinstance(dist, dict) else None
+                        )
+                        if isinstance(pct, dict) and all(
+                            k in pct for k in ("p10", "p50", "p90")
+                        ):
+                            line += (
+                                f"  p10/p50/p90="
+                                f"{pct['p10']:.1f}/{pct['p50']:.1f}/{pct['p90']:.1f}"
+                            )
+                        eval_results.append(line)
                         # When multiple eval sources were scored, the headline
                         # mean is a macro-average — show the per-source breakdown.
                         per_source = result.get("per_source") or {}
@@ -5201,6 +5673,10 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
         if eval_results:
             lines.append("  Eval scores:")
             lines.extend(eval_results)
+
+    # Final eval (run-root eval_result.json): eval-of-best for training
+    # runs, headline for standalone eval runs — with score distribution.
+    lines.extend(_format_final_eval_block(run_dir))
 
     # Chosen-pool ceiling — the harness scores the training set once
     # upfront and stashes the mean here. The model can't exceed this

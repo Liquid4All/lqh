@@ -748,6 +748,82 @@ def _score_stats(values: list[float]) -> dict[str, float]:
     }
 
 
+def score_distribution_stats(scores: list[float]) -> dict[str, Any] | None:
+    """Percentiles + per-integer-bucket histogram over judge scores.
+
+    Single source of truth for distribution stats — the ``run_scoring`` tool
+    rendering and the GPU-eval ``eval_result.json`` both go through here so
+    the two paths can never disagree. Returns ``None`` for empty input.
+
+    Callers must pass only genuinely scored samples (filter scoring errors
+    via :func:`is_scoring_error` first) — 0 is the rubric's worst-quality
+    grade, not an error marker, so it gets its own bucket.
+
+    Percentile estimator: nearest-index on the sorted values,
+    ``idx = round(p * (n - 1))`` with Python banker's rounding — i.e.
+    numpy's ``method="nearest"``, NOT the classical nearest-rank
+    ``ceil(p * n)`` definition (for scores 1..10 this reports p10=2 where
+    nearest-rank would report 1). Chosen deliberately: it is what the
+    ``run_scoring`` rendering has always used, and changing it would make
+    historical and new distributions incomparable.
+
+    Histogram keys are strings ("0".."10") so the dict round-trips through
+    JSON unchanged.
+    """
+    if not scores:
+        return None
+    ordered = sorted(scores)
+    n = len(ordered)
+
+    def _q(p: float) -> float:
+        idx = max(0, min(n - 1, int(round(p * (n - 1)))))
+        return float(ordered[idx])
+
+    buckets = {b: 0 for b in range(0, 11)}
+    for s in ordered:
+        b = max(0, min(10, int(s)))
+        buckets[b] += 1
+
+    return {
+        "n": n,
+        "percentiles": {
+            "p10": _q(0.10),
+            "p25": _q(0.25),
+            "p50": _q(0.50),
+            "p75": _q(0.75),
+            "p90": _q(0.90),
+        },
+        "histogram": {str(b): c for b, c in buckets.items()},
+    }
+
+
+def format_score_distribution_text(dist: dict[str, Any]) -> str:
+    """Render :func:`score_distribution_stats` output as the 4-6 line block
+    (quantile line + horizontal mini-histogram) shown in tool results."""
+    n = dist["n"]
+    pct = dist["percentiles"]
+    buckets = {int(b): c for b, c in dist["histogram"].items()}
+
+    max_count = max(buckets.values()) if buckets else 1
+    bar_width = 24
+    lines: list[str] = []
+    lines.append("  Score distribution (n={}):".format(n))
+    lines.append(
+        "    p10={:.1f}  p25={:.1f}  p50={:.1f}  p75={:.1f}  p90={:.1f}".format(
+            pct["p10"], pct["p25"], pct["p50"], pct["p75"], pct["p90"]
+        )
+    )
+    # Bucket 0 (worst grade) included; absent in pre-fix dicts → .get.
+    for b in range(10, -1, -1):
+        c = buckets.get(b, 0)
+        if c == 0:
+            continue
+        bar = "█" * max(1, int(round(c / max_count * bar_width)))
+        share = 100.0 * c / n
+        lines.append(f"    {b:>2} | {bar:<{bar_width}}  {c:>5}  ({share:4.1f}%)")
+    return "\n".join(lines)
+
+
 async def score_predictions_by_source(
     predictions_path: Path,
     scorer_path: Path,
@@ -845,6 +921,13 @@ async def score_predictions_by_source(
         "scores_weighted_mean": round(result.mean_score, 2),
         "per_source": per_source,
     }
+    # Distribution over all valid scores (no per-source split — token bloat
+    # for little routing value). Omitted entirely when nothing scored;
+    # readers must treat the key as optional (old files / version skew).
+    all_valid_scores = [s for scores_list in grouped.values() for s in scores_list]
+    dist = score_distribution_stats(all_valid_scores)
+    if dist is not None:
+        payload["score_distribution"] = dist
     (output_dir / "eval_result.json").write_text(
         json.dumps(payload, indent=2) + "\n", encoding="utf-8"
     )
@@ -1219,6 +1302,79 @@ async def run_data_filter(
 # Failure extraction
 # ---------------------------------------------------------------------------
 
+def _load_result_rows(
+    results_path: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Load a ``results.parquet`` into row dicts and partition scoring
+    infrastructure errors (judge API failures, parse errors) from genuinely
+    scored samples. Returns ``(valid_rows, scoring_errors)``."""
+    table = pq.read_table(results_path)
+    all_rows: list[dict[str, Any]] = []
+    for i in range(len(table)):
+        score_val = table.column("score")[i].as_py()
+        reasoning = table.column("reasoning")[i].as_py() or ""
+        all_rows.append({
+            "sample_index": table.column("sample_index")[i].as_py(),
+            "messages": json.loads(table.column("messages")[i].as_py()),
+            "score": float(score_val) if score_val is not None else 0.0,
+            "reasoning": reasoning,
+        })
+
+    scoring_errors = [r for r in all_rows if is_scoring_error(r["reasoning"])]
+    valid_rows = [r for r in all_rows if not is_scoring_error(r["reasoning"])]
+    return valid_rows, scoring_errors
+
+
+def browse_results(
+    results_path: Path,
+    *,
+    score_min: float | None = None,
+    score_max: float | None = None,
+    sort: str = "asc",
+    limit: int = 15,
+    offset: int = 0,
+    seed: int = 0,
+    sample_indices: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Flexible browse over an eval run's scored samples.
+
+    Complements :func:`extract_failures` (which answers "show me the worst"):
+    this answers "show me a slice" — a score band, a page, a random draw, or
+    exact samples. The failure-analysis skill uses it to tell extreme-outlier
+    failures apart from uniformly mediocre ones.
+
+    Returns ``(rows, scoring_errors, total_matching)`` where *rows* is the
+    ``[offset:offset+limit]`` window of the filtered+sorted selection and
+    *total_matching* the filtered count before paging. ``sort="random"``
+    shuffles with ``random.Random(seed)`` so pages are stable across calls.
+    ``sample_indices`` short-circuits every filter and returns exactly those
+    samples in the given order (missing indices are silently skipped).
+    """
+    import random as _random
+
+    valid_rows, scoring_errors = _load_result_rows(results_path)
+
+    if sample_indices is not None:
+        by_idx = {r["sample_index"]: r for r in valid_rows}
+        rows = [by_idx[i] for i in sample_indices if i in by_idx]
+        return rows, scoring_errors, len(rows)
+
+    matching = [
+        r for r in valid_rows
+        if (score_min is None or r["score"] >= score_min)
+        and (score_max is None or r["score"] <= score_max)
+    ]
+    if sort == "desc":
+        matching.sort(key=lambda r: r["score"], reverse=True)
+    elif sort == "random":
+        _random.Random(seed).shuffle(matching)
+    else:
+        matching.sort(key=lambda r: r["score"])
+
+    total = len(matching)
+    return matching[offset:offset + limit], scoring_errors, total
+
+
 def extract_failures(
     results_path: Path,
     *,
@@ -1249,21 +1405,7 @@ def extract_failures(
     max_failures:
         Cap for both the model-failure and the scoring-error list.
     """
-    table = pq.read_table(results_path)
-    all_rows: list[dict[str, Any]] = []
-    for i in range(len(table)):
-        score_val = table.column("score")[i].as_py()
-        reasoning = table.column("reasoning")[i].as_py() or ""
-        all_rows.append({
-            "sample_index": table.column("sample_index")[i].as_py(),
-            "messages": json.loads(table.column("messages")[i].as_py()),
-            "score": float(score_val) if score_val is not None else 0.0,
-            "reasoning": reasoning,
-        })
-
-    # Partition: scoring infrastructure errors vs. genuinely scored samples
-    scoring_errors = [r for r in all_rows if is_scoring_error(r["reasoning"])]
-    valid_rows = [r for r in all_rows if not is_scoring_error(r["reasoning"])]
+    valid_rows, scoring_errors = _load_result_rows(results_path)
 
     # Sort valid rows by score ascending (worst first)
     valid_rows.sort(key=lambda r: r["score"])

@@ -50,6 +50,7 @@ PURPOSES = (
     "validation",
     "training",
     "failures",
+    "probe",
     "imported",
     "unspecified",
 )
@@ -298,9 +299,20 @@ def write_run_manifest(
         except (OSError, ValueError):
             pass
 
+        # Sweep launches wrap the real training config: {"type": "sweep",
+        # "base_config": {...}}. The lineage fields (base_model, dataset,
+        # dataset_rows, training, spec_sha256, ...) live in base_config, so
+        # read through the wrapper — otherwise every default (sweep-enabled)
+        # run gets a manifest with no lineage at all.
+        inner = config
+        if config.get("type") == "sweep" and isinstance(
+            config.get("base_config"), dict
+        ):
+            inner = config["base_config"]
+
         manifest_path = run_dir / "manifest.json"
         previous = _existing_manifest(manifest_path)
-        submitted_spec = config.get("spec_sha256")
+        submitted_spec = config.get("spec_sha256") or inner.get("spec_sha256")
         manifest: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "run_id": previous.get("run_id") or str(uuid.uuid4()),
@@ -330,13 +342,17 @@ def write_run_manifest(
             "revision",
             "training_method",
             "num_samples",
+            "dataset_rows",
             "inference_model",
             "judge_size",
             "system_prompt_path",
             "response_format_path",
         ):
-            if config.get(key) is not None:
-                manifest[key] = config[key]
+            value = inner.get(key)
+            if value is None:
+                value = config.get(key)
+            if value is not None:
+                manifest[key] = value
         metrics = _last_progress_metrics(run_dir)
         if metrics:
             manifest["final_metrics"] = metrics

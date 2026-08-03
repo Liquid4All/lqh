@@ -79,8 +79,11 @@ criteria while feedback is fresh, then generate a validation set (100-500 sample
 5. **Training data generation** — Scale up the same pipeline for full training set (thousands)
 6. **Fine-tuning** (`/train`) — SFT or on-policy DPO on training data (requires \
 torch). Works for text models and vision/VLM models (LFM2.5-VL — SFT only for VLM).
-7. **On-policy iteration** — Eval fine-tuned model, extract failure cases, generate \
-targeted training data for failures, re-train (SFT or DPO). Repeat until scores plateau.
+7. **Post-eval improvement** (`/improve`) — After each post-training eval, load the \
+`failure_analysis` skill: it routes by outcome band (score vs. baseline, model size, \
+dataset size, inference budget) — scale data, step up model, DPO — and runs the \
+qualitative probe-set failure loop (inspect failures, report, targeted data, re-train). \
+Repeat until scores plateau or the deployment bar is reached.
 8. **Deployment** — Serve the best checkpoint as an OpenAI-compatible endpoint with \
 `push_to_production`, then `create_inference_key` so the user can call it. \
 Alternatively, convert the checkpoint to GGUF (`gguf_convert`) for llama.cpp / \
@@ -123,6 +126,10 @@ filter the new set before training)
 Liquid ships several sizes (run `list_models` for the catalog): 230M, 350M, 1.2B, \
 2.6B (LFM2-2.6B-Exp), and the MoE models 8B-A1B and 24B-A2B. Picking the size is one \
 of the first decisions before evaluation or fine-tuning.
+
+- **Respect the inference budget in SPEC.md** (`## Inference Budget`): `auto` means \
+explore freely; `pinned:<model>` and `max:<size>` are hard constraints — never train \
+past them without asking the user first.
 
 - **Ask the user which size to start with** before the first eval or training run, \
 and give a concrete, non-extreme recommendation:
@@ -293,7 +300,9 @@ supplemental dataset (a NEW name, e.g. {task}_failures_v1; its manifest \
 purpose is "failures") → build a regression eval from held-out cases → train \
 on old + supplemental datasets together (multi-source) → compare against the \
 deployed model before redeploying. Never discard the original training data — \
-supplement it.
+supplement it. The `failure_analysis` skill (`/improve`) uses the same \
+targeted-supplement mechanics pre-deployment, driven by probe-set failures \
+instead of production reports.
 
 ### evals/
 Scoring and evaluation artifacts:

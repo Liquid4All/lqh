@@ -302,7 +302,7 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     },
                     "purpose": {
                         "type": "string",
-                        "enum": ["smoke", "inspection", "validation", "training", "failures", "imported", "unspecified"],
+                        "enum": ["smoke", "inspection", "validation", "training", "failures", "probe", "imported", "unspecified"],
                         "default": "unspecified",
                         "description": (
                             "Semantic purpose of this run. Declare it explicitly; do not infer it "
@@ -669,12 +669,17 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
             name="get_eval_failures",
             cli=True,
             description=(
-                "Extract failure cases from an eval run's results. Returns the "
-                "lowest-scoring samples with their messages, scores, and judge "
-                "reasoning. Uses a hybrid approach: all samples below a score "
-                "threshold, padded with bottom-N lowest scorers to ensure a "
-                "minimum number of failures. Use after run_scoring to identify "
-                "what went wrong and guide prompt refinement."
+                "Inspect scored samples of an eval run (messages, score, judge "
+                "reasoning). Two modes. (a) Failure extraction (default): all "
+                "samples below a score threshold, padded with bottom-N lowest "
+                "scorers to a minimum count. (b) Browse: activated by passing "
+                "any of score_min/score_max/sort/limit/offset/sample_indices — "
+                "filter a score band, page through it, or draw a stable random "
+                "sample; threshold/min_failures/max_failures are ignored. Use "
+                "after an eval to identify what went wrong: bottom band for "
+                "extreme failures, mid band (e.g. score_min=4, score_max=6, "
+                "sort='random') to see what a mediocre-everywhere model gets "
+                "wrong."
             ),
             parameters={
                 "type": "object",
@@ -683,39 +688,98 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "type": "string",
                         "description": (
                             "Relative path to the eval run directory "
-                            "(e.g. 'evals/runs/prompt_v1_iter1'). "
-                            "Must contain results.parquet."
+                            "(e.g. 'evals/runs/prompt_v1_iter1' or "
+                            "'runs/my_eval'). Must contain results.parquet."
                         ),
                     },
                     "threshold": {
                         "type": "number",
                         "description": (
-                            "Score threshold: samples scoring strictly below this "
-                            "are considered failures. Default: 6.0."
+                            "Failure-extraction mode: samples scoring strictly "
+                            "below this are considered failures. Default: 6.0."
                         ),
                         "default": 6.0,
                     },
                     "min_failures": {
                         "type": "integer",
                         "description": (
-                            "Minimum number of failure samples to return. If fewer "
-                            "than this score below threshold, the lowest-scoring "
-                            "samples are added. Default: 5."
+                            "Failure-extraction mode: minimum number of failure "
+                            "samples to return. If fewer than this score below "
+                            "threshold, the lowest-scoring samples are added. "
+                            "Default: 5."
                         ),
                         "default": 5,
                     },
                     "max_failures": {
                         "type": "integer",
                         "description": (
-                            "Maximum number of failure samples to return. Default: 15."
+                            "Failure-extraction mode: maximum number of failure "
+                            "samples to return. Default: 15."
                         ),
                         "default": 15,
+                    },
+                    "score_min": {
+                        "type": "number",
+                        "description": (
+                            "Browse mode: inclusive lower score bound."
+                        ),
+                    },
+                    "score_max": {
+                        "type": "number",
+                        "description": (
+                            "Browse mode: inclusive upper score bound."
+                        ),
+                    },
+                    "sort": {
+                        "type": "string",
+                        "enum": ["asc", "desc", "random"],
+                        "description": (
+                            "Browse mode: order by score ascending (default), "
+                            "descending, or seeded-random (stable across pages "
+                            "for the same seed)."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": (
+                            "Browse mode: samples per page. Default 15, max 25."
+                        ),
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": (
+                            "Browse mode: number of matching samples to skip "
+                            "(paging). Default 0."
+                        ),
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "description": (
+                            "Browse mode: seed for sort='random'. Default 0."
+                        ),
+                    },
+                    "sample_indices": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": (
+                            "Browse mode: fetch exactly these sample_index "
+                            "values (in the given order); overrides all "
+                            "filters and sort."
+                        ),
+                    },
+                    "max_chars_per_message": {
+                        "type": "integer",
+                        "description": (
+                            "Truncation limit per message in the rendered "
+                            "output (both modes). Default 500, max 4000 — "
+                            "raise it when deep-reading ~20 samples."
+                        ),
                     },
                     "export_path": {
                         "type": "string",
                         "description": (
                             "Optional relative path (e.g. 'feedback/eval_failures_v1.jsonl') "
-                            "to durably export the failures as JSONL — full untruncated "
+                            "to durably export the selection as JSONL — full untruncated "
                             "messages plus origin metadata (eval run, evaluated model). "
                             "Use this to feed the feedback/ remediation workflow instead "
                             "of copying from the truncated display."
@@ -1617,13 +1681,24 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         ),
                         "default": 3,
                     },
+                    "override_budget": {
+                        "type": "boolean",
+                        "description": (
+                            "The call is rejected when base_model exceeds the "
+                            "inference budget in SPEC.md ('**Budget**:' line, "
+                            "pinned:<model> or max:<size>). Pass true ONLY after "
+                            "the user explicitly agreed (via ask_user) to train "
+                            "past their budget. Default: false."
+                        ),
+                        "default": False,
+                    },
                     "learning_rate": {
                         "type": "number",
                         "description": (
                             "Learning rate. Only takes effect with `enable_sweep=false` "
                             "(the sweep grid overrides it). Recommended single-run "
                             "value: 5e-5 (medium) for SFT; default if omitted: 2e-5 for "
-                            "SFT, 5e-6 for DPO."
+                            "SFT, 1e-6 for DPO."
                         ),
                     },
                     "num_iterations": {
@@ -2165,8 +2240,9 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "Report the current pipeline stage to the auto-mode TUI. Call this "
                 "whenever you advance to a new stage (e.g. 'rubric', 'data_gen_draft', "
                 "'data_gen_validation', 'filter_validation', 'baseline_eval', "
-                "'sft_initial', 'sft_scaled', 'dpo', 'final_report'). The note is a "
-                "short free-text status line shown beneath the stage label."
+                "'sft_initial', 'sft_scaled', 'dpo', 'failure_analysis', "
+                "'final_report'). The note is a short free-text status line shown "
+                "beneath the stage label."
             ),
             parameters={
                 "type": "object",

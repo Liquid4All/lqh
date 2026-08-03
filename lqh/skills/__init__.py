@@ -49,6 +49,11 @@ def list_available_skills() -> list[dict[str, str]]:
             "command": "/eval",
         },
         {
+            "name": "failure_analysis",
+            "description": "Decide next steps after a post-training eval and run qualitative failure analysis",
+            "command": "/improve",
+        },
+        {
             "name": "prompt_optimization",
             "description": "Create and optimize system prompts via iterative eval refinement",
             "command": "/prompt",
@@ -87,6 +92,10 @@ _SKILL_ALIASES: dict[str, str] = {
     "/prompt": "prompt_optimization",
     "prompt_opt": "prompt_optimization",
     "/train": "train",
+    "improve": "failure_analysis",
+    "/improve": "failure_analysis",
+    "failures": "failure_analysis",
+    "failure-analysis": "failure_analysis",
 }
 
 

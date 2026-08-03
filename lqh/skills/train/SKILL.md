@@ -95,6 +95,11 @@ run). Based on the comparison:
 high-quality samples before a real gain appears. Equally, don't jump straight from
 a tiny pilot to a 20k run without reading the pilot signal first.
 
+For the full post-eval routing — outcome bands (including when to offer
+deployment), dataset-size/model-size escalation ladders, inference-budget
+compliance, and the qualitative probe-set failure loop — load the
+`failure_analysis` skill (`/improve`).
+
 ## Workflow
 
 ### 1. Pre-requisites

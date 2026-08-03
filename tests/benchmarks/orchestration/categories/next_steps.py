@@ -338,6 +338,182 @@ def _seed_finetune_failed(project_dir: Path) -> None:
     _write_stub_parquet(run_dir / "results", 50)
 
 
+def _seed_post_sft_outcome(
+    project_dir: Path,
+    *,
+    baseline_mean: float,
+    post_sft_mean: float,
+    train_rows: int,
+    base_model: str,
+) -> None:
+    """State: full pre-training pipeline done, a fine-tune COMPLETED and was
+    evaluated. The baseline eval, the post-SFT eval, the base-model size, and
+    the training-set row count are all visible — the failure_analysis routing
+    inputs. Scenarios vary the four knobs to plant different correct answers."""
+    _seed_after_eval(project_dir)  # SPEC + pipeline + scorer + eval set
+    prompts = project_dir / "prompts"
+    prompts.mkdir(parents=True, exist_ok=True)
+    (prompts / "translation_v0.md").write_text(_PROMPT_V0, encoding="utf-8")
+
+    # Training set at the story's scale, scored + "filtered" (scores attached).
+    train_ds = project_dir / "datasets" / "translation_v1"
+    _write_stub_parquet(train_ds, train_rows)
+    _attach_scores(train_ds, train_rows)
+
+    run = _seed_completed_training_run(project_dir)
+    config = json.loads((run / "config.json").read_text(encoding="utf-8"))
+    config["base_model"] = base_model
+    config["dataset_rows"] = {
+        "train": train_rows, "train_effective": train_rows, "eval": 50,
+    }
+    (run / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    # Post-SFT eval of the checkpoint (run-root eval_result.json, the shape
+    # training_status renders as "Final eval").
+    (run / "eval_result.json").write_text(json.dumps({
+        "num_scored": 50, "num_failed": 0,
+        "scores": {"mean": post_sft_mean, "median": post_sft_mean},
+        "scores_weighted_mean": post_sft_mean,
+        "per_source": {"all": {"num_scored": 50, "scores": {
+            "mean": post_sft_mean, "median": post_sft_mean,
+            "std": 1.4, "min": max(1.0, post_sft_mean - 3),
+            "max": min(10.0, post_sft_mean + 2),
+        }}},
+    }), encoding="utf-8")
+
+    # Zero-shot baseline of the same base model on the same eval set.
+    baseline = project_dir / "evals" / "runs" / "baseline_zero_shot"
+    baseline.mkdir(parents=True, exist_ok=True)
+    (baseline / "summary.json").write_text(json.dumps({
+        "scores": {"mean": baseline_mean, "median": baseline_mean},
+        "num_samples": 50, "model": base_model, "mode": "model_eval",
+        "system_prompt": "prompts/translation_v0.md",
+    }), encoding="utf-8")
+    (baseline / "config.json").write_text(json.dumps({
+        "eval_dataset": "datasets/translation_v1_eval",
+        "scorer": "evals/scorers/translation_v1.md",
+        "model": base_model, "mode": "model_eval",
+    }), encoding="utf-8")
+
+
+def _seed_sft_flat_small_dataset(project_dir: Path) -> None:
+    """SFT did not improve (5.5 → 5.6) and the training set is only 1.5k rows.
+    Per the failure_analysis routing, the FIRST check is dataset size: below
+    ~2k, grow the data before blaming the model."""
+    _seed_post_sft_outcome(
+        project_dir,
+        baseline_mean=5.5, post_sft_mean=5.6,
+        train_rows=1500, base_model="lfm2.5-350m",
+    )
+
+
+def _seed_sft_flat_small_model(project_dir: Path) -> None:
+    """SFT did not improve (5.5 → 5.6) with an ALREADY-sufficient dataset
+    (4k rows) on a tiny model (350M). The routing says: dataset size checks
+    out, so step UP the model size (zero-shot a larger model and/or train it
+    on the same data) — not more data at 350M."""
+    _seed_post_sft_outcome(
+        project_dir,
+        baseline_mean=5.5, post_sft_mean=5.6,
+        train_rows=4000, base_model="lfm2.5-350m",
+    )
+
+
+def _seed_sft_improved_scale_data(project_dir: Path) -> None:
+    """SFT clearly improved (4.2 → 6.0) from a modest 2k-row set on a 1.2B
+    model. The routing's first lever when training works but isn't good
+    enough: SCALE THE DATA (10-20k) before touching model size or DPO."""
+    _seed_post_sft_outcome(
+        project_dir,
+        baseline_mean=4.2, post_sft_mean=6.0,
+        train_rows=2000, base_model="lfm2.5-1.2b-instruct",
+    )
+
+
+def _seed_sft_good_offer_deploy(project_dir: Path) -> None:
+    """Post-SFT eval is strong (8.4/10, up from 5.0). Per the outcome bands,
+    the agent should OFFER the user deployment (push_to_production /
+    create_inference_key) or GGUF export — not silently keep training."""
+    _seed_post_sft_outcome(
+        project_dir,
+        baseline_mean=5.0, post_sft_mean=8.4,
+        train_rows=10000, base_model="lfm2.5-1.2b-instruct",
+    )
+
+
+def _seed_probe_scored_for_inspection(project_dir: Path) -> None:
+    """State: the quantitative levers are exhausted — a 1.2B model trained on
+    20k rows improved 4.0 → 6.2 but is stuck — and a PROBE-set eval has just
+    completed with per-sample results showing extreme low outliers (most
+    samples 7-9, a cluster at 1-3). The next step per the failure_analysis
+    skill is the qualitative loop: read the distribution shape, inspect ~20
+    low scorers (get_eval_failures), and write a findings report under
+    reports/ that names the failure patterns and plans targeted data."""
+    _seed_post_sft_outcome(
+        project_dir,
+        baseline_mean=4.0, post_sft_mean=6.2,
+        train_rows=20000, base_model="lfm2.5-1.2b-instruct",
+    )
+    # Probe dataset (separate from train/validation) + its completed eval.
+    _write_stub_parquet(project_dir / "datasets" / "translation_probe_v1", 200)
+    probe_run = project_dir / "runs" / "probe_eval_v1"
+    probe_run.mkdir(parents=True, exist_ok=True)
+
+    scores: list[float] = []
+    messages: list[str] = []
+    reasons: list[str] = []
+    for i in range(200):
+        if i < 20:
+            # The planted pattern: idiomatic/slang inputs collapse to a
+            # literal word-by-word translation.
+            score = float(1 + i % 3)
+            reasons.append(
+                "Slang/idiomatic source translated word-by-word; meaning lost "
+                "in all five languages."
+            )
+            user = f"Idiomatic sample {i}: 'spill the beans already, mate!'"
+        else:
+            score = float(7 + i % 3)
+            reasons.append("All five translations present and natural.")
+            user = f"Plain sample {i}: 'The meeting starts at nine.'"
+        scores.append(score)
+        messages.append(json.dumps([
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": json.dumps(
+                {"de": "...", "fr": "...", "es": "...", "en": "...", "zh": "..."}
+            )},
+        ]))
+    pq.write_table(
+        pa.table({
+            "sample_index": list(range(200)),
+            "messages": messages,
+            "score": scores,
+            "reasoning": reasons,
+        }),
+        probe_run / "results.parquet",
+    )
+    (probe_run / "eval_result.json").write_text(json.dumps({
+        "num_scored": 200, "num_failed": 0,
+        "scores": {"mean": 7.2, "median": 8.0},
+        "scores_weighted_mean": 7.2,
+        "per_source": {"all": {"num_scored": 200, "scores": {
+            "mean": 7.2, "median": 8.0, "std": 2.4, "min": 1.0, "max": 9.0,
+        }}},
+        "score_distribution": {
+            "n": 200,
+            "percentiles": {"p10": 3.0, "p25": 7.0, "p50": 8.0,
+                            "p75": 8.0, "p90": 9.0},
+            "histogram": {"0": 0, "1": 7, "2": 7, "3": 6, "4": 0, "5": 0,
+                          "6": 0, "7": 60, "8": 60, "9": 60, "10": 0},
+        },
+    }), encoding="utf-8")
+    (probe_run / "config.json").write_text(json.dumps({
+        "type": "eval_hf", "base_model": "lfm2.5-1.2b-instruct",
+        "eval_dataset": "datasets/translation_probe_v1",
+        "scorer": "evals/scorers/translation_v1.md",
+    }), encoding="utf-8")
+
+
 def _seed_after_train_success(project_dir: Path) -> None:
     """State: data generated, prompt optimized, and a fine-tune has completed
     successfully (a run is present under runs/ with a final model-lora
@@ -592,6 +768,142 @@ NEXT_AFTER_TRAIN_SUCCESS = Scenario(
 )
 
 
+NEXT_SFT_FLAT_GROW_DATA = Scenario(
+    name="bench_next_sft_flat_grow_data",
+    description=_PASSIVE_USER,
+    initial_message="What should we do next?",
+    expected_tools=["summary"],
+    expected_files=["SPEC.md"],
+    # SFT flat (5.5→5.6) with only 1.5k training rows → grow the dataset
+    # to ≥2k first (failure_analysis routing, "no improvement" branch (a)).
+    judge_criteria="data_generation,failure_analysis",
+    next_step_quality_criteria=(
+        "A fine-tune on a 1,500-row training set did NOT improve over the "
+        "zero-shot baseline (5.5 → 5.6). The correct first move is to check the "
+        "training-set size and GROW THE DATASET to at least ~2k samples before "
+        "blaming the model — 2-5k good samples should show measurable movement. "
+        "Rate (1-10) whether the agent identified the small dataset as the "
+        "first suspect and moved to scale data generation. "
+        "10 = explicitly reasoned about the 1.5k size and scaled generation to "
+        "2k+; 5 = scaled data without connecting it to the size check, or only "
+        "talked about it; 1 = retrained the same data, jumped to a bigger model "
+        "or DPO, or ignored the flat result."
+    ),
+    max_turns=20,
+    stage_limits={"data_generation": 15, "failure_analysis": 15},
+    seed_fn=_seed_sft_flat_small_dataset,
+)
+
+NEXT_SFT_FLAT_BIGGER_MODEL = Scenario(
+    name="bench_next_sft_flat_bigger_model",
+    description=_PASSIVE_USER,
+    initial_message="What should we do next?",
+    expected_tools=["summary"],
+    expected_files=["SPEC.md"],
+    # SFT flat (5.5→5.6) but the dataset is already 4k rows on a 350M model →
+    # step up the model size (zero-shot the larger model and/or train it).
+    judge_criteria="evaluation,train,failure_analysis",
+    next_step_quality_criteria=(
+        "A fine-tune of the 350M model on an already-sufficient 4,000-row "
+        "training set did NOT improve over baseline (5.5 → 5.6). Dataset size "
+        "checks out, so the correct next move is to STEP UP THE MODEL SIZE "
+        "(e.g. 1.2B or 2.6B): zero-shot the larger model to gauge headroom "
+        "and/or train it on the same dataset. Rate (1-10) whether the agent "
+        "moved to a larger model rather than generating more data for the 350M. "
+        "10 = explicitly picked a larger model (eval or train) with the "
+        "capacity rationale; 5 = mentioned model size but kept working at 350M; "
+        "1 = generated more data, retrained 350M, or ignored the flat result."
+    ),
+    max_turns=20,
+    stage_limits={"evaluation": 15, "train": 15, "failure_analysis": 15},
+    seed_fn=_seed_sft_flat_small_model,
+)
+
+NEXT_SFT_IMPROVED_SCALE_DATA = Scenario(
+    name="bench_next_sft_improved_scale_data",
+    description=_PASSIVE_USER,
+    initial_message="What should we do next?",
+    expected_tools=["summary"],
+    expected_files=["SPEC.md"],
+    # SFT improved (4.2→6.0) from 2k rows → the first lever is scaling the
+    # data (10-20k), not model size or DPO.
+    judge_criteria="data_generation,failure_analysis",
+    next_step_quality_criteria=(
+        "A fine-tune improved clearly over baseline (4.2 → 6.0) from a 2,000-row "
+        "training set, but 6.0 is not good enough yet. Training works, so the "
+        "first lever is to SCALE THE TRAINING DATA (e.g. to 10-20k samples with "
+        "the same pipeline) and retrain — before changing model size or trying "
+        "DPO. Rate (1-10) whether the agent scaled data generation as the next "
+        "step. 10 = explicitly scaled the dataset to ~10k+ citing the working "
+        "trend; 5 = generated somewhat more data or hedged between levers; "
+        "1 = jumped to a bigger model or DPO first, or stopped."
+    ),
+    max_turns=20,
+    stage_limits={"data_generation": 15, "failure_analysis": 15},
+    seed_fn=_seed_sft_improved_scale_data,
+)
+
+NEXT_SFT_GOOD_OFFER_DEPLOY = Scenario(
+    name="bench_next_sft_good_offer_deploy",
+    description=_PASSIVE_USER,
+    initial_message="What should we do next?",
+    expected_tools=["summary"],
+    expected_files=["SPEC.md"],
+    # Post-SFT 8.4/10 → offer the user deployment (API or GGUF export) or
+    # continued improvement — the ≥8 outcome band.
+    judge_criteria="deployment,failure_analysis",
+    next_step_quality_criteria=(
+        "The fine-tuned checkpoint scores 8.4/10 (baseline was 5.0) — a strong "
+        "result. Per the outcome bands the agent should tell the user the model "
+        "is good and OFFER the choice: deploy it as an API (push_to_production "
+        "+ create_inference_key), export it for on-device use (gguf_convert), "
+        "or keep improving. Rate (1-10) whether the agent surfaced the "
+        "deployment/export offer. 10 = clearly presented deploy/export options "
+        "(e.g. via ask_user) or started deployment on the user's yes; 5 = noted "
+        "the good score but offered no concrete next step; 1 = kept training/"
+        "generating as if the result were poor, or ignored the score."
+    ),
+    max_turns=20,
+    stage_limits={"failure_analysis": 15},
+    seed_fn=_seed_sft_good_offer_deploy,
+)
+
+
+NEXT_PROBE_QUALITATIVE_LOOP = Scenario(
+    name="bench_next_probe_qualitative_loop",
+    description=_PASSIVE_USER,
+    initial_message="What should we do next?",
+    expected_tools=["summary"],
+    expected_files=["SPEC.md"],
+    # Quantitative levers exhausted; a probe eval with per-sample results and
+    # an outlier-heavy distribution is ready → run the qualitative loop:
+    # inspect ~20 low scorers, write a findings report, plan targeted data.
+    judge_criteria="failure_analysis,prompt_optimization",
+    next_step_quality_criteria=(
+        "The model (1.2B, trained on 20k rows, improved 4.0 → 6.2) is stuck "
+        "after the quantitative levers, and a probe-set eval just completed at "
+        "runs/probe_eval_v1 with per-sample results whose distribution shows "
+        "extreme low outliers (a 1-3 cluster under a 7-9 majority). The correct "
+        "next step is the QUALITATIVE failure-analysis loop: read the "
+        "distribution shape, inspect on the order of 20 low-scoring samples "
+        "with their judge reasoning (get_eval_failures on runs/probe_eval_v1), "
+        "identify the common failure pattern (idiomatic/slang inputs "
+        "translated literally), and write a findings report (e.g. "
+        "reports/failure_analysis_v1.md) that plans targeted supplemental "
+        "training data for that pattern. Rate (1-10): "
+        "10 = inspected a meaningful batch of low scorers, named the "
+        "idiom/slang pattern, and wrote a report planning targeted data; "
+        "6 = inspected failures but produced no report/plan, or wrote a plan "
+        "without actually reading the samples; "
+        "1 = ignored the probe results and jumped to more training/data "
+        "generation, or did nothing relevant."
+    ),
+    max_turns=25,
+    stage_limits={"failure_analysis": 20},
+    seed_fn=_seed_probe_scored_for_inspection,
+)
+
+
 SCENARIOS = [
     NEXT_AFTER_SPEC,
     NEXT_AFTER_DRAFT,
@@ -606,4 +918,9 @@ SCENARIOS = [
     NEXT_SCALE_AFTER_SUCCESS,
     NEXT_INSPECT_ON_FAILURE,
     NEXT_AFTER_TRAIN_SUCCESS,
+    NEXT_SFT_FLAT_GROW_DATA,
+    NEXT_SFT_FLAT_BIGGER_MODEL,
+    NEXT_SFT_IMPROVED_SCALE_DATA,
+    NEXT_SFT_GOOD_OFFER_DEPLOY,
+    NEXT_PROBE_QUALITATIVE_LOOP,
 ]

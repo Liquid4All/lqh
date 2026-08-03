@@ -1008,6 +1008,10 @@ five quantiles (p10/p25/p50/p75/p90) under the headline numbers. The
   and proceed; the rare failures are probably API-side issues, not
   systematic.
 
+The same shape-reading applied to a *fine-tuned model's* eval scores
+(rather than dataset quality) lives in the `failure_analysis` skill
+(`/improve`) — load that one after post-training evals.
+
 #### Step 3.5.4: When SFT or DPO show no improvement, **scale data**
 
 If you've validated that SFT (and possibly DPO) gives a real but

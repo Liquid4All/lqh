@@ -43,15 +43,20 @@ its own judgment.
 6. Score both datasets and filter low-quality samples.
 7. Zero-shot eval on the validation set → baseline.
 8. Fine-tune (SFT) on the training dataset.
-9. On-policy preference optimization (DPO) to refine.
-10. Deploy: API endpoint (`push_to_production`) or GGUF export for edge
-    (`gguf_convert`).
+9. Evaluate the checkpoint and improve until it clears the bar
+   (`failure_analysis`): read the score against the baseline, model size,
+   and dataset size, then pull the right lever — scale the data, step up
+   the model size, on-policy preference optimization (DPO), or the
+   qualitative probe-set failure loop (inspect low scorers, synthesize
+   targeted supplemental data, retrain). Iterate.
+10. Deploy — only once step 9 clears the bar: API endpoint
+    (`push_to_production`) or GGUF export for edge (`gguf_convert`).
 11. Real-world evaluation of the deployed model.
 12. Feedback (failure cases under `feedback/`, or spec changes) →
     re-enter at whichever earlier step the feedback implicates.
 
 Iteration is the norm, not the exception: poor data quality sends you
-back to 3–6, a model that doesn't learn sends you back to 5–8.
+back to 3–6, a model that doesn't learn sends you back to 5–9.
 
 ### Read the stage skill BEFORE doing the stage's work
 
@@ -68,7 +73,8 @@ Pull the relevant one with `lqh docs skill <name>` before starting:
 | Scoring criteria for generated data | `data_validation` |
 | Filtering user-brought data (step 6) | `data_filtering` |
 | Baseline/model evaluation (steps 7, 11) | `evaluation` |
-| Training runs (steps 8–9) | `train` |
+| Training runs (SFT/DPO, steps 8–9) | `train` |
+| Post-training eval routing + failure analysis (step 9) | `failure_analysis` |
 | System-prompt optimization | `prompt_optimization` |
 
 Skills are written for lqh's built-in agent; `lqh docs skill` renders

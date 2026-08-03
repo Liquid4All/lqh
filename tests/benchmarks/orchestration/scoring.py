@@ -650,6 +650,10 @@ def _detect_next_step(
     - prompt_optimization: files under prompts/; get_eval_failures (drives prompt
       refinement); load_skill(prompt_optimization)
     - train: start_training; load_skill(train)
+    - failure_analysis: load_skill(failure_analysis); get_eval_failures also
+      counts (it is the skill's inspection tool) — the bucket precedence below
+      resolves the double mapping via expected_buckets order.
+    - deployment: push_to_production, create_inference_key, gguf_convert
 
     Note: ``run_scoring`` is split by its ``mode`` argument — ``data_quality``
     (scoring drafts during data generation) maps to data_generation, while
@@ -666,6 +670,8 @@ def _detect_next_step(
         "evaluation": [],
         "prompt_optimization": [],
         "train": [],
+        "failure_analysis": [],
+        "deployment": [],
     }
 
     # Skills loaded (any, not just first). data_filtering is now its own bucket
@@ -678,6 +684,7 @@ def _detect_next_step(
         "evaluation": "evaluation",
         "prompt_optimization": "prompt_optimization",
         "train": "train",
+        "failure_analysis": "failure_analysis",
     }
     for skill in result.skills_loaded:
         bucket = skill_to_bucket.get(skill)
@@ -702,10 +709,13 @@ def _detect_next_step(
                 matches["data_generation"].append("run_scoring:data_quality")
             else:
                 matches["evaluation"].append(f"run_scoring:{mode or 'model_eval'}")
-        elif name == "start_local_eval":
+        elif name in ("start_local_eval", "eval_hf_model"):
             matches["evaluation"].append(name)
         elif name == "get_eval_failures":
             matches["prompt_optimization"].append("get_eval_failures")
+            matches["failure_analysis"].append("get_eval_failures")
+        elif name in ("push_to_production", "create_inference_key", "gguf_convert"):
+            matches["deployment"].append(name)
         elif name == "start_training":
             matches["train"].append("start_training")
         elif name == "load_skill":
@@ -722,6 +732,9 @@ def _detect_next_step(
                 matches["evaluation"].append(f"{name}:evals/runs/")
             elif "prompts/" in args:
                 matches["prompt_optimization"].append(f"{name}:prompts/")
+            elif "reports/" in args:
+                # Failure-analysis findings reports (reports/failure_analysis_v*.md).
+                matches["failure_analysis"].append(f"{name}:reports/")
 
     # Prefer the FIRST acceptable bucket that has signals; otherwise pick the
     # bucket with the most signals; otherwise unknown.

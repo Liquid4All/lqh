@@ -583,6 +583,60 @@ class JobSupervisor:
         except (OSError, json.JSONDecodeError):
             return ""
 
+    def _run_artifact_entry(self, run_name: str, relpath: str) -> dict | None:
+        """The artifacts.json entry with the given relpath, or None."""
+        path = self.project_dir / "runs" / run_name / "artifacts.json"
+        try:
+            manifest = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        entries = manifest.get("artifacts") if isinstance(manifest, dict) else None
+        if not isinstance(entries, list):
+            return None
+        for entry in entries:
+            if (
+                isinstance(entry, dict)
+                and entry.get("relpath") == relpath
+                and entry.get("artifact_id")
+            ):
+                return entry
+        return None
+
+    async def _download_run_results_parquet(self, run_name: str) -> None:
+        """Best-effort local copy of the run's results.parquet (per-sample
+        scores + judge reasoning), so get_eval_failures / failure-analysis
+        browsing works right after a cloud eval. Falls back to the backend
+        artifact API when the SSE-fed manifest missed the publish event.
+        Never raises — the aggregate notice must not fail over a missing
+        per-sample file.
+        """
+        run_dir = self.project_dir / "runs" / run_name
+        target = run_dir / "results.parquet"
+        if target.exists():
+            return
+        entry = self._run_artifact_entry(run_name, "results.parquet")
+        artifact_id = entry.get("artifact_id") if entry else None
+        try:
+            from lqh.artifacts import BackendArtifactStore
+
+            store = BackendArtifactStore()
+            if artifact_id is None:
+                job_id = self._cloud_job_id(run_name)
+                if not job_id:
+                    return
+                handles = await store.list_for_project(
+                    _ckey(self.project_dir), kind="predictions", job_id=job_id,
+                )
+                for handle in handles:
+                    if handle.r2_key.endswith("results.parquet"):
+                        artifact_id = handle.id
+                        break
+            if artifact_id is None:
+                return
+            await store.download(str(artifact_id), target)
+        except Exception:
+            return
+
     async def resolve_eval_hf_result_artifact(
         self, run_name: str,
     ) -> tuple[dict | None, bool]:
@@ -678,6 +732,8 @@ class JobSupervisor:
                 "the scoring or publish error, then decide whether to retry.]"
             )
         self.eval_hf_verdicts[run_name] = "ok"
+        # Per-sample scores for get_eval_failures / failure analysis.
+        await self._download_run_results_parquet(run_name)
 
         result_path = run_dir / "eval_result.json"
         score_part = ""
@@ -705,7 +761,14 @@ class JobSupervisor:
                     f" Judge mean {float(mean):.3f} over "
                     f"{int(summary.get('num_scored') or 0)} scored samples."
                 )
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                dist = summary.get("score_distribution")
+                pct = dist.get("percentiles") if isinstance(dist, dict) else None
+                if isinstance(pct, dict):
+                    score_part += (
+                        f" p10/p50/p90 = {pct['p10']:.1f}/{pct['p50']:.1f}"
+                        f"/{pct['p90']:.1f}."
+                    )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError):
             pass
         return (
             f"[System: eval run {run_name} completed{location}.{score_part} "

@@ -213,6 +213,14 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
         "status.json": "metrics",
         "eval_request.json": "eval_result",
         "eval_result.json": "eval_result",
+        # Per-sample scores + judge reasoning. Without it the local
+        # get_eval_failures (failure-analysis browsing) has nothing to
+        # read after a cloud eval — eval_result.json alone only carries
+        # the aggregates. Kind "predictions", NOT "eval_result": it holds
+        # raw per-sample content (full messages/responses, and inline
+        # base64 images for VLMs) and must follow the same retention as
+        # predictions.parquet, not the never-expiring aggregate kind.
+        "results.parquet": "predictions",
         "predictions.parquet": "predictions",
         "stdout.log": "logs",
         "stderr.log": "logs",
@@ -307,6 +315,12 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
                     )
                 for fname, kind in (
                     ("predictions.parquet", "predictions"),
+                    # Per-sample scores + reasoning (same retention
+                    # rationale as the run-root entry) — non-sweep SFT
+                    # writes its final eval under checkpoints/final/, so
+                    # without this the qualitative failure loop has no
+                    # per-sample cases for single-run cloud training.
+                    ("results.parquet", "predictions"),
                     ("eval_request.json", "eval_result"),
                     ("eval_result.json", "eval_result"),
                 ):

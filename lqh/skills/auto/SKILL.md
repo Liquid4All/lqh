@@ -123,11 +123,22 @@ bar depends on baseline:
 - baseline ≈ 4–6/10 → aim for ≥7/10.
 - baseline already ≥7/10 → aim for at least +1.0 absolute improvement.
 - improvement < ~0.5 over baseline with no clear trajectory → this is a
-  failure signal. Before giving up, if you haven't already and the data +
-  scorer check out, step **up one model size** (e.g. 1.2B → 2.6B or 8B-A1B)
-  and retry the initial SFT once — a model that is simply too small won't be
-  rescued by more data. If a larger size still can't clear the bar, call
-  `exit_auto_mode("failure", ...)` rather than burning compute on Stages 7–8.
+  failure signal. Escalate in this order (the `failure_analysis` routing):
+  1. **Check the FILTERED training-set size first** (`training_status`'s
+     "Data:" line / the dataset summary). Filtering can shrink a nominal
+     2k generation well below 2k effective rows — below ~2k, generate more
+     data to reach ≥2k good samples and retry SFT before blaming the model.
+  2. With ≥2k rows and the data + scorer checked out, step **up one model
+     size** (e.g. 1.2B → 2.6B or 8B-A1B) within the inference budget and
+     retry the initial SFT once — a model that is simply too small won't be
+     rescued by more data.
+  3. If a larger size still can't clear the bar, load the `failure_analysis`
+     skill (report `set_auto_stage('failure_analysis', ...)` while
+     iterating) and run its qualitative probe-set loop once — targeted
+     supplemental data sometimes unblocks what scaling can't. Only when that
+     too is exhausted within the inference budget, call
+     `exit_auto_mode("failure", ...)` rather than burning compute on
+     Stages 7–8.
 
 ### Stage 7 — `sft_scaled`
 On a successful initial SFT, scale training data further (**~10,000–
@@ -136,12 +147,24 @@ On a successful initial SFT, scale training data further (**~10,000–
 SFT is cheap relative to data generation, so spending a few extra runs
 here is the right tradeoff.
 
+**If the scaled SFT already clears the success bar (e.g. ≥8/10, or the
+baseline-relative target from Stage 6), skip Stage 8** and go straight to
+`final_report` — DPO on an already-good checkpoint risks a regression and
+burns compute for little headroom. Run DPO only when the score is close
+but not there and the remaining failures look like consistent, fixable
+modes.
+
 ### Stage 8 — `dpo`
 Run **on-policy DPO** on top of the best SFT checkpoint. Default to
 **3–5 iterations**, score against the validation set after each
 iteration. **Stop early** if you see a regression (drop in score
 compared to the previous iteration) — DPO instability is real and more
 iterations can hurt.
+
+If DPO also fails to reach the bar, load the `failure_analysis` skill
+(report `set_auto_stage('failure_analysis', ...)`) and run one round of
+its qualitative loop — probe set, failure patterns, targeted supplemental
+data, retrain — before concluding failure.
 
 ### Stage 9 — `final_report`
 Pick the best-scoring checkpoint across the entire run (could be from
@@ -201,10 +224,13 @@ Use exactly these names with `set_auto_stage`:
 - `sft_initial`
 - `sft_scaled`
 - `dpo`
+- `failure_analysis`
 - `final_report`
 
 The TUI uses these to render progress; deviating from the list still
-works but breaks the visual ordering.
+works but breaks the visual ordering. `failure_analysis` is a loop, not a
+linear stage — report it while running the qualitative failure loop from
+Stage 6 or 8, then return to the stage you escalated from.
 
 ## Maintain NOTES.md
 

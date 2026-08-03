@@ -28,6 +28,9 @@ __all__ = [
     "is_liquid_model_name",
     "is_vlm_model_name",
     "format_catalog",
+    "model_param_count",
+    "parse_inference_budget",
+    "check_budget_for_model",
 ]
 
 # Short, non-extreme starting-size guidance surfaced to the orchestration agent
@@ -132,6 +135,143 @@ def is_vlm_model_name(name: str | None) -> bool:
         if m.vision and (n == m.id.lower() or n == m.hf_id.lower()):
             return True
     return ("lfm" in n) and ("-vl-" in n or n.endswith("-vl"))
+
+
+_PARAM_COUNT_RE = None  # compiled lazily; module import stays regex-free
+
+
+def model_param_count(name: str | None) -> float | None:
+    """Approximate parameter count parsed from a model name, or None.
+
+    Reads the first ``<number>M``/``<number>B`` size token in the name
+    (``lfm2.5-350m`` → 350e6, ``LiquidAI/LFM2.5-8B-A1B`` → 8e9). Version
+    prefixes like ``2.5-`` don't match because they aren't followed by a
+    size suffix. Total parameters, not active (the 8B-A1B MoE ranks as 8B).
+    """
+    global _PARAM_COUNT_RE
+    if not name:
+        return None
+    if _PARAM_COUNT_RE is None:
+        import re
+
+        _PARAM_COUNT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([mb])(?![a-z0-9.])", re.IGNORECASE)
+    match = _PARAM_COUNT_RE.search(name)
+    if not match:
+        return None
+    value = float(match.group(1))
+    return value * (1e6 if match.group(2).lower() == "m" else 1e9)
+
+
+def parse_inference_budget(spec_text: str | None) -> tuple[str, str | None]:
+    """Parse the ``**Budget**:`` line of SPEC.md's ``## Inference Budget``
+    section into ``(mode, value)``.
+
+    Only that section is read — a ``**Budget**:`` line elsewhere in the
+    spec (e.g. a project cost budget) never constrains training. Modes:
+
+    - ``("auto", None)`` — explicit ``auto``, or no section / no Budget line.
+    - ``("pinned", "<model>")`` / ``("max", "<size>")``.
+    - ``("invalid", "<raw>")`` — a Budget line exists but its value is not
+      one of the three forms (or pinned:/max: with an empty argument).
+      Callers treat this as a violation, NOT as auto: a malformed hard
+      constraint must fail closed, not silently vanish.
+
+    Trailing ``#``-comments on the line are ignored.
+    """
+    if not spec_text:
+        return ("auto", None)
+    in_section = False
+    for line in spec_text.splitlines():
+        stripped = line.strip()
+        low = stripped.lower()
+        if low.startswith("#"):
+            heading = low.lstrip("#").strip()
+            in_section = heading.startswith("inference budget")
+            continue
+        if not in_section:
+            continue
+        if not (low.startswith("- **budget**:") or low.startswith("**budget**:")):
+            continue
+        # Split on the colon that ends the "**Budget**" label (the value
+        # itself may contain colons: pinned:<model>, max:<size>).
+        value = stripped.split(":", 1)[1] if ":" in stripped else ""
+        value = value.split("#", 1)[0].strip()
+        low_value = value.lower()
+        if low_value == "auto":
+            return ("auto", None)
+        if low_value.startswith("pinned:"):
+            pinned = value.split(":", 1)[1].strip()
+            return ("pinned", pinned) if pinned else ("invalid", value)
+        if low_value.startswith("max:"):
+            cap = value.split(":", 1)[1].strip()
+            return ("max", cap) if cap else ("invalid", value)
+        return ("invalid", value)
+    return ("auto", None)
+
+
+def check_budget_for_model(
+    spec_text: str | None, model_name: str,
+) -> str | None:
+    """Human-readable violation message when *model_name* exceeds the
+    SPEC.md inference budget, else None.
+
+    ``pinned:<model>`` matches the pinned model's short id or HF id
+    (case-insensitive, with or without the ``LiquidAI/`` prefix).
+    ``max:<size>`` compares parsed parameter counts; models whose size
+    cannot be parsed are allowed (fail open — the guard is a guardrail
+    for the catalog ladder, not a general validator).
+    """
+    mode, value = parse_inference_budget(spec_text)
+    if mode == "auto":
+        return None
+    if mode == "invalid" or not value:
+        return (
+            f"SPEC.md's Inference Budget line is unparsable "
+            f"({value!r}) — it must be exactly 'auto', 'pinned:<model>', "
+            "or 'max:<size>'. Fix the '**Budget**:' line (with the user) "
+            "before training."
+        )
+
+    def _norm(n: str) -> str:
+        n = n.strip().lower()
+        return n.removeprefix("liquidai/")
+
+    if mode == "pinned":
+        target = _norm(value)
+        candidate = _norm(model_name)
+        aliases = {target}
+        for m in LIQUID_MODELS:
+            if target in (m.id.lower(), _norm(m.hf_id)):
+                aliases.update((m.id.lower(), _norm(m.hf_id)))
+        if candidate in aliases:
+            return None
+        return (
+            f"SPEC.md pins the inference budget to '{value}', but this run "
+            f"uses '{model_name}'."
+        )
+
+    cap = model_param_count(value)
+    if cap is None:
+        # The cap itself must parse — an unenforceable hard constraint
+        # fails closed until the SPEC line is fixed.
+        return (
+            f"SPEC.md's Inference Budget cap 'max:{value}' has no parsable "
+            "size — use e.g. 'max:1.2B'. Fix the '**Budget**:' line (with "
+            "the user) before training."
+        )
+    candidate_params = model_param_count(model_name)
+    if candidate_params is None:
+        # No size token in the model name (custom HF repo, unresolved
+        # local path). Deliberately fail open: callers resolve checkpoint
+        # lineage before calling, so what's left is names the guardrail
+        # cannot reason about — prose-level compliance still applies.
+        return None
+    if candidate_params > cap:
+        return (
+            f"SPEC.md caps the inference budget at {value}, but "
+            f"'{model_name}' is larger."
+        )
+    return None
 
 
 def format_catalog() -> str:

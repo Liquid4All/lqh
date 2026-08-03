@@ -87,6 +87,20 @@ The user can check multiple presets or select "Other" to specify custom language
 - What is most important: accuracy, speed, creativity, safety, something else?
 - Is this a v1/prototype or a production-grade model?
 
+### Inference Budget
+- Where will the model run, and is there a model-size constraint? Present
+  three options, with **"auto" as the recommended default**:
+  - **auto** (recommended) — no constraint; the agent explores sizes and
+    recommends the smallest model that reaches the quality target.
+  - **pin an exact model** — e.g. "LFM2.5-1.2B-Instruct only" (an existing
+    deployment target or a hard requirement).
+  - **a size cap** — e.g. "1.2B max" (on-device inference, latency or
+    memory limits).
+- Record the answer in SPEC.md under `## Inference Budget` (format below).
+  Training and improvement skills read it and will not exceed a pin or cap
+  without asking the user first — so an honest "auto" is better than a
+  guessed cap.
+
 ## Example Interaction
 
 Below is an example showing the full interview flow. Your actual interaction should follow a similar pattern but adapt to the user's specific needs.
@@ -383,7 +397,19 @@ that can later be turned into automated validation.>
 - **Conciseness**: <is brevity valued? what's too long?>
 - **Tone/Style**: <formal, casual, technical, accessible?>
 - **Faithfulness**: <must the output be grounded in the input? no hallucination?>
+
+## Inference Budget
+
+- **Budget**: auto
+- **Rationale**: <optional — deployment target, latency/memory constraints>
 ```
+
+The `**Budget**:` line is the machine-readable contract — `start_training`
+parses it and refuses to train past it without explicit user consent, and
+the `train`/`failure_analysis` skills read it for routing. The value must be
+exactly one of: `auto`, `pinned:<model>` (a short id from `list_models`,
+e.g. `pinned:lfm2.5-1.2b-instruct`), or `max:<size>` (e.g. `max:1.2B`) —
+nothing else on that line.
 
 ## Next Steps
 

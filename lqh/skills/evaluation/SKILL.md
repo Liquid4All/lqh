@@ -108,6 +108,11 @@ After comparing model baselines, use `ask_user`:
 3. **"Try more models"** — Run additional baselines with different models or configurations.
 4. **"I'm done for now"** — End the session.
 
+If this eval was of a **fine-tuned checkpoint** (not a baseline), the next step
+is different: load the `failure_analysis` skill (`/improve`) to interpret the
+score in context (baseline delta, model size, dataset size) and decide between
+scaling, DPO, qualitative failure analysis, or offering deployment.
+
 ## Maintain NOTES.md
 
 Before finishing a work phase here (and whenever you make a significant decision

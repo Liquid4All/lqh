@@ -28,6 +28,7 @@ COMMANDS: list[SlashCommand] = [
     SlashCommand("/validate", "Start data validation mode"),
     SlashCommand("/train", "Start training mode (requires torch)"),
     SlashCommand("/eval", "Start evaluation mode"),
+    SlashCommand("/improve", "Post-eval next steps and failure analysis"),
     SlashCommand("/prompt", "Start prompt optimization mode"),
     SlashCommand("/reconnect", "Retry a failed network/API operation"),
     SlashCommand("/feedback", "Send feedback to the lqh team"),
