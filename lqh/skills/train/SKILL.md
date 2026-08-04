@@ -447,7 +447,7 @@ When helping the user with training:
 
 7. **Filter the data before training** — pipeline-generated training (and eval) data must be passed through `run_data_filter` with the scorer before it is used, and training must point at the `*_filtered` dataset. Filtering both checks quality and removes the low-scoring tail; low-quality training data = low-quality fine-tuned model. Skip only for human-curated data or when the user explicitly opts out.
 
-8. **Use `training_status` proactively** — after starting a run, periodically check status. The sweep table in `training_status` shows per-config results with the validated proxy (`eval_loss` for SFT, `eval_ce_chosen_mean` for DPO). It is intentional that DPO `eval_loss` and `eval_rewards/margins` are NOT shown — those metrics would mislead you (they can look great when the model has actually collapsed). Trust the sweep's chosen winner.
+8. **Wait with a single `training_status` call — never poll.** After starting a run, call `training_status(run_name=...)` **once** when you need the result, then stop. In headless/auto runs that one call parks until the run is terminal and spends zero LLM cycles while waiting. In the TUI it returns the current state and the harness wakes the session with a `[System: ...]` notification the moment the run finishes — so if it says "running", end your turn without another tool call. Never call it twice in a row, never loop, never invent your own wait. The sweep table in `training_status` shows per-config results with the validated proxy (`eval_loss` for SFT, `eval_ce_chosen_mean` for DPO). It is intentional that DPO `eval_loss` and `eval_rewards/margins` are NOT shown — those metrics would mislead you (they can look great when the model has actually collapsed). Trust the sweep's chosen winner.
 
 9. **Suggest next steps** — after a sweep completes:
    - Run local eval to compare the winner with baseline.
@@ -456,9 +456,33 @@ When helping the user with training:
    - If every DPO config in the sweep collapsed (`sweep_summary.json` winner is null), the preference set may have no useful signal for the current model — suggest either better preference filtering, smaller preference quantile, or skipping DPO.
    - If the model is ready, suggest pushing to HF Hub.
 
-10. **Handle errors gracefully** — if training fails (CUDA OOM, etc.), read `stderr.log` (or `sweep_<config>/stderr.log` for a specific config) and suggest fixes (lower batch size, enable gradient checkpointing, etc.).
+10. **Read the failure class before proposing a fix.** `training_status` names it (the `Diagnosis:` and `Attempts:` lines). A **preempted** run is our cloud infrastructure: nothing is wrong with the config, and a resubmit starts from step 0 because run names cannot be reused and cloud checkpoints belong to the original job. An **orphaned** run is an *observation* — the sandbox stopped appearing in the provider's list with no terminal event — which is usually preemption but can also be a workload that died while the backend restarted; check `artifacts` and `stderr.log` before calling it ours. **interrupted** (exit 137) is genuinely ambiguous: preemption or OOM, and only the trainer's own OOM signal separates them, so consider memory before retrying unchanged. A **timeout** is NOT infrastructure — it is a wall-clock budget the job outgrew; shrink it, don't repeat it. An **OOM** or a trainer crash is a real config/code problem: read `stderr.log` (or `sweep_<config>/stderr.log`) and fix it. Load the `job_recovery` skill (`/recover`) for the full playbook, including what to tell the user about the GPU time they were billed for.
 
 11. **Respect user preferences** — if the user wants to start with DPO, skip the pilot, or use a different strategy, follow their instructions (with a one-sentence warning that it deviates from the ideal process). The validate → scale → polish strategy is a default recommendation, not a requirement.
+
+## Interrupted cloud runs are expected
+
+LQH Cloud runs every GPU job in a preemptible sandbox — there is no paid opt-out —
+so long runs *will* occasionally be killed, restarted, or orphaned. Some
+interruptions are restarted automatically from the on-volume checkpoint before
+you see them; the `Attempts:` line on the status card is what tells you whether
+that happened, and how many leases the job burned.
+
+Plan around it rather than being surprised by it:
+
+- **Prefer several shorter runs to one very long one.** A 12-hour sweep has far
+  more preemption exposure than three 4-hour runs, and each finished run
+  publishes a checkpoint you keep.
+- **The pilot → scale → polish order already does this.** Don't collapse it into
+  one giant job to "save time" — you lose everything on a kill.
+- **One retry, then cut.** After the first infrastructure failure a single retry
+  is reasonable (smaller if the run is long, always smaller for a timeout). After
+  a second failure on the same shape, stop: cut sweep configs, epochs, dataset
+  size, or model size instead.
+- **Check `artifacts` before declaring work lost.** A run killed at its wall
+  clock often published its checkpoint and only lost the evaluation.
+- **Be honest about cost.** Failed attempts bill GPU time. Say the number, don't
+  promise a refund, and point the user at `/feedback` to reach the team.
 
 ## Common Failure Modes and Issues
 

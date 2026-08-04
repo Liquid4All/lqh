@@ -173,6 +173,74 @@ def test_completion_message_tells_agent_to_check_status(tmp_path: Path) -> None:
     assert "continue with the natural next step" in message
 
 
+def test_failure_message_unchanged_without_a_classification(tmp_path: Path) -> None:
+    # No taxonomy (SSH backend, or a backend that predates the recovery
+    # fields) → today's message, so nothing regresses on old servers.
+    app = LqhApp(tmp_path)
+
+    message = app._supervisor.format_completion_message(
+        "run_1", "failed", "exit code 1", "cloud",
+    )
+
+    assert "explain the failure and the natural recovery step" in message
+    assert "INFRASTRUCTURE" not in message
+
+
+def test_failure_message_carries_the_recovery_directive(tmp_path: Path) -> None:
+    app = LqhApp(tmp_path)
+    app._supervisor.job_failure["run_1"] = {
+        "cls": "orphaned", "infra": True, "leases": 3, "preemptions": 3,
+        "runtime_minutes": 210, "timeout_minutes": 720,
+        "gpu_type": "A100-80GB", "last_stage": "config 3/6",
+        "billed_micros": 6_400_000,
+    }
+
+    message = app._supervisor.format_completion_message(
+        "run_1", "failed",
+        "orphaned: provider has no live sandbox for this job", "cloud",
+    )
+
+    # It must name the class, say the retry restarts, and be honest
+    # about the money — the three things the agent improvised wrongly.
+    # An orphan states what was observed rather than asserting a cause;
+    # a confirmed preemption is the one that says "NOT YOUR CONFIG".
+    assert "OBSERVATION, not a diagnosis" in message
+    assert "step 0" in message
+    assert "$6.40" in message
+    assert "/feedback" in message
+    assert "do not retry the same job shape blindly" in message
+
+
+def test_success_message_mentions_survived_interruptions(tmp_path: Path) -> None:
+    app = LqhApp(tmp_path)
+    app._supervisor.job_failure["run_1"] = {"cls": "preempted", "leases": 3}
+
+    message = app._supervisor.format_completion_message(
+        "run_1", "completed", None, "cloud",
+    )
+
+    assert "interrupted 2 times" in message
+    assert "the result itself is valid" in message
+
+
+def test_failure_taxonomy_survives_a_restart_via_disk(tmp_path: Path) -> None:
+    # The supervisor's in-memory map is empty in a fresh process; the
+    # marker the poll wrote is what keeps the diagnosis available.
+    run_dir = tmp_path / "runs" / "run_1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "cloud_failure.json").write_text(
+        json.dumps({"cls": "timeout", "infra": True, "timeout_minutes": 360}) + "\n"
+    )
+    app = LqhApp(tmp_path)
+
+    message = app._supervisor.format_completion_message(
+        "run_1", "failed", "exit code 124", "cloud",
+    )
+
+    assert "WALL-CLOCK TIMEOUT" in message
+    assert "360-minute cap" in message
+
+
 # ---------------------------------------------------------------------------
 # Auto-mode transparent waiting (_await_background)
 # ---------------------------------------------------------------------------

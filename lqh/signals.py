@@ -38,6 +38,76 @@ class Signal:
     text: str
 
 
+def infra_failure_signals(
+    project_dir: Path, states: dict[str, str],
+) -> list[Signal]:
+    """Signals for runs that died on cloud infrastructure.
+
+    Sourced from the ``cloud_failure.json`` the job watcher writes when it
+    observes a terminal state, so the diagnosis survives the session that
+    saw it.
+
+    Only the MOST RECENT such failure is surfaced, and only while no run
+    has started since it. Anything cleverer here would be guessing:
+    nothing on disk links a retry to the run it retried, so "a later run
+    exists" is the strongest honest signal that the user moved on. Runs
+    still going are left alone — they are the follow-up.
+    """
+    from lqh.remote.failure import failure_from_dict
+
+    runs_dir = project_dir / "runs"
+    if not runs_dir.is_dir():
+        return []
+
+    newest: tuple[float, str, str] | None = None
+    newest_start = 0.0
+    for entry in runs_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        started = _run_started_at(entry)
+        newest_start = max(newest_start, started)
+
+        marker = entry / "cloud_failure.json"
+        if not marker.exists():
+            continue
+        if states.get(entry.name) not in (None, "failed", "unknown"):
+            continue
+        try:
+            failure = failure_from_dict(json.loads(marker.read_text()))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if failure is None or not failure.infra:
+            continue
+        if newest is None or started > newest[0]:
+            newest = (started, entry.name, failure.cls)
+
+    if newest is None or newest[0] < newest_start:
+        return []
+    _, name, cls = newest
+    return [Signal(
+        "infra_failure",
+        f"the most recent run, runs/{name}, failed on cloud infrastructure "
+        f"({cls}) and nothing has been started since — the GPU time was "
+        "billed; check `artifacts` for anything it published, then load the "
+        "job_recovery skill before spending more compute",
+    )]
+
+
+def _run_started_at(run_dir: Path) -> float:
+    """When this run was submitted, best-effort.
+
+    ``remote_job.json`` is written at submit and never rewritten, which
+    makes it a better ordering key than the run directory or config
+    (either can be touched later by syncs and edits).
+    """
+    for candidate in ("remote_job.json", "config.json"):
+        try:
+            return (run_dir / candidate).stat().st_mtime
+        except OSError:
+            continue
+    return 0.0
+
+
 def _seen_path(project_dir: Path) -> Path:
     return project_dir / ".lqh" / "job_seen.json"
 
@@ -192,7 +262,9 @@ def observe_run_states(project_dir: Path) -> dict[str, str]:
 
 
 def finished_while_away_signals(
-    project_dir: Path, run_states: dict[str, str]
+    project_dir: Path,
+    run_states: dict[str, str],
+    seen: dict[str, str] | None = None,
 ) -> list[Signal]:
     """One-shot diff signals: jobs that went terminal since last recorded.
 
@@ -205,8 +277,15 @@ def finished_while_away_signals(
     baseline via ``record_seen_states``) and re-injects the same list for
     /clear and /resume — recomputing after recording would silently drop
     them.
+
+    ``seen`` overrides the on-disk baseline. Headless needs it: the diff
+    is only meaningful against REFRESHED remote state (see
+    ``observe_run_states``), but the supervisor scan that refreshes it
+    also records a new baseline. So headless snapshots the baseline
+    before the scan and passes it back in afterwards.
     """
-    seen = load_seen_states(project_dir)
+    if seen is None:
+        seen = load_seen_states(project_dir)
     signals: list[Signal] = []
     finished_away = sorted(
         n for n, s in run_states.items()
@@ -277,6 +356,12 @@ def collect_signals(
             f"cloud submission with unknown fate: runs/{name}/submit_intent.json "
             "(billing-relevant — check remote_status/artifacts before resubmitting)",
         ))
+
+    # A run killed by OUR infrastructure that nobody has followed up on.
+    # The failure notification only exists in the session that saw the
+    # job die; a session opened afterwards would otherwise have no idea
+    # the user paid for a run that produced nothing.
+    signals.extend(infra_failure_signals(project_dir, states))
 
     # Spec drift vs the last cloud-submitted spec hash.
     from lqh.project_meta import compute_spec_sha256

@@ -75,6 +75,7 @@ Pull the relevant one with `lqh docs skill <name>` before starting:
 | Baseline/model evaluation (steps 7, 11) | `evaluation` |
 | Training runs (SFT/DPO, steps 8–9) | `train` |
 | Post-training eval routing + failure analysis (step 9) | `failure_analysis` |
+| A cloud job that was preempted, orphaned, or timed out | `job_recovery` |
 | System-prompt optimization | `prompt_optimization` |
 
 Skills are written for lqh's built-in agent; `lqh docs skill` renders

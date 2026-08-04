@@ -971,6 +971,7 @@ class LqhApp:
             "/train": "train",
             "/eval": "evaluation",
             "/improve": "failure_analysis",
+            "/recover": "job_recovery",
             "/prompt": "prompt_optimization",
         }
         skill_name = skill_map.get(command)

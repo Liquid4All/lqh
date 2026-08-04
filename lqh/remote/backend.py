@@ -169,6 +169,10 @@ class JobStatus:
     started_at: str | None = None
     last_update: str | None = None
     error: str | None = None
+    # Cloud only: the computed interruption taxonomy for a terminal job
+    # (lqh.remote.failure.failure_to_dict). None on SSH/local backends
+    # and on a backend that predates the recovery fields.
+    failure: dict[str, Any] | None = None
 
     @classmethod
     def from_status_json(cls, data: dict[str, Any]) -> JobStatus:
@@ -180,6 +184,7 @@ class JobStatus:
             started_at=data.get("started_at"),
             last_update=data.get("last_update"),
             error=data.get("error"),
+            failure=data.get("failure"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -196,6 +201,8 @@ class JobStatus:
             d["last_update"] = self.last_update
         if self.error is not None:
             d["error"] = self.error
+        if self.failure is not None:
+            d["failure"] = self.failure
         return d
 
 

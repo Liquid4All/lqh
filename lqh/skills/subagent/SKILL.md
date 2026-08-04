@@ -31,6 +31,14 @@ sit on top of it.
    action: report it via `exit_auto_mode` (the result will say how to
    re-invoke with the grant) — do not retry and do not look for
    workarounds.
+6. **Interrupted cloud jobs: one smaller retry, then report.** A
+   preempted or orphaned run is (usually) infrastructure rather than your
+   task failing; a `timeout` is a sizing problem and an `interrupted`
+   (exit 137) may be an out-of-memory. Either way: retry at most once and
+   only with reduced exposure; a resubmit never resumes (it starts from
+   step 0). Then
+   `exit_auto_mode(status="failure", ...)` with the class, the attempt
+   count, and the billed cost so the delegating harness can decide.
 
 ## Project conventions
 

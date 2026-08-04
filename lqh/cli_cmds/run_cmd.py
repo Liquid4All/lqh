@@ -371,6 +371,26 @@ async def _run_async(
             content=content[:2000] + ("…" if len(content) > 2000 else ""),
         )
 
+    def _on_job_notice(run: str, text: str, state: str) -> None:
+        """Surface a supervisor notice on the NDJSON event stream.
+
+        Headless installed no on_notice hook at all, so a stall advisory
+        — the one signal that says "this job is wedged and it is costing
+        you money" — reached nothing in this mode. The wrapping harness
+        now sees it the moment it fires.
+
+        It deliberately does NOT interrupt the agent: there is no input
+        queue to push to here, and appending a system message to a
+        session that may be mid tool-call round-trip is not worth the
+        risk for an advisory. The agent still learns about it — the
+        supervisor stashes the advisory and folds it into the run's
+        completion notice (JobSupervisor.stall_advisories) — but not
+        before the run ends. Cloud jobs always end, at the wall-clock
+        cap if nothing else, so this is bounded rather than unbounded;
+        it is still the weakest delivery path of the three modes.
+        """
+        events.emit("job_notice", run=run, state=state, text=text)
+
     def _on_auto_stage(stage: str, note: str | None) -> None:
         events.emit("stage", stage=stage, note=note)
 
@@ -396,6 +416,7 @@ async def _run_async(
             on_running=lambda run, remote: events.emit(
                 "job_running", run=run, remote=remote,
             ),
+            on_notice=_on_job_notice,
         ),
     )
 
@@ -461,16 +482,51 @@ async def _run_async(
             except Exception:
                 pass
 
-            # prepare_context BEFORE the supervisor starts scanning: its
-            # finished-while-away diff consumes the job_seen.json baseline,
-            # which the supervisor's first scan would otherwise overwrite.
-            await agent.prepare_context()
+            # Snapshot the finished-while-away BASELINE before the
+            # supervisor runs, because its first scan records a new one.
+            # The diff itself is computed after that scan — observe_run_states
+            # reads whatever the last sync left on disk, so computing it
+            # first compared stale local state against the baseline and
+            # missed every job that finished remotely while the CLI was
+            # closed. Same ordering the TUI uses: refresh, then diff.
+            try:
+                from lqh.signals import load_seen_states
+
+                _baseline = load_seen_states(project_dir)
+            except Exception:
+                _baseline = {}
+
             watch_task = asyncio.create_task(supervisor.watch_loop())
             # Wait for the first scan so a resumed agent's immediate
             # training_status sees pre-existing jobs in the registry
             # (otherwise parking would see nothing running and fall back
-            # to LLM polling).
+            # to LLM polling) — and so a failure that happened while the
+            # CLI was closed has landed on disk before we read signals.
             await supervisor.wait_primed()
+
+            # Now remote state is fresh and cloud_failure.json (written by
+            # the poll) exists, so both the finished-while-away diff and
+            # the infra_failure signal see reality. Headless gets no
+            # second context refresh, so this is the only chance.
+            try:
+                from lqh.signals import (
+                    finished_while_away_signals,
+                    observe_run_states,
+                    record_seen_states,
+                )
+
+                _states = observe_run_states(project_dir)
+                _diff = finished_while_away_signals(project_dir, _states, _baseline)
+                record_seen_states(project_dir, _states)
+                agent.set_startup_facts(
+                    snapshot=agent._startup_snapshot,
+                    snapshot_fresh=agent._startup_snapshot_fresh,
+                    diff_signals=_diff,
+                )
+            except Exception:
+                pass
+
+            await agent.prepare_context()
 
             # Telemetry (CLI_PLAN §4.7): start a session only when consent
             # was previously recorded (the TUI notice); else a one-line note.

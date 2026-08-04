@@ -49,3 +49,24 @@ def test_publish_sidecar_lineage_wins_over_adapter_inference(tmp_path: Path):
     assert checkpoint.lineage is not None
     assert checkpoint.lineage["training_method"] == "full"
     assert checkpoint.lineage["base_model"] == "explicit/base"
+
+
+def _model_dir(run_dir: Path) -> None:
+    model = run_dir / "model"
+    model.mkdir()
+    (model / "model.safetensors").write_bytes(b"weights")
+    (model / "config.json").write_text("{}\n")
+
+
+def test_a_failed_run_still_publishes_a_protected_model(tmp_path: Path):
+    """checkpoint_role="final" marks the run's headline model, which the
+    retention engine refuses to expire. It is NOT a success oracle:
+    a sweep materializes its running winner after every winning config,
+    and SFT saves the model before final evaluation can fail. Those
+    weights are real and must survive, so the role stands regardless of
+    how the run ended — and nothing downstream may read it as
+    "this job completed".
+    """
+    _model_dir(tmp_path)
+    checkpoint = next(c for c in _resolve_candidates(tmp_path) if c.relpath == "model")
+    assert checkpoint.checkpoint_role == "final"

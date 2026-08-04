@@ -32,6 +32,19 @@ guidance, but this skill remains the source of truth for the overall plan.
    wait/sleep: one call per run is enough, and it spends zero LLM cycles
    while waiting (the user watches live step/percent progress in the status
    bar meanwhile). The call only returns once the run is genuinely done.
+6. **An interrupted cloud job is not a reason to loop.** A `[System: ...]`
+   failure notification names the class and the recovery step; follow that
+   step rather than the label. For any interruption class (preempted /
+   orphaned / interrupted / timeout) you get **one** retry per pipeline
+   stage, and it must be a *smaller* job than the one that died. Note that
+   `timeout` is a sizing problem rather than infrastructure, and
+   `interrupted` may be an out-of-memory in disguise — in both cases the
+   smaller retry is the point, not an optional courtesy. Never resubmit the identical
+   shape, never treat a resubmit as a resume (it starts from step 0), and
+   if the reduced retry also fails, call `exit_auto_mode(status="failure",
+   ...)` naming the class, the attempts, and the GPU cost. Burning the
+   user's credits on blind retries is a worse outcome than a clean,
+   explained failure.
 
 ## Goal
 

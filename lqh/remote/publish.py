@@ -273,6 +273,16 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
     # checkpoints are visually distinguishable in the artifact list
     # without needing a separate ArtifactKind. Without this branch
     # a successful fine-tune leaves no model state in R2.
+    #
+    # checkpoint_role="final" marks the run's HEADLINE model — the one
+    # the retention engine refuses to expire (retention_engine.go:225).
+    # It is deliberately NOT a statement that the run succeeded: a sweep
+    # materializes its running winner into run_dir/model after every
+    # winning config, and SFT saves the model before final evaluation
+    # can fail, so this dir exists for plenty of runs that then failed.
+    # Publishing those bytes is the point — losing a trained model to a
+    # failed eval is the bug — and they still deserve protection from
+    # expiry. Nothing downstream may read this role as "job completed".
     for sub in ("model", "model-lora"):
         p = run_dir / sub
         if _dir_has_weights(p):

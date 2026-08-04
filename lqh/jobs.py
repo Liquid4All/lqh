@@ -23,6 +23,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
@@ -42,6 +43,64 @@ SLEEP_GAP_FACTOR = 2.0
 # Bounded grace for the scoring watcher to write eval_result.json after an
 # infer run goes terminal, so a parked agent wakes to readable results.
 SCORING_GRACE_SEC = 180.0
+# A running job that has emitted no progress for this long is very
+# likely a stalled sandbox. Deliberately generous: base-model download,
+# batch-size calibration, checkpoint evaluation and DPO rollouts all
+# have legitimately long quiet stretches, and a false alarm here costs
+# the user real GPU time if they act on it.
+STALL_NOTICE_MINUTES = 60.0
+# A job that has never reported ANY progress gets longer still: cold
+# start, image pull and a multi-GB model download all happen before the
+# first event, and on a busy provider that can legitimately take a while.
+STALL_NOTICE_SILENT_MINUTES = 90.0
+# A reattached run cannot emit progress at all, so its frozen file is
+# not evidence of a stall — but "cannot prove it is stuck" is not "is
+# fine forever". This much quieter threshold still catches a reattached
+# job that is genuinely wedged, without warning on every long run that
+# outlived a deploy.
+STALL_NOTICE_REATTACHED_MINUTES = 240.0
+# Marker text the cloud backend appends to progress.jsonl when a
+# reattached pump takes over a running sandbox.
+_STALE_PROGRESS_MARKER = "progress may be stale"
+
+
+# Keys that mean a row is REAL progress from the workload, as opposed to
+# the lifecycle rows the cloud event translator mirrors into the same
+# file (it appends a status=running row the moment the job starts).
+# Treating any non-empty progress.jsonl as "has reported progress" put
+# every cloud job on the 60-minute threshold, so the 90-minute
+# silent-start allowance never applied to the runs it was written for.
+_PROGRESS_KEYS = ("step", "completed", "overall_fraction", "phase")
+
+
+def _has_real_progress(run_dir: Path) -> bool:
+    try:
+        from lqh.progress import read_jsonl_tail
+
+        rows = read_jsonl_tail(run_dir / "progress.jsonl", last_n=64)
+    except Exception:  # noqa: BLE001 — advisory path
+        return False
+    return any(
+        any(k in row for k in _PROGRESS_KEYS) for row in rows if isinstance(row, dict)
+    )
+
+
+def _progress_is_known_stale(run_dir: Path) -> bool:
+    """Whether the newest progress row is the reattach staleness note."""
+    try:
+        from lqh.progress import read_jsonl_tail
+
+        rows = read_jsonl_tail(run_dir / "progress.jsonl", last_n=8)
+    except Exception:  # noqa: BLE001 — advisory path, never fatal
+        return False
+    for row in reversed(rows):
+        detail = row.get("detail")
+        if isinstance(detail, str) and _STALE_PROGRESS_MARKER in detail:
+            return True
+        # Any later real progress row means the marker is history.
+        if isinstance(row.get("overall_fraction"), (int, float)):
+            return False
+    return False
 
 # CloudBackend maps backend "cancelled" → "failed" already; "cancelled" is
 # listed defensively so a path that surfaces the raw status still
@@ -103,6 +162,16 @@ class JobSupervisor:
         self.run_watchers: dict[str, Any] = {}
         # Cloud data-gen runs whose download gave up this session.
         self.data_gen_gave_up: set[str] = set()
+        # Computed interruption taxonomy per run (lqh.remote.failure),
+        # captured on the poll that observed the terminal state and used
+        # to write the recovery directive into the completion notice.
+        self.job_failure: dict[str, dict[str, Any]] = {}
+        # Runs we've already warned about stalling, so the notice fires
+        # once per run per process rather than every poll.
+        self.stall_notified: set[str] = set()
+        # The advisory text per stalled run, folded into that run's
+        # completion notice so a parked agent hears about it too.
+        self.stall_advisories: dict[str, str] = {}
         # Per-run verdict from finalize_eval_hf_run, consumed by the
         # watch loop to keep the recorded state consistent with the
         # notice: "ok" | "missing_result" | "unverified".
@@ -208,6 +277,43 @@ class JobSupervisor:
 
         return results
 
+    def _record_terminal_locally(self, run_dir: Path, status: Any) -> None:
+        """Mirror a backend-reported terminal state into the run dir.
+
+        Best-effort and idempotent: the startup signals read run-dir
+        files, not the backend, so a terminal the event stream never
+        carried has to land here or it is invisible to a fresh process.
+        """
+        try:
+            from lqh.remote.cloud import _CloudState
+
+            path = run_dir / "cloud_state.json"
+            state = _CloudState.load(path)
+            if state is not None and state.status == status.state:
+                return
+            if state is not None:
+                state.status = status.state
+                state.save(path)
+        except Exception:  # noqa: BLE001 — advisory bookkeeping
+            pass
+        # progress.jsonl is the other source observe_run_states consults
+        # (SSH runs have no cloud_state.json, and cloud runs may have a
+        # stale one), and it is what progress_terminal_state reads.
+        try:
+            from lqh.progress import read_jsonl_tail
+
+            for row in read_jsonl_tail(run_dir / "progress.jsonl", last_n=16):
+                if row.get("status") in ("completed", "failed", "cancelled"):
+                    return
+            with (run_dir / "progress.jsonl").open("a") as fh:
+                fh.write(json.dumps({
+                    "status": status.state,
+                    "error": status.error,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+
     async def poll_remote(
         self, run_dir: Path, meta: dict[str, Any],
     ) -> tuple[str, str | None]:
@@ -219,6 +325,41 @@ class JobSupervisor:
         if remote_run_dir:
             await backend.sync_progress(str(remote_run_dir), str(run_dir))
         status = await backend.poll_status(str(meta["job_id"]))
+        # Reconcile LOCAL state with what the backend just told us.
+        #
+        # The orphan reconciler resolves a vanished sandbox by updating
+        # the cloud_jobs row; it appends no terminal cloud_job_events
+        # entry, so sync_progress has nothing to mirror and this run dir
+        # still looks "running" on disk. observe_run_states reads exactly
+        # that (cloud_state.json / progress.jsonl), so a session opened
+        # after an orphan failure got NEITHER the finished-while-away
+        # signal nor the infra_failure one — the two things built to
+        # surface it.
+        if status.state in ("completed", "failed", "cancelled"):
+            self._record_terminal_locally(run_dir, status)
+        # getattr, not attribute access: scan_jobs swallows exceptions
+        # into state="unknown", so a backend whose JobStatus predates
+        # this field must not silently blind the watcher.
+        if getattr(status, "failure", None):
+            self.job_failure[run_dir.name] = status.failure
+            # On disk ONLY for a run that actually failed. A completed
+            # run also carries a taxonomy — that is how the success
+            # notice knows to mention "interrupted twice, elapsed time is
+            # higher" — but writing cloud_failure.json for it leaves a
+            # durable file whose name says the run failed, for a run that
+            # succeeded. The in-memory copy above is enough: the
+            # completion notice is formatted in this same process.
+            #
+            # lqh/signals.py reads the file to raise a startup signal in
+            # a session opened AFTER the failure, which is exactly the
+            # case that needs it.
+            if status.state in ("failed", "cancelled"):
+                try:
+                    (run_dir / "cloud_failure.json").write_text(
+                        json.dumps(status.failure, indent=2) + "\n"
+                    )
+                except OSError:
+                    pass
         return (status.state, status.error)
 
     def make_remote_backend(self, meta: dict[str, Any]) -> Any | None:
@@ -458,7 +599,9 @@ class JobSupervisor:
                     self.ensure_task_registered(run_name, remote)
                     if self.hooks.on_running is not None:
                         self.hooks.on_running(run_name, remote)
+                    self.maybe_notify_stall(run_name)
                 elif state in TERMINAL_STATES:
+                    self.stall_notified.discard(run_name)
                     self.tasks.unregister(run_name)
                     if self.hooks.on_terminal is not None:
                         self.hooks.on_terminal(run_name)
@@ -505,6 +648,138 @@ class JobSupervisor:
             self._primed.set()
 
     # ------------------------------------------------------------------
+    # Stall detection
+    # ------------------------------------------------------------------
+
+    def stalled_minutes(self, run_name: str) -> tuple[float, bool] | None:
+        """``(idle_minutes, saw_progress)`` for a run, or None if unknown.
+
+        ``saw_progress`` False means the run has never reported anything
+        and the clock runs from submission instead — a job wedged during
+        model download or setup produces no progress event at all, which
+        is exactly the case a "last progress was N minutes ago" check
+        would miss forever.
+        """
+        run_dir = self.project_dir / "runs" / run_name
+        progress = run_dir / "progress.jsonl"
+        reattached = _progress_is_known_stale(run_dir)
+        try:
+            stat = progress.stat()
+            if stat.st_size > 0:
+                idle = max(0.0, (time.time() - stat.st_mtime) / 60.0)
+                # A reattached pump never re-streams trainer stdout
+                # (lqh/remote/cloud.py: _append_stale_progress_marker
+                # says so in the row it appends), so the file freezes
+                # whether or not the job is healthy. Report it as
+                # "never reported progress", which routes it to the much
+                # longer threshold instead of exempting it forever.
+                #
+                # And a file containing only the translator's lifecycle
+                # rows is not progress either: the cloud path writes a
+                # status=running row at submit, so "non-empty" was true
+                # for every cloud job from second one.
+                return idle, (not reattached) and _has_real_progress(run_dir)
+        except OSError:
+            pass
+        for anchor in (run_dir / "remote_job.json", run_dir / "config.json"):
+            try:
+                return max(0.0, (time.time() - anchor.stat().st_mtime) / 60.0), False
+            except OSError:
+                continue
+        return None
+
+    def maybe_notify_stall(self, run_name: str) -> None:
+        """Push a one-shot advisory when a running job stops moving.
+
+        Deliberately NOT a completion notice: it never enters
+        ``pending_completions``, so ``wait_for_runs`` keeps blocking and
+        a parked auto-mode agent stays parked at zero LLM cycles. The
+        job is still registered as running and nothing has been
+        cancelled — this is information, not a state change.
+        """
+        if run_name in self.stall_notified:
+            return
+        # Durable across restarts: both collections are in-memory, so a
+        # CLI restart used to re-notify about the same stalled run and
+        # an advisory raised before the restart could never be folded
+        # into the completion notice that arrived after it.
+        stamp = self.project_dir / "runs" / run_name / ".lqh_stall_notice.json"
+        if stamp.exists():
+            self.stall_notified.add(run_name)
+            try:
+                saved = json.loads(stamp.read_text())
+                if isinstance(saved.get("text"), str):
+                    self.stall_advisories[run_name] = saved["text"]
+            except (OSError, ValueError):
+                pass
+            return
+        observed = self.stalled_minutes(run_name)
+        if observed is None:
+            return
+        idle, saw_progress = observed
+        if saw_progress:
+            threshold = STALL_NOTICE_MINUTES
+        elif _progress_is_known_stale(self.project_dir / "runs" / run_name):
+            threshold = STALL_NOTICE_REATTACHED_MINUTES
+        else:
+            threshold = STALL_NOTICE_SILENT_MINUTES
+        if idle < threshold:
+            return
+        self.stall_notified.add(run_name)
+        stage = ""
+        try:
+            from lqh.train.progress import read_latest_metrics
+
+            latest = read_latest_metrics(self.project_dir / "runs" / run_name) or {}
+            label = latest.get("phase_label") or latest.get("phase")
+            if label:
+                stage = f" (last: {label})"
+        except Exception:  # noqa: BLE001 — advisory text only
+            pass
+        what = (
+            f"has produced no progress for {int(idle)} minutes{stage}"
+            if saw_progress
+            else f"has not reported any progress in the {int(idle)} minutes "
+            "since it was submitted"
+        )
+        text = (
+            f"[System: training run {run_name} {what}. It is still registered as "
+            "running and nothing has been cancelled — this usually means a "
+            "stalled sandbox. Tell the user in one sentence and offer "
+            f"stop_training(run_name='{run_name}') if they would rather stop "
+            "paying for it. Otherwise keep waiting: do NOT call training_status "
+            "in a loop, and do not start a second run of the same job.]"
+        )
+        # Durable, because the immediate hook reaches the three modes
+        # very unevenly:
+        #
+        #   interactive TUI — queued as input, seen on the next turn;
+        #   auto mode       — parked in wait_for_runs, which explicitly
+        #                     drops [System: ...] input
+        #                     (tui/app.py _pause_for_input);
+        #   headless run    — surfaced on the NDJSON event stream for
+        #                     the wrapping harness, but the agent itself
+        #                     is mid-task with nothing consuming input.
+        #
+        # So in two of three modes the agent only learns about it at
+        # wake, attached to the completion it does receive. That is
+        # bounded rather than unbounded — a cloud job always terminates,
+        # at its wall-clock cap if nothing else — but it is a real
+        # latency, not a delivery guarantee.
+        self.stall_advisories[run_name] = text
+        try:
+            (self.project_dir / "runs" / run_name / ".lqh_stall_notice.json").write_text(
+                json.dumps({
+                    "text": text,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }) + "\n"
+            )
+        except OSError:
+            pass
+        if self.hooks.on_notice is not None:
+            self.hooks.on_notice(run_name, text, "stalled")
+
+    # ------------------------------------------------------------------
     # Completion recording / formatting
     # ------------------------------------------------------------------
 
@@ -515,6 +790,37 @@ class JobSupervisor:
         # status derives the remote from the run's remote_job.json, so the
         # call never needs a remote argument.
         status_call = f"training_status(run_name='{run_name}')"
+        # The recovery directive is COMPUTED from the job's lease history
+        # (lqh/remote/failure.py) rather than left to the agent to recall:
+        # an interruption can land at any point in a session, including
+        # after a compaction dropped whatever guidance it once read.
+        from lqh.remote.failure import (
+            completion_note,
+            describe_failure,
+            failure_from_dict,
+        )
+
+        # A run that went quiet for an hour and then ended is a different
+        # story from one that ended promptly, and the agent parked in
+        # wait_for_runs never saw the live advisory (see maybe_notify_stall).
+        stall = self.stall_advisories.pop(run_name, None)
+        stall_note = (
+            " Note: this run stopped reporting progress well before it ended "
+            "(the harness flagged it as stalled), so some of the elapsed GPU "
+            "time produced nothing."
+            if stall
+            else ""
+        )
+        failure = failure_from_dict(self.job_failure.get(run_name))
+        if failure is None:
+            failure_marker = (
+                self.project_dir / "runs" / run_name / "cloud_failure.json"
+            )
+            if failure_marker.exists():
+                try:
+                    failure = failure_from_dict(json.loads(failure_marker.read_text()))
+                except (OSError, json.JSONDecodeError):
+                    failure = None
         if state == "completed":
             run_dir = self.project_dir / "runs" / run_name
             scoring_failed = any(path.exists() for path in (
@@ -540,15 +846,28 @@ class JobSupervisor:
                     "the completed model and scoring error, then decide whether to retry.]"
                 )
             return (
-                f"[System: training run {run_name} completed successfully{location}. "
+                f"[System: training run {run_name} completed successfully{location}."
+                f"{completion_note(failure)}{stall_note} "
                 f"Call {status_call} now to read final details, then continue with "
                 "the natural next step.]"
             )
         err_part = f": {error}" if error else "."
+        diagnosis = describe_failure(failure, run_name)
+        if not diagnosis:
+            # Unclassifiable (no snapshot, or a backend that predates the
+            # recovery fields) — today's message, unchanged.
+            return (
+                f"[System: training run {run_name} failed{location}{err_part}{stall_note} "
+                f"Call {status_call} now to read final details, then explain the failure "
+                "and the natural recovery step.]"
+            )
         return (
-            f"[System: training run {run_name} failed{location}{err_part} "
-            f"Call {status_call} now to read final details, then explain the failure "
-            "and the natural recovery step.]"
+            f"[System: training run {run_name} failed{location}{err_part} {diagnosis}"
+            f"{stall_note} "
+            f"Call {status_call} now for the full attempt history, then follow the "
+            "recovery step above and explain it to the user in one or two "
+            "sentences. Do not call this a generic transient issue and do not "
+            "retry the same job shape blindly.]"
         )
 
     def eval_hf_result_artifact(self, run_name: str) -> dict | None:
@@ -892,10 +1211,26 @@ class JobSupervisor:
                 _emit_terminal("failed")
                 verb = "was cancelled" if state == "cancelled" else "failed"
                 err_part = f": {error}" if error else "."
+                # Route through the same taxonomy as training and eval.
+                # This branch used to assert "the pipeline error" for
+                # every terminal, so an orphaned or interrupted data-gen
+                # sandbox was reported to the agent as the user's
+                # pipeline being broken — the one diagnosis it certainly
+                # was not.
+                from lqh.remote.failure import describe_failure, failure_from_dict
+
+                directive = describe_failure(
+                    failure_from_dict(self.job_failure.get(run_name)), run_name,
+                )
+                if not directive:
+                    directive = (
+                        f"Check runs/{run_name}/stderr.log (or the job's log "
+                        "artifacts) for the pipeline error, fix it, validate "
+                        "locally, and resubmit."
+                    )
                 return (
                     f"[System: cloud data-gen run {run_name} {verb}{err_part} "
-                    f"Check runs/{run_name}/stderr.log (or the job's log artifacts) "
-                    "for the pipeline error, fix it, validate locally, and resubmit.]"
+                    f"{directive}]"
                 )
             recovered_note = (
                 " (the job was reported failed — likely a backend restart — "

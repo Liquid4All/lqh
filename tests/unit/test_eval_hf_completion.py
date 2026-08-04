@@ -667,6 +667,48 @@ def test_format_cloud_resource_lines() -> None:
     assert _format_cloud_resource_lines({}) == []
 
 
+def test_status_card_reports_lease_history() -> None:
+    """A restarted job must be legible as one: "preempted 2×, resumed"
+    rather than a bare error the reader has to interpret."""
+    from lqh.remote.failure import attempt_lines, diagnosis_line
+
+    snap = {
+        "status": "failed",
+        "error": "orphaned: provider has no live sandbox for this job",
+        "resource": {"gpu_type": "A100-80GB", "timeout_minutes": 720},
+        "recovery": {
+            "lease_no": 2,
+            "budget_exhausted": True,
+            # Margin-applied, straight from the backend. actual_cost_micros
+            # on the wire is RAW and must never be shown as a bill.
+            "billed_cost_micros": 6_400_000,
+            "attempts": [
+                {"terminal_reason": "preempted"},
+                {"terminal_reason": "preempted", "continued": True},
+                {"terminal_reason": "orphaned"},
+            ],
+        },
+    }
+
+    assert diagnosis_line(snap, snap["error"]) == [
+        "  Diagnosis: orphaned (the sandbox vanished with no terminal event — "
+        "usually ours, but check artifacts and stderr.log first)"
+    ]
+    assert attempt_lines(snap) == [
+        "  Attempts: 3 leases — preempted, preempted (continued), orphaned · "
+        "relaunch budget exhausted",
+        "  Billed: ≈$6.40 across 3 leases",
+    ]
+
+
+def test_status_card_says_nothing_extra_for_a_clean_run() -> None:
+    from lqh.remote.failure import attempt_lines, diagnosis_line
+
+    clean = {"status": "completed", "resource": {"gpu_type": "L4"}}
+    assert attempt_lines(clean) == []
+    assert diagnosis_line(clean) == []
+
+
 # ---------------------------------------------------------------------------
 # Stale-progress marker
 # ---------------------------------------------------------------------------

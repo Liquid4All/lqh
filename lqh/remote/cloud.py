@@ -544,7 +544,17 @@ class CloudBackend(RemoteBackend):
         # feeds the TUI job watcher, which distinguishes cancelled from
         # failed for its terminal notifications.
         state = "cancelled" if raw == "cancelled" else _STATUS_MAP.get(raw, raw or "unknown")
-        return JobStatus(state=state, error=snap.get("error"))
+        error = snap.get("error")
+        # Classify terminal outcomes here, where the snapshot is already
+        # in hand: the agent-facing notification and status card both
+        # render from this rather than re-deriving a diagnosis from the
+        # error string (lqh/remote/failure.py).
+        failure = None
+        if raw in ("failed", "cancelled") or (raw == "completed" and snap.get("recovery")):
+            from lqh.remote.failure import classify_job_failure, failure_to_dict
+
+            failure = failure_to_dict(classify_job_failure(snap, error))
+        return JobStatus(state=state, error=error, failure=failure)
 
     async def is_job_alive(self, job_id: str) -> bool:
         """The cloud equivalent of "is the PID still around." True iff

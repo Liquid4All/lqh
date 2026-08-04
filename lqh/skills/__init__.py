@@ -54,6 +54,11 @@ def list_available_skills() -> list[dict[str, str]]:
             "command": "/improve",
         },
         {
+            "name": "job_recovery",
+            "description": "Diagnose an interrupted cloud job (preempted, orphaned, timed out) and choose the next attempt",
+            "command": "/recover",
+        },
+        {
             "name": "prompt_optimization",
             "description": "Create and optimize system prompts via iterative eval refinement",
             "command": "/prompt",
@@ -96,6 +101,13 @@ _SKILL_ALIASES: dict[str, str] = {
     "/improve": "failure_analysis",
     "failures": "failure_analysis",
     "failure-analysis": "failure_analysis",
+    "recover": "job_recovery",
+    "/recover": "job_recovery",
+    "recovery": "job_recovery",
+    "job_failure": "job_recovery",
+    "preemption": "job_recovery",
+    "preempted": "job_recovery",
+    "orphaned": "job_recovery",
 }
 
 

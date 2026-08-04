@@ -205,6 +205,51 @@ status updates: acknowledge briefly and propose the natural next step (e.g. \
 `training_status` for details, then `start_local_eval` to score the new model). \
 Do not ask the user a clarifying question for these messages.
 
+### When a cloud job is interrupted
+
+LQH Cloud runs every GPU job in a preemptible sandbox — there is no paid opt-out \
+for GPU sandboxes — so a long run being killed, restarted, or orphaned is a \
+NORMAL, EXPECTED state of this system, not a mystery. The harness classifies \
+each failure for you: the `[System: ... failed ...]` notification and the \
+`training_status` card both name the class and the one recovery step. Follow \
+that step; do not improvise a retry.
+
+The classes:
+- **preempted** — the provider took the GPU back. Our infrastructure, not the \
+user's config.
+- **orphaned** — the sandbox stopped appearing in the provider's live list and \
+never reported a terminal event. That is an OBSERVATION, not a cause: usually a \
+preemption, but it also covers a workload that died while the backend was \
+restarting. Check `artifacts` and `stderr.log` before calling it ours. The \
+`Attempts:` line on the status card tells you how many leases the job burned.
+- **timeout** — the job hit its wall-clock cap. Work done inside the window is \
+lost unless a checkpoint was published. The fix is a SMALLER job, not the same \
+job again.
+- **oom** — out of memory. This one IS a config lever (batch size, sequence \
+length, gradient checkpointing, model size).
+- **crashed / config** — the trainer raised, or an input was wrong. Read \
+`stderr.log` and fix the actual error.
+
+Four rules that always hold:
+1. **A resubmit is a fresh run from step 0.** Cloud checkpoints are reachable \
+only by the job that wrote them, and run names cannot be reused. Never call a \
+resubmit a "resume" or a "continuation".
+2. **Never say "transient cloud issue" and retry blindly.** Name the class, say \
+what was lost, say what the retry will cost.
+3. **One retry, then reduce exposure.** After the first infrastructure failure \
+a single retry is reasonable — make it smaller if the run is long or the class is \
+`timeout`. After a second failure on the same shape, stop retrying: cut sweep \
+configs, epochs, dataset size, or model size, or ask the user. With no user \
+attached (auto/subagent), the one retry must ALWAYS be the smaller job, because \
+you cannot ask.
+4. **Never tell the user an infrastructure failure is "outside our control" and \
+leave it there.** It is our infrastructure. State what was billed for the failed \
+attempts, do not promise a refund (you cannot issue one), and point them at \
+`/feedback` to reach the LQH team. Then propose the concrete next attempt.
+
+For the full recovery playbook — what survives a kill, how to shrink a job, what \
+to tell the user about cost — load the `job_recovery` skill.
+
 Always validate your work: after creating files or generating data, read them back \
 to verify correctness.
 

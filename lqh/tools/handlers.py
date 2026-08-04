@@ -5371,17 +5371,29 @@ async def _training_status_remote(
     lines = [f"{emoji} **{run_name}** — {status.state} (remote: {display_remote})"]
     if status.current_step is not None:
         lines.append(f"  Step: {status.current_step}")
-    if status.error:
-        lines.append(f"  Error: {status.error}")
 
-    # Cloud jobs: show the selected GPU, elapsed vs. the wall-clock
-    # limit, and the billed hard cap — best-effort, never fails status.
+    # Cloud jobs: fetch the snapshot BEFORE the error line so the
+    # diagnosis can sit right under it — a bare provider error ("exit
+    # code 124", "orphaned: ...") tells the reader nothing about what to
+    # do next. Best-effort, never fails status.
+    snap: dict[str, Any] | None = None
     if display_remote == "LQH Cloud":
         try:
             snap = await backend.job_snapshot(job_id)
-            lines.extend(_format_cloud_resource_lines(snap))
         except Exception:  # noqa: BLE001
-            pass
+            snap = None
+
+    if status.error:
+        lines.append(f"  Error: {status.error}")
+    if snap is not None:
+        from lqh.remote.failure import attempt_lines, diagnosis_line
+
+        # Diagnosis (what class of failure), then the compute line, then
+        # the lease history — "preempted 2×, resumed" has to be legible
+        # to the user and to the agent without reading the raw error.
+        lines.extend(diagnosis_line(snap, status.error))
+        lines.extend(_format_cloud_resource_lines(snap))
+        lines.extend(attempt_lines(snap))
 
     # Also show local mirror progress if available
     from lqh.train.progress import read_latest_metrics
