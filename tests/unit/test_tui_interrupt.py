@@ -365,6 +365,38 @@ class TestCtrlCAndEsc:
         await _drive_keys(app, [(CTRL_C, 0.1), (CTRL_C, 0.1)])
         assert app._shutdown_requested
 
+    async def test_double_ctrl_c_unblocks_pending_prompt(self, app: LqhApp) -> None:
+        """Shutdown must resolve a pending options prompt.
+
+        Nothing else will ever answer it (the startup login prompt, the
+        copy continue-vs-fork prompt, the /resume picker), so run() would
+        stay parked on the await, never reach teardown, and leave the
+        process alive after the UI is gone.
+        """
+        emitted: list[str] = []
+
+        async def _emit(text: str) -> None:
+            emitted.append(text)
+
+        app._emit = _emit  # type: ignore[method-assign]
+        waiter = asyncio.create_task(
+            app._wait_for_user_response(options=["Yes", "No"])
+        )
+        # Let the coroutine register its future before the keys arrive.
+        for _ in range(100):
+            if app._ask_user_future is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert app._ask_user_future is not None
+
+        await _drive_keys(app, [(CTRL_C, 0.3), (CTRL_C, 0.3)])
+
+        assert app._shutdown_requested
+        assert await asyncio.wait_for(waiter, timeout=10) == _SHUTDOWN_SENTINEL
+        # The sentinel matches no option, so callers fall through to their
+        # shutdown check instead of acting on a choice nobody made.
+        assert not _SHUTDOWN_SENTINEL.startswith(("Yes", "No"))
+
     async def test_single_ctrl_c_idle_only_warns(self, app: LqhApp) -> None:
         await _drive_keys(app, [(CTRL_C, 0.1)])
         assert not app._shutdown_requested

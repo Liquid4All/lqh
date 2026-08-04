@@ -122,6 +122,34 @@ def test_list_sessions_skips_malformed_header(project_dir: Path) -> None:
     assert [s["id"] for s in listed] == [good.id]
 
 
+def _session_with_id(project_dir: Path, session_id: str) -> Session:
+    """Persist a one-message session under a chosen id (UUIDs aren't stable)."""
+    session = Session.create(project_dir)
+    session.id = session_id
+    session.add_message({"role": "user", "content": f"task {session_id[:4]}"})
+    return session
+
+
+def test_resolve_id_exact_and_unique_prefix(project_dir: Path) -> None:
+    first = _session_with_id(project_dir, "aaaa1111-0000-4000-8000-000000000001")
+    _session_with_id(project_dir, "bbbb2222-0000-4000-8000-000000000002")
+
+    assert Session.resolve_id(project_dir, first.id) == first.id
+    assert Session.resolve_id(project_dir, "aaaa1111") == first.id
+    assert Session.resolve_id(project_dir, "a") == first.id
+
+
+def test_resolve_id_rejects_unknown_and_ambiguous(project_dir: Path) -> None:
+    _session_with_id(project_dir, "aaaa1111-0000-4000-8000-000000000001")
+    _session_with_id(project_dir, "aaaa2222-0000-4000-8000-000000000002")
+
+    with pytest.raises(LookupError, match="No conversation"):
+        Session.resolve_id(project_dir, "zzzz")
+
+    with pytest.raises(LookupError, match="matches 2 conversations"):
+        Session.resolve_id(project_dir, "aaaa")
+
+
 def test_metadata_has_lifecycle_state(project_dir: Path) -> None:
     """Flipped from Phase 0: meta.json now records state/updated_at/pid so
     a crash (stale active + dead pid) is distinguishable from a clean

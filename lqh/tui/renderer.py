@@ -419,3 +419,20 @@ def render_welcome(width: int = 100) -> str:
     )
     console.print()
     return buf.getvalue()
+
+
+def render_resume_hint(session_id: str, width: int = 100) -> str:
+    """Render the farewell hint that brings this conversation back.
+
+    Printed after the application is torn down, so it lands in plain
+    scrollback where the user can select and paste it.
+    """
+    buf = StringIO()
+    console = Console(
+        file=buf, force_terminal=True, width=width, color_system="truecolor"
+    )
+    console.print()
+    console.print(Text("  Resume this conversation with:", style="dim"))
+    console.print(Text(f"    lqh --resume {session_id}", style="bold #60a5fa"))
+    console.print()
+    return buf.getvalue()

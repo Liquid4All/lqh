@@ -23,7 +23,7 @@ def test_bare_invocation_routes_to_tui(monkeypatch, tmp_path: Path) -> None:
         "lqh.cli._launch_tui", lambda *a: calls.append(a)
     )
     main()
-    assert calls == [(tmp_path, False, None)]
+    assert calls == [(tmp_path, False, None, None)]
 
 
 def test_spec_passthrough(monkeypatch, tmp_path: Path) -> None:
@@ -32,7 +32,7 @@ def test_spec_passthrough(monkeypatch, tmp_path: Path) -> None:
     calls: list = []
     monkeypatch.setattr("lqh.cli._launch_tui", lambda *a: calls.append(a))
     main()
-    assert calls == [(tmp_path, False, "use the small model")]
+    assert calls == [(tmp_path, False, "use the small model", None)]
 
 
 def test_version_output(monkeypatch, capsys) -> None:
@@ -68,7 +68,7 @@ def test_auto_with_spec_md_launches_tui(monkeypatch, tmp_path: Path) -> None:
     calls: list = []
     monkeypatch.setattr("lqh.cli._launch_tui", lambda *a: calls.append(a))
     main()
-    assert calls == [(tmp_path.resolve(), True, None)]
+    assert calls == [(tmp_path.resolve(), True, None, None)]
 
 
 def test_unknown_command_is_usage_error(monkeypatch, capsys) -> None:
@@ -161,6 +161,41 @@ def test_root_spec_survives_run_subcommand(monkeypatch) -> None:
     with pytest.raises(SystemExit):
         main()
     assert seen["spec"] == "override"
+
+
+def test_resume_passthrough(monkeypatch, tmp_path: Path) -> None:
+    """`lqh --resume ID` reaches the TUI launcher."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["lqh", "--resume", "4f2a9c1e"])
+    calls: list = []
+    monkeypatch.setattr("lqh.cli._launch_tui", lambda *a: calls.append(a))
+    main()
+    assert calls == [(tmp_path, False, None, "4f2a9c1e")]
+
+
+def test_resume_with_subcommand_refused(monkeypatch, capsys) -> None:
+    """The root --resume drives the TUI; `run` has its own."""
+    monkeypatch.setattr(sys, "argv", ["lqh", "--resume", "abc", "status"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert "--resume cannot be combined" in capsys.readouterr().err
+
+
+def test_run_resume_unaffected_by_root_flag(monkeypatch) -> None:
+    """`lqh run --resume ID` keeps its own dest and still dispatches."""
+    seen: dict = {}
+
+    def fake_dispatch(args):
+        seen["resume"] = args.resume
+        seen["root"] = args.resume_session
+        return 0
+
+    monkeypatch.setattr("lqh.cli._dispatch", fake_dispatch)
+    monkeypatch.setattr(sys, "argv", ["lqh", "run", "t", "--resume", "sid"])
+    with pytest.raises(SystemExit):
+        main()
+    assert seen == {"resume": "sid", "root": None}
 
 
 def test_auto_with_subcommand_refused(monkeypatch, tmp_path: Path, capsys) -> None:

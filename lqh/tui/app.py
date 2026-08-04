@@ -34,6 +34,7 @@ from lqh.tui.renderer import (
     render_error,
     render_file_view,
     render_options,
+    render_resume_hint,
     render_secret,
     render_system_message,
     render_tool_call,
@@ -125,10 +126,13 @@ class LqhApp:
         *,
         auto_mode: bool = False,
         extra_spec: str | None = None,
+        resume_session_id: str | None = None,
     ) -> None:
         self.project_dir = project_dir
         self.auto_mode = auto_mode
         self.extra_spec = extra_spec
+        # `lqh --resume ID`: adopted at startup instead of the fresh session.
+        self._resume_session_id = resume_session_id
         self._status_bar = StatusBar(project_dir=project_dir)
         self._status_bar.auto_mode = auto_mode
         self._foreground_progress_history: list[Any] = []
@@ -594,8 +598,18 @@ class LqhApp:
         from lqh.headless import release_loop
 
         release_loop(self.project_dir)
-        if self._app and self._app.is_running:
-            self._app.exit()
+        app = self._app
+        if app is None or not app.is_running or app.is_done:
+            return
+        try:
+            app.exit()
+        except Exception:
+            # Already exiting: a Ctrl+C binding requests shutdown and
+            # teardown follows immediately behind, so the second call can
+            # land in the window before is_running flips. prompt_toolkit
+            # raises "Return value already set" there — nothing to do, but
+            # letting it escape would abort teardown and exit non-zero.
+            logger.debug("application already exiting", exc_info=True)
 
     def _request_shutdown(self) -> None:
         """Mark the session for shutdown and stop the live application."""
@@ -606,6 +620,14 @@ class LqhApp:
         # Wake any consumer parked on the input queue (auto-mode pause,
         # main loop) so it sees the shutdown instead of waiting forever.
         self._input_queue.put_nowait(_SHUTDOWN_SENTINEL)
+        # Same for a pending prompt (startup login, copy continue-vs-fork,
+        # /resume picker, ask_user): nothing else will ever answer it, so
+        # the awaiting coroutine would block forever and the process would
+        # never reach teardown. Callers see the sentinel, match none of
+        # their options, and fall through to the shutdown checks.
+        future = self._ask_user_future
+        if future is not None and not future.done():
+            future.set_result(_SHUTDOWN_SENTINEL)
         self._exit_application()
 
     def _agent_busy(self) -> bool:
@@ -1481,6 +1503,61 @@ class LqhApp:
         self._status_bar.completion_tokens = session.completion_tokens
         self._agent = self._create_agent()
         self._invalidate()
+
+    async def _resume_requested_session(self) -> bool:
+        """Adopt the session named by ``lqh --resume ID``.
+
+        Returns True when the session was adopted. Every failure is
+        reported in the UI and falls back to the fresh session created at
+        startup — the user is already inside the TUI, so refusing to start
+        would be worse than starting a new conversation.
+        """
+        ref = self._resume_session_id
+        if not ref:
+            return False
+        try:
+            session_id = Session.resolve_id(self.project_dir, ref)
+            loaded = Session.load(self.project_dir, session_id)
+        except LookupError as exc:
+            await self._emit(render_error(f"{exc} Starting a new conversation."))
+            return False
+        except Exception as exc:
+            # Deliberately broad: damaged metadata surfaces as ValueError /
+            # TypeError from the int() conversions in Session.load, and a
+            # corrupt file must not take the whole startup down.
+            await self._emit(render_error(
+                f"Could not load session '{ref}': {type(exc).__name__}: {exc}. "
+                "Starting a new conversation."
+            ))
+            logger.warning("resume of session %s failed", ref, exc_info=True)
+            return False
+        # Atomic ownership claim (CLI_PLAN §7): a headless `lqh run` may own
+        # this session right now — never interleave two loops in one
+        # conversation.
+        if not loaded.claim_active():
+            await self._emit(render_error(
+                f"Session {session_id[:8]} is active in another process "
+                "(e.g. `lqh run`) — starting a new conversation instead."
+            ))
+            return False
+        self._adopt_session(loaded)
+        await self._emit(render_system_message(f"Resumed session {session_id[:8]}"))
+        await self._render_session_history()
+        return True
+
+    async def _emit_resume_hint(self) -> None:
+        """Print the `lqh --resume ID` shortcut on the way out.
+
+        Only for conversations that actually have history: an empty session
+        is never persisted, so its id would not resolve.
+        """
+        if self._session is None or not self._session.messages:
+            return
+        try:
+            await self._emit(render_resume_hint(self._session.id))
+        except Exception:
+            # Teardown output must never mask the real exit path.
+            logger.debug("resume hint emit failed", exc_info=True)
 
     async def _offer_interrupted_resume(self) -> None:
         """Offer to pick up the newest interrupted session at startup.
@@ -2367,6 +2444,12 @@ class LqhApp:
             choice = await self._wait_for_user_response(
                 options=["Yes, log in now", "No, continue without login"],
             )
+            # Ctrl+C twice at the prompt resolves it with the shutdown
+            # sentinel — leave immediately instead of announcing a choice
+            # the user never made.
+            if self._shutdown_requested:
+                await self._teardown(app_task)
+                return
             if choice.startswith("Yes"):
                 await self._do_login()
                 self._status_bar.logged_in = bool(get_token())
@@ -2404,13 +2487,7 @@ class LqhApp:
                     "cannot decide continue-vs-fork on its own. Run lqh "
                     "interactively once to choose, then re-run --auto."
                 ))
-                await self._stop_update_check()
-                self._exit_application()
-                await self._wait_for_app_task(app_task)
-                self._save_session()
-                if self._session is not None:
-                    self._session.mark_state("completed")
-                await self._finish_telemetry()
+                await self._teardown(app_task)
                 return
             await self._emit(render_system_message(
                 "📁 This directory looks like a COPY of another project "
@@ -2422,6 +2499,12 @@ class LqhApp:
                 "Continue as the same project (shares cloud history/jobs)",
                 "Fork into a new project (fresh identity and cloud namespace)",
             ])
+            # Quitting at the prompt leaves the decision unrecorded — which
+            # is safe, the prompt simply reappears next start. Recording a
+            # choice nobody made would not be.
+            if self._shutdown_requested:
+                await self._teardown(app_task)
+                return
             try:
                 if choice.startswith("Fork"):
                     fork_identity(self.project_dir)
@@ -2445,13 +2528,7 @@ class LqhApp:
                     f"{exc}\nStopping. Fix the .lqh/ directory (permissions/"
                     "disk) and restart — you will be asked again."
                 ))
-                await self._stop_update_check()
-                self._exit_application()
-                await self._wait_for_app_task(app_task)
-                self._save_session()
-                if self._session is not None:
-                    self._session.mark_state("completed")
-                await self._finish_telemetry()
+                await self._teardown(app_task)
                 return
         if not identity_error and get_token():
             try:
@@ -2466,6 +2543,10 @@ class LqhApp:
                 ))
 
         await self._refresh_startup_state()
+
+        # Explicit `lqh --resume ID` wins over the interrupted-session offer,
+        # and applies in auto mode too (a killed --auto run can be picked up).
+        resumed = await self._resume_requested_session()
 
         # Auto mode: skip the interactive welcome / resume flow and run the
         # pipeline non-interactively. The agent's auto skill (sticky system
@@ -2483,16 +2564,17 @@ class LqhApp:
                         pass
                 await self._run_auto_mode()
             finally:
-                await self._stop_update_check()
-                self._exit_application()
-                await self._wait_for_app_task(app_task)
-                self._save_session()
-                if self._session is not None:
-                    self._session.mark_state("completed")
-                await self._finish_telemetry()
+                await self._teardown(app_task)
             return
 
-        await self._offer_interrupted_resume()
+        # An explicit --resume that failed must NOT slide into the automatic
+        # offer for some other conversation: the user named the one they
+        # wanted, and got an error saying why they didn't get it.
+        if not resumed and not self._resume_session_id:
+            await self._offer_interrupted_resume()
+        if self._shutdown_requested:
+            await self._teardown(app_task)
+            return
         await self._prepare_agent_context()
 
         self._job_watcher_task = asyncio.create_task(self._watch_jobs())
@@ -2530,29 +2612,44 @@ class LqhApp:
                 for task in pending:
                     task.cancel()
         finally:
-            await self._stop_update_check()
-            if self._progress_refresh_task is not None:
-                self._progress_refresh_task.cancel()
-                self._progress_refresh_task = None
-            if self._job_watcher_task is not None:
-                self._job_watcher_task.cancel()
-                try:
-                    await self._job_watcher_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                self._job_watcher_task = None
-            for watcher in list(self._run_watchers.values()):
-                try:
-                    await watcher.stop()
-                except Exception:
-                    pass
-            self._run_watchers.clear()
-            self._exit_application()
+            await self._teardown(app_task)
+
+    async def _teardown(self, app_task: asyncio.Task | None) -> None:
+        """Stop background work, tear the application down, close the session.
+
+        Every exit route goes through here — the main loop's finally, auto
+        mode, and the startup bail-outs — so the ordering is defined in
+        exactly one place: background tasks first, then the application,
+        then session state and telemetry, and the user-facing hint last,
+        once the terminal is ours again and _emit writes straight to
+        stdout. Safe to call after _request_shutdown already exited the
+        application; _exit_application is idempotent.
+        """
+        await self._stop_update_check()
+        if self._progress_refresh_task is not None:
+            self._progress_refresh_task.cancel()
+            self._progress_refresh_task = None
+        if self._job_watcher_task is not None:
+            self._job_watcher_task.cancel()
+            try:
+                await self._job_watcher_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._job_watcher_task = None
+        for watcher in list(self._run_watchers.values()):
+            try:
+                await watcher.stop()
+            except Exception:
+                pass
+        self._run_watchers.clear()
+        self._exit_application()
+        if app_task is not None:
             await self._wait_for_app_task(app_task)
-            self._save_session()
-            if self._session is not None:
-                self._session.mark_state("completed")
-            await self._finish_telemetry()
+        self._save_session()
+        if self._session is not None:
+            self._session.mark_state("completed")
+        await self._finish_telemetry()
+        await self._emit_resume_hint()
 
     async def _telemetry_heartbeat(self) -> None:
         next_heartbeat = time.monotonic() + TELEMETRY_HEARTBEAT_INTERVAL_SEC

@@ -836,6 +836,35 @@ class Session:
         return listed
 
     @classmethod
+    def resolve_id(cls, project_dir: Path, ref: str) -> str:
+        """Resolve an exact session id or a unique id prefix.
+
+        The TUI shows 8-character ids all over the place (``Resumed session
+        4f2a9c1e``), so a prefix is what a user is most likely to have at
+        hand. Raises ``LookupError`` with a user-facing message when the
+        reference matches nothing or is ambiguous.
+        """
+        ref = (ref or "").strip()
+        if not ref:
+            raise LookupError("No session id given.")
+        ids = [s["id"] for s in cls.list_sessions(project_dir)]
+        if ref in ids:
+            return ref
+        matches = [sid for sid in ids if sid.startswith(ref)]
+        if not matches:
+            raise LookupError(
+                f"No conversation in this project matches '{ref}'."
+            )
+        if len(matches) > 1:
+            shown = ", ".join(sid[:8] for sid in matches[:5])
+            more = ", …" if len(matches) > 5 else ""
+            raise LookupError(
+                f"'{ref}' matches {len(matches)} conversations "
+                f"({shown}{more}) — use more characters."
+            )
+        return matches[0]
+
+    @classmethod
     def repair_states(cls, project_dir: Path) -> list[str]:
         """Mark active sessions owned by dead processes as interrupted.
 

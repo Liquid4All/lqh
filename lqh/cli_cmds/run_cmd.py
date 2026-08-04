@@ -335,7 +335,11 @@ async def _run_async(
     # CONTEXTUAL — prepare_context below rebuilds fresh state regardless.
     if ns.resume:
         try:
-            session = Session.load(project_dir, ns.resume)
+            # Accepts a full id or a unique prefix (same as the TUI's
+            # `lqh --resume`).
+            session = Session.load(
+                project_dir, Session.resolve_id(project_dir, ns.resume)
+            )
         except Exception as e:
             return _usage_error(f"cannot resume session {ns.resume}: {e}")
         # Contention guard (CLI_PLAN §7): an ATOMIC check-and-mark under

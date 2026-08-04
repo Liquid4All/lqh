@@ -145,7 +145,7 @@ Base, instruct, and thinking variants are available; the agent recommends the ri
 | `/train` | Start training (requires `torch`) |
 | `/eval` | Start evaluation |
 | `/prompt` | Start prompt optimization |
-| `/resume` | Resume a previous conversation |
+| `/resume` | Resume a previous conversation (or `lqh --resume <id>` at launch — the id is printed when you exit) |
 | `/clear` | Start a fresh conversation |
 | `/reconnect` | Retry a failed network/API operation |
 | `/feedback` | Send feedback (with the current conversation) to the lqh team |

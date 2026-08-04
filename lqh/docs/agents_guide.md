@@ -137,7 +137,8 @@ Progress events stream on stderr as NDJSON
 `stage`, `end`) — but stderr is a MIXED stream: log lines, warnings, and
 redirected library output appear between events, so parse only lines
 that start with `{` and JSON-decode. `--resume <session_id>` continues a
-prior run contextually — e.g. after granting `--allow-publish`.
+prior run contextually — e.g. after granting `--allow-publish`. It takes
+the full session id or a unique prefix.
 
 ## Contracts
 
@@ -204,6 +205,10 @@ lqh tool call training_status --args '{"run_name": "…"}' --wait
                                 # park until the run is terminal (results incl.)
 lqh status [--json]             # run states + attention signals at a glance
 lqh project continue|fork       # resolve a copied project directory (see below)
+lqh --resume <ID>               # interactive TUI, resuming a prior conversation
+                                # (full id or unique prefix; the id is printed
+                                # on exit). Not for headless use — that is
+                                # `lqh run --resume ID`.
 ```
 
 ## Tools

@@ -156,6 +156,21 @@ def _build_parser() -> argparse.ArgumentParser:
             "both interactive and auto mode."
         ),
     )
+    # dest is deliberately NOT "resume": the `run` subparser defines its own
+    # --resume, and subparser defaults overwrite values already in the
+    # namespace (the same collision --spec dodges with argparse.SUPPRESS
+    # below). A separate dest keeps both flags independent.
+    parser.add_argument(
+        "--resume",
+        metavar="SESSION_ID",
+        dest="resume_session",
+        default=None,
+        help=(
+            "Resume a previous conversation in the interactive TUI. Accepts "
+            "the full session id or a unique prefix — the id printed when "
+            "you exit."
+        ),
+    )
 
     sub = parser.add_subparsers(
         dest="command", title="commands", metavar="[command]",
@@ -352,14 +367,24 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _launch_tui(project_dir: Path, auto_mode: bool, extra_spec: str | None) -> None:
+def _launch_tui(
+    project_dir: Path,
+    auto_mode: bool,
+    extra_spec: str | None,
+    resume_id: str | None = None,
+) -> None:
     """Start the interactive TUI (the pre-subcommand `lqh` behavior)."""
     # Keep lightweight commands such as --help and --version from importing
     # the full TUI dependency graph.
     from lqh.tui.app import LqhApp
 
     _configure_logging(project_dir)
-    app = LqhApp(project_dir, auto_mode=auto_mode, extra_spec=extra_spec)
+    app = LqhApp(
+        project_dir,
+        auto_mode=auto_mode,
+        extra_spec=extra_spec,
+        resume_session_id=resume_id,
+    )
 
     try:
         asyncio.run(app.run())
@@ -415,6 +440,12 @@ def main() -> None:
                 "--auto cannot be combined with a subcommand; use "
                 "`lqh run --project DIR` for headless runs."
             )
+        if args.resume_session is not None:
+            # The root --resume drives the TUI; `run` has its own.
+            parser.error(
+                "--resume cannot be combined with a subcommand; use "
+                "`lqh run --resume ID` for headless runs."
+            )
         if not hasattr(args, "spec"):
             args.spec = None
         sys.exit(_dispatch(args))
@@ -440,7 +471,7 @@ def main() -> None:
         project_dir = Path.cwd()
         auto_mode = False
 
-    _launch_tui(project_dir, auto_mode, args.spec)
+    _launch_tui(project_dir, auto_mode, args.spec, args.resume_session)
 
 
 if __name__ == "__main__":
