@@ -62,8 +62,12 @@ class SSHSlurmBackend(RemoteBackend):
         config: dict[str, Any],
         *,
         module: str = "lqh.train",
+        donate_hf_token: bool = False,
     ) -> str:
         """Submit a training job via sbatch.
+
+        ``donate_hf_token`` is accepted for interface compatibility and
+        ignored — same reasoning as SSHDirectBackend.
 
         Planned behavior:
         1. Sync dataset and config to headnode (rsync over SSH)

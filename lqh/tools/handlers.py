@@ -1313,6 +1313,7 @@ async def handle_run_data_gen_pipeline(
                 timeout_minutes=timeout_minutes,
                 permissions=perms,
                 on_bg_started=kwargs.get("on_background_task_started"),
+                hf_donate=kwargs.get("_hf_donate"),
             )
 
         # Execute the pipeline (pass through any callbacks from kwargs)
@@ -1382,6 +1383,7 @@ async def _submit_cloud_data_gen(
     timeout_minutes: int = 720,
     permissions: PermissionContext,
     on_bg_started: Callable[[str, str, str, str | None], None] | None = None,
+    hf_donate: bool | None = None,
 ) -> ToolResult:
     """Submit the pipeline as a background cloud CPU job.
 
@@ -1474,20 +1476,34 @@ async def _submit_cloud_data_gen(
         hf_line = ""
         if record.needs_hf:
             # Be explicit that a credential leaves the machine with the
-            # job — this is a consent prompt, not a changelog.
-            if os.environ.get("HF_TOKEN"):
+            # job — this is a consent prompt, not a changelog. The
+            # donation itself is consented separately (hf_donate, below);
+            # this line only sets expectations about what the pipeline
+            # needs, since it streams a Hugging Face dataset.
+            from lqh.hf_token import hf_token_origin
+
+            origin = hf_token_origin(project_dir)
+            if origin is not None and origin.donation_enabled:
                 hf_line = (
-                    "  HF:      pipeline streams a Hugging Face dataset — your "
-                    "local HF_TOKEN is sent with this job (not persisted) and is "
-                    "available to the trusted pipeline Python process\n"
+                    "  HF:      pipeline streams a Hugging Face dataset — you'll be "
+                    f"asked whether to send the token from {origin.label} with it "
+                    "(available to the trusted pipeline Python process)\n"
                 )
             else:
                 hf_line = (
-                    "  HF:      pipeline streams a Hugging Face dataset — no "
-                    "local HF_TOKEN found; private datasets need one (or a "
-                    "stored account token) or the job will fail. Any stored token "
-                    "used is available to the trusted pipeline Python process\n"
+                    "  HF:      pipeline streams a Hugging Face dataset — no local "
+                    "token found; private datasets need one (or a stored account "
+                    "token) or the job will fail. Any stored token used is "
+                    "available to the trusted pipeline Python process\n"
                 )
+        else:
+            # needs_hf only sees lqh.sources.hf_dataset. A pipeline
+            # reaching HF another way still gets the donation question,
+            # so say so here rather than letting the next prompt arrive
+            # unannounced.
+            from lqh.hf_token import hf_disclosure_line
+
+            hf_line = hf_disclosure_line(project_dir)
         return ToolResult(
             content="PERMISSION_REQUIRED",
             requires_user_input=True,
@@ -1523,6 +1539,30 @@ async def _submit_cloud_data_gen(
                 "Do not submit",
             ],
         )
+
+    # HF donation. Runs after the submit consent above so the user isn't
+    # asked about a credential for a job they then decline.
+    #
+    # Deliberately NOT gated on record.needs_hf, unlike the stored-token
+    # injection. needs_hf is an observation of `lqh.sources.hf_dataset`
+    # specifically, confirmed against the script text — a deliberately
+    # narrow signal, because it decides whether to hand a job the user's
+    # ACCOUNT credential without asking. A pipeline reaching HF through
+    # datasets.load_dataset, huggingface_hub, or any wrapper indirect
+    # enough to defeat the text check is invisible to it, and those
+    # pipelines were silently denied the donation too: they worked
+    # locally (the resolver finds the token) and 401'd in the cloud.
+    #
+    # Donation is the opposite kind of decision — explicit, per-job, and
+    # declinable — so it does not need a detector to be right. Training
+    # and eval already offer it on every cloud submit; data-gen was the
+    # only workflow where a detector stood between the user and the
+    # question, and the cost of it being wrong was a paid failure.
+    donate_hf, hf_prompt = _resolve_hf_donation(
+        project_dir, permissions, hf_donate, "data-gen"
+    )
+    if hf_prompt is not None:
+        return hf_prompt
 
     from datetime import datetime, timezone
 
@@ -1584,13 +1624,6 @@ async def _submit_cloud_data_gen(
         type="cloud",
         hostname="api.lqh.ai",  # informational; CloudBackend hits api_root()
         remote_root="cloud:lqh",
-        # The validated local run observed lqh.sources.hf_dataset — donate
-        # the local HF_TOKEN (if the env carries one) so a PRIVATE dataset
-        # that worked locally also works in the sandbox. Without this the
-        # sandbox only gets the account-stored token, and a user relying
-        # on an env token validates locally, then fails after paying for
-        # the launch. submit_run reads this flag for the donate path.
-        hf_token_configured=record.needs_hf,
     )
     backend = CloudBackend(cfg, project_dir)
     # Provenance captured BEFORE submission — these are the revisions the
@@ -1612,6 +1645,7 @@ async def _submit_cloud_data_gen(
             str(run_dir), config,
             module="lqh.remote.data_gen",
             telemetry_workflow_id=workflow_id,
+            donate_hf_token=donate_hf,
         )
     except CloudError as e:
         if telemetry:
@@ -1706,6 +1740,7 @@ async def _submit_cloud_data_gen(
             f"training_status(run_name='{run_name}') — it parks until the job "
             "finishes and the dataset is downloaded."
             + marker_warning
+            + _submit_advisories(backend)
         ),
         workflow_launched=True,
     )
@@ -2951,24 +2986,193 @@ async def handle_run_scoring(
 
 HF_MAPPINGS_FILE = ".lqh/hf.json"
 
+# Options for the HF-donation consent prompt. Matched by substring in the
+# agent loop's grant site, so keep the distinguishing words ("don't ask
+# again", "without") stable.
+HF_DONATE_OPTIONAL_OPTIONS = [
+    "Yes — send my HF token with this job",
+    "Yes, and don't ask again for this project",
+    "No — run this job without it",
+]
 
-def _get_hf_token() -> str:
-    """Return HF_TOKEN from environment or raise with instructions."""
-    token = os.environ.get("HF_TOKEN")
+# Same three answers, but the decline option cannot claim the job still
+# runs: a transfer or a GGUF push with no token anywhere is rejected by
+# the backend.
+HF_DONATE_REQUIRED_OPTIONS = [
+    "Yes — send my HF token with this job",
+    "Yes, and don't ask again for this project",
+    "No — don't send it (needs a token stored via /hf_login)",
+]
+
+# Back-compat alias; the optional wording is the common case.
+HF_DONATE_OPTIONS = HF_DONATE_OPTIONAL_OPTIONS
+
+
+def _is_cloud_target(remote: str) -> bool:
+    """Whether a resolved compute target is LQH Cloud."""
+    from lqh.remote.compute import is_cloud
+
+    return is_cloud(remote)
+
+
+def _eval_hf_disclosure(project_dir: Path) -> str:
+    """HF disclosure line for the cloud-eval consent prompt ("" when none)."""
+    from lqh.hf_token import hf_disclosure_line
+
+    return hf_disclosure_line(project_dir, indent="  ")
+
+
+def _submit_advisories(backend: Any) -> str:
+    """Render a cloud backend's post-submit advisories, or "".
+
+    submit_run returns only a job id (the RemoteBackend contract), so
+    non-fatal notes — a credential-like file left out of the upload, a
+    donated token the backend could not make restart-safe — ride on the
+    backend object. Dropping them is how a user ends up debugging a paid
+    sandbox failure with no idea a file was excluded.
+    """
+    warnings = getattr(backend, "last_submit_warnings", None) or []
+    if not warnings:
+        return ""
+    return "\n" + "\n".join(f"  \u26a0\ufe0f {w}" for w in warnings)
+
+
+def _resolve_hf_donation(
+    project_dir: Path,
+    permissions: PermissionContext | None,
+    hf_donate: bool | None,
+    job_label: str,
+    *,
+    token_required: bool = False,
+) -> tuple[bool, ToolResult | None]:
+    """Decide whether to send a locally-found HF token with a cloud job.
+
+    Returns ``(donate, prompt)``. A non-None ``prompt`` means the caller
+    must return it unchanged — the user has to answer first.
+
+    Note what this gate does NOT do: block the job. Declining donation
+    submits the job without a token, which is why the decline answer
+    travels back as ``_hf_donate=False`` rather than as an absent grant
+    (an absent grant is indistinguishable from "not asked yet" and would
+    re-prompt forever).
+
+    ``token_required`` changes only the copy, and it has to. For most
+    jobs a decline is genuinely free — the job runs, it just can't reach
+    gated repos. But an HF *upload* (a transfer, or a GGUF conversion
+    with a push target) cannot run at all without a credential: the
+    backend rejects it outright when neither an inline nor an account
+    token exists. Telling those users "declining still runs the job" and
+    then handing them a 400 is a promise the workflow can't keep, so
+    they get told what declining actually costs.
+
+    The prompt only fires when a token was actually found, so users
+    without one never see it, and at most once per project for anyone who
+    picks "don't ask again".
+
+    Provenance only in this function — no plaintext. See lqh.hf_token.
+    """
+    if hf_donate is False:
+        return False, None
+
+    from lqh.hf_token import hf_token_origin
+
+    origin = hf_token_origin(project_dir)
+    if origin is None or not origin.donation_enabled:
+        # Nothing to donate, or LQH_HF_DONATE=0. Either way: no prompt,
+        # no donation, job proceeds.
+        return False, None
+
+    # Default rather than skip when no invocation context was supplied.
+    # `allows_hf_donate` consults the DURABLE per-project grant as well
+    # as the invocation grants, and a tool's first call normally carries
+    # no _permissions at all — so gating the whole check on "is there a
+    # context" meant "Accept, and don't ask again for this project" was
+    # honoured on the re-invocation and forgotten on every submit after
+    # that. The option read as broken.
+    if (permissions or PermissionContext()).allows_hf_donate(project_dir):
+        return True, None
+
+    where = origin.label
+    if origin.path:
+        where += f" ({origin.path})"
+    if token_required:
+        # This workflow uploads to HF. Without a token there is nothing
+        # to run, so "declining still runs the job" would be a lie.
+        decline_note = (
+            "This job UPLOADS to Hugging Face, so it needs a token. Declining "
+            "works only if you already stored one with /hf_login — otherwise "
+            "the job is rejected and nothing is charged. Set LQH_HF_DONATE=0 "
+            "to stop offering this."
+        )
+    else:
+        decline_note = (
+            "Declining still runs the job — without this token (any token you "
+            "stored with /hf_login is unaffected). Set LQH_HF_DONATE=0 to stop "
+            "offering this."
+        )
+    extra = ""
+    if origin.is_hub_cache:
+        # This token was created for the Hub CLI, not for us. Say so.
+        extra = (
+            "\nThis is the token `huggingface-cli login` saved on this machine — "
+            "you didn't set it up for LQH specifically."
+        )
+    return False, ToolResult(
+        content="PERMISSION_REQUIRED",
+        requires_user_input=True,
+        permission_key=f"hf_donate:{job_label}",
+        question=(
+            f"Send your Hugging Face token with this {job_label} job?\n"
+            f"  Source:  {where}\n"
+            f"  Used to: read gated/private models and datasets inside the sandbox\n"
+            # Precise about retention: the backend holds it encrypted,
+            # scoped to this job, so a replacement worker after a restart
+            # still has it — and deletes it when the job ends. Saying
+            # "not stored" would be false.
+            f"  Kept:    encrypted for this job only, then deleted — it is not "
+            f"added to your LQH account{extra}\n"
+            # Precedence matters and is easy to get wrong from the outside:
+            # a donated token REPLACES the account one for this job, so a
+            # user with both could unknowingly run under a different (or
+            # weaker) credential than they expect.
+            f"  Note:    if you have a token stored via /hf_login, this one "
+            f"takes precedence for this job\n\n"
+            # Not "the job won't have HF access": an account token stored
+            # via /hf_login still applies, and claiming otherwise would
+            # push people into donating unnecessarily.
+            + decline_note
+        ),
+        options=HF_DONATE_OPTIONAL_OPTIONS if not token_required else HF_DONATE_REQUIRED_OPTIONS,
+    )
+
+
+def _get_hf_token(project_dir: Path | None = None) -> str:
+    """Return a local HF token or raise with instructions.
+
+    Shares :mod:`lqh.hf_token` with the cloud donate path so a token in a
+    project ``.env`` (or from ``huggingface-cli login``) works the same for
+    local tools as it does for a cloud submit — otherwise a user would find
+    that cloud fine-tuning works while ``push`` insists the env var is unset.
+    The token stays on this machine here; nothing is sent to LQH.
+    """
+    from lqh.hf_token import local_hf_token
+
+    token = local_hf_token(project_dir)
     if not token:
         raise ValueError(
-            "HF_TOKEN environment variable is not set. "
-            "Export HF_TOKEN=hf_... or set it in your shell. "
+            "No Hugging Face token found. Looked at: HF_TOKEN and "
+            "HUGGING_FACE_HUB_TOKEN in the environment, .env.local/.env in the "
+            "project, and ~/.cache/huggingface/token (huggingface-cli login). "
             "Get a token at https://huggingface.co/settings/tokens"
         )
     return token
 
 
-def _get_hf_api():
+def _get_hf_api(project_dir: Path | None = None):
     """Create an authenticated HfApi instance."""
     from huggingface_hub import HfApi
 
-    token = _get_hf_token()
+    token = _get_hf_token(project_dir)
     return HfApi(token=token)
 
 
@@ -3032,7 +3236,7 @@ async def handle_hf_repo_info(
 ) -> ToolResult:
     """Get info about a HF repo or the authenticated user."""
     try:
-        api = _get_hf_api()
+        api = _get_hf_api(kwargs.get("project_dir"))
     except ValueError as e:
         return ToolResult.fail("auth", f"Error: {e}")
 
@@ -3158,9 +3362,14 @@ async def handle_push(
     if src.scheme == "local":
         return await handle_hf_push(
             project_dir, local_path=src.value, repo_id=dst.value, private=private,
+            **{k: kwargs[k] for k in ("_permissions",) if k in kwargs},
         )
     if src.scheme == "lqh":
-        return await _push_lqh_to_hf(project_dir, src.value, dst.value, private)
+        return await _push_lqh_to_hf(
+            project_dir, src.value, dst.value, private,
+            permissions=kwargs.get("_permissions"),
+            hf_donate=kwargs.get("_hf_donate"),
+        )
     return ToolResult.fail(
         "validation",
         (
@@ -3171,10 +3380,48 @@ async def handle_push(
 
 
 async def _push_lqh_to_hf(
-    project_dir: Path, artifact_id: str, target_repo: str, private: bool,
+    project_dir: Path,
+    artifact_id: str,
+    target_repo: str,
+    private: bool,
+    *,
+    permissions: PermissionContext | None = None,
+    hf_donate: bool | None = None,
 ) -> ToolResult:
-    """Submit a CPU-only transfer job that copies an R2 artifact to HF."""
+    """Submit a CPU-only transfer job that copies an R2 artifact to HF.
+
+    Gated on the same hf_push domain as the local-file push path. This
+    writes to the user's HuggingFace account, so "the bytes start in R2
+    rather than on disk" is not a reason to skip consent — and donating a
+    token sharpens it, since the agent could otherwise reach any repo the
+    token can.
+    """
     from lqh.remote.transfer import submit_transfer
+
+    perms = permissions or PermissionContext()
+    if not perms.allows_hf_push(project_dir, target_repo):
+        return ToolResult(
+            content="PERMISSION_REQUIRED",
+            requires_user_input=True,
+            permission_key=f"hf_push:{target_repo}",
+            question=(
+                f"The agent wants to upload a checkpoint to your HuggingFace account:\n"
+                f"  Artifact: lqh:{artifact_id}\n"
+                f"  Repo:     {target_repo} ({'private' if private else 'PUBLIC'})\n\n"
+                f"Allow the upload?"
+            ),
+            options=[
+                "Upload",
+                "Upload and don't ask again for this repo",
+                "Do not upload",
+            ],
+        )
+
+    donate_hf, hf_prompt = _resolve_hf_donation(
+        project_dir, perms, hf_donate, "transfer", token_required=True
+    )
+    if hf_prompt is not None:
+        return hf_prompt
 
     try:
         job_id = await submit_transfer(
@@ -3182,6 +3429,8 @@ async def _push_lqh_to_hf(
             source_artifact_id=artifact_id,
             target_hf_repo=target_repo,
             private=private,
+            project_dir=project_dir,
+            donate_hf_token=donate_hf,
         )
     except Exception as e:  # noqa: BLE001 - surface clearly to the agent
         return ToolResult.fail("upstream", f"Error starting transfer of lqh:{artifact_id}: {e}")
@@ -3189,8 +3438,7 @@ async def _push_lqh_to_hf(
         content=(
             f"🚚 Transferring lqh:{artifact_id} → hf:{target_repo} via a CPU sandbox "
             f"(job {job_id}). The checkpoint is uploaded from R2 directly; check "
-            "training_status or the artifact's hf_repo once it completes. Requires a "
-            "stored HF token (run /hf_login) since the upload happens in the cloud."
+            "training_status or the artifact's hf_repo once it completes."
         ),
     )
 
@@ -3214,6 +3462,56 @@ async def handle_gguf_convert(
     if not quant_types:
         return ToolResult.fail("validation", "Error: quant_types must list at least one type.")
 
+    perms = kwargs.get("_permissions") or PermissionContext()
+    # A push writes to the user's HF account — same gate as any other
+    # upload. Conversion without a push target touches nothing of theirs.
+    if target_hf_repo and not perms.allows_hf_push(project_dir, target_hf_repo):
+        return ToolResult(
+            content="PERMISSION_REQUIRED",
+            requires_user_input=True,
+            permission_key=f"hf_push:{target_hf_repo}",
+            question=(
+                f"The agent wants to upload GGUF files to your HuggingFace account:\n"
+                f"  Artifact: lqh:{artifact_id}\n"
+                f"  Quants:   {', '.join(quant_types)}\n"
+                f"  Repo:     {target_hf_repo} ({'private' if private else 'PUBLIC'})\n\n"
+                f"Allow the upload?"
+            ),
+            options=[
+                "Upload",
+                "Upload and don't ask again for this repo",
+                "Do not upload",
+            ],
+        )
+
+    # Offer when the sandbox can actually use the token, which mirrors
+    # the backend's two conditions: a push target, or a LoRA merge that
+    # downloads a possibly-gated base.
+    #
+    # `artifact_format="full"` is the one case the CLI can rule out
+    # locally — the backend treats it as authoritative (it overrides
+    # lineage and the filename convention), so a full checkpoint with no
+    # push target neither downloads nor uploads anything and the token
+    # has no purpose. Every other combination stays permissive: a LoRA's
+    # base is normally resolved from server-side lineage, so the CLI
+    # commonly sees neither `base_model` nor a format and must not skip
+    # the token in exactly that case — that would hand the user a paid
+    # job that 401s.
+    #
+    # This matters most AFTER a "don't ask again" grant, where an
+    # unnecessary donation is silent.
+    donate_hf = False
+    if target_hf_repo or artifact_format != "full":
+        donate_hf, hf_prompt = _resolve_hf_donation(
+            project_dir, perms, kwargs.get("_hf_donate"), "gguf",
+            # Only a push is unconditional: converting a public base
+            # needs no credential, so the token is genuinely optional
+            # there and the decline copy must not claim otherwise.
+            token_required=bool(target_hf_repo),
+        )
+        if hf_prompt is not None:
+            return hf_prompt
+
     try:
         job_id = await submit_gguf(
             project_id=_ckey(project_dir),
@@ -3224,6 +3522,8 @@ async def handle_gguf_convert(
             include_f16=include_f16,
             base_model=base_model,
             artifact_format=artifact_format,
+            project_dir=project_dir,
+            donate_hf_token=donate_hf,
         )
     except Exception as e:  # noqa: BLE001 - surface clearly to the agent
         return ToolResult.fail("upstream", f"Error starting gguf conversion of lqh:{artifact_id}: {e}")
@@ -3236,7 +3536,9 @@ async def handle_gguf_convert(
             f"(job {job_id}). Each quant is converted from R2 directly and smoke-tested; "
             "the produced .gguf files register as new artifacts (kind 'gguf'). Check "
             "training_status for progress, then 'artifacts' (action=list) to download them."
-            + (" HF push requires a stored token (run /hf_login)." if target_hf_repo else "")
+            + (" The HF push uses whichever token applied to this job — the one "
+               "you approved sending, or the one stored on your account."
+               if target_hf_repo else "")
         ),
     )
 
@@ -3797,10 +4099,12 @@ async def handle_hf_pull(
     **kwargs: Any,
 ) -> ToolResult:
     """Download a dataset or model from HF Hub to local storage."""
-    token = os.environ.get("HF_TOKEN")  # optional for public repos
+    from lqh.hf_token import local_hf_token
+
+    token = local_hf_token(project_dir)  # optional for public repos
 
     try:
-        api = _get_hf_api()
+        api = _get_hf_api(project_dir)
     except ValueError as e:
         return ToolResult.fail("auth", f"Error: {e}")
 
@@ -4028,7 +4332,7 @@ async def handle_hf_push(
     """Push a local dataset or model checkpoint to HF Hub. Requires permission."""
     # Check HF token first
     try:
-        api = _get_hf_api()
+        api = _get_hf_api(project_dir)
     except ValueError as e:
         return ToolResult.fail("auth", f"Error: {e}")
 
@@ -4557,12 +4861,12 @@ async def handle_start_training(
     disable_scoring: bool = False,
     run_name: str | None = None,
     lora: bool = True,
-    num_epochs: int = 3,
+    num_epochs: int | None = None,
     learning_rate: float | None = None,
     num_iterations: int = 5,
     dpo_beta: float = 0.1,
     golden_source: str = "dataset",
-    enable_sweep: bool = True,
+    enable_sweep: bool | None = None,
     grid_size: str = "small",
     override_budget: bool = False,
     _permissions: PermissionContext | None = None,
@@ -4572,9 +4876,20 @@ async def handle_start_training(
 
     Sweep behaviour
     ---------------
-    By default ``enable_sweep=True``: instead of a single training run, we
-    sweep a small hyperparameter grid (see ``lqh.train.sweep``) and pick
-    the best config by a cheap, validated in-training proxy:
+    ``enable_sweep`` defaults to None, which resolves per run type
+    (``lqh.train.defaults.sweeps_by_default``):
+
+    - **SFT: no sweep.** One run at the recommended defaults from
+      ``lqh/train/defaults.py``. A sweep trains the grid sequentially inside a
+      single job, so it costs hours on the very first run after a dataset is
+      ready — the wrong trade when the defaults are already validated. Sweep
+      later, once data volume and model size are settled and the remaining
+      gains are small enough to be worth searching for.
+    - **DPO: sweep.** DPO is far more sensitive to learning rate and beta, and
+      its defaults are not covered by the SFT calibration study, so paying for
+      the search is still the safer default there.
+
+    Winners are picked by a cheap, validated in-training proxy:
 
     - SFT: ``eval_loss`` (Pearson r = −0.90 with judge_mean on ar_to_de).
     - DPO: fixed held-out judge score, with chosen-response CE retained as a
@@ -4585,11 +4900,9 @@ async def handle_start_training(
     SFT sweeps. This avoids ranking configurations on incomparable on-policy
     preference subsets.
 
-    Pass ``enable_sweep=false`` to fall back to single-config behaviour
-    only when the user explicitly asks for it (e.g. "just train one
-    config with lr=2e-5"). Specific ``learning_rate``/``num_epochs``/
-    ``dpo_beta`` values supplied by the agent are honoured under
-    ``enable_sweep=false``; under sweep they are overridden by the grid.
+    Explicit ``enable_sweep=true/false`` always wins. ``learning_rate`` /
+    ``num_epochs`` / ``dpo_beta`` supplied by the agent are honoured when not
+    sweeping; under a sweep they are overridden by the grid.
 
     Eval / scoring contract
     -----------------------
@@ -4828,60 +5141,20 @@ async def handle_start_training(
             ),
         )
 
-    # Build config
-    default_lr = 2e-5 if type == "sft" else 1e-6
-    if is_vision and type == "sft":
-        default_lr = 5e-4  # Liquid VLM LoRA recipe
-    lr = learning_rate if learning_rate is not None else default_lr
-    if is_vision:
-        # No calibration probe for vision — start conservative and let the
-        # OOM self-heal (report_oom_downgrade) shrink further if needed.
-        default_micro_batch = 2
-        default_effective_batch = 16
-    elif lora and type in ("on_policy_dpo", "dpo"):
-        # DPO preference batches are normally only a few hundred rows.  The
-        # old LoRA-wide default of 256 reduced those batches to one or two
-        # optimizer updates per on-policy iteration.  Keep enough updates to
-        # learn from the pairs; the GPU calibrator may still reduce the micro
-        # batch for memory safety without increasing this effective target.
-        default_micro_batch = 16
-        default_effective_batch = 16
-    elif lora:
-        default_micro_batch = 256
-        default_effective_batch = 256
-    else:
-        default_micro_batch = 1
-        default_effective_batch = 16 if type == "sft" else 2
-    default_grad_accum = max(
-        1,
-        (default_effective_batch + default_micro_batch - 1) // default_micro_batch,
-    )
+    # Build config. Every hyperparameter default comes from one place
+    # (lqh/train/defaults.py) so the hp_defaults calibration study can update
+    # them with a data-only edit; explicit tool arguments still win.
+    from lqh.train import defaults as hp_defaults
 
-    if is_vision:
-        lora_defaults: dict[str, Any] = {
-            "enabled": lora,
-            "r": 8,
-            "alpha": 16,
-            "dropout": 0.05,
-            # Liquid VLM recipe: attention + FFN + vision-tower MLPs (fc1/
-            # fc2) + multimodal projector (linear). Intentionally different
-            # from the text LFM module list.
-            "target_modules": [
-                "q_proj", "v_proj", "fc1", "fc2", "linear",
-                "gate_proj", "up_proj", "down_proj",
-            ],
-        }
-    else:
-        lora_defaults = {
-            "enabled": lora,
-            "r": 32,
-            "alpha": 64,
-            "dropout": 0.02,
-            "target_modules": [
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "in_proj", "out_proj", "w1", "w2", "w3",
-            ],
-        }
+    recommended = hp_defaults.recommended(
+        run_type=type,
+        lora=lora,
+        modality="vision" if is_vision else "text",
+        base_model=base_model,
+        train_rows=None,
+    )
+    lr = learning_rate if learning_rate is not None else recommended.learning_rate
+    epochs = num_epochs if num_epochs is not None else recommended.num_epochs
 
     from lqh.project_meta import compute_spec_sha256
 
@@ -4913,22 +5186,22 @@ async def handle_start_training(
         # config stay traceable to the spec they were built against even
         # after SPEC.md changes mid-run (PERSISTENCY_PLAN.md R6).
         "spec_sha256": compute_spec_sha256(project_dir),
+        # Recommended defaults, with the caller's explicit overrides applied.
+        # training_config() carries num_epochs for SFT and omits it for DPO.
         "training": {
+            **recommended.training_config(),
             "learning_rate": lr,
-            "max_seq_length": 2048,
-            "per_device_batch_size": default_micro_batch,
-            "gradient_accumulation_steps": default_grad_accum,
-            "effective_batch_size": default_effective_batch,
-            "auto_batch": True,
         },
-        "lora": lora_defaults,
+        "lora": recommended.lora,
         "manifest": ["base_model", "dataset"],
     }
+    if epochs is not None:
+        config["training"]["num_epochs"] = epochs
     if is_vision:
         config["modality"] = "vision"
         # Per-image token budget for the processor. Effective text budget
         # is roughly max_seq_length − n_images × max_image_tokens.
-        config["training"]["max_image_tokens"] = 256
+        config["training"]["max_image_tokens"] = hp_defaults.VISION_MAX_IMAGE_TOKENS
 
     if eval_sources:
         config["eval_dataset"] = _sources_to_config(eval_sources)
@@ -4944,9 +5217,7 @@ async def handle_start_training(
         config["scorer"] = scorer_path
         config["manifest"].append("scorer")
 
-    if type == "sft":
-        config["training"]["num_epochs"] = num_epochs
-    elif type in ("on_policy_dpo", "dpo"):
+    if type in ("on_policy_dpo", "dpo"):
         config["num_iterations"] = num_iterations
         config["dpo_beta"] = dpo_beta
         config["golden_source"] = golden_source
@@ -4997,6 +5268,13 @@ async def handle_start_training(
     # arbitrary pipeline/script execution.
     perm_key = f"training:{run_name}"
     if not (_permissions or PermissionContext()).allows_training(project_dir, run_name):
+        # Only on the cloud branch: this prompt is shared with local and
+        # SSH runs, where "sent with this job" would simply be false.
+        hf_line = ""
+        if remote and _is_cloud_target(remote):
+            from lqh.hf_token import hf_disclosure_line
+
+            hf_line = hf_disclosure_line(project_dir, indent="  ")
         return ToolResult(
             content="PERMISSION_REQUIRED",
             requires_user_input=True,
@@ -5007,14 +5285,27 @@ async def handle_start_training(
                 f"  Model:     {base_model}\n"
                 f"  Dataset:   {dataset_summary}\n"
                 f"  Eval:      {eval_summary}\n"
-                f"  GPU:       {gpu_info}{size_warning}\n\n"
-                f"Allow execution?"
+                f"  GPU:       {gpu_info}{size_warning}\n"
+                + hf_line
+                + "\nAllow execution?"
             ),
             options=[
                 "Start training",
                 "Do not start training",
             ],
         )
+
+    # HF donation, cloud only — on a local or SSH run nothing leaves the
+    # machine through us, so there is nothing to consent to. Asked before
+    # the run name is claimed below: a prompt returns and re-invokes, and
+    # claiming first would strand a run directory on every round trip.
+    donate_hf = False
+    if remote and _is_cloud_target(remote):
+        donate_hf, hf_prompt = _resolve_hf_donation(
+            project_dir, _permissions, kwargs.get("_hf_donate"), "training"
+        )
+        if hf_prompt is not None:
+            return hf_prompt
 
     # Consent has been established for this exact name. Reserve it atomically
     # only now, so permission prompts and declines never leave ghost run
@@ -5034,6 +5325,11 @@ async def handle_start_training(
     # single-config sends the base config directly. The remote backend
     # ships either payload identically — sweep just looks like a different
     # subprocess type to the watcher.
+    #
+    # None means "decide by run type": SFT trains once at the validated
+    # defaults, DPO still sweeps. An explicit boolean from the agent wins.
+    if enable_sweep is None:
+        enable_sweep = hp_defaults.sweeps_by_default(type)
     if enable_sweep:
         launch_config: dict[str, Any] = {
             "type": "sweep",
@@ -5051,6 +5347,7 @@ async def handle_start_training(
             kwargs.get("api_key", ""),
             on_bg_started=on_bg_started,
             module=launch_module,
+            donate_hf_token=donate_hf,
         )
     return await _execute_start_training(
         project_dir, run_dir, launch_config, run_name,
@@ -5069,6 +5366,7 @@ async def _execute_start_training_remote(
     *,
     on_bg_started: Callable[[str, str, str, str | None], None] | None = None,
     module: str = "lqh.train",
+    donate_hf_token: bool = False,
 ) -> ToolResult:
     """Start training on a remote backend.
 
@@ -5091,7 +5389,10 @@ async def _execute_start_training_remote(
         )
         backend = CloudBackend(cfg, project_dir)
         try:
-            job_id = await backend.submit_run(str(run_dir), config, module=module)
+            job_id = await backend.submit_run(
+                str(run_dir), config, module=module,
+                donate_hf_token=donate_hf_token,
+            )
         except Exception as e:
             return ToolResult.fail("upstream", f"Error launching cloud training: {e}")
 
@@ -5118,6 +5419,7 @@ async def _execute_start_training_remote(
                 + (f"  Data:    {data_line}\n" if data_line else "")
                 + f"  Job ID:  {job_id}\n\n"
                 f"Backend: LQH Cloud (api.lqh.ai). Use training_status to monitor progress."
+                + _submit_advisories(backend)
             ),
             workflow_launched=True,
         )
@@ -5730,12 +6032,12 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
         except (json.JSONDecodeError, OSError):
             lines.append("  ⚠️  Early-abort signaled (unparseable)")
 
-    # Sweep summary (when handle_start_training was invoked with the
-    # default enable_sweep=True). We deliberately surface only the
-    # validated proxy here:
+    # Sweep summary (present only when the run was launched as a sweep —
+    # every DPO run, and SFT runs where the caller asked for one). We
+    # deliberately surface only the validated selection metric here:
     #   - For SFT: eval_loss (Pearson r=-0.90 with judge_mean).
-    #   - For DPO: eval_ce_chosen_mean and eval_ce_chosen_delta_ref
-    #     (Spearman ρ=-1.0). DPO eval_loss and eval_rewards/margins are
+    #   - For DPO: the held-out judge score, plus eval_ce_chosen_delta_ref
+    #     as the collapse veto. DPO eval_loss and eval_rewards/margins are
     #     NOT shown — they correlate with judge in the wrong direction
     #     and would mislead the agent into picking a collapsed config.
     #     See lqh/train/sweep.py for the experiment that established this.
@@ -5912,15 +6214,22 @@ def _format_sweep_summary(run_dir: Path) -> list[str]:
         if mode == "sft":
             out.append(f"    {cid} · {hp_str} · eval_loss={primary_s}{marker}")
         else:
-            # DPO row: CE-mean + Δref. Hide DPO eval_loss and margins.
+            # DPO row: held-out judge score (the selection metric) + the
+            # chosen-CE drift that acts as the collapse veto. DPO eval_loss and
+            # reward margins stay hidden — they can look great on a collapsed
+            # model. `primary` is the NEGATED judge mean so that lower-is-better
+            # holds for every mode; show the judge score itself, right way up.
             dref = r.get("eval_ce_chosen_delta_ref")
-            p90 = r.get("eval_ce_chosen_p90")
+            judge = r.get("held_out_judge_mean")
             extras: list[str] = []
-            extras.append(f"CE(ch)_mean={primary_s}")
-            if isinstance(p90, (int, float)):
-                extras.append(f"p90={p90:.3f}")
+            if isinstance(judge, (int, float)):
+                extras.append(f"judge={judge:.3f}")
+            elif isinstance(primary, (int, float)):
+                extras.append(f"judge={-primary:.3f}")
+            else:
+                extras.append("judge=—")
             if isinstance(dref, (int, float)):
-                extras.append(f"Δref={dref:+.3f}")
+                extras.append(f"CE(ch)Δref={dref:+.3f}")
             out.append(f"    {cid} · {hp_str} · " + " ".join(extras) + marker)
     return out
 
@@ -6410,6 +6719,7 @@ async def handle_eval_hf_model(
                 f"  Eval:    {num_samples} samples, judge:{judge_size}, "
                 f"max {max_new_tokens} tokens/sample\n"
                 + compute_line
+                + _eval_hf_disclosure(project_dir)
                 + "Submit the cloud eval?"
             ),
             options=[
@@ -6418,6 +6728,18 @@ async def handle_eval_hf_model(
                 "Do not submit",
             ],
         )
+
+    # HF donation. Evaluating your own PRIVATE checkpoint is the headline
+    # trial workflow, and lqh.infer.eval_hf reads HF_TOKEN in the sandbox
+    # to fetch it — so this is the path where a missing token most often
+    # costs someone a paid failed run. Asked before the run name is
+    # claimed: a prompt returns and re-invokes, and claiming first would
+    # strand a run directory each round trip.
+    donate_hf, hf_prompt = _resolve_hf_donation(
+        project_dir, _permissions, kwargs.get("_hf_donate"), "eval"
+    )
+    if hf_prompt is not None:
+        return hf_prompt
 
     run_name, claim_err = _claim_run_name(project_dir, run_name or None, "eval_hf")
     if claim_err:
@@ -6474,6 +6796,7 @@ async def handle_eval_hf_model(
     try:
         job_id = await backend.submit_run(
             str(run_dir), config, module="lqh.infer.eval_hf",
+            donate_hf_token=donate_hf,
         )
     except Exception as e:  # noqa: BLE001
         return ToolResult.fail("upstream", f"Error submitting eval_hf job: {e}")
@@ -6527,6 +6850,7 @@ async def handle_eval_hf_model(
             + f"  Job ID:  {job_id}\n\n"
             f"Use training_status to monitor; eval_result.json lands "
             f"under runs/{run_name}/ when done."
+            + _submit_advisories(backend)
         ),
         workflow_launched=True,
     )

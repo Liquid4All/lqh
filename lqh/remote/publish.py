@@ -226,6 +226,14 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
         "stderr.log": "logs",
         "config.json": "other",
         "eval_history.json": "metrics",
+        # Sweep leaderboard + per-config ledger. Small JSON, and the only
+        # place a sweep's per-config results exist off the sandbox volume:
+        # write_run_manifest reads sweep_summary.json from the run root to
+        # build result_summary, and _format_sweep_summary renders the table
+        # in training_status. Without these a cloud sweep comes back with a
+        # winner checkpoint and no record of what it beat.
+        "sweep_summary.json": "metrics",
+        "runs.jsonl": "metrics",
         # Scoring-failure diagnostic (eval_hf / watcher scoring) — small
         # and load-bearing for debugging failed evals off-volume.
         "eval_error.json": "metrics",

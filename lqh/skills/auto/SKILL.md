@@ -155,10 +155,14 @@ bar depends on baseline:
 
 ### Stage 7 — `sft_scaled`
 On a successful initial SFT, scale training data further (**~10,000–
-20,000 samples**) and run a light hyperparameter sweep over epoch count
-(e.g. 1, 2, 3 epochs). Pick the best checkpoint by validation score.
-SFT is cheap relative to data generation, so spending a few extra runs
-here is the right tradeoff.
+20,000 samples**) and run SFT again at default hyperparameters. More data
+is the lever here; do not sweep. Training already keeps the best checkpoint
+by validation loss, so the epoch count needs no search of its own.
+
+If the scaled run lands *just* short of the bar and more data has stopped
+helping, a hyperparameter sweep (`enable_sweep=true`) is the last thing to
+try before Stage 8 — it costs several times a normal run for typically a
+fraction of a point, so it is a final move, not a routine one.
 
 **If the scaled SFT already clears the success bar (e.g. ≥8/10, or the
 baseline-relative target from Stage 6), skip Stage 8** and go straight to

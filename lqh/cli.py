@@ -268,6 +268,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Persist a delivered secret into the project's .env file.",
     )
     tool_call.add_argument(
+        "--allow-hf-donate",
+        action="store_true",
+        help=(
+            "Permit sending a locally-found Hugging Face token with this "
+            "call's cloud job. Invoking a tool is consent to run it, but not "
+            "to hand over a credential — so this is opt-in even here."
+        ),
+    )
+    tool_call.add_argument(
         "--wait",
         action="store_true",
         help=(
@@ -305,6 +314,15 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--allow-publish", action="store_true",
         help="Permit outward-facing publishing tools in this run.",
+    )
+    run.add_argument(
+        "--allow-hf-donate", action="store_true",
+        help=(
+            "Permit sending a locally-found Hugging Face token (env, project "
+            ".env, or huggingface-cli login) with this run's cloud jobs. "
+            "Without it the run proceeds without the token rather than "
+            "stopping for consent."
+        ),
     )
     run.add_argument(
         "--project", metavar="DIR", default=None,

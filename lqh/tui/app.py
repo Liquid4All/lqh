@@ -1261,10 +1261,16 @@ class LqhApp:
             return
         await self._refresh_hf_status()
         await self._emit(render_system_message(
-            "✅ Hugging Face token stored (encrypted on the backend). Cloud jobs will "
-            "use it for private models/datasets and pushes — the laptop env is not needed. "
-            "For cloud data generation, the token is available directly to the trusted "
-            "pipeline Python process; use a fine-grained, read-only token when possible."
+            "✅ Hugging Face token stored (encrypted on the backend). Cloud jobs "
+            "will use it for private models/datasets and pushes, with no dependency "
+            "on this machine.\n"
+            "If this machine ALSO has a token (shell, project .env, or "
+            "`huggingface-cli login`), you'll still be asked once per job whether to "
+            "send that one instead — it takes precedence for that job. Answer "
+            "\"don't ask again\" or set LQH_HF_DONATE=0 to settle it.\n"
+            "Either way the token is available to the trusted pipeline Python "
+            "process during cloud data generation — use a fine-grained, read-only "
+            "token when possible."
         ))
         self._invalidate()
 
@@ -1331,10 +1337,9 @@ class LqhApp:
         self._invalidate()
 
     async def _refresh_hf_status(self) -> None:
-        """Resolve the project's compute target and, for cloud projects,
-        query the backend for the stored-HF-token status so the 🤗
-        indicator reflects what the sandbox will actually have.
-        Best-effort — never raises into the caller."""
+        """Resolve the project's compute target and refresh both HF token
+        sources so the 🤗 indicator reflects what the sandbox will
+        actually have. Best-effort — never raises into the caller."""
         try:
             from lqh.remote.compute import resolve_compute
             target = resolve_compute(self.project_dir)
@@ -1342,6 +1347,40 @@ class LqhApp:
             target = "cloud"
         is_cloud = target == "cloud"
         self._status_bar.compute_is_cloud = is_cloud
+
+        # Local source first: it is a filesystem read, while the stored
+        # status below is a network round-trip. An offline or slow
+        # backend must not delay a purely local fact. Stores the source
+        # LABEL, never the token.
+        try:
+            from lqh.hf_token import hf_token_origin
+
+            origin = hf_token_origin(self.project_dir)
+            # Presence and donatability are recorded separately: a token
+            # suppressed by LQH_HF_DONATE=0 still works for local and SSH
+            # compute, and the bar's local branch must say so.
+            self._status_bar.hf_local_source = (
+                origin.label if origin is not None else None
+            )
+            # Donatable means "would actually reach a sandbox", which is
+            # two conditions, not one. LQH_HF_DONATE=0 is the durable
+            # opt-out; the other is consent. In auto mode the donation
+            # gate is answered "no" unless a durable grant exists, so a
+            # green ✓env there described a token the job would never
+            # receive.
+            donatable = origin is not None and origin.donation_enabled
+            if donatable and self._agent is not None and self._agent.policy.auto_grant_permissions:
+                from lqh.tools.permissions import check_hf_donate_permission
+
+                donatable = (
+                    self._agent.policy.allow_hf_donate
+                    or check_hf_donate_permission(self.project_dir)
+                )
+            self._status_bar.hf_local_donatable = donatable
+        except Exception:
+            self._status_bar.hf_local_source = None
+            self._status_bar.hf_local_donatable = False
+
         if is_cloud and get_token():
             try:
                 from lqh.auth import hf_token_status
@@ -1349,6 +1388,12 @@ class LqhApp:
                 self._status_bar.hf_cloud_configured = bool(status.get("configured"))
             except Exception:
                 self._status_bar.hf_cloud_configured = None
+        else:
+            # Clear it. A stale True from a previous cloud project (or
+            # from before a logout) kept rendering ✓acct/✓both against a
+            # backend we are no longer asking, so the indicator outlived
+            # the fact it described.
+            self._status_bar.hf_cloud_configured = None
         self._invalidate()
 
     async def _refresh_startup_state(self) -> None:
@@ -2431,10 +2476,11 @@ class LqhApp:
         token = get_token()
         self._status_bar.logged_in = bool(token)
         self._invalidate()
-        if token:
-            # Best-effort: reflect the stored HF-token status for cloud
-            # projects in the 🤗 indicator.
-            await self._refresh_hf_status()
+        # Best-effort 🤗 indicator refresh. Unconditional: the stored-token
+        # query inside is already gated on being logged in, but the local
+        # source (env / .env / huggingface-cli login) is a purely local
+        # fact that a logged-out user on local compute still wants shown.
+        await self._refresh_hf_status()
         if token:
             await self._emit(render_system_message("✅ Logged in to lqh.ai"))
         else:

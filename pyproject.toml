@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lqh"
-version = "0.9.1"
+version = "0.9.2"
 description = "Liquid Harness – customize Liquid AI foundation models into task-specific models."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -70,6 +70,7 @@ markers = [
     "integration: tests that hit api.lqh.ai (require LQH_DEBUG_API_KEY or ~/.lqh/config.json)",
     "gpu: tests that require a CUDA GPU and optional [train] deps",
     "slow: long-running tests",
+    "ambient_hf_token: opt out of the fixture that hides the machine's HF token",
 ]
 
 [project.urls]

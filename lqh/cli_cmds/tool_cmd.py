@@ -284,7 +284,9 @@ def _cmd_call(ns: argparse.Namespace) -> int:
         emit(envelope, pretty=ns.pretty)
         return code
 
-    consent = registry.full_consent_kwargs(call_args)
+    consent = registry.full_consent_kwargs(
+        call_args, allow_hf_donate=getattr(ns, "allow_hf_donate", False),
+    )
 
     import asyncio
 

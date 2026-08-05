@@ -65,6 +65,64 @@ def _check_torch() -> bool:
         return False
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_hf_token(monkeypatch, request, tmp_path_factory):
+    """Hide any HF token the developer's shell or machine happens to carry.
+
+    Cloud submits now ask before donating a local HF token, and the prompt
+    fires whenever one is discoverable — from the environment, a project
+    ``.env``, or ``~/.cache/huggingface/token``. Without this, whether a
+    cloud test sees a consent prompt or a submitted job would depend on
+    whether whoever ran the suite had ``huggingface-cli login`` in their
+    history. All three sources are neutralized below, each at the source
+    rather than at one of its inputs. Tests that exercise donation opt
+    back in by setting HF_TOKEN or re-patching the file candidates
+    themselves (monkeypatch runs after this fixture).
+
+    Scoped to ``tests/unit`` on purpose. The functional and e2e suites
+    talk to real services and legitimately read the developer's exported
+    token (``tests/function/test_sft_and_upload.py`` copies it to a remote
+    host); stripping it there would break a correctly-configured run.
+    """
+    if "ambient_hf_token" in request.keywords:
+        return
+    if "unit" not in Path(str(request.node.fspath)).parts:
+        return
+    # LQH_HF_DONATE too: an exported opt-out in the developer's shell
+    # would otherwise silently disable donation and make every consent
+    # test pass for the wrong reason.
+    for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "LQH_ENV_FILE", "LQH_HF_DONATE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("lqh.hf_token._hub_cached_token", lambda: None)
+    # Env FILES are the third source, and deleting variables does nothing
+    # about them: a test that passes the repo root (or any other real
+    # directory) as its project_dir reads whatever .env the developer
+    # keeps there.
+    #
+    # Confine discovery to pytest's own temp tree rather than disabling
+    # it. Blanking the list outright would also blind the tests that
+    # exist to exercise file resolution, which build their .env under
+    # tmp_path and are the reason the source is covered at all. Anything
+    # outside that tree belongs to the developer, not the test.
+    basetemp = tmp_path_factory.getbasetemp().resolve()
+    import lqh.hf_token
+
+    real_candidates = lqh.hf_token._candidate_env_files
+
+    def _tmp_only(project_dir):
+        out = []
+        for path in real_candidates(project_dir):
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved == basetemp or basetemp in resolved.parents:
+                out.append(path)
+        return out
+
+    monkeypatch.setattr("lqh.hf_token._candidate_env_files", _tmp_only)
+
+
 @pytest.fixture(scope="session")
 def has_api_access() -> bool:
     """True when ``LQH_DEBUG_API_KEY`` or ``~/.lqh/config.json`` is set."""

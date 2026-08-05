@@ -459,7 +459,7 @@ async def test_eval_hf_submit_clamps_timeout_into_config(tmp_path, monkeypatch) 
     submitted: dict = {}
 
     async def fake_submit(self, run_dir, config, *, module="lqh.train",
-                          telemetry_workflow_id=None):
+                          telemetry_workflow_id=None, **_kw):
         submitted["config"] = config
         submitted["module"] = module
         return "job-7"
@@ -498,7 +498,7 @@ async def test_eval_hf_default_timeout_in_config(tmp_path, monkeypatch) -> None:
     submitted: dict = {}
 
     async def fake_submit(self, run_dir, config, *, module="lqh.train",
-                          telemetry_workflow_id=None):
+                          telemetry_workflow_id=None, **_kw):
         submitted["config"] = config
         return "job-8"
 

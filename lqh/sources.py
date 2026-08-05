@@ -7,8 +7,9 @@ iterable ready to feed into ``generate(client, input)``.
 
 Design rules:
 
-* Every helper validates that resolved paths stay inside ``Path.cwd()``
-  (the project directory — lqh always runs with cwd set to the project).
+* Every helper validates that resolved paths stay inside the project
+  directory (:func:`project_root`), which is ``Path.cwd()`` unless a
+  caller selected a project without chdir'ing into it.
 * Missing files raise ``FileNotFoundError`` *at call time* (before the
   engine schedules work) so the agent gets a crisp, non-retryable error.
 * Items are typed dataclasses so ``generate(self, client, input: ImageItem)``
@@ -38,6 +39,9 @@ __all__ = [
     "parquet",
     "jsonl",
     "hf_dataset",
+    "project_root",
+    "scoped_project_root",
+    "set_project_root",
     "seed_data",
     "record_source_paths",
     "hf_dataset_was_used",
@@ -194,14 +198,59 @@ def hf_dataset_was_used() -> bool:
     return bool(flag and flag[0])
 
 
+# The project directory these helpers resolve against.
+#
+# Normally this IS the working directory: the TUI and the cloud sandbox
+# both run with cwd at the project root. `lqh run --project DIR` is the
+# exception — it selects a project WITHOUT chdir'ing (run_cmd.py), so
+# every cwd-derived answer in this module silently described whatever
+# directory the user happened to be standing in. For the HF token that
+# meant local validation authenticating with one project's credential
+# while the cloud submit donated another's; for seed_data and friends it
+# meant reading another project's files, or refusing to read the right
+# ones.
+_PROJECT_ROOT: ContextVar[Path | None] = ContextVar("lqh_project_root", default=None)
+
+
+def set_project_root(project_dir: Path | None) -> None:
+    """Point the source helpers at *project_dir* instead of the cwd.
+
+    Called by entry points that select a project without chdir'ing into
+    it. Passing None restores cwd-derived behavior.
+    """
+    _PROJECT_ROOT.set(Path(project_dir).resolve() if project_dir is not None else None)
+
+
+@contextmanager
+def scoped_project_root(project_dir: Path | None) -> Iterator[None]:
+    """Point the source helpers at *project_dir* for the duration of the block.
+
+    Preferred over :func:`set_project_root` for anything that returns.
+    ``lqh run`` is a one-shot process in production, but it is also called
+    in-process, and an unscoped set leaks: every later caller silently
+    resolved paths against a project they never selected.
+    """
+    token = _PROJECT_ROOT.set(
+        Path(project_dir).resolve() if project_dir is not None else None
+    )
+    try:
+        yield
+    finally:
+        _PROJECT_ROOT.reset(token)
+
+
+def project_root() -> Path:
+    """The directory these helpers treat as the project root."""
+    explicit = _PROJECT_ROOT.get()
+    return explicit if explicit is not None else Path.cwd().resolve()
+
+
 def _resolve_inside_project(path: Path | str) -> Path:
     """Resolve *path* and ensure it is inside the project directory.
 
-    The project directory is ``Path.cwd()`` (lqh sets cwd to the project
-    root before importing pipelines).  Rejects ``..`` escapes and
-    symlinks pointing outside the project.
+    Rejects ``..`` escapes and symlinks pointing outside the project.
     """
-    project_dir = Path.cwd().resolve()
+    project_dir = project_root()
     p = Path(path)
     if not p.is_absolute():
         p = project_dir / p
@@ -448,6 +497,25 @@ def jsonl(path: Path | str) -> Iterator[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _hf_dataset_token() -> str | None:
+    """Token for a Hub read, or None for public repos.
+
+    Resolved against :func:`project_root`, not the cwd, so a pipeline
+    validated under `lqh run --project DIR` reads DIR's env file — the
+    same one the cloud submit will donate from. When the two disagreed,
+    a pipeline could pass local validation on one credential and then run
+    in the sandbox on another.
+
+    A missing token is not an error: it just means "public repo".
+    """
+    from lqh.hf_token import local_hf_token
+
+    try:
+        return local_hf_token(project_root())
+    except Exception:  # noqa: BLE001 - never break a dataset read over this
+        return os.environ.get("HF_TOKEN") or None
+
+
 def hf_dataset(
     repo: str,
     *,
@@ -458,8 +526,16 @@ def hf_dataset(
 ) -> Iterable[dict[str, Any]]:
     """Load a Hugging Face dataset as an iterable of row dicts.
 
-    Uses ``datasets.load_dataset`` under the hood.  Respects ``HF_TOKEN``
-    from the environment for private repos.
+    Uses ``datasets.load_dataset`` under the hood.  For private repos it
+    resolves a token via :mod:`lqh.hf_token` — the environment first, then
+    a project ``.env``/``.env.local``, then ``huggingface-cli login``.
+
+    Reading the same sources as the cloud path matters here, not just for
+    convenience: cloud data-gen only offers to send a token after a
+    successful LOCAL run reports that the pipeline touched HF. If this
+    function saw environment variables only, a user whose token lives in
+    ``.env`` could never complete that validation, and the private-dataset
+    pipeline they just ran locally could never be submitted at all.
 
     Parameters
     ----------
@@ -490,8 +566,10 @@ def hf_dataset(
         revision=revision,
         # Explicit rather than relying on implicit library discovery: cloud
         # jobs receive HF_TOKEN as a Modal secret under the trusted-pipeline
-        # contract, including direct streaming of private datasets.
-        token=os.environ.get("HF_TOKEN") or None,
+        # contract, including direct streaming of private datasets. Local
+        # runs additionally pick up a project env file (never by mutating
+        # os.environ — see lqh.hf_token).
+        token=_hf_dataset_token(),
     )
     col_set = set(columns) if columns else None
     for row in ds:

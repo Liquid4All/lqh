@@ -681,7 +681,7 @@ class TestLocalEvalMultiSource:
             def __init__(self, remote_config, project_dir):
                 pass
 
-            async def submit_run(self, run_dir, config, *, module):
+            async def submit_run(self, run_dir, config, *, module, **_kw):
                 captured["config"] = config
                 return "job-123"
 

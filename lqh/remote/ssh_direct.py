@@ -70,8 +70,15 @@ class SSHDirectBackend(RemoteBackend):
         config: dict[str, Any],
         *,
         module: str = "lqh.train",
+        donate_hf_token: bool = False,
     ) -> str:
-        """Sync data to remote, launch the subprocess, return PID as job_id."""
+        """Sync data to remote, launch the subprocess, return PID as job_id.
+
+        ``donate_hf_token`` is accepted for interface compatibility and
+        ignored: SSH remotes get their token at bootstrap time (see
+        ``configure_hf_token``), written to the remote host's .env.
+        """
+        del donate_hf_token
         run_dir = Path(local_run_dir)
         run_name = run_dir.name
 

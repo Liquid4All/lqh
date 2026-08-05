@@ -28,21 +28,23 @@ import argparse
 import asyncio
 import json
 import logging
-import math
 import os
-import shutil
 import time
 from pathlib import Path
 
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lqh.auth import api_root, get_token
 from lqh.client import create_client
 from lqh.engine import run_pipeline
-from lqh.scoring import run_data_filter
 from lqh.subprocess_manager import SubprocessManager
 
+from ..shared.datagen import (
+    dataset_ready as _dataset_ready,
+    dataset_rows as _dataset_rows,
+    ensure_split,
+    generate_filtered_split as _generate_filtered_split,
+)
 from .eval_local import _await_run, eval_local
 from .report import ModelResult, write_report
 from .tasks import Task, resolve_tasks
@@ -190,20 +192,6 @@ def _resolve_models(spec: str) -> list[tuple[str, str]]:
                 f"unknown model {key!r}; choose from {', '.join(MODELS)} or pass a HF id"
             )
     return out
-
-
-def _dataset_ready(data_parquet: Path, want_rows: int) -> bool:
-    rows = _dataset_rows(data_parquet)
-    return rows is not None and rows >= want_rows
-
-
-def _dataset_rows(data_parquet: Path) -> int | None:
-    if not data_parquet.exists():
-        return None
-    try:
-        return pq.read_metadata(data_parquet).num_rows
-    except Exception:
-        return None
 
 
 def _status_completed(run_dir: Path) -> bool:
@@ -486,81 +474,6 @@ async def _run_sweep(
     return model_dir, _sweep_timing(run_dir)
 
 
-async def _generate_filtered_split(
-    *, script_path: Path, scorer_path: Path, target: int, out_dir: Path,
-    client, concurrency: int, threshold: float, overgen_factor: float,
-    label: str, judge_size: str = "small", max_rounds: int = 4,
-) -> None:
-    """Generate a split, score every sample's gold against the task scorer, and
-    keep only samples at/above *threshold*, regenerating until *target* clear.
-
-    Writes ``out_dir/data.parquet`` with exactly *target* high-quality rows.
-    Over-generates by *overgen_factor* up front, then tops up using the
-    observed keep-rate. Raises if it cannot reach *target* within *max_rounds*.
-    """
-    tmp_root = out_dir.parent / f"_filt_tmp_{out_dir.name}"
-    shutil.rmtree(tmp_root, ignore_errors=True)
-    tmp_root.mkdir(parents=True, exist_ok=True)
-
-    kept_tables: list[pa.Table] = []
-    kept = 0
-    total_generated = 0
-    keep_rate = 1.0 / max(overgen_factor, 1.0)  # initial drop-rate estimate
-    for round_i in range(1, max_rounds + 1):
-        if kept >= target:
-            break
-        need = target - kept
-        gen_n = max(need, math.ceil(need / max(keep_rate, 0.05)))
-        # Cap per-round blow-up: if the keep-rate is pathologically low, prefer
-        # failing across rounds with a clear message over one giant round.
-        gen_n = min(gen_n, target * 4)
-        raw_dir = tmp_root / f"raw_{round_i}"
-        filt_dir = tmp_root / f"filt_{round_i}"
-        logger.info(
-            "datagen %s: round %d — generating %d (need %d more) ...",
-            label, round_i, gen_n, need,
-        )
-        gen = await run_pipeline(
-            script_path=script_path, num_samples=gen_n, output_dir=raw_dir,
-            client=client, concurrency=concurrency,
-        )
-        fr = await run_data_filter(
-            input_path=raw_dir / "data.parquet", scorer_path=scorer_path,
-            output_dataset_dir=filt_dir, client=client,
-            threshold=threshold, model_size=judge_size, concurrency=concurrency,
-        )
-        kept_tbl = pq.read_table(filt_dir / "data.parquet")
-        total_generated += gen.succeeded
-        if kept_tbl.num_rows:
-            kept_tables.append(kept_tbl)
-            kept += kept_tbl.num_rows
-        observed = (kept_tbl.num_rows / gen.succeeded) if gen.succeeded else 0.0
-        if observed > 0:
-            keep_rate = max(0.05, observed)
-        logger.info(
-            "datagen %s: round %d kept %d/%d (rate=%.2f, mean=%.2f); total %d/%d",
-            label, round_i, kept_tbl.num_rows, gen.succeeded, observed,
-            fr.mean_score, kept, target,
-        )
-
-    if kept < target:
-        shutil.rmtree(tmp_root, ignore_errors=True)
-        raise RuntimeError(
-            f"datagen {label}: only {kept}/{target} samples cleared the "
-            f"score>={threshold} filter after {max_rounds} rounds. Lower "
-            "--filter-threshold or raise --overgen-factor."
-        )
-
-    full = pa.concat_tables(kept_tables).slice(0, target)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    pq.write_table(full, out_dir / "data.parquet")
-    shutil.rmtree(tmp_root, ignore_errors=True)
-    logger.info(
-        "datagen %s: wrote %d filtered rows (generated %d, kept %d, drop %d)",
-        label, target, total_generated, kept, total_generated - kept,
-    )
-
-
 async def _ensure_datasets(
     *, workdir: Path, task: Task, train_size: int, eval_size: int,
     client, concurrency: int, resume: bool,
@@ -584,44 +497,19 @@ async def _ensure_datasets(
         (f"datasets/{task.name}_eval", eval_size),
     ]
     for rel, n in specs:
-        out_dir = workdir / rel
-        data_parquet = out_dir / "data.parquet"
-        if resume and _dataset_ready(data_parquet, n):
-            logger.info("datagen %s: reusing %d rows", rel, n)
-            continue
-
-        if filter_threshold is None:
-            logger.info("datagen %s: generating %d samples (no filter) ...", rel, n)
-            res = await run_pipeline(
-                script_path=task.pipeline_path,
-                num_samples=n,
-                output_dir=out_dir,
-                client=client,
-                concurrency=concurrency,
-            )
-            logger.info(
-                "datagen %s: %d ok / %d failed", rel, res.succeeded, res.failed,
-            )
-        else:
-            await _generate_filtered_split(
-                script_path=task.pipeline_path,
-                scorer_path=scorer_path,
-                target=n,
-                out_dir=out_dir,
-                client=client,
-                concurrency=concurrency,
-                threshold=filter_threshold,
-                overgen_factor=overgen_factor,
-                judge_size=judge_size,
-                label=rel,
-            )
-
-        rows = _dataset_rows(data_parquet) or 0
-        if rows < n:
-            raise RuntimeError(
-                f"datagen produced only {rows}/{n} rows for {rel}. Refusing to "
-                "run a benchmark on a partial dataset."
-            )
+        await ensure_split(
+            out_dir=workdir / rel,
+            pipeline_path=task.pipeline_path,
+            scorer_path=scorer_path,
+            n=n,
+            client=client,
+            concurrency=concurrency,
+            resume=resume,
+            filter_threshold=filter_threshold,
+            overgen_factor=overgen_factor,
+            judge_size=judge_size,
+            label=rel,
+        )
 
     return (
         f"datasets/{task.name}_train/data.parquet",

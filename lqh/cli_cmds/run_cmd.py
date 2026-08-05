@@ -221,7 +221,22 @@ def cmd_run(ns: argparse.Namespace) -> int:
     # The whole run executes under an fd-level stdout redirect: pipeline
     # subprocesses and library prints land on stderr, and the ONLY bytes
     # on stdout are the final result JSON written to the saved fd.
-    with stdout_to_stderr() as real_stdout:
+    from lqh.sources import scoped_project_root
+
+    # lqh.sources resolves seed files, image folders and the HF token
+    # against a project root that defaults to the cwd. That default is
+    # right everywhere except here: --project selects a project WITHOUT
+    # chdir'ing into it, so without this a pipeline validated locally
+    # read the *caller's* directory while the cloud submit used
+    # project_dir — including for the HF token, so the two halves could
+    # authenticate as different accounts.
+    #
+    # Scoped rather than set-and-forget. A one-shot CLI process would not
+    # care, but cmd_run is also called in-process (tests, embedders), and
+    # a global that outlives the call silently re-points every later
+    # caller's path resolution at a directory they never asked for.
+    project_dir = Path(ns.project).resolve() if ns.project else Path.cwd()
+    with stdout_to_stderr() as real_stdout, scoped_project_root(project_dir):
         return _cmd_run_guarded(ns, real_stdout)
 
 
@@ -435,7 +450,10 @@ async def _run_async(
         legacy_pipeline_progress_callback=False,
     )
 
-    policy = subagent_policy(allow_publish=ns.allow_publish)
+    policy = subagent_policy(
+        allow_publish=ns.allow_publish,
+        allow_hf_donate=getattr(ns, "allow_hf_donate", False),
+    )
 
     status: str
     reason: str

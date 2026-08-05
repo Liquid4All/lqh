@@ -49,7 +49,9 @@ def validate(name: str, args: dict[str, Any]) -> list[str]:
     return validate_args(args, schema)
 
 
-def full_consent_kwargs(args: dict[str, Any]) -> dict[str, Any]:
+def full_consent_kwargs(
+    args: dict[str, Any], *, allow_hf_donate: bool = False
+) -> dict[str, Any]:
     """Consent extra-kwargs for a direct `lqh tool call` (CLI_PLAN §3.2).
 
     Invocation is consent for the PERMISSION store — but NOT for the
@@ -60,9 +62,13 @@ def full_consent_kwargs(args: dict[str, Any]) -> dict[str, Any]:
     """
     from lqh.tools.permissions import PermissionContext
 
-    consent: dict[str, Any] = {
-        "_permissions": PermissionContext(full_consent=True),
-    }
+    # hf_donate is excluded from full_consent on purpose (see
+    # PermissionContext.allows_hf_donate): running a tool is one decision,
+    # sending a credential is another. --allow-hf-donate grants it.
+    perms = PermissionContext(full_consent=True)
+    if allow_hf_donate:
+        perms = perms.with_grants("hf_donate")
+    consent: dict[str, Any] = {"_permissions": perms}
     if args.get("overwrite") is True:
         consent["_overwrite_consent"] = True
     return consent

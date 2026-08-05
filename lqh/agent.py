@@ -1576,6 +1576,23 @@ class Agent:
             return ToolResult(content="[No user input handler available]")
 
         if result.requires_user_input and result.content == "PERMISSION_REQUIRED":
+            # Credential donation is settled BEFORE the blanket auto-grant
+            # below, and answered "no" on every surface with nobody
+            # watching. `--auto` means "don't stop to ask before spending
+            # my compute"; it is not consent to put my HF token on the
+            # wire, and the synthetic "Execute and don't ask again"
+            # answer it would otherwise send is a durable yes nobody
+            # typed. Opt in with `lqh run --allow-hf-donate`, or answer
+            # the prompt once interactively with "don't ask again" (which
+            # persists the grant, so the gate never fires here at all).
+            if not self.policy.allow_hf_donate and (
+                self.policy.auto_grant_permissions or self.policy.no_user
+            ):
+                handled = await self._headless_donation_decline(
+                    result.permission_key, tool_name, arguments,
+                )
+                if handled is not None:
+                    return handled
             # TUI auto mode: auto-grant project-wide so the pipeline never
             # blocks.
             if self.policy.auto_grant_permissions:
@@ -1799,14 +1816,123 @@ class Agent:
 
         return await self._reinvoke_tool(tool_name, tool_args)
 
+    # Domains a tool must already have cleared before its HF-donation
+    # prompt can fire. The donation gate lives *after* each handler's own
+    # consent check, so reaching it proves those grants were given
+    # earlier in this same prompt chain — but invocation-scoped grants
+    # don't survive a re-invocation, so they have to be restated or the
+    # tool's own prompt fires again and the two ping-pong forever.
+    _DONATE_CHAIN_DOMAINS: dict[str, tuple[str, ...]] = {
+        "eval_hf_model": ("cloud_eval_hf",),
+        "run_data_gen_pipeline": ("script", "cloud_data_gen"),
+        "push": ("hf_push",),
+        "gguf_convert": ("hf_push",),
+    }
+
+    def _chain_grants(self, tool_name: str, *extra: str) -> PermissionContext:
+        """Invocation grants to carry through an HF-donation re-invocation."""
+        domains = self._DONATE_CHAIN_DOMAINS.get(tool_name, ()) + extra
+        return PermissionContext.granting(*domains) if domains else PermissionContext()
+
+    async def _headless_donation_decline(
+        self, permission_key: str | None, tool_name: str, arguments: dict,
+    ) -> ToolResult | None:
+        """Answer a donation prompt with "no" when there is nobody to ask.
+
+        Returns None for any other permission key, so genuine gates still
+        halt the run.
+
+        Donation is the one domain where declining does not cancel the
+        action — the job runs, just without the token. Halting instead
+        would mean a discoverable HF token turns a working headless run
+        into needs_permission, which is backwards. `lqh run
+        --allow-hf-donate` opts in ahead of time.
+
+        Applies to TUI ``--auto`` as well as `lqh run`. Both are surfaces
+        where a prompt has no reader; neither is a place to infer "yes,
+        send my credential" from silence.
+        """
+        if not permission_key or not permission_key.startswith("hf_donate:"):
+            return None
+        return await self._reinvoke_tool(
+            tool_name, arguments,
+            internal_kwargs={
+                "_hf_donate": False,
+                "_permissions": self._chain_grants(tool_name),
+            },
+        )
+
     async def _handle_permission_response(
         self, response: str, tool_name: str, tool_args: dict,
         permission_key: str | None = None,
     ) -> ToolResult:
         """Process the user's permission choice for pipeline execution or HF push."""
+        # HF token donation (lqh.hf_token). Checked before the tool_name
+        # branches below, because the key is the more specific signal:
+        # start_training answering its *donation* prompt would otherwise
+        # fall into the training branch, which re-grants training and
+        # re-invokes without the donation answer — so the two prompts
+        # alternate forever.
+        #
+        # The odd one out among domains: declining does NOT cancel the
+        # tool, it runs the job without the token. An absent grant can't
+        # express that (indistinguishable from "not asked yet"), so the
+        # decline travels back as an explicit _hf_donate=False.
+        if permission_key and permission_key.startswith("hf_donate:"):
+            from lqh.tools.permissions import grant_hf_donate_permission
+
+            # Fail CLOSED: donate only on an explicit affirmative. Every
+            # offered yes-option starts with "Yes"; the TUI additionally
+            # injects a free-text "Other", so the answer here is not
+            # drawn from a fixed set. Matching "not a no" instead would
+            # send the token for "Do not send it", "cancel", or an empty
+            # answer. Declining costs the user a re-run; the inverse
+            # mistake is unrecoverable.
+            lowered = response.strip().lower()
+            if not lowered.startswith("yes"):
+                return await self._reinvoke_tool(
+                    tool_name, tool_args,
+                    internal_kwargs={
+                        "_hf_donate": False,
+                        "_permissions": self._chain_grants(tool_name),
+                    },
+                )
+            # Persist only on an explicit "don't ask again" from a human.
+            # Auto mode never reaches here (donation is declined before
+            # the auto-grant branch), so this is belt-and-braces against
+            # a future surface that synthesizes an answer.
+            if not self.policy.auto_grant_permissions and "don't ask again" in lowered:
+                grant_hf_donate_permission(self.project_dir)
+            return await self._reinvoke_tool(
+                tool_name, tool_args,
+                internal_kwargs={
+                    "_permissions": self._chain_grants(tool_name, "hf_donate"),
+                },
+            )
+
         if tool_name == "hf_push":
             return await self._handle_hf_push_permission(
                 response, tool_args, permission_key=permission_key
+            )
+
+        # Other tools that write to the user's HF account — `push` with an
+        # lqh: source, and `gguf_convert` with a push target — raise the
+        # same hf_push gate but cannot use the handler above, which is
+        # built around hf_push's own arguments.
+        #
+        # Dispatching on the key rather than the tool name is what makes
+        # this correct: keyed on tool name, approval fell through to the
+        # generic script branch below, re-invoked with only a `script`
+        # grant, failed the same hf_push check, and re-prompted — forever.
+        if permission_key and permission_key.startswith("hf_push:"):
+            if "do not" in response.lower():
+                return ToolResult(content="Upload to HuggingFace declined by user.")
+            repo = permission_key.split(":", 1)[1]
+            if self.policy.auto_grant_permissions or "don't ask again" in response.lower():
+                grant_hf_permission(self.project_dir, repo_id=repo or None)
+            return await self._reinvoke_tool(
+                tool_name, tool_args,
+                internal_kwargs={"_permissions": PermissionContext.granting("hf_push")},
             )
 
         if tool_name in ("start_training", "start_local_eval"):
@@ -1921,7 +2047,7 @@ class Agent:
         # Execute the push
         from lqh.tools.handlers import _execute_hf_push, _get_hf_api, _validate_path
 
-        api = _get_hf_api()
+        api = _get_hf_api(self.project_dir)
         local_path = push_args.get("local_path", "")
         target = _validate_path(self.project_dir, local_path)
 

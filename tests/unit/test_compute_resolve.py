@@ -197,10 +197,15 @@ def test_first_run_routes_to_cloud_silently(tmp_path, isolated_home, monkeypatch
     assert not res.requires_user_input
 
 
+@pytest.mark.parametrize("enable_sweep", [False, True])
 def test_cloud_training_config_uses_project_relative_dataset_paths(
-    tmp_path, isolated_home, monkeypatch,
+    tmp_path, isolated_home, monkeypatch, enable_sweep,
 ):
-    """Cloud submit configs must not contain laptop-local absolute paths."""
+    """Cloud submit configs must not contain laptop-local absolute paths.
+
+    Checked for both launch shapes: a single run sends the training config
+    directly, a sweep nests it under ``base_config``.
+    """
     import lqh.tools.handlers as handlers
 
     project = tmp_path / "proj"
@@ -231,10 +236,13 @@ def test_cloud_training_config_uses_project_relative_dataset_paths(
         dataset=ds,
         eval_dataset=_make_dataset(project, "ds_eval"),
         disable_scoring=True,
+        enable_sweep=enable_sweep,
     ))
 
     assert recorded["remote_name"] == "cloud"
-    base_config = recorded["config"]["base_config"]
+    launch = recorded["config"]
+    assert ("base_config" in launch) is enable_sweep
+    base_config = launch["base_config"] if enable_sweep else launch
     assert base_config["dataset"] == "datasets/ds/data.parquet"
     assert base_config["eval_dataset"] == "datasets/ds_eval/data.parquet"
     assert not Path(base_config["dataset"]).is_absolute()

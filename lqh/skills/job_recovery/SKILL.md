@@ -54,8 +54,10 @@ Never diagnose from the run name or from memory. Read the status card first.
 A shorter job is preempted less often — exposure is roughly proportional to wall
 clock. In order of what to give up first:
 
-1. **Fewer sweep configs** — `enable_sweep=false` with the best-known
-   hyperparameters, or a sweep over a subset. Usually the largest single cut.
+1. **Drop the sweep** — `enable_sweep=false` with the best-known
+   hyperparameters. Usually the largest single cut, since a sweep trains its
+   configs sequentially in one job. Only applies to a run that was sweeping:
+   SFT does not by default, so check before reaching for this.
 2. **Fewer epochs** — one epoch on a large set beats three on a small one.
 3. **Smaller training set** — validate the direction, then scale.
 4. **Smaller base model** — one step down the ladder, with the user's consent and

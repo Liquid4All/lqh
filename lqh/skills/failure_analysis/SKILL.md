@@ -101,11 +101,19 @@ clears the deployment bar above:
    moved the score, go to 10k–20k with the same pipeline and compare. Stop
    scaling when a 2–5× data increase moves the mean by < ~0.3.
 2. **Step up the model size** (within budget). Same dataset, next size up.
-3. **On-policy DPO** on the best SFT checkpoint (text models only — VLMs
+3. **Sweep the SFT hyperparameters** — `start_training(..., enable_sweep=true)`
+   on the settled dataset and model size. **This is the first lever that is
+   purely about tuning, and it belongs here, not earlier.** SFT runs at
+   validated defaults (`lqh/train/defaults.py`), so a sweep is chasing what
+   those defaults left on the table: expect a fraction of a point, for
+   several times the wall-clock of one run. It only makes sense once levers
+   1 and 2 have stopped paying — a sweep cannot rescue a run that is short
+   on data or on model capacity.
+4. **On-policy DPO** on the best SFT checkpoint (text models only — VLMs
    skip this lever). DPO polishes consistent failure modes; it is
    task-dependent and much slower than SFT — follow the train skill's DPO
-   guidance (small pair sets, sweep, held-out trajectory).
-4. **All of the above exhausted?** Run the qualitative failure-analysis
+   guidance (small pair sets, held-out trajectory; DPO sweeps by default).
+5. **All of the above exhausted?** Run the qualitative failure-analysis
    loop below — quantitative scaling can only get you so far.
 
 ## Inference budget compliance

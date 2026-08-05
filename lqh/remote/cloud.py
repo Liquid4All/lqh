@@ -161,6 +161,13 @@ class CloudBackend(RemoteBackend):
         # session (see _append_stale_progress_marker) — one note per
         # backend restart is enough.
         self._stale_marked_runs: set[str] = set()
+        # Non-fatal advisories from the last submit_run: files excluded
+        # from the bundle, plus whatever the backend returned in
+        # `warnings` (e.g. a donated token that could not be made
+        # restart-safe). submit_run returns only the job id by the
+        # RemoteBackend contract, so callers read these afterwards and
+        # fold them into what they show the user. Reset per submit.
+        self.last_submit_warnings: list[str] = []
 
     # ------------------------------------------------------------------
     # Auth
@@ -191,6 +198,7 @@ class CloudBackend(RemoteBackend):
         *,
         module: str = "lqh.train",
         telemetry_workflow_id: str | None = None,
+        donate_hf_token: bool = False,
     ) -> str:
         """Build the bundle, POST to /v1/cloud/jobs, persist state, return
         the job_id.
@@ -262,6 +270,10 @@ class CloudBackend(RemoteBackend):
                 "execution_target":"cloud", "outcome":outcome,
             }, telemetry_workflow_id)
 
+        # Advisories are per-submit; a retry must not inherit the last
+        # attempt's.
+        self.last_submit_warnings = []
+
         # Bundle construction and submission can fail before a cloud job
         # exists. Always close the client-side workflow in those paths.
         bundle_tmp = run_dir / ".bundle.tar.gz.tmp"
@@ -289,7 +301,30 @@ class CloudBackend(RemoteBackend):
                 config["spec_sha256"] = spec_hash
             # Build to disk so bring-your-own seed data (image folders on
             # data_gen submits) never sits fully in RAM.
-            bundle_size = build_bundle_to_file(config, self.project_dir, bundle_tmp)
+            bundle_size, referenced_skips, swept_skips = build_bundle_to_file(
+                config, self.project_dir, bundle_tmp
+            )
+            if referenced_skips:
+                # The config still names these files, so the sandbox would
+                # look for something that isn't in the tarball. Refuse
+                # here rather than launching: the alternative is a paid
+                # sandbox failing on a missing input, with the
+                # explanation buried in a warning nobody reads until
+                # after the bill.
+                raise CloudError(
+                    "refusing to submit: "
+                    + ", ".join(referenced_skips)
+                    + " is referenced by the run config but looks like a credential "
+                    "file, so it was not uploaded. Rename it, or pass its contents "
+                    "through the config instead of by path."
+                )
+            if swept_skips:
+                self.last_submit_warnings.append(
+                    "left out of the upload as credential-like: "
+                    + ", ".join(swept_skips)
+                    + " (found inside a bundled directory; nothing in the run "
+                    "config points at them)"
+                )
             meta = {
                 "kind": kind,
                 "project_id": project_key,
@@ -320,12 +355,24 @@ class CloudBackend(RemoteBackend):
             # The backend upserts the projects row on submit; missing
             # fields don't overwrite previously-recorded values.
             meta.update(gather_project_meta(self.project_dir, config).to_meta_dict())
-            # HF token donate path: if the project binding asked us to
-            # donate the local env var, attach it to meta.hf_token. The
-            # backend forwards it as an ephemeral cloud secret and never
-            # persists it.
-            if getattr(self.config, "hf_token_configured", False):
-                hf = os.environ.get("HF_TOKEN")
+            # HF token donate path. This is the ONE place in the submit
+            # flow where the plaintext token exists: it is read here,
+            # goes straight onto the wire, and dies with this frame.
+            # Callers pass a bool; nothing that builds a ToolResult ever
+            # sees the value. See lqh/hf_token.py for the full contract.
+            #
+            # The per-call kwarg is the ONLY way in. `config.hf_token_configured`
+            # used to be OR'd in here for compatibility, but it is a
+            # RemoteConfig field persisted to .lqh/remotes.json whose SSH
+            # meaning is "a token was written to that host's .env" — it
+            # has never carried a donation consent decision, and no live
+            # call site sets it for cloud. Honouring it would let a
+            # config file donate a credential the hf_donate gate was
+            # never asked about.
+            if donate_hf_token:
+                from lqh.hf_token import donatable_hf_token
+
+                hf, _origin = donatable_hf_token(self.project_dir)
                 if hf:
                     meta["hf_token"] = hf
 
@@ -368,9 +415,13 @@ class CloudBackend(RemoteBackend):
                             attempt + 1, exc,
                         )
                         await asyncio.sleep(_SUBMIT_RETRY_BACKOFF_SECONDS * (attempt + 1))
-                _raise_for_cloud_error(resp)
+                _raise_for_cloud_error(resp, meta.get("hf_token"))
                 data = resp.json()
                 job_id = data["job_id"]
+                # Additive field; older backends omit it entirely.
+                for warning in data.get("warnings") or []:
+                    if isinstance(warning, str) and warning:
+                        self.last_submit_warnings.append(warning)
         except asyncio.CancelledError:
             # Fate unknown (cancelled mid-POST?) — keep submit_intent.json.
             await emit_submit_terminal("cancelled")
@@ -925,14 +976,28 @@ def _is_cloud_rate_limit_error(exc: Exception) -> bool:
     return "429" in msg or "rate limit" in msg or "too many requests" in msg
 
 
-def _raise_for_cloud_error(resp: httpx.Response) -> None:
+def _raise_for_cloud_error(resp: httpx.Response, secret: str | None = None) -> None:
+    """Raise CloudError for a non-2xx response.
+
+    ``secret`` is scrubbed from the surfaced message. The message reaches
+    a ToolResult and therefore the session log and the backend's payload
+    capture, so a server that echoed the request body back — a common
+    validation-error shape — would otherwise put a donated HF token into
+    the conversation. The backend is not supposed to do that; scrubbing
+    here means we do not have to rely on it.
+    """
     if 200 <= resp.status_code < 300:
         return
+    from lqh.hf_token import redact
+
+    # Redact BEFORE truncating: slicing first can cut a token in half and
+    # leave a prefix that exact replacement no longer matches.
     try:
         body = resp.json()
-        msg = body.get("error", {}).get("message", resp.text[:200])
+        msg = body.get("error", {}).get("message", resp.text)
     except Exception:
-        msg = resp.text[:200]
+        msg = resp.text
+    msg = redact(str(msg), secret)[:200]
     # 402 is the "billing precondition" status the backend returns
     # for monthly-cap exhaustion, GPU min-balance floor violation,
     # and org deactivation (see OpenAPI CostLimitExceeded). The

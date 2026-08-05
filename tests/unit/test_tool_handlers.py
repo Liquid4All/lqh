@@ -628,7 +628,7 @@ class TestHfPushPermissionSentinel:
             def whoami(self):
                 return {"name": "tester"}
 
-        monkeypatch.setattr("lqh.tools.handlers._get_hf_api", lambda: FakeApi())
+        monkeypatch.setattr("lqh.tools.handlers._get_hf_api", lambda *a, **k: FakeApi())
         dataset = tmp_path / "datasets" / "demo"
         dataset.mkdir(parents=True)
         (dataset / "data.parquet").write_bytes(b"x")

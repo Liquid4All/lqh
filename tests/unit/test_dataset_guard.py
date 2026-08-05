@@ -106,7 +106,7 @@ def test_pending_cloud_target_needs_confirmation_even_with_overwrite(
 
 
 def _stub_hf(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("lqh.tools.handlers._get_hf_api", lambda: object())
+    monkeypatch.setattr("lqh.tools.handlers._get_hf_api", lambda *a, **k: object())
     monkeypatch.setattr(
         "lqh.tools.handlers._resolve_hf_pull_repo_type",
         lambda api, repo_id, repo_type: ("dataset", None),

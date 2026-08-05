@@ -52,12 +52,22 @@ async def submit_gguf(
     include_f16: bool = False,
     base_model: str | None = None,
     artifact_format: str | None = None,
+    project_dir: Path | None = None,
+    donate_hf_token: bool = False,
 ) -> str:
-    """Ask the backend to start a CPU GGUF-conversion job. Returns the job id."""
+    """Ask the backend to start a CPU GGUF-conversion job. Returns the job id.
+
+    ``donate_hf_token`` attaches a locally-found HF token to this one
+    conversion. Needed both to push to ``target_hf_repo`` and to download
+    a gated base model when merging a LoRA. One of the few functions
+    allowed to hold the plaintext (see lqh.hf_token): it goes straight
+    into the request body, never into a return value or an exception.
+    """
     import httpx
 
     from lqh.auth import require_token
     from lqh.config import load_config
+    from lqh.hf_token import donatable_hf_token, redact
     from lqh.models import is_vlm_model_name
 
     # Vision-language checkpoints need a separate mmproj (vision tower)
@@ -90,6 +100,11 @@ async def submit_gguf(
         body["base_model"] = base_model
     if artifact_format:
         body["artifact_format"] = artifact_format
+    hf: str | None = None
+    if donate_hf_token:
+        hf, _origin = donatable_hf_token(project_dir)
+        if hf:
+            body["hf_token"] = hf
     # project_id isn't part of the request body (the source artifact
     # carries it) but keep the signature symmetric with submit_transfer
     # in case the backend contract adds it later.
@@ -100,7 +115,13 @@ async def submit_gguf(
             url, json=body, headers={"Authorization": f"Bearer {token}"}
         )
         if r.status_code not in (200, 201):
-            raise RuntimeError(f"gguf submit failed ({r.status_code}): {r.text[:300]}")
+            # Scrub first — this string reaches a tool result, and a
+            # server that echoed the request body would otherwise put the
+            # donated token into the conversation.
+            raise RuntimeError(
+                f"gguf submit failed ({r.status_code}): "
+                f"{redact(r.text, hf)[:300]}"
+            )
         return r.json()["job_id"]
 
 

@@ -18,8 +18,19 @@ fine-tuning is severely asymmetric:
 
 We sweep training cheaply, pick a winner with an in-training proxy that
 costs essentially nothing, then optionally pay for one judge eval on
-the winner. The handler can be told ``enable_sweep=False`` if the user
-explicitly says "just train one config".
+the winner.
+
+A sweep is nonetheless several times the wall clock of one run, since the
+configs train sequentially in a single job. So it is NOT the default for SFT
+any more — ``start_training`` runs SFT once at the defaults in
+``lqh/train/defaults.py`` and sweeps only when asked (a ``/improve``
+late-stage decision). DPO still sweeps by default; see
+``lqh.train.defaults.sweeps_by_default``.
+
+``eval_all`` judge-scores every config rather than only the winner. It is off
+by default — it multiplies judge cost by the grid size — and exists for the
+hp_defaults calibration study, which needs a real metric for every config in
+order to compute each cell's best-achievable score.
 
 Picking the proxy
 -----------------
@@ -70,6 +81,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import subprocess
 import sys
@@ -561,39 +573,47 @@ def _winner_model_dir(run_dir: Path) -> Path | None:
     return None
 
 
-def _build_eval_of_best_config(base: dict[str, Any], run_dir: Path) -> dict[str, Any] | None:
-    """Compose the infer config the eval-of-best step runs against.
+def _build_eval_config(
+    base: dict[str, Any],
+    model_path: Path | None,
+    *,
+    progress_run_dir: Path | None,
+) -> dict[str, Any] | None:
+    """Compose the infer config an eval step runs against.
 
-    Returns None when there's nothing to evaluate against — either no
-    ``eval_dataset`` was supplied in the sweep's base config, or no
-    winner model has been materialized at the run root yet.
+    Returns None when there's nothing to evaluate — either no ``eval_dataset``
+    was supplied in the sweep's base config, or no model has been materialized.
+
+    ``progress_run_dir`` folds this inference into that run's whole-job
+    progress lifecycle. Eval-of-best passes the sweep's run dir (it IS the
+    tail of the job); per-config eval under ``eval_all`` passes None, since
+    N evals cannot each claim the same slice of the parent's progress bar.
     """
     eval_dataset = base.get("eval_dataset")
-    if not eval_dataset:
-        return None
-    model_path = _winner_model_dir(run_dir)
-    if model_path is None:
+    if not eval_dataset or model_path is None:
         return None
     # Build a minimal lqh.infer config that matches what the rest of
     # the stack expects (matches the shape produced by
     # handle_start_local_eval).
-    from lqh.progress import FINAL_INFERENCE_END, TRAINING_END
-
-    progress_start = TRAINING_END if base.get("scorer") else FINAL_INFERENCE_END
-    progress_end = FINAL_INFERENCE_END if base.get("scorer") else 1.0
     cfg: dict[str, Any] = {
         "type": "infer",
         "base_model": str(model_path.resolve()),
         "dataset": eval_dataset,
         "max_new_tokens": int(base.get("max_new_tokens", 4096)),
         "manifest": ["base_model", "dataset"],
-        # Report final inference into the parent sweep's whole-job lifecycle.
-        "progress_run_dir": str(run_dir),
-        "progress_start": progress_start,
-        "progress_end": progress_end,
-        "progress_label": f"{base.get('type', 'training').upper()} evaluation",
-        "progress_task_kind": "training_sweep",
     }
+    if progress_run_dir is not None:
+        from lqh.progress import FINAL_INFERENCE_END, TRAINING_END
+
+        progress_start = TRAINING_END if base.get("scorer") else FINAL_INFERENCE_END
+        progress_end = FINAL_INFERENCE_END if base.get("scorer") else 1.0
+        cfg.update({
+            "progress_run_dir": str(progress_run_dir),
+            "progress_start": progress_start,
+            "progress_end": progress_end,
+            "progress_label": f"{base.get('type', 'training').upper()} evaluation",
+            "progress_task_kind": "training_sweep",
+        })
     if scorer := base.get("scorer"):
         cfg["scorer"] = scorer
         cfg["manifest"].append("scorer")
@@ -605,34 +625,64 @@ def _build_eval_of_best_config(base: dict[str, Any], run_dir: Path) -> dict[str,
 
 
 def _run_eval_of_best(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
-    """Run ``lqh.infer`` against the sweep's winner model and surface
-    the predictions at the run-dir level so the watcher scores them.
-
-    Self-contained: builds the infer config, runs it as a subprocess
-    in a ``eval_of_best/`` subdir (so its progress.jsonl / pid don't
-    collide with the sweep's), then symlinks the resulting
-    ``predictions.parquet`` + ``eval_request.json`` up to ``run_dir``
-    so the existing scoring loop picks them up without changes.
+    """Run ``lqh.infer`` against the sweep's winner and surface the
+    predictions at the run-dir level so the watcher scores them.
 
     Returns a small summary dict for the sweep's final status payload
     or ``{"skipped": "<reason>"}`` if eval was a no-op (no eval_dataset
     in base config, no winner model, or infer subprocess crashed).
     """
-    cfg = _build_eval_of_best_config(base, run_dir)
-    if cfg is None:
-        return {"skipped": "no eval_dataset or no winner model"}
+    model_path = _winner_model_dir(run_dir)
+    return _run_eval(
+        base,
+        model_path,
+        run_dir / "eval_of_best",
+        progress_run_dir=run_dir,
+        surface_to=run_dir,
+        label="eval-of-best on winner",
+        skip_reason="no eval_dataset or no winner model",
+    )
 
-    eval_dir = run_dir / "eval_of_best"
+
+def _run_eval(
+    base: dict[str, Any],
+    model_path: Path | None,
+    eval_dir: Path,
+    *,
+    progress_run_dir: Path | None,
+    surface_to: Path | None,
+    label: str,
+    skip_reason: str,
+) -> dict[str, Any]:
+    """Run ``lqh.infer`` on *model_path* and judge-score the predictions.
+
+    Self-contained: builds the infer config, runs it as a subprocess inside
+    *eval_dir* (so its progress.jsonl / pid don't collide with the sweep's),
+    then scores it.
+
+    ``surface_to`` is where ``predictions.parquet`` + ``eval_request.json``
+    get symlinked and scoring runs. Eval-of-best passes the sweep run dir so
+    the existing laptop-watcher scoring loop picks them up unchanged. Per-config
+    eval passes None: those artifacts must stay inside *eval_dir*, because a
+    ``predictions.parquet`` at the run root is what the publisher classifies as
+    THE run's eval result (``lqh/remote/publish.py:_resolve_candidates``), and
+    one config's eval is not the sweep's result.
+    """
+    cfg = _build_eval_config(base, model_path, progress_run_dir=progress_run_dir)
+    if cfg is None:
+        return {"skipped": skip_reason}
+
     eval_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = eval_dir / "config.json"
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
 
-    print(f"sweep: starting eval-of-best on winner ({cfg['base_model']})", flush=True)
-    write_progress(
-        run_dir,
-        step=0,
-        extra={"phase": "eval_of_best_start", "dataset": cfg.get("dataset")},
-    )
+    print(f"sweep: starting {label} ({cfg['base_model']})", flush=True)
+    if progress_run_dir is not None:
+        write_progress(
+            progress_run_dir,
+            step=0,
+            extra={"phase": "eval_of_best_start", "dataset": cfg.get("dataset")},
+        )
 
     log_path = eval_dir / "infer.log"
     with log_path.open("w") as log:
@@ -674,34 +724,42 @@ def _run_eval_of_best(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
             return {"skipped": f"failed to spawn infer subprocess: {exc}"}
 
     if rc != 0:
-        print(f"sweep: eval-of-best failed (rc={rc}); see eval_of_best/infer.log", flush=True)
+        print(
+            f"sweep: {label} failed (rc={rc}); see {eval_dir.name}/infer.log",
+            flush=True,
+        )
         return {"skipped": f"infer subprocess exit code {rc}"}
 
-    # Surface predictions + eval_request at the run-dir level so the
-    # remote watcher's existing path detection scores them. Use
-    # symlinks (cheap, no duplicated disk) and fall back to copies
-    # on filesystems that reject symlinks.
-    for fname in ("predictions.parquet", "eval_request.json"):
-        src = eval_dir / fname
-        if not src.exists():
-            continue
-        dst = run_dir / fname
-        if dst.is_symlink() or dst.exists():
+    # Surface predictions + eval_request one level up so the remote watcher's
+    # existing path detection scores them. Use symlinks (cheap, no duplicated
+    # disk) and fall back to copies on filesystems that reject symlinks.
+    if surface_to is not None:
+        for fname in ("predictions.parquet", "eval_request.json"):
+            src = eval_dir / fname
+            if not src.exists():
+                continue
+            dst = surface_to / fname
+            if dst.is_symlink() or dst.exists():
+                try:
+                    dst.unlink()
+                except OSError:
+                    pass
             try:
-                dst.unlink()
+                dst.symlink_to(src.resolve())
             except OSError:
-                pass
-        try:
-            dst.symlink_to(src.resolve())
-        except OSError:
-            import shutil
-            shutil.copy2(src, dst)
+                import shutil
+                shutil.copy2(src, dst)
 
     summary: dict[str, Any] = {
         "ok": True,
         "dataset": cfg.get("dataset"),
         "model": cfg["base_model"],
     }
+
+    # Where the judge writes eval_result.json. score_run_eval_inline is
+    # directory-scoped, so pointing it at eval_dir keeps a per-config eval
+    # entirely inside that config's subtree.
+    scoring_dir = surface_to if surface_to is not None else eval_dir
 
     # Cloud-mode: score the eval predictions inline so we emit a
     # complete real-metric (judge_score) artifact without depending
@@ -713,14 +771,14 @@ def _run_eval_of_best(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
 
         scoring_config = dict(base)
         scoring_config["progress_task_kind"] = "training_sweep"
-        score_summary = score_run_eval_inline(run_dir, scoring_config)
+        score_summary = score_run_eval_inline(scoring_dir, scoring_config)
         if score_summary is not None:
             summary["score_summary"] = score_summary
         elif os.environ.get("LQH_JOB_ID") and base.get("scorer"):
             from lqh.progress import write_error_marker
 
-            error_path = run_dir / "eval_error.json"
-            message = "inline eval-of-best scoring produced no result"
+            error_path = scoring_dir / "eval_error.json"
+            message = f"inline {label} scoring produced no result"
             if error_path.exists():
                 try:
                     message = str(json.loads(error_path.read_text()).get(
@@ -732,16 +790,168 @@ def _run_eval_of_best(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
                 write_error_marker(error_path, message)
             summary["scoring_error"] = message
     except Exception as exc:  # noqa: BLE001
-        print(f"sweep: inline eval-of-best scoring failed: {exc}", flush=True)
+        print(f"sweep: inline {label} scoring failed: {exc}", flush=True)
         from lqh.progress import write_error_marker
 
         write_error_marker(
-            run_dir / "eval_error.json",
-            f"inline eval-of-best scoring failed: {exc}",
+            scoring_dir / "eval_error.json",
+            f"inline {label} scoring failed: {exc}",
         )
         summary["scoring_error"] = str(exc)
 
     return summary
+
+
+def _judge_mean_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Flatten an eval summary into the judge fields a sweep row carries.
+
+    Returns empty when the eval was skipped or produced no score, so a failed
+    config leaves the fields absent rather than claiming a score of zero.
+    """
+    score_summary = summary.get("score_summary")
+    if not isinstance(score_summary, dict):
+        return {}
+    scores = score_summary.get("scores")
+    if not isinstance(scores, dict):
+        return {}
+    out: dict[str, Any] = {}
+    if isinstance(scores.get("mean"), (int, float)):
+        out["judge_mean"] = float(scores["mean"])
+    if isinstance(scores.get("median"), (int, float)):
+        out["judge_median"] = float(scores["median"])
+    std = _judge_std(score_summary)
+    if std is not None:
+        out["judge_std"] = std
+    if isinstance(score_summary.get("num_scored"), int):
+        out["judge_num_scored"] = score_summary["num_scored"]
+    return out
+
+
+def _judge_std(score_summary: dict[str, Any]) -> float | None:
+    """Spread of the judge's scores, pooled across eval sources.
+
+    ``score_predictions_by_source`` puts the headline under ``scores`` with only
+    mean and median — the standard deviation lives per-source. Consumers that
+    want to know how noisy a score is (the hp_defaults noise floor) have to pool
+    it back themselves.
+    """
+    direct = score_summary.get("scores")
+    if isinstance(direct, dict) and isinstance(direct.get("std"), (int, float)):
+        return float(direct["std"])
+
+    per_source = score_summary.get("per_source")
+    if not isinstance(per_source, dict):
+        return None
+    # Pooled variance: sum((n_i - 1) * s_i^2) / sum(n_i - 1).
+    numerator = 0.0
+    dof = 0
+    for entry in per_source.values():
+        if not isinstance(entry, dict):
+            continue
+        stats = entry.get("scores")
+        n = entry.get("num_scored")
+        if not isinstance(stats, dict) or not isinstance(n, int) or n < 2:
+            continue
+        s = stats.get("std")
+        if not isinstance(s, (int, float)):
+            continue
+        numerator += (n - 1) * float(s) ** 2
+        dof += n - 1
+    if dof == 0:
+        return None
+    return math.sqrt(numerator / dof)
+
+
+def _read_best_epoch(sub_run_dir: Path) -> dict[str, Any]:
+    """Which epoch the child's saved checkpoint actually came from.
+
+    ``sft.py`` trains with ``load_best_model_at_end=True`` on ``eval_loss``, so
+    a 3-epoch config may well have saved an epoch-2 model. Without this the
+    ``num_epochs`` axis looks like it is doing work that checkpoint selection
+    already did — the hp_defaults study cross-tabs the two to find out.
+    """
+    history_path = sub_run_dir / "eval_history.json"
+    try:
+        history = json.loads(history_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(history, list):
+        return {}
+
+    best: dict[str, Any] | None = None
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        loss = entry.get("eval_loss")
+        if not isinstance(loss, (int, float)):
+            continue
+        if best is None or loss < best["eval_loss"]:
+            best = {
+                "eval_loss": float(loss),
+                "epoch": entry.get("epoch"),
+                "step": entry.get("step"),
+            }
+    if best is None:
+        return {}
+    out: dict[str, Any] = {}
+    if isinstance(best.get("epoch"), (int, float)):
+        out["best_epoch"] = float(best["epoch"])
+    if isinstance(best.get("step"), (int, float)):
+        out["best_step"] = int(best["step"])
+    return out
+
+
+def _run_eval_for_config(
+    sub_run_dir: Path, base: dict[str, Any], config_id: str,
+) -> dict[str, Any]:
+    """Judge-eval one sweep config and return the fields to stamp on its row.
+
+    This is the ``eval_all`` path: the study needs a real metric for EVERY
+    config, not just the winner, or it cannot compute each cell's oracle. The
+    row is the transport — ``sweep_summary.json`` and ``runs.jsonl`` already
+    sync back from cloud sandboxes, so nothing new has to be published.
+    """
+    model_path = _winner_model_dir(sub_run_dir)
+    summary = _run_eval(
+        base,
+        model_path,
+        sub_run_dir / "eval_of_config",
+        progress_run_dir=None,
+        surface_to=None,
+        label=f"eval of config {config_id}",
+        skip_reason="no eval_dataset or no model for this config",
+    )
+    fields = _judge_mean_from_summary(summary)
+    if not fields:
+        # Always record WHY a config has no real metric. A silently missing
+        # score is indistinguishable from one nobody asked for, and the study
+        # would quietly analyse a grid with holes in it.
+        fields["judge_skipped"] = str(
+            summary.get("skipped")
+            or summary.get("scoring_error")
+            or "eval produced no judge score"
+        )
+    return fields
+
+
+def _discard_child_checkpoints(sub_run_dir: Path) -> None:
+    """Drop a finished config's intermediate checkpoints.
+
+    Under ``eval_all`` a sweep can hold 15+ configs, and HF keeps up to
+    ``save_total_limit`` checkpoints each — enough to fill a cloud sandbox's
+    disk before the grid finishes. The final model dir (``model`` /
+    ``model-lora``) and every metric file are kept; only ``checkpoints/`` goes,
+    and only after that config has been evaluated.
+    """
+    checkpoints = sub_run_dir / "checkpoints"
+    if not checkpoints.is_dir():
+        return
+    import shutil
+
+    try:
+        shutil.rmtree(checkpoints)
+    except OSError as exc:
+        print(f"sweep: could not remove {checkpoints}: {exc}", flush=True)
 
 
 def _materialize_best_model(winner_dir: Path, run_dir: Path) -> None:
@@ -1013,6 +1223,16 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
         write_progress_event,
     )
 
+    # eval_all judge-scores every config, not just the winner. Off by default:
+    # it multiplies judge cost by the grid size, which only the hp_defaults
+    # calibration study (which needs each cell's oracle) is willing to pay.
+    eval_all = bool(
+        sweep_config.get("eval_all", False)
+        and base.get("eval_dataset")
+    )
+    if eval_all:
+        print(f"sweep: eval_all on — judging all {len(grid)} configs", flush=True)
+
     will_eval_best = bool(
         sweep_config.get("eval_best", True)
         and base.get("eval_dataset")
@@ -1182,6 +1402,16 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
         for k, v in proxy.items():
             if k != "primary":
                 row[k] = v
+        row.update(_read_best_epoch(sub_run_dir))
+
+        # eval_all: judge-score this config before moving on, and stamp the
+        # result onto its row. Must happen before the row is appended and
+        # flushed, or a resumed sweep would treat the config as complete with
+        # no real metric.
+        if eval_all and rc == 0:
+            row.update(_run_eval_for_config(sub_run_dir, base, point.id))
+            _discard_child_checkpoints(sub_run_dir)
+
         rows.append(row)
 
         try:

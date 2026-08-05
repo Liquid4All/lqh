@@ -319,7 +319,7 @@ async def test_full_consent_context_skips_prompts(tmp_path: Path, monkeypatch) -
     )
 
     async def fake_submit(self, run_dir, config, *, module="lqh.train",
-                          telemetry_workflow_id=None):
+                          telemetry_workflow_id=None, **_kw):
         return "job-full-consent"
 
     monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
@@ -415,7 +415,7 @@ async def test_cloud_submit_with_consent(tmp_path: Path, monkeypatch) -> None:
     submitted: dict = {}
 
     async def fake_submit(self, run_dir, config, *, module="lqh.train",
-                          telemetry_workflow_id=None):
+                          telemetry_workflow_id=None, **_kw):
         submitted["run_dir"] = run_dir
         submitted["config"] = config
         submitted["module"] = module
@@ -491,7 +491,7 @@ async def test_validation_instructions_stored_project_relative(
     seen: dict = {}
 
     async def fake_submit(self, run_dir, config, *, module="lqh.train",
-                          telemetry_workflow_id=None):
+                          telemetry_workflow_id=None, **_kw):
         seen["config"] = config
         return "job-v"
 
@@ -567,7 +567,7 @@ async def test_cloud_concurrency_accounts_for_samples_per_item(
     seen: dict = {}
 
     async def fake_submit(self, run_dir, config, *, module="lqh.train",
-                          telemetry_workflow_id=None):
+                          telemetry_workflow_id=None, **_kw):
         seen["config"] = config
         return "job-c"
 
@@ -746,7 +746,7 @@ async def test_rapid_double_submit_gets_distinct_run_dirs(
     run_dirs: list[str] = []
 
     async def fake_submit(self, run_dir, config, *, module="lqh.train",
-                          telemetry_workflow_id=None):
+                          telemetry_workflow_id=None, **_kw):
         run_dirs.append(run_dir)
         return f"job-{len(run_dirs)}"
 
@@ -785,7 +785,7 @@ async def test_observed_hf_usage_sets_needs_hf(tmp_path: Path, monkeypatch) -> N
     seen: dict = {}
 
     async def fake_submit(self, run_dir, config, *, module="lqh.train",
-                          telemetry_workflow_id=None):
+                          telemetry_workflow_id=None, **_kw):
         seen["config"] = config
         return "job-hf"
 
@@ -871,7 +871,7 @@ async def test_persisted_cloud_grant_skips_prompt(tmp_path: Path, monkeypatch) -
     record_validation(project, project / script_rel, num_samples=3, succeeded=3, failed=0)
 
     async def fake_submit(self, run_dir, config, *, module="lqh.train",
-                          telemetry_workflow_id=None):
+                          telemetry_workflow_id=None, **_kw):
         return "job-7"
 
     monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
@@ -961,7 +961,7 @@ def test_bundle_to_file_contains_sources(tmp_path: Path) -> None:
         "manifest": ["script_path", "source_paths"],
     }
     dest = tmp_path / "bundle.tar.gz"
-    size = build_bundle_to_file(config, project, dest)
+    size, _ref, _swept = build_bundle_to_file(config, project, dest)
     assert size == dest.stat().st_size > 0
     with tarfile.open(dest, "r:gz") as tar:
         names = set(tar.getnames())
@@ -1177,10 +1177,92 @@ def test_publish_gates_dataset_on_completed_status(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_needs_hf_configures_token_donation(tmp_path: Path, monkeypatch) -> None:
-    """A pipeline whose validated local run used hf_dataset must submit
-    with hf_token_configured, so a locally-working private dataset also
-    works in the sandbox (submit_run donates the env HF_TOKEN)."""
+async def test_needs_hf_donates_once_consented(tmp_path: Path, monkeypatch) -> None:
+    """A pipeline whose validated local run used hf_dataset submits with
+    donation on, so a locally-working PRIVATE dataset also works in the
+    sandbox — but only after the user consented to sending the token."""
+    project, script_rel = _handler_project(tmp_path)
+    grant_permission(project, None, project_wide=True)
+    _mark_script_uses_hf(project, script_rel)
+    record_validation(
+        project, project / script_rel,
+        num_samples=3, succeeded=3, failed=0, needs_hf=True,
+    )
+    monkeypatch.setenv("HF_TOKEN", "hf_dummy")
+
+    seen: dict = {}
+
+    async def fake_submit(self, run_dir, config, *, module="lqh.train",
+                          telemetry_workflow_id=None, donate_hf_token=False, **_kw):
+        seen["donate"] = donate_hf_token
+        return "job-hf"
+
+    monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
+    await handle_run_data_gen_pipeline(
+        project, script_path=script_rel, num_samples=5,
+        output_dataset="d", execution="cloud",
+        _permissions=PermissionContext.granting("cloud_data_gen", "hf_donate"),
+    )
+    assert seen["donate"] is True
+
+
+@pytest.mark.asyncio
+async def test_needs_hf_prompts_before_donating(tmp_path: Path, monkeypatch) -> None:
+    """Without an hf_donate grant the submit stops for consent first."""
+    project, script_rel = _handler_project(tmp_path)
+    grant_permission(project, None, project_wide=True)
+    _mark_script_uses_hf(project, script_rel)
+    record_validation(
+        project, project / script_rel,
+        num_samples=3, succeeded=3, failed=0, needs_hf=True,
+    )
+    monkeypatch.setenv("HF_TOKEN", "hf_dummy")
+
+    result = await handle_run_data_gen_pipeline(
+        project, script_path=script_rel, num_samples=5,
+        output_dataset="d", execution="cloud",
+        _permissions=PermissionContext.granting("cloud_data_gen"),
+    )
+    assert result.content == "PERMISSION_REQUIRED"
+    assert result.permission_key.startswith("hf_donate:")
+    # Declining must still be an option that runs the job.
+    assert any("without it" in o for o in result.options)
+
+
+@pytest.mark.asyncio
+async def test_declining_donation_still_submits(tmp_path: Path, monkeypatch) -> None:
+    """Unlike every other permission domain, "no" means "run it without
+    the token", not "don't run it"."""
+    project, script_rel = _handler_project(tmp_path)
+    grant_permission(project, None, project_wide=True)
+    _mark_script_uses_hf(project, script_rel)
+    record_validation(
+        project, project / script_rel,
+        num_samples=3, succeeded=3, failed=0, needs_hf=True,
+    )
+    monkeypatch.setenv("HF_TOKEN", "hf_dummy")
+
+    seen: dict = {}
+
+    async def fake_submit(self, run_dir, config, *, module="lqh.train",
+                          telemetry_workflow_id=None, donate_hf_token=False, **_kw):
+        seen["donate"] = donate_hf_token
+        return "job-declined-hf"
+
+    monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
+    result = await handle_run_data_gen_pipeline(
+        project, script_path=script_rel, num_samples=5,
+        output_dataset="d", execution="cloud",
+        _permissions=PermissionContext.granting("cloud_data_gen"),
+        _hf_donate=False,
+    )
+    assert seen["donate"] is False
+    assert "job-declined-hf" in result.content
+
+
+@pytest.mark.asyncio
+async def test_no_local_token_means_no_prompt(tmp_path: Path, monkeypatch) -> None:
+    """Users without a discoverable token never see the donation prompt."""
     project, script_rel = _handler_project(tmp_path)
     grant_permission(project, None, project_wide=True)
     _mark_script_uses_hf(project, script_rel)
@@ -1189,19 +1271,17 @@ async def test_needs_hf_configures_token_donation(tmp_path: Path, monkeypatch) -
         num_samples=3, succeeded=3, failed=0, needs_hf=True,
     )
 
-    seen: dict = {}
-
     async def fake_submit(self, run_dir, config, *, module="lqh.train",
-                          telemetry_workflow_id=None):
-        seen["hf_flag"] = self.config.hf_token_configured
-        return "job-hf"
+                          telemetry_workflow_id=None, donate_hf_token=False, **_kw):
+        return "job-no-token"
 
     monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
-    await handle_run_data_gen_pipeline(
+    result = await handle_run_data_gen_pipeline(
         project, script_path=script_rel, num_samples=5,
-        output_dataset="d", execution="cloud", _permissions=PermissionContext.granting("cloud_data_gen"),
+        output_dataset="d", execution="cloud",
+        _permissions=PermissionContext.granting("cloud_data_gen"),
     )
-    assert seen["hf_flag"] is True
+    assert "job-no-token" in result.content
 
 
 @pytest.mark.asyncio
@@ -1216,8 +1296,8 @@ async def test_no_hf_usage_means_no_token_donation(tmp_path: Path, monkeypatch) 
     seen: dict = {}
 
     async def fake_submit(self, run_dir, config, *, module="lqh.train",
-                          telemetry_workflow_id=None):
-        seen["hf_flag"] = self.config.hf_token_configured
+                          telemetry_workflow_id=None, donate_hf_token=False, **_kw):
+        seen["hf_flag"] = donate_hf_token
         return "job-nohf"
 
     monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
@@ -1247,7 +1327,11 @@ async def test_consent_prompt_discloses_hf_token_donation(
         output_dataset="d", execution="cloud",
     )
     assert result.content == "PERMISSION_REQUIRED"
-    assert "HF_TOKEN is sent" in result.question
+    # The submit prompt comes first and must set the expectation that a
+    # credential question is coming; the donation itself is consented
+    # separately (see test_needs_hf_prompts_before_donating).
+    assert "Hugging Face" in result.question
+    assert "asked whether to send the token" in result.question
 
 
 # ---------------------------------------------------------------------------
@@ -1500,3 +1584,48 @@ def test_remote_data_gen_clamps_nonpositive_concurrency(
         dg.main()
     assert exc.value.code == 0
     assert seen["concurrency"] >= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("needs_hf", [True, False])
+async def test_data_gen_offers_donation_regardless_of_hf_detection(
+    tmp_path: Path, monkeypatch, needs_hf: bool,
+) -> None:
+    """The donation question must not depend on needs_hf being right.
+
+    needs_hf observes `lqh.sources.hf_dataset` specifically and then
+    re-confirms it against the script text. That narrowness is correct
+    for the STORED account token, which the backend injects without
+    asking — but it used to gate the donation prompt too. A pipeline
+    reaching HF through datasets.load_dataset, huggingface_hub, or a
+    wrapper indirect enough to defeat the text check therefore worked
+    locally (the resolver finds the token) and 401'd in the cloud, having
+    never been offered the credential it needed.
+
+    Training and eval have always offered on every cloud submit; data-gen
+    was the one workflow with a detector between the user and the
+    question, and the cost of a false negative was a paid failure.
+    """
+    project, script_rel = _handler_project(tmp_path)
+    grant_permission(project, None, project_wide=True)
+    if needs_hf:
+        _mark_script_uses_hf(project, script_rel)
+    (project / ".env").write_text("HF_TOKEN=hf_datagen_local_token\n")
+    record_validation(
+        project, project / script_rel,
+        num_samples=3, succeeded=3, failed=0, needs_hf=needs_hf,
+    )
+
+    async def fake_submit(self, run_dir, config, *, module="lqh.train",
+                          telemetry_workflow_id=None, **_kw):
+        return "job-x"
+
+    monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
+    result = await handle_run_data_gen_pipeline(
+        project, script_path=script_rel, num_samples=600,
+        output_dataset="d", execution="cloud",
+        _permissions=PermissionContext.granting("cloud_data_gen"),
+    )
+
+    assert result.content == "PERMISSION_REQUIRED"
+    assert result.permission_key == "hf_donate:data-gen"

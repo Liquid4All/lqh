@@ -1064,8 +1064,9 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "  - a local path — uploaded directly (dataset or model, auto-detected); "
                 "or\n"
                 "  - 'lqh:<artifact_id>' — an R2 artifact, transferred to HF by a short "
-                "CPU-only cloud sandbox (bytes never round-trip through this machine; "
-                "requires a stored HF token via /hf_login).\n"
+                "CPU-only cloud sandbox (bytes never round-trip through this machine). "
+                "Needs an HF token: either one stored via /hf_login, or a local one the "
+                "user approves sending with the job.\n"
                 "Creates the repo if missing (private by default)."
             ),
             parameters={
@@ -1106,7 +1107,8 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "(kind 'gguf'). If the checkpoint is a LoRA adapter it is merged "
                 "onto its base first (auto-detected from lineage; pass base_model "
                 "if it isn't recorded). Optionally also pushes the files to a HF "
-                "repo (requires a stored HF token via /hf_login). Use 'artifacts' "
+                "repo (needs an HF token: stored via /hf_login, or a local one the "
+                "user approves sending with the job). Use 'artifacts' "
                 "(action=list) to find checkpoint ids; check training_status for "
                 "progress. Common quant picks: Q4_K (fast, good), Q8_0 (near-"
                 "lossless, ~2x slower)."
@@ -1494,15 +1496,15 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "fixed per project and chosen once via a system picker — do NOT ask the "
                 "user where to train and do NOT pass any compute/remote argument; just "
                 "call start_training and it routes automatically. "
-                "By default a small hyperparameter sweep runs (`enable_sweep=true`) — "
-                "the right choice for most users: on a new dataset you don't know how "
-                "this model size × dataset combination behaves, so several lr/epoch "
-                "configs train and the winner is picked on the held-out signal. Set "
-                "`enable_sweep=false` for a single run when the working hyperparameters "
-                "are already known from a previous sweep, when the user explicitly "
-                "specifies them, or for quick test/smoke runs — then set "
-                "`learning_rate` and `num_epochs` manually. "
-                "`eval_dataset` is REQUIRED either way (sweep winner selection and "
+                "SFT runs ONCE at validated default hyperparameters — do not pass "
+                "`learning_rate`, `num_epochs` or `enable_sweep` unless the user asks "
+                "for specific values. A hyperparameter sweep trains its configs "
+                "sequentially inside one job, so it multiplies the wait on the very "
+                "first run after a dataset is ready; it belongs later, once the data "
+                "and model size are settled and only a small gain is left to find "
+                "(the `/improve` skill decides that). DPO still sweeps by default — it "
+                "is far more sensitive to learning rate and beta. "
+                "`eval_dataset` is REQUIRED either way (checkpoint selection and "
                 "judge scoring both need it). "
                 "You must also pass `scorer` — set to the project's default/best scorer — "
                 "so the best checkpoint gets a real judge score; the call is rejected "
@@ -1662,28 +1664,32 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     "enable_sweep": {
                         "type": "boolean",
                         "description": (
-                            "Default true: train a small hyperparameter grid "
-                            "(SFT: lr ∈ {2e-5, 5e-5, 1e-4} × epochs ∈ {2, 3}) and keep "
-                            "the winner — use this whenever you don't yet know how this "
-                            "model size × dataset combination performs (i.e. most new "
-                            "datasets). Set false for a single training run when good "
-                            "hyperparameters are already known (e.g. from an earlier "
-                            "sweep on this dataset), when the user explicitly prescribes "
-                            "them, or for test/smoke runs where speed matters more than "
-                            "tuning. With false, set `learning_rate` and `num_epochs` "
-                            "yourself — reasonable SFT starting point: a medium lr of "
-                            "5e-5 and 2 epochs."
+                            "Whether to train a hyperparameter grid and keep the "
+                            "winner instead of running once. OMIT IT and the right "
+                            "default applies per run type: SFT trains a SINGLE run at "
+                            "validated defaults, DPO sweeps. Do not pass it just to "
+                            "restate the default.\n"
+                            "Set true for SFT only as a LATE-STAGE move: the data "
+                            "pipeline is settled, the model size is chosen, training "
+                            "already works, and the user wants the last fraction of a "
+                            "point. A sweep trains its configs one after another inside "
+                            "a single job, so it costs several times a normal run — "
+                            "hours the first run after a new dataset should not spend. "
+                            "The `/improve` skill decides when that trade is worth it.\n"
+                            "Set false for DPO only when the user prescribes specific "
+                            "hyperparameters or wants a quick smoke run."
                         ),
-                        "default": True,
                     },
                     "num_epochs": {
                         "type": "integer",
                         "description": (
-                            "Number of training epochs (SFT only). Only takes effect "
-                            "with `enable_sweep=false` (the sweep grid overrides it). "
-                            "Recommended single-run value: 2. Default: 3."
+                            "Number of training epochs (SFT only). Omit it — the "
+                            "default comes from lqh/train/defaults.py (currently 3) and "
+                            "training stops on the best checkpoint by eval loss, so a "
+                            "generous epoch count does not overtrain. Under a sweep the "
+                            "grid overrides it. Set it only when the user asks for a "
+                            "specific number."
                         ),
-                        "default": 3,
                     },
                     "override_budget": {
                         "type": "boolean",
@@ -1699,10 +1705,11 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     "learning_rate": {
                         "type": "number",
                         "description": (
-                            "Learning rate. Only takes effect with `enable_sweep=false` "
-                            "(the sweep grid overrides it). Recommended single-run "
-                            "value: 5e-5 (medium) for SFT; default if omitted: 2e-5 for "
-                            "SFT, 1e-6 for DPO."
+                            "Learning rate. Omit it — the default comes from "
+                            "lqh/train/defaults.py (currently 2e-5 for SFT, 1e-6 for "
+                            "DPO, 5e-4 for vision LoRA). Under a sweep the grid "
+                            "overrides it. Set it only when the user prescribes a value "
+                            "or a previous sweep on this dataset found a better one."
                         ),
                     },
                     "num_iterations": {

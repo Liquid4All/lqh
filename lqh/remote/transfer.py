@@ -33,12 +33,22 @@ async def submit_transfer(
     source_artifact_id: str,
     target_hf_repo: str,
     private: bool = True,
+    project_dir: Path | None = None,
+    donate_hf_token: bool = False,
 ) -> str:
-    """Ask the backend to start a CPU transfer job. Returns the job id."""
+    """Ask the backend to start a CPU transfer job. Returns the job id.
+
+    ``donate_hf_token`` attaches a locally-found HF token to this one
+    transfer instead of relying on an account-stored one. This is one of
+    the two functions allowed to hold the plaintext (see lqh.hf_token):
+    it goes straight into the request body and never into a return value
+    or an exception message.
+    """
     import httpx
 
     from lqh.auth import require_token
     from lqh.config import load_config
+    from lqh.hf_token import donatable_hf_token, redact
 
     config = load_config()
     token = require_token()
@@ -51,12 +61,24 @@ async def submit_transfer(
         "target_hf_repo": target_hf_repo,
         "private": private,
     }
+    hf: str | None = None
+    if donate_hf_token:
+        hf, _origin = donatable_hf_token(project_dir)
+        if hf:
+            body["hf_token"] = hf
     async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.post(
             url, json=body, headers={"Authorization": f"Bearer {token}"}
         )
         if r.status_code not in (200, 201):
-            raise RuntimeError(f"transfer submit failed ({r.status_code}): {r.text[:300]}")
+            # Scrub before the body reaches an exception message: this
+            # string ends up in a tool result, and a server that echoed
+            # the request back would otherwise put the token in the
+            # conversation. See lqh.hf_token.redact.
+            raise RuntimeError(
+                f"transfer submit failed ({r.status_code}): "
+                f"{redact(r.text, hf)[:300]}"
+            )
         return r.json()["job_id"]
 
 

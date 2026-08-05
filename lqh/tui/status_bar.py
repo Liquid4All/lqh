@@ -37,14 +37,28 @@ class StatusBar:
         self.recent_completion: tuple[str, float] | None = None
         self._spinner_frame: int = 0
         self._spin_start: float = 0.0
-        self._hf_token: bool = bool(os.environ.get("HF_TOKEN"))
-        # Compute-aware HF indicator. For a cloud project the token that
-        # matters is the one STORED on the backend (injected into the
-        # sandbox), not the laptop's env. compute_is_cloud +
-        # hf_cloud_configured are set by the app after resolving the
-        # project's compute target and querying the backend.
+        # Compute-aware HF indicator. Two independent sources now:
+        #
+        #   hf_cloud_configured — a token STORED on the backend, used by
+        #     every cloud job of this account.
+        #   hf_local_source     — a token discoverable on this machine
+        #     (env, project .env, huggingface-cli login), which a cloud
+        #     job can carry for its lifetime once the user consents.
+        #
+        # Both are refreshed by the app; hf_local_source holds a source
+        # LABEL, never a token value. Resolving it is a filesystem read,
+        # so it must not happen in the render path (which runs on every
+        # keystroke) — hence a stored field rather than a lookup below.
+        #
+        # hf_local_donatable is a separate axis because LQH_HF_DONATE=0
+        # disables *sending* the token to a cloud sandbox without making
+        # it any less usable for local or SSH runs. Folding the two into
+        # one field made the bar show HF ✗ to a local user whose next
+        # `push` would in fact authenticate fine.
         self.compute_is_cloud: bool = True
         self.hf_cloud_configured: bool | None = None  # None = unknown
+        self.hf_local_source: str | None = None
+        self.hf_local_donatable: bool = False
         self._gpu_info: str = self._detect_gpu()
         self._cwd: str = self._format_cwd(project_dir)
 
@@ -187,17 +201,30 @@ class StatusBar:
 
         parts.append(("class:status.separator", " │ "))
 
-        # HF token — compute-aware. On a cloud project, the relevant
-        # token is the one stored on the backend (used inside the
-        # sandbox); on ssh/local, it's the laptop's HF_TOKEN env.
+        # HF token — compute-aware. On a cloud project either source can
+        # get a token into the sandbox, so the indicator names which one
+        # is in play: an account token works unattended, while a local
+        # one is offered per job and can be declined. Collapsing them to
+        # a single ✓/✗ used to tell a .env user they had no token while
+        # their next submit would in fact carry one.
         if self.compute_is_cloud:
-            if self.hf_cloud_configured is True:
-                parts.append(("class:status", "🤗 HF ✓"))
+            # Cloud asks the narrower question: not "is there a token on
+            # this machine" but "will one reach the sandbox". A token
+            # behind LQH_HF_DONATE=0 will not, so it must not show as ✓env.
+            has_local = self.hf_local_source is not None and self.hf_local_donatable
+            if self.hf_cloud_configured is True and has_local:
+                parts.append(("class:status", "🤗 ✓both"))
+            elif self.hf_cloud_configured is True:
+                parts.append(("class:status", "🤗 ✓acct"))
+            elif has_local:
+                parts.append(("class:status", "🤗 ✓env"))
             elif self.hf_cloud_configured is False:
                 parts.append(("class:status.dim", "🤗 HF ✗"))
             else:
                 parts.append(("class:status.dim", "🤗 HF ?"))
-        elif self._hf_token:
+        elif self.hf_local_source is not None:
+            # ssh/local: only the machine's own token can matter. Now
+            # sees .env and huggingface-cli login, not just the env var.
             parts.append(("class:status", "🤗 HF ✓"))
         else:
             parts.append(("class:status.dim", "🤗 HF ✗"))

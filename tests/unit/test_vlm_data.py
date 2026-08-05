@@ -370,6 +370,17 @@ def training_project(tmp_path, isolated_home, monkeypatch):
     return project, recorded
 
 
+def _launched_training_config(recorded: dict) -> dict:
+    """The training config out of whichever launch shape was submitted.
+
+    SFT launches a single run (the config is the payload); a sweep nests it
+    under ``base_config``. These tests assert on the training config itself, so
+    they should not care which one ran.
+    """
+    launch = recorded["config"]
+    return launch["base_config"] if launch.get("type") == "sweep" else launch
+
+
 def test_vlm_base_gets_vision_config(training_project) -> None:
     import lqh.tools.handlers as handlers
 
@@ -385,7 +396,7 @@ def test_vlm_base_gets_vision_config(training_project) -> None:
         )
     )
 
-    config = recorded["config"]["base_config"]
+    config = _launched_training_config(recorded)
     assert config["modality"] == "vision"
     assert config["training"]["max_image_tokens"] == 256
     assert config["training"]["learning_rate"] == 5e-4
@@ -416,7 +427,7 @@ def test_text_base_config_unchanged(training_project) -> None:
         )
     )
 
-    config = recorded["config"]["base_config"]
+    config = _launched_training_config(recorded)
     assert "modality" not in config
     assert "max_image_tokens" not in config["training"]
     assert config["training"]["learning_rate"] == 2e-5

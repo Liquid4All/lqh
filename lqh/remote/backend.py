@@ -238,8 +238,17 @@ class RemoteBackend(ABC):
         config: dict[str, Any],
         *,
         module: str = "lqh.train",
+        donate_hf_token: bool = False,
     ) -> str:
-        """Submit a training/inference job.  Returns a job ID (e.g. PID)."""
+        """Submit a training/inference job.  Returns a job ID (e.g. PID).
+
+        ``donate_hf_token`` asks the backend to attach a locally-found
+        Hugging Face token to *this job only* (see :mod:`lqh.hf_token`).
+        Cloud-only and per-call: the SSH backends ignore it, because
+        they have their own token handling that writes to the remote
+        host's ``.env`` — a persistent copy on someone else's machine,
+        which is a different consent question entirely.
+        """
 
     @abstractmethod
     async def poll_status(self, job_id: str) -> JobStatus:

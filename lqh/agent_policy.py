@@ -38,6 +38,16 @@ class AgentPolicy:
     granted_domains: frozenset[str] = frozenset()
     # False: PUBLISH_TOOLS terminate the run with needs_permission.
     allow_publish: bool = True
+    # May an unattended surface send the machine's local HF token with a
+    # cloud job? Deliberately NOT implied by auto_grant_permissions: that
+    # flag means "don't stop to ask before spending compute", which is a
+    # different question from "hand my credential to a remote sandbox".
+    # When False, a donation gate reached without a human is answered
+    # "no" and the job runs without the token (see
+    # Agent._headless_donation_decline). The durable per-project grant in
+    # .lqh/permissions.json is the other way in, and it can only be
+    # written by a human choosing "don't ask again".
+    allow_hf_donate: bool = False
     # COMPUTE_PICK_REQUIRED resolution when no_user: persist this target
     # ("cloud"); None terminates the run with needs_configuration.
     compute_default: str | None = None
@@ -66,23 +76,34 @@ TUI_AUTO = AgentPolicy(
 )
 
 
-def subagent_policy(*, allow_publish: bool = False) -> AgentPolicy:
+def subagent_policy(
+    *, allow_publish: bool = False, allow_hf_donate: bool = False
+) -> AgentPolicy:
     """Policy for `lqh run` (CLI_PLAN §3.3, §4.2).
 
     Task-implied work (scripts, cloud data-gen, training) is auto-granted
     for the invocation; publishing is gated behind ``allow_publish``.
     Secrets always ride the result payload; the run driver additionally
     persists them to .env when the caller passed --save-secret.
+
+    ``allow_hf_donate`` is separate from ``allow_publish`` because it is a
+    different question: not "may this run write to my HF account" but "may
+    it send my local HF token to LQH cloud jobs". Without it a headless
+    run simply proceeds without the token — never blocks (see the
+    hf_donate handling in the agent loop).
     """
     domains = {"script", "cloud_data_gen", "training"}
     if allow_publish:
         domains.add("hf_push")
+    if allow_hf_donate:
+        domains.add("hf_donate")
     return AgentPolicy(
         no_user=True,
         sticky_skill="subagent",
         auto_grant_permissions=False,
         granted_domains=frozenset(domains),
         allow_publish=allow_publish,
+        allow_hf_donate=allow_hf_donate,
         compute_default=None,
         secret_delivery="result",
         terminal_tools=True,

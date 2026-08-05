@@ -46,7 +46,9 @@ def test_build_eval_config_carries_required_fields(tmp_path: Path):
         "scorer": "evals/scorers/translate.md",
         "max_new_tokens": 2048,
     }
-    cfg = sweep._build_eval_of_best_config(base, tmp_path)
+    cfg = sweep._build_eval_config(
+        base, sweep._winner_model_dir(tmp_path), progress_run_dir=tmp_path,
+    )
     assert cfg is not None
     assert cfg["type"] == "infer"
     assert cfg["dataset"] == "datasets/heldout"
@@ -67,7 +69,9 @@ def test_build_eval_config_accepts_lora_winner_dir(tmp_path: Path):
     (tmp_path / "model-lora").mkdir()
     base = {"eval_dataset": "datasets/heldout"}
 
-    cfg = sweep._build_eval_of_best_config(base, tmp_path)
+    cfg = sweep._build_eval_config(
+        base, sweep._winner_model_dir(tmp_path), progress_run_dir=tmp_path,
+    )
 
     assert cfg is not None
     assert cfg["base_model"].endswith("/model-lora")
@@ -78,14 +82,18 @@ def test_build_eval_config_accepts_lora_winner_dir(tmp_path: Path):
 def test_build_eval_config_skips_when_no_eval_dataset(tmp_path: Path):
     (tmp_path / "model").mkdir()
     base = {"type": "sft", "base_model": "x", "dataset": "datasets/train"}
-    assert sweep._build_eval_of_best_config(base, tmp_path) is None
+    assert sweep._build_eval_config(
+        base, sweep._winner_model_dir(tmp_path), progress_run_dir=tmp_path,
+    ) is None
 
 
 def test_build_eval_config_skips_when_no_winner_model(tmp_path: Path):
     # No tmp_path/model directory exists — sweep failed to materialize
     # a winner, so eval-of-best must skip.
     base = {"type": "sft", "eval_dataset": "datasets/heldout"}
-    assert sweep._build_eval_of_best_config(base, tmp_path) is None
+    assert sweep._build_eval_config(
+        base, sweep._winner_model_dir(tmp_path), progress_run_dir=tmp_path,
+    ) is None
 
 
 def test_build_eval_config_includes_optional_system_prompt_and_format(tmp_path: Path):
@@ -95,7 +103,9 @@ def test_build_eval_config_includes_optional_system_prompt_and_format(tmp_path: 
         "system_prompt": "You are a translator.",
         "response_format": {"type": "json_schema", "json_schema": {"name": "x"}},
     }
-    cfg = sweep._build_eval_of_best_config(base, tmp_path)
+    cfg = sweep._build_eval_config(
+        base, sweep._winner_model_dir(tmp_path), progress_run_dir=tmp_path,
+    )
     assert cfg["system_prompt"] == "You are a translator."
     assert cfg["response_format"]["type"] == "json_schema"
 

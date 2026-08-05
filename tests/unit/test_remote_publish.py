@@ -70,3 +70,25 @@ def test_a_failed_run_still_publishes_a_protected_model(tmp_path: Path):
     _model_dir(tmp_path)
     checkpoint = next(c for c in _resolve_candidates(tmp_path) if c.relpath == "model")
     assert checkpoint.checkpoint_role == "final"
+
+
+def test_publish_uploads_the_sweep_leaderboard(tmp_path: Path):
+    """A cloud sweep's per-config results only exist in these two files.
+
+    Without them the run comes back with a winner checkpoint and no record of
+    what it beat: `write_run_manifest` reads sweep_summary.json from the run
+    root to fill `result_summary`, and `_format_sweep_summary` renders the
+    table in `training_status`. Both silently found nothing for cloud runs
+    until these were added to the allowlist.
+    """
+    (tmp_path / "sweep_summary.json").write_text(
+        json.dumps({"mode": "sft", "rows": [{"config_id": "lr2e-5_e2"}]}) + "\n"
+    )
+    (tmp_path / "runs.jsonl").write_text(
+        json.dumps({"config_id": "lr2e-5_e2", "rc": 0}) + "\n"
+    )
+
+    kinds = {c.relpath: c.kind for c in _resolve_candidates(tmp_path)}
+
+    assert kinds["sweep_summary.json"] == "metrics"
+    assert kinds["runs.jsonl"] == "metrics"

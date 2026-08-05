@@ -30,6 +30,16 @@ class PermissionStore:
     # Cloud HF-eval submission (eval_hf_model). Its own domain: GPU
     # wall-clock spend, gated by the same consent shape as data_gen.
     cloud_eval_hf_allow_all: bool = False
+    # Donating a locally-found Hugging Face token to a cloud job
+    # (lqh.hf_token). Unlike every other domain here, what is being
+    # consented to is a *credential leaving the machine*, not spend or
+    # execution — so it is deliberately not implied by any of them.
+    #
+    # There is no per-job list to match the allow_all flag: the decision
+    # is "may my token go to LQH cloud jobs from this project", which
+    # doesn't vary per run. A one-time "yes" is carried out-of-band for
+    # that invocation instead of being written here.
+    hf_donate_allow_all: bool = False
 
 
 def _permissions_lock(project_dir: Path):
@@ -51,6 +61,7 @@ def load_permissions(project_dir: Path) -> PermissionStore:
             allowed_training=data.get("allowed_training", []),
             cloud_data_gen_allow_all=data.get("cloud_data_gen_allow_all", False),
             cloud_eval_hf_allow_all=data.get("cloud_eval_hf_allow_all", False),
+            hf_donate_allow_all=data.get("hf_donate_allow_all", False),
         )
     except (json.JSONDecodeError, OSError):
         return PermissionStore()
@@ -136,6 +147,24 @@ def grant_cloud_eval_hf_permission(project_dir: Path) -> None:
         save_permissions(project_dir, perms)
 
 
+def check_hf_donate_permission(project_dir: Path) -> bool:
+    """Whether a locally-found HF token may be sent with cloud jobs."""
+    return load_permissions(project_dir).hf_donate_allow_all
+
+
+def grant_hf_donate_permission(project_dir: Path) -> None:
+    """Project-wide grant — used by "don't ask again" and by auto mode.
+
+    Note there is no one-time counterpart: a plain "yes" rides the
+    invocation's PermissionContext and is never written to disk, so the
+    prompt returns on the next submit.
+    """
+    with _permissions_lock(project_dir):
+        perms = load_permissions(project_dir)
+        perms.hf_donate_allow_all = True
+        save_permissions(project_dir, perms)
+
+
 def check_hf_permission(project_dir: Path, repo_id: str) -> bool:
     perms = load_permissions(project_dir)
     return perms.hf_push_allow_all or repo_id in perms.hf_allowed_repos
@@ -162,7 +191,7 @@ def grant_hf_permission(
 # Consent domain names. Keep aligned with the `permission_domain` tool
 # metadata in lqh/tools/definitions.py.
 PERMISSION_DOMAINS = frozenset(
-    {"script", "cloud_data_gen", "cloud_eval_hf", "training", "hf_push"}
+    {"script", "cloud_data_gen", "cloud_eval_hf", "training", "hf_push", "hf_donate"}
 )
 
 
@@ -229,4 +258,26 @@ class PermissionContext:
             self.full_consent
             or "hf_push" in self.grants
             or check_hf_permission(project_dir, repo_id)
+        )
+
+    def allows_hf_donate(self, project_dir: Path) -> bool:
+        """Whether a locally-found HF token may ride along with a cloud job.
+
+        Two things make this domain unlike the others here.
+
+        It answers "may we", not "should we": a caller that gets False
+        still submits the job, just without the token — see the
+        ``_hf_donate`` decline channel in the agent loop.
+
+        And it deliberately does NOT honour ``full_consent``. That flag
+        means "invoking this tool is consent to what it does", which is a
+        fair reading for running a script or spending compute — but
+        sending one of the user's credentials to our servers is not
+        something the invocation implies. Surfaces that want it say so
+        explicitly: ``lqh tool call --allow-hf-donate``, ``lqh run
+        --allow-hf-donate``, or a durable grant from the TUI prompt.
+        """
+        return (
+            "hf_donate" in self.grants
+            or check_hf_donate_permission(project_dir)
         )
