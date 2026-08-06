@@ -415,3 +415,264 @@ async def test_fetch_result_artifacts_reports_a_download_failure_as_absent(
 
     monkeypatch.setattr("lqh.artifacts.BackendArtifactStore", lambda: BrokenStore())
     assert await runner.fetch_result_artifacts(run_dir) == []
+
+
+# ---------------------------------------------------------------------------
+# Auth is a precondition, not a per-cell failure
+# ---------------------------------------------------------------------------
+
+
+def test_auth_errors_are_told_apart_from_job_errors():
+    from lqh.remote.cloud import CloudError
+
+    assert runner.is_auth_error(CloudError("401: authentication required"))
+    assert runner.is_auth_error(CloudError("403: forbidden"))
+    # A real job failure must still be handled per-cell, not abort the study.
+    assert not runner.is_auth_error(CloudError("500: internal error"))
+    assert not runner.is_auth_error(RuntimeError("401"))
+
+
+def test_auth_help_names_the_usual_cause():
+    """LQH_DEBUG_API_KEY is accepted on /v1/* so datagen succeeds, but it
+    carries no user or org and every cloud submit is rejected. A bare
+    '401: authentication required' sends people looking in the wrong place.
+    """
+    help_text = runner._auth_help("401: authentication required")
+    assert "LQH_DEBUG_API_KEY" in help_text
+    assert "unset LQH_DEBUG_API_KEY" in help_text
+    assert "/login" in help_text
+
+
+async def test_cloud_auth_preflight_raises_on_a_rejected_token(tmp_path, monkeypatch):
+    """It must fail here — before data generation — not hours later."""
+    from lqh.remote.cloud import CloudError
+
+    class RejectingBackend:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def plan_job(self, kind, **kw):
+            raise CloudError("401: authentication required")
+
+    monkeypatch.setattr("lqh.remote.cloud.CloudBackend", RejectingBackend)
+
+    with pytest.raises(runner.CloudAuthError, match="LQH_DEBUG_API_KEY"):
+        await runner.check_cloud_auth(tmp_path)
+
+
+async def test_cloud_auth_preflight_tolerates_a_non_auth_planner_failure(
+    tmp_path, monkeypatch,
+):
+    """A planner blip must not block a study whose credentials are fine —
+    submit will surface any real problem with a better message."""
+    from lqh.remote.cloud import CloudError
+
+    class FlakyBackend:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def plan_job(self, kind, **kw):
+            raise CloudError("503: planner unavailable")
+
+    monkeypatch.setattr("lqh.remote.cloud.CloudBackend", FlakyBackend)
+    await runner.check_cloud_auth(tmp_path)  # must not raise
+
+
+async def test_cloud_auth_preflight_passes_on_a_good_token(tmp_path, monkeypatch):
+    class OkBackend:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def plan_job(self, kind, **kw):
+            return {"fits": True, "gpu_type": "A100-40GB"}
+
+    monkeypatch.setattr("lqh.remote.cloud.CloudBackend", OkBackend)
+    await runner.check_cloud_auth(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Jobs that report success and publish nothing
+#
+# Stage A, 2026-08-06: two sandboxes went quiet mid-eval and the next backend
+# restart ("job pump reattached") wrote exit_code=0 for both. Zero artifacts,
+# full GPU time billed, and the harness recorded them as permanent failures
+# against a message blaming the sandbox image. Both halves were wrong.
+# ---------------------------------------------------------------------------
+
+
+def _spec(run_name: str = "cell__c0", n_configs: int = 6) -> runner.JobSpec:
+    return runner.JobSpec(
+        cell_id="cell", chunk_index=0, run_name=run_name,
+        launch_config={"grid_override": [{"training": {}} for _ in range(n_configs)]},
+    )
+
+
+def test_no_artifacts_at_all_reads_as_an_orphan_not_a_stale_image(tmp_path):
+    (tmp_path / "artifacts.json").write_text(json.dumps({"artifacts": []}))
+    msg = runner._no_result_message(_spec(), "job-1", tmp_path)
+    assert "orphan" in msg
+    assert "Retrying" in msg
+    assert "Modal" not in msg  # the image is not the suspect here
+
+
+def test_a_published_run_missing_only_the_leaderboard_blames_the_image(tmp_path):
+    (tmp_path / "artifacts.json").write_text(json.dumps({"artifacts": [
+        {"relpath": "model-lora/adapter.safetensors", "artifact_id": "a"},
+        {"relpath": "stdout.log", "artifact_id": "b"},
+    ]}))
+    msg = runner._no_result_message(_spec(), "job-1", tmp_path)
+    assert "eval_all" in msg
+    assert "rebuild the Modal training image" in msg
+    assert "orphan" not in msg
+
+
+def test_reset_clears_the_terminal_state_that_would_block_a_resubmit(tmp_path):
+    run_dir = tmp_path / "runs" / "cell__c0"
+    run_dir.mkdir(parents=True)
+    for name in ("cloud_state.json", "artifacts.json", "status.json",
+                 "progress.jsonl", "stdout.log"):
+        (run_dir / name).write_text("stale")
+    (run_dir / "config.json").write_text("keep me")
+
+    runner.reset_run_dir(tmp_path, "cell__c0")
+
+    assert not (run_dir / "cloud_state.json").exists()
+    assert not (run_dir / "artifacts.json").exists()
+    assert (run_dir / "config.json").exists()
+
+
+def _cloud_backend(monkeypatch, *, state: str, failure=None):
+    from lqh.remote.backend import JobStatus
+
+    class Backend:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def submit_run(self, run_dir, config, module="lqh.train"):
+            return "job-1"
+
+        async def sync_progress(self, remote, local):
+            return None
+
+        async def poll_status(self, job_id):
+            return JobStatus(state=state, error="boom", failure=failure)
+
+    monkeypatch.setattr("lqh.remote.cloud.CloudBackend", Backend)
+
+
+async def test_a_completed_job_with_no_leaderboard_is_retryable(tmp_path, monkeypatch):
+    _cloud_backend(monkeypatch, state="completed")
+    monkeypatch.setattr(runner, "fetch_result_artifacts", _returns([]))
+
+    with pytest.raises(runner.EmptyResultError):
+        await runner.run_cloud(_spec(), workdir=tmp_path, timeout=60)
+
+
+async def test_an_infra_classified_failure_is_retryable(tmp_path, monkeypatch):
+    _cloud_backend(monkeypatch, state="failed", failure={"cls": "preempted", "infra": True})
+
+    with pytest.raises(runner.InfraJobError):
+        await runner.run_cloud(_spec(), workdir=tmp_path, timeout=60)
+
+
+async def test_a_config_failure_is_not_retryable(tmp_path, monkeypatch):
+    """An OOM or a bad config fails identically on the second submit — the
+    only thing a retry buys is another GPU bill."""
+    _cloud_backend(monkeypatch, state="failed", failure={"cls": "oom", "infra": False})
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await runner.run_cloud(_spec(), workdir=tmp_path, timeout=60)
+    assert not isinstance(excinfo.value, runner.RetryableJobError)
+
+
+def _returns(value):
+    async def _f(*a, **kw):
+        return value
+    return _f
+
+
+# ---------------------------------------------------------------------------
+# The retry loop in _run_cell
+# ---------------------------------------------------------------------------
+
+
+def _cell_args(**over):
+    import argparse
+    base = dict(no_resume=True, compute="cloud", job_timeout=60)
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+async def _run_one_cell(monkeypatch, tmp_path, outcomes: list):
+    """Drive _run_cell with a scripted sequence of run_job outcomes."""
+    import asyncio
+
+    from tests.benchmarks.hp_defaults import run as run_mod
+    from tests.benchmarks.hp_defaults.cells import build_cells
+
+    attempts: list[str] = []
+
+    async def fake_run_job(spec, **kw):
+        attempts.append(spec.run_name)
+        outcome = outcomes[len(attempts) - 1]
+        if outcome is not None:
+            raise outcome
+
+    monkeypatch.setattr(runner, "run_job", fake_run_job)
+    notes = await run_mod._run_cell(
+        build_cells()[0], [_spec()], workdir=tmp_path, args=_cell_args(),
+        semaphore=asyncio.Semaphore(1),
+    )
+    return attempts, notes
+
+
+async def test_an_orphaned_chunk_is_resubmitted_once(tmp_path, monkeypatch):
+    attempts, notes = await _run_one_cell(
+        monkeypatch, tmp_path, [runner.EmptyResultError("orphan"), None],
+    )
+    assert len(attempts) == 2
+    assert notes == []  # the retry succeeded, so the cell is whole
+
+
+async def test_a_chunk_lost_twice_is_reported_not_retried_forever(
+    tmp_path, monkeypatch,
+):
+    attempts, notes = await _run_one_cell(
+        monkeypatch, tmp_path,
+        [runner.EmptyResultError("orphan"), runner.EmptyResultError("orphan again")],
+    )
+    assert len(attempts) == 2
+    assert len(notes) == 1 and "orphan again" in notes[0]
+
+
+async def test_a_config_failure_is_recorded_on_the_first_attempt(
+    tmp_path, monkeypatch,
+):
+    attempts, notes = await _run_one_cell(
+        monkeypatch, tmp_path, [RuntimeError("CUDA out of memory"), None],
+    )
+    assert len(attempts) == 1
+    assert len(notes) == 1 and "out of memory" in notes[0]
+
+
+async def test_a_retry_clears_the_previous_attempts_state(tmp_path, monkeypatch):
+    """Without this the resubmit inherits a terminal cloud_state.json and
+    sync_progress returns instantly, so the new job is never watched."""
+    run_dir = tmp_path / "runs" / "cell__c0"
+    run_dir.mkdir(parents=True)
+    (run_dir / "cloud_state.json").write_text('{"status": "completed"}')
+
+    await _run_one_cell(
+        monkeypatch, tmp_path, [runner.EmptyResultError("orphan"), None],
+    )
+    assert not (run_dir / "cloud_state.json").exists()
+
+
+async def test_auth_failure_still_aborts_instead_of_retrying(tmp_path, monkeypatch):
+    from lqh.remote.cloud import CloudError
+
+    with pytest.raises(runner.CloudAuthError):
+        await _run_one_cell(
+            monkeypatch, tmp_path,
+            [CloudError("401: authentication required"), None],
+        )

@@ -28,6 +28,92 @@ logger = logging.getLogger(__name__)
 DEFAULT_CHUNK_SIZE = 6
 
 
+def is_auth_error(exc: BaseException) -> bool:
+    """Whether a submit failure is a credentials problem rather than a job one.
+
+    Auth is a precondition of the whole study, not a property of one cell:
+    retrying the other 47 cells against the same rejected token just burns
+    wall-clock and produces 47 identical tracebacks.
+    """
+    from lqh.remote.cloud import CloudError
+
+    return isinstance(exc, CloudError) and (
+        "401" in str(exc) or "403" in str(exc)
+    )
+
+
+class CloudAuthError(SystemExit):
+    """Raised when the credentials cannot submit cloud jobs."""
+
+
+class RetryableJobError(RuntimeError):
+    """A job that failed for a reason unrelated to its configuration.
+
+    Resubmitting the identical chunk is pointless for an OOM or a bad config
+    and correct for an interruption, so the two are separate exception types.
+    """
+
+
+class EmptyResultError(RetryableJobError):
+    """The job reported success but published no sweep leaderboard.
+
+    Observed on 2026-08-06 in stage A: two sandboxes went quiet mid-eval, and
+    on the next backend restart the job pump reattached and immediately wrote
+    ``exit_code=0, status=completed`` for both. Nothing was ever published, yet
+    the study was billed the full GPU time. A job that really finishes writes
+    the leaderboard *before* exiting, so "completed with no artifacts" is an
+    orphan wearing a success label — retry it rather than trusting the status.
+    """
+
+
+class InfraJobError(RetryableJobError):
+    """The job failed and the backend classified the cause as infrastructure."""
+
+
+def _auth_help(detail: str) -> str:
+    return (
+        f"cloud authentication failed ({detail}).\n\n"
+        "The most common cause is LQH_DEBUG_API_KEY being set: it is accepted "
+        "on /v1/* (so data generation works fine) but carries no user or org, "
+        "and cloud jobs need both for ownership and billing — so every submit "
+        "is rejected. Check with:\n"
+        "    echo $LQH_DEBUG_API_KEY\n"
+        "and if it is set, unset it so the logged-in credentials are used:\n"
+        "    unset LQH_DEBUG_API_KEY\n\n"
+        "Otherwise the CLI token is missing or expired — run `lqh` and /login."
+    )
+
+
+async def check_cloud_auth(workdir: Path) -> None:
+    """Verify the credentials can submit cloud jobs, before spending anything.
+
+    The planner endpoint validates auth and creates nothing, so this costs one
+    round trip. It runs BEFORE data generation on purpose: a study that
+    generates four tasks' worth of data for hours and only then discovers it
+    cannot submit has wasted the expensive part for no result.
+    """
+    from lqh.remote.backend import RemoteConfig
+    from lqh.remote.cloud import CloudBackend, CloudError
+
+    backend = CloudBackend(
+        RemoteConfig(
+            name="cloud", type="cloud",
+            hostname="api.lqh.ai", remote_root="cloud:lqh",
+        ),
+        workdir,
+    )
+    try:
+        await backend.plan_job("train_sft", base_model="LiquidAI/LFM2.5-350M")
+    except CloudError as exc:
+        if is_auth_error(exc):
+            raise CloudAuthError(_auth_help(str(exc))) from exc
+        # A planner error that is not about auth (an unknown kind, a backend
+        # blip) should not block the study — submit will surface it properly.
+        logger.warning("cloud preflight could not reach the planner: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cloud preflight skipped: %s", exc)
+
+
 @dataclass
 class JobSpec:
     cell_id: str
@@ -137,6 +223,56 @@ async def fetch_result_artifacts(run_dir: Path) -> list[str]:
     return fetched
 
 
+def _published_anything(run_dir: Path) -> int:
+    try:
+        listing = json.loads((run_dir / "artifacts.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0
+    entries = listing.get("artifacts")
+    return len(entries) if isinstance(entries, list) else 0
+
+
+def _no_result_message(spec: JobSpec, job_id: str, run_dir: Path) -> str:
+    """Why a 'completed' job left nothing behind — the two causes look alike.
+
+    Distinguishing them from the client costs one already-synced file: an
+    orphan publishes *nothing*, while an out-of-date sandbox image still
+    publishes checkpoints and logs and only misses the leaderboard.
+    """
+    published = _published_anything(run_dir)
+    if published == 0:
+        return (
+            f"{spec.label}: cloud job {job_id} reported completed but published "
+            "no artifacts at all — not even logs. A sandbox that finishes "
+            "normally registers its artifacts before exiting, so this is an "
+            "infrastructure orphan mislabelled as success (a backend restart "
+            "reattaching to a sandbox it can no longer observe writes "
+            "exit_code=0). Retrying the chunk."
+        )
+    return (
+        f"{spec.label}: cloud job {job_id} published {published} artifacts but no "
+        "sweep_summary.json. The sandbox image's lqh most likely predates "
+        "eval_all / the sweep-leaderboard artifact — check the job log for the "
+        "'sweep: eval_all on' banner, and if it is missing, publish the current "
+        "lqh and rebuild the Modal training image (CLAUDE.md 'push to "
+        "production')."
+    )
+
+
+def reset_run_dir(workdir: Path, run_name: str) -> None:
+    """Clear one job's synced state so the chunk can be resubmitted in place.
+
+    The run dir has to keep its name — ``_collect`` finds a cell's rows by run
+    name — so a retry reuses it and only the previous attempt's bookkeeping is
+    removed. cloud_state.json is the important one: sync_progress returns
+    immediately when the state it loads is already terminal.
+    """
+    run_dir = workdir / "runs" / run_name
+    for name in ("cloud_state.json", "artifacts.json", "status.json",
+                 "progress.jsonl", "stdout.log", "stderr.log"):
+        (run_dir / name).unlink(missing_ok=True)
+
+
 def read_rows(workdir: Path, run_name: str) -> list[dict[str, Any]]:
     """Per-config rows from a finished job, or [] if it has none yet."""
     path = sweep_summary_path(workdir, run_name)
@@ -225,20 +361,17 @@ async def run_cloud(
         if status.state == "completed":
             fetched = await fetch_result_artifacts(run_dir)
             if "sweep_summary.json" not in fetched:
-                raise RuntimeError(
-                    f"{spec.label}: cloud job {job_id} completed but published no "
-                    "sweep_summary.json. The sandbox image's lqh predates "
-                    "eval_all / the sweep-leaderboard artifact — publish the "
-                    "current lqh and rebuild the Modal training image before "
-                    "running the study (see CLAUDE.md 'push to production')."
-                )
+                raise EmptyResultError(_no_result_message(spec, job_id, run_dir))
             logger.info("%s: cloud job completed", spec.label)
             return
         if status.state == "failed":
-            raise RuntimeError(
+            detail = (
                 f"{spec.label}: cloud job {job_id} failed: "
                 f"{status.error or 'no error recorded'}"
             )
+            if (status.failure or {}).get("infra"):
+                raise InfraJobError(f"{detail} (classified infrastructure)")
+            raise RuntimeError(detail)
         await asyncio.sleep(poll_interval)
         waited += poll_interval
 

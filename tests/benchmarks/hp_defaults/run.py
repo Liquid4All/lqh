@@ -48,6 +48,11 @@ from .report import write_report
 
 logger = logging.getLogger("hp_defaults")
 
+# One resubmit for a chunk lost to infrastructure. Two identical losses are
+# not bad luck, and an unbounded retry on a systematically broken cell would
+# spend the study's budget on a config that can never report.
+_MAX_CHUNK_ATTEMPTS = 2
+
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -209,19 +214,42 @@ async def _run_cell(
         if not args.no_resume and runner.job_complete(workdir, spec.run_name, expected):
             logger.info("%s: reusing %d completed configs", spec.label, expected)
             continue
-        async with semaphore:
-            logger.info("%s: launching %d configs", spec.label, expected)
-            try:
-                await runner.run_job(
-                    spec, workdir=workdir, compute=args.compute,
-                    timeout=args.job_timeout,
+        for attempt in range(1, _MAX_CHUNK_ATTEMPTS + 1):
+            async with semaphore:
+                logger.info(
+                    "%s: launching %d configs%s", spec.label, expected,
+                    f" (attempt {attempt})" if attempt > 1 else "",
                 )
-            except Exception as exc:  # noqa: BLE001
-                # One dead chunk must not sink the study. Its configs simply
-                # go unmeasured, the analysis excludes them from the balanced
-                # panel, and the report says so.
-                logger.exception("%s failed", spec.label)
-                notes.append(f"{spec.label}: {exc}")
+                try:
+                    await runner.run_job(
+                        spec, workdir=workdir, compute=args.compute,
+                        timeout=args.job_timeout,
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    if runner.is_auth_error(exc):
+                        # Not this cell's problem — the credentials are wrong
+                        # for every cell. Marching through the remaining 47
+                        # produces 47 identical tracebacks and an empty report.
+                        raise runner.CloudAuthError(
+                            runner._auth_help(str(exc))
+                        ) from exc
+                    retryable = isinstance(exc, runner.RetryableJobError)
+                    if retryable and attempt < _MAX_CHUNK_ATTEMPTS:
+                        # Preemption and silently-orphaned jobs say nothing
+                        # about the config, and losing a chunk costs six cells'
+                        # worth of the panel the analysis needs to stay
+                        # balanced. Resubmit once; a second identical loss is
+                        # evidence of something real, so stop there.
+                        logger.warning("%s: %s", spec.label, exc)
+                        runner.reset_run_dir(workdir, spec.run_name)
+                        continue
+                    # One dead chunk must not sink the study. Its configs
+                    # simply go unmeasured, the analysis excludes them from the
+                    # balanced panel, and the report says so.
+                    logger.exception("%s failed", spec.label)
+                    notes.append(f"{spec.label}: {exc}")
+                    break
     return notes
 
 
@@ -368,6 +396,12 @@ async def _main_async(args: argparse.Namespace) -> int:
                 "Drop the offending model(s) or pass --skip-preflight."
             )
 
+    # Prove we can submit BEFORE generating anything. Data generation for four
+    # tasks at scale runs for hours; discovering a rejected token afterwards
+    # spends the expensive part for nothing.
+    if not args.analyze_only and args.compute == "cloud":
+        await runner.check_cloud_auth(workdir)
+
     tasks = {t.name: t for t in resolve_tasks(task_names)}
     datasets: dict[str, dict[int, str]] = {}
     if not args.analyze_only:
@@ -397,20 +431,30 @@ async def _main_async(args: argparse.Namespace) -> int:
     notes: list[str] = []
     if not args.analyze_only:
         semaphore = asyncio.Semaphore(max(1, args.max_concurrent_jobs))
-        pending = [
-            _run_cell(cell, specs_by_cell[cell.id], workdir=workdir,
-                      args=args, semaphore=semaphore)
+        running = [
+            asyncio.create_task(
+                _run_cell(cell, specs_by_cell[cell.id], workdir=workdir,
+                          args=args, semaphore=semaphore)
+            )
             for cell in cells
         ]
-        for coro in asyncio.as_completed(pending):
-            notes.extend(await coro)
-            # Rewrite the report after every cell so a long study is
-            # inspectable while it is still running.
-            observations = [
-                o for cell in cells
-                for o in _collect(cell, specs_by_cell[cell.id], workdir)
-            ]
-            write_report(workdir / "report", meta, observations, notes)
+        try:
+            for task in asyncio.as_completed(running):
+                notes.extend(await task)
+                # Rewrite the report after every cell so a long study is
+                # inspectable while it is still running.
+                observations = [
+                    o for cell in cells
+                    for o in _collect(cell, specs_by_cell[cell.id], workdir)
+                ]
+                write_report(workdir / "report", meta, observations, notes)
+        except runner.CloudAuthError:
+            # Stop the fleet rather than let the remaining cells each rediscover
+            # the same rejected token.
+            for task in running:
+                task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+            raise
 
     observations = [
         o for cell in cells for o in _collect(cell, specs_by_cell[cell.id], workdir)
