@@ -1504,7 +1504,7 @@ class LqhApp:
             self._invalidate()
             await self._emit(
                 render_agent_message(
-                    "👋 **Welcome to Liquid Harness!**\n\n"
+                    "👋 **Welcome to LQH!**\n\n"
                     "I don't see a `SPEC.md` in this directory yet, so let's start "
                     "by figuring out what problem you want to solve.\n\n"
                     "**What kind of model do you want to build?** Describe the task — "

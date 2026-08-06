@@ -1,15 +1,15 @@
 
 <p align="center">
   <a href="https://youtu.be/suC4VlY8z6Y">
-    <img src="misc/image.png" alt="Liquid Harness — watch the demo" />
+    <img src="misc/image.png" alt="LQH — watch the demo" />
   </a>
 </p>
 
-# lqh — Liquid Harness
+# LQH
 
 **From zero to a fine-tuned model in under an hour.**
 
-Liquid Harness is a terminal agent that turns a plain-English description of your task into a small, fast, task-specific [Liquid Foundation Model](https://www.liquid.ai/). You describe the problem; the agent interviews you, writes the specification, generates and curates training data, fine-tunes, evaluates, and iterates until the model beats baseline. No ML experience required.
+LQH is a terminal agent that turns a plain-English description of your task into a small, fast, task-specific [Liquid Foundation Model](https://www.liquid.ai/). You describe the problem; the agent interviews you, writes the specification, generates and curates training data, fine-tunes, evaluates, and iterates until the model beats baseline. No ML experience required.
 
 > [!IMPORTANT]
 > ⚠️ **Closed beta** — visit [lqh.ai](https://lqh.ai) to request access.
@@ -25,7 +25,7 @@ lqh
 
 Large general-purpose models are expensive, slow, and overkill for most production tasks. A 350M–1.2B model fine-tuned on *your* task is cheaper, faster, runs on-device, and often more accurate — but getting there normally requires an ML team: data pipelines, judges, training loops, eval harnesses.
 
-Liquid Harness collapses all of that into a conversation:
+LQH collapses all of that into a conversation:
 
 1. **💬 Describe your task** — the agent asks clarifying questions and writes a spec.
 2. **☕ Let it work** — it generates synthetic data, scores every sample against a rubric, filters, runs baselines, fine-tunes, and evaluates.
@@ -196,7 +196,7 @@ Everything is plain files — specs are markdown, pipelines are Python, datasets
 ## 🔧 Requirements
 
 - Python 3.11+ (`uv tool install` fetches one automatically if needed)
-- A Liquid Harness account ([request access](https://lqh.ai))
+- An LQH account ([request access](https://lqh.ai))
 - Optional: `torch` + `transformers` for local fine-tuning
 - Optional: `HF_TOKEN` for HuggingFace dataset sync
 

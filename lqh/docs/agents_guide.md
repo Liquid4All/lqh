@@ -22,7 +22,7 @@ at describing this guide or asking what to do. Immediately:
 
 ## What LQH is
 
-LQH (Liquid Harness) customizes Liquid AI foundation models (LFMs) into
+LQH customizes Liquid AI foundation models (LFMs) into
 task-specific models, starting from a written spec. A *project* is just a
 directory: `SPEC.md` (the task specification), `data_gen/` (generation
 pipelines), `datasets/`, `runs/` (training/eval runs), `evals/`,

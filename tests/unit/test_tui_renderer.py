@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from lqh.tui.renderer import (
+    LIQUID_AI_LOGO,
+    WELCOME_LOGO,
     render_agent_message,
     render_system_message,
     render_user_message,
@@ -39,3 +41,12 @@ class TestRenderer:
 
     def test_welcome_includes_version(self) -> None:
         assert f"v{__version__}" in render_welcome()
+
+    def test_welcome_uses_compact_lqh_logo(self) -> None:
+        assert len(WELCOME_LOGO) == 6
+        assert max(map(len, WELCOME_LOGO)) < 40
+
+    def test_welcome_includes_liquid_ai_ascii_logo(self) -> None:
+        assert len(LIQUID_AI_LOGO) == 15
+        assert set("".join(LIQUID_AI_LOGO)) == {" ", "L", "Q", "H"}
+        assert chr(64) not in "".join(LIQUID_AI_LOGO)

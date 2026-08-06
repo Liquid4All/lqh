@@ -13,16 +13,38 @@ from lqh import __version__
 
 BLOCK_INDENT = 2
 MIN_RENDER_WIDTH = 20
-WELCOME_LOGO = (
-    "██╗     ██╗ ██████╗ ██╗   ██╗██╗██████╗     ██╗  ██╗ █████╗ ██████╗ ███╗   ██╗███████╗███████╗███████╗",
-    "██║     ██║██╔═══██╗██║   ██║██║██╔══██╗    ██║  ██║██╔══██╗██╔══██╗████╗  ██║██╔════╝██╔════╝██╔════╝",
-    "██║     ██║██║   ██║██║   ██║██║██║  ██║    ███████║███████║██████╔╝██╔██╗ ██║█████╗  ███████╗███████╗",
-    "██║     ██║██║▄▄ ██║██║   ██║██║██║  ██║    ██╔══██║██╔══██║██╔══██╗██║╚██╗██║██╔══╝  ╚════██║╚════██║",
-    "███████╗██║╚██████╔╝╚██████╔╝██║██████╔╝    ██║  ██║██║  ██║██║  ██║██║ ╚████║███████╗███████║███████║",
-    "╚══════╝╚═╝ ╚══▀▀═╝  ╚═════╝ ╚═╝╚═════╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝╚══════╝",
+LIQUID_AI_LOGO = (
+    "                LQH",
+    "               LQHLQH",
+    "               LQHLQHL",
+    "            LQ   LQHLQHLQ",
+    "          LQHLQ   LQHLQHLQ",
+    "         LQHLQHLQ   LQHLQHLQ",
+    "       LQHLQHLQ     LQHLQHLQ",
+    "      LQHLQHLQ       LQHLQHLQ",
+    "    LQHLQHLQ           LQHLQHLQ",
+    "   LQHLQHLQ             LQHLQHLQ",
+    "   LQHLQHLQ",
+    "     LQHLQHLQ           LQHLQH",
+    "      LQHLQHLQH   LQHLQHLQHL",
+    "        LQHLQ   LQHLQHLQHLQ",
+    "         LQ   LQHLQHLQHLQ",
 )
-# Fixed column spans for the large L, Q, and H glyphs in the welcome banner.
-WELCOME_LOGO_HIGHLIGHTS = ((0, 8), (11, 20), (40, 52))
+LIQUID_AI_LOGO_STYLE = "bold #f8fafc"
+WELCOME_LOGO = (
+    "██╗      ██████╗  ██╗  ██╗",
+    "██║     ██╔═══██╗ ██║  ██║",
+    "██║     ██║   ██║ ███████║",
+    "██║     ██║▄▄ ██║ ██╔══██║",
+    "███████╗╚██████╔╝ ██║  ██║",
+    "╚══════╝ ╚══▀▀═╝  ╚═╝  ╚═╝",
+)
+# Fixed column spans and colors for the large L, Q, and H glyphs.
+WELCOME_LOGO_GLYPHS = (
+    (0, 8, "bold #38bdf8"),  # L — cyan
+    (9, 18, "bold #a78bfa"),  # Q — violet
+    (19, 27, "bold #fbbf24"),  # H — gold
+)
 
 
 def _make_console(width: int = 100) -> Console:
@@ -83,12 +105,17 @@ def render_markdown(text: str, width: int = 100) -> str:
     return buf.getvalue()
 
 
-def _render_welcome_logo_line(line: str, *, base_style: str, accent_style: str) -> Text:
-    """Render one welcome banner row with brighter L/Q/H spans."""
+def _render_welcome_logo_line(line: str, *, base_style: str) -> Text:
+    """Render one welcome banner row with a distinct color for each glyph."""
     text = Text(f"  {line}", style=base_style)
-    for start, end in WELCOME_LOGO_HIGHLIGHTS:
-        text.stylize(accent_style, 2 + start, 2 + end)
+    for start, end, style in WELCOME_LOGO_GLYPHS:
+        text.stylize(style, 2 + start, 2 + end)
     return text
+
+
+def _render_liquid_ai_logo_line(line: str) -> Text:
+    """Render the Liquid AI mark in white."""
+    return Text(f"  {line}", style=LIQUID_AI_LOGO_STYLE)
 
 
 def render_agent_message(text: str, width: int = 100) -> str:
@@ -370,7 +397,10 @@ def render_file_view(path: str, content: str, width: int = 100) -> str:
 def render_welcome(width: int = 100) -> str:
     """Render the welcome screen."""
     buf = StringIO()
-    logo_width = max(len(line) for line in WELCOME_LOGO) + 2
+    liquid_logo_width = max(len(line) for line in LIQUID_AI_LOGO)
+    lqh_logo_width = max(len(line) for line in WELCOME_LOGO)
+    logo_gap = 4
+    logo_width = 2 + liquid_logo_width + logo_gap + 2 + lqh_logo_width
     console = Console(
         file=buf,
         force_terminal=True,
@@ -378,21 +408,23 @@ def render_welcome(width: int = 100) -> str:
         color_system="truecolor",
     )
 
-    logo_style = "bold #60a5fa"
-    accent_style = "bold #f8fafc"
+    logo_style = "bold #94a3b8"
     accent = "dim #94a3b8"
 
     console.print()
-    for line in WELCOME_LOGO:
-        console.print(
-            _render_welcome_logo_line(
-                line,
-                base_style=logo_style,
-                accent_style=accent_style,
-            ),
-            no_wrap=True,
-            overflow="ignore",
-        )
+    lqh_start_row = (len(LIQUID_AI_LOGO) - len(WELCOME_LOGO)) // 2
+    for row, liquid_line in enumerate(LIQUID_AI_LOGO):
+        brand_line = _render_liquid_ai_logo_line(liquid_line)
+        lqh_row = row - lqh_start_row
+        if 0 <= lqh_row < len(WELCOME_LOGO):
+            brand_line.append(" " * (liquid_logo_width - len(liquid_line) + logo_gap))
+            brand_line.append_text(
+                _render_welcome_logo_line(
+                    WELCOME_LOGO[lqh_row],
+                    base_style=logo_style,
+                )
+            )
+        console.print(brand_line, no_wrap=True, overflow="ignore")
 
     console.print()
     console.print(

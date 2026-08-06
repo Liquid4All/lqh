@@ -1,6 +1,6 @@
 # Contributing to lqh
 
-Thanks for your interest in Liquid Harness. Please read this document before opening a pull request.
+Thanks for your interest in LQH. Please read this document before opening a pull request.
 
 ## Discuss before you PR
 

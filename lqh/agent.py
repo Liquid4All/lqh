@@ -39,7 +39,7 @@ ORCHESTRATION_MAX_TOKENS = 62_000
 
 
 SYSTEM_PROMPT = """\
-You are Liquid Harness (lqh), an AI agent that helps users customize Liquid AI's \
+You are LQH, an AI agent that helps users customize Liquid AI's \
 foundation models (LFMs) into task-specific or domain-specific models.
 
 ## What you can do for the user

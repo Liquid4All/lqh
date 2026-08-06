@@ -1,4 +1,4 @@
-"""Liquid Harness CLI entry point.
+"""LQH CLI entry point.
 
 Bare ``lqh`` (and ``lqh --auto``) launch the TUI, unchanged. The
 subcommands (``hello``, ``docs``, ``tool``, ``login``, ``project``) are
@@ -120,7 +120,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = _ContractParser(
         prog="lqh",
         description=(
-            "Liquid Harness — agent for customizing Liquid AI foundation "
+            "LQH — agent for customizing Liquid AI foundation "
             "models into task-specific models. Run `lqh` with no arguments "
             "in your project directory to start the interactive TUI."
         ),

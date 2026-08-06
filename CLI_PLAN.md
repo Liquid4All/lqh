@@ -499,7 +499,7 @@ subparsers; then the harness block as an epilog (~5 lines, decision #1):
 ```
 usage: lqh [-h] [--version] [--auto SPEC_DIR] [--spec STRING] [command] …
 
-Liquid Harness — agent for customizing Liquid AI foundation models into
+LQH — agent for customizing Liquid AI foundation models into
 task-specific models. Run `lqh` with no arguments in your project
 directory to start the interactive TUI.
 
