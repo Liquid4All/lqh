@@ -15,7 +15,7 @@ from lqh.project_identity import cloud_project_key as _ckey
 from typing import Any, Callable, Awaitable
 
 from lqh.skills import list_available_skills, load_skill_content
-from lqh.tools.permissions import PermissionContext
+from lqh.tools.permissions import PERMISSIONS_FILE, PermissionContext
 
 logger = logging.getLogger(__name__)
 
@@ -2984,19 +2984,27 @@ HF_MAPPINGS_FILE = ".lqh/hf.json"
 # Options for the HF-donation consent prompt. Matched by substring in the
 # agent loop's grant site, so keep the distinguishing words ("don't ask
 # again", "without") stable.
+#
+# Yes and no are deliberately symmetric: both have a durable form. Without
+# the durable no, a user who declines gets asked again at every cloud
+# submit — five sites, so a single pipeline re-asks several times — and
+# the only way out was LQH_HF_DONATE=0, which means leaving the session to
+# set an env var.
 HF_DONATE_OPTIONAL_OPTIONS = [
     "Yes — send my HF token with this job",
     "Yes, and don't ask again for this project",
     "No — run this job without it",
+    "No, and don't ask again for this project",
 ]
 
-# Same three answers, but the decline option cannot claim the job still
+# Same four answers, but the decline options cannot claim the job still
 # runs: a transfer or a GGUF push with no token anywhere is rejected by
 # the backend.
 HF_DONATE_REQUIRED_OPTIONS = [
     "Yes — send my HF token with this job",
     "Yes, and don't ask again for this project",
     "No — don't send it (needs a token stored via /hf_login)",
+    "No, and don't ask again for this project",
 ]
 
 # Back-compat alias; the optional wording is the common case.
@@ -3097,9 +3105,9 @@ def _resolve_hf_donation(
     # again mid-pipeline is the complaint this path exists to remove: a
     # credential question arriving between two stages of a run the user
     # is watching reads as "something needs my token *now*", when in fact
-    # nothing here does. The durable per-project grant written by "don't
-    # ask again" is one of the answers this reads, so that option keeps
-    # working exactly as before.
+    # nothing here does. Both durable per-project answers written by the
+    # "don't ask again" options are read here, so answering either one
+    # mid-pipeline silences every later submit in the same run.
     decision = resolve_hf_donate_decision(project_dir)
     if decision is not None:
         return decision == DONATE_ALWAYS, None
@@ -3107,20 +3115,34 @@ def _resolve_hf_donation(
     where = origin.label
     if origin.path:
         where += f" ({origin.path})"
+    # Both "don't ask again" answers are written to disk, and there is no
+    # in-product toggle to undo them — so the prompt has to name the file,
+    # the way the startup question does. Being told a decision is durable
+    # without being told where it lives is how a user ends up unable to
+    # take it back.
+    durable_note = (
+        f"Either \"don't ask again\" answer is recorded in "
+        f"{PERMISSIONS_FILE} — change it there any time, or set "
+        f"LQH_HF_DONATE=0 to stop offering this on every project."
+    )
     if token_required:
         # This workflow uploads to HF. Without a token there is nothing
         # to run, so "declining still runs the job" would be a lie.
         decline_note = (
             "This job UPLOADS to Hugging Face, so it needs a token. Declining "
             "works only if you already stored one with /hf_login — otherwise "
-            "the job is rejected and nothing is charged. Set LQH_HF_DONATE=0 "
-            "to stop offering this."
+            "the job is rejected and nothing is charged. \"No, and don't ask "
+            "again\" also makes that the standing answer for this project — "
+            "later upload jobs then behave the same way, without asking. "
+            + durable_note
         )
     else:
         decline_note = (
             "Declining still runs the job — without this token (any token you "
-            "stored with /hf_login is unaffected). Set LQH_HF_DONATE=0 to stop "
-            "offering this."
+            "stored with /hf_login is unaffected). \"No, and don't ask again\" "
+            "also makes that the standing answer for this project, so no later "
+            "job in this run asks again. "
+            + durable_note
         )
     extra = ""
     if origin.is_hub_cache:

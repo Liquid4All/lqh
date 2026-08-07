@@ -40,12 +40,13 @@ class PermissionStore:
     # doesn't vary per run. A one-time "yes" is carried out-of-band for
     # that invocation instead of being written here.
     hf_donate_allow_all: bool = False
-    # The recorded "no" to that same question. Only the up-front startup
-    # question writes this — a mid-job decline stays one-time (it rides
-    # the invocation as _hf_donate=False), because "not this job" and
-    # "not ever" are different answers and only the startup prompt offers
-    # the second one. Set means: never ask again in this project, never
-    # donate from it.
+    # The recorded "no" to that same question. Written by whichever
+    # prompt offered a durable decline — the up-front startup question,
+    # or the mid-job fallback's "No, and don't ask again". A PLAIN
+    # mid-job "no" stays one-time (it rides the invocation as
+    # _hf_donate=False), because "not this job" and "not ever" are
+    # different answers. Set means: never ask again in this project,
+    # never donate from it.
     hf_donate_declined: bool = False
 
 
@@ -179,11 +180,13 @@ def grant_hf_donate_permission(project_dir: Path) -> None:
 
 
 def deny_hf_donate_permission(project_dir: Path) -> None:
-    """Project-wide "no" — recorded by the startup question only.
+    """Project-wide "no" — the durable half of the decline.
 
-    Distinct from the mid-job decline, which is deliberately not
-    persisted (see PermissionStore.hf_donate_declined): declining one job
-    is not the same statement as declining the project.
+    Written by the startup question's "No — not for this project" and by
+    the mid-job prompt's "No, and don't ask again for this project". A
+    PLAIN mid-job decline is deliberately not persisted (see
+    PermissionStore.hf_donate_declined): declining one job is not the
+    same statement as declining the project.
     """
     with _permissions_lock(project_dir):
         perms = load_permissions(project_dir)

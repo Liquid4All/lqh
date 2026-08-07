@@ -1,4 +1,4 @@
-"""The three answers to the HF-donation prompt, across every tool that asks.
+"""The four answers to the HF-donation prompt, across every tool that asks.
 
 hf_donate is the only permission domain where declining does not cancel
 the action — the job still runs, without the token. That asymmetry lives
@@ -22,7 +22,7 @@ from lqh.tools.permissions import (
     load_permissions,
 )
 
-YES, YES_ALWAYS, NO = HF_DONATE_OPTIONS
+YES, YES_ALWAYS, NO, NO_ALWAYS = HF_DONATE_OPTIONS
 
 
 @pytest.fixture
@@ -38,7 +38,7 @@ def project(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize("label", ["training", "eval", "data-gen", "gguf", "transfer"])
-def test_every_job_kind_prompts_with_the_same_three_options(project, label):
+def test_every_job_kind_prompts_with_the_same_options(project, label):
     donate, prompt = _resolve_hf_donation(project, PermissionContext(), None, label)
 
     assert donate is False
@@ -73,9 +73,10 @@ def test_decline_donates_nothing_and_does_not_reprompt(project):
 
 def test_decline_is_not_persisted(project):
     """A remembered "no" would silently break a later run that needs the
-    token; LQH_HF_DONATE=0 is the durable opt-out instead."""
+    token, so only the explicit "and don't ask again" answer persists."""
     _resolve_hf_donation(project, PermissionContext(), False, "training")
     assert check_hf_donate_permission(project) is False
+    assert load_permissions(project).hf_donate_declined is False
 
 
 def test_no_prompt_without_a_discoverable_token(tmp_path):
@@ -101,13 +102,20 @@ class _FakeAgent:
     """Just enough of the agent to drive _handle_permission_response."""
 
     def __init__(self, project_dir: Path):
-        from lqh.agent import Agent
+        from lqh.agent import Agent, AgentCallbacks
 
         self.project_dir = project_dir
         self.reinvoked: list[dict] = []
+        self.hf_refreshes = 0
         self._handle_permission_response = Agent._handle_permission_response.__get__(self)
+        self._hf_donation_recorded = Agent._hf_donation_recorded.__get__(self)
         self._chain_grants = Agent._chain_grants.__get__(self)
         self._DONATE_CHAIN_DOMAINS = Agent._DONATE_CHAIN_DOMAINS
+
+        async def _recorded() -> None:
+            self.hf_refreshes += 1
+
+        self.callbacks = AgentCallbacks(on_hf_donation_recorded=_recorded)
 
         class _Policy:
             auto_grant_permissions = False
@@ -159,6 +167,169 @@ async def test_no_reinvokes_with_an_explicit_decline(project):
 
     assert call["internal"]["_hf_donate"] is False
     assert check_hf_donate_permission(project) is False
+    assert load_permissions(project).hf_donate_declined is False
+
+
+@pytest.mark.asyncio
+async def test_no_always_persists_the_decline(project):
+    """The reported bug: without a durable no, the offer came back at
+    every cloud submit and the only way out was leaving the session to
+    export LQH_HF_DONATE=0."""
+    call = await _answer(project, "start_training", NO_ALWAYS)
+
+    assert call["internal"]["_hf_donate"] is False
+    assert load_permissions(project).hf_donate_declined is True
+    assert check_hf_donate_permission(project) is False
+
+
+@pytest.mark.asyncio
+async def test_no_always_silences_every_later_submit(project):
+    """What the answer is actually for: the next stage of the same
+    pipeline must not ask again."""
+    await _answer(project, "run_data_gen_pipeline", NO_ALWAYS)
+
+    for label in ("training", "eval", "gguf"):
+        donate, prompt = _resolve_hf_donation(project, PermissionContext(), None, label)
+        assert donate is False
+        assert prompt is None
+
+
+@pytest.mark.asyncio
+async def test_no_always_is_offered_by_upload_jobs_too(project):
+    """The required-token wording changes only the plain decline; the
+    durable one has to be reachable from a transfer or GGUF push as
+    well, or those sites keep re-asking."""
+    from lqh.tools.handlers import HF_DONATE_REQUIRED_OPTIONS
+
+    assert HF_DONATE_REQUIRED_OPTIONS[-1] == NO_ALWAYS
+    await _answer(project, "gguf_convert", HF_DONATE_REQUIRED_OPTIONS[-1])
+    assert load_permissions(project).hf_donate_declined is True
+
+
+@pytest.mark.asyncio
+async def test_the_upload_variants_plain_decline_stays_one_time(project):
+    """Closest near-miss to the durable answer: it starts with "no" and
+    contains "don't", so only the full phrase may separate them."""
+    from lqh.tools.handlers import HF_DONATE_REQUIRED_OPTIONS
+
+    call = await _answer(project, "gguf_convert", HF_DONATE_REQUIRED_OPTIONS[2])
+
+    assert call["internal"]["_hf_donate"] is False
+    assert load_permissions(project).hf_donate_declined is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer",
+    ["stop asking me about this, don't ask again", "cancel", ""],
+)
+async def test_free_text_declines_without_recording_anything(project, answer):
+    """"Other" is free text, so an answer that merely mentions not being
+    asked again is not the offered option. Pinned deliberately: the job
+    is still declined, but nothing durable is inferred from prose about
+    a credential — the offered answer is one keystroke away."""
+    call = await _answer(project, "start_training", answer)
+
+    assert call["internal"]["_hf_donate"] is False
+    perms = load_permissions(project)
+    assert perms.hf_donate_declined is False
+    assert perms.hf_donate_allow_all is False
+
+
+@pytest.mark.asyncio
+async def test_no_always_undoes_a_standing_yes(project):
+    """Changing your mind has to actually move the answer — leaving both
+    flags set would put a contradiction on disk for the resolver."""
+    grant_hf_donate_permission(project)
+    await _answer(project, "start_training", NO_ALWAYS)
+
+    perms = load_permissions(project)
+    assert perms.hf_donate_allow_all is False
+    assert perms.hf_donate_declined is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["auto_grant_permissions", "no_user"])
+@pytest.mark.parametrize("answer_kind", ["yes", "no"])
+async def test_a_headless_surface_never_persists_a_standing_answer(
+    project, surface, answer_kind,
+):
+    """Neither headless surface reaches this handler for a donation key
+    today, but if one starts synthesizing answers again it must not
+    leave a standing decision behind about a credential nobody was
+    asked about — in either direction."""
+    agent = _FakeAgent(project)
+    setattr(agent.policy, surface, True)
+
+    await agent._handle_permission_response(
+        YES_ALWAYS if answer_kind == "yes" else NO_ALWAYS,
+        "start_training", {}, permission_key="hf_donate:training",
+    )
+    perms = load_permissions(project)
+    assert perms.hf_donate_declined is False
+    assert perms.hf_donate_allow_all is False
+    assert agent.hf_refreshes == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["yes", "no"])
+async def test_a_standing_answer_refreshes_the_surfaces_indicator(project, answer):
+    """The 🤗 indicator is derived from the standing answer and is
+    otherwise only recomputed at startup — a mid-workflow answer that
+    didn't notify would leave it describing the old decision all
+    session."""
+    agent = _FakeAgent(project)
+
+    await agent._handle_permission_response(
+        YES_ALWAYS if answer == "yes" else NO_ALWAYS,
+        "start_training", {}, permission_key="hf_donate:training",
+    )
+    assert agent.hf_refreshes == 1
+
+
+@pytest.mark.asyncio
+async def test_a_one_time_answer_does_not_notify(project):
+    """Nothing changed on disk, so there is nothing to re-render."""
+    agent = _FakeAgent(project)
+
+    for response in (YES, NO):
+        await agent._handle_permission_response(
+            response, "start_training", {}, permission_key="hf_donate:training",
+        )
+    assert agent.hf_refreshes == 0
+
+
+@pytest.mark.asyncio
+async def test_the_tui_actually_wires_the_refresh(project, monkeypatch):
+    """The half of the fix the user sees. Without this the callback can
+    be dropped from _create_agent and the suite stays green while the 🤗
+    indicator goes stale for the rest of the session."""
+    import asyncio
+
+    from lqh.session import Session
+    from lqh.tui.app import LqhApp
+
+    monkeypatch.setenv("HOME", str(project))
+    monkeypatch.setattr("lqh.tui.app.get_token", lambda: None)
+    app = LqhApp(project)
+    app._session = Session.create(project)
+    app._invalidate = lambda: None
+
+    refreshed = []
+
+    async def _refresh():
+        refreshed.append(1)
+
+    app._refresh_hf_status = _refresh
+
+    agent = app._create_agent()
+    assert agent.callbacks.on_hf_donation_recorded is not None
+
+    await agent.callbacks.on_hf_donation_recorded()
+    # Scheduled, not awaited — the refresh can take a 15s round trip and
+    # must not stall the agent between the answer and the re-invocation.
+    await asyncio.sleep(0)
+    assert refreshed == [1]
 
 
 @pytest.mark.asyncio
@@ -228,6 +399,9 @@ async def test_a_synthesized_answer_never_donates(project):
 
     assert call["internal"]["_hf_donate"] is False
     assert check_hf_donate_permission(project) is False
+    # Nor does it read as the durable *decline*: an answer synthesized for
+    # some other domain must not settle the donation question either way.
+    assert load_permissions(project).hf_donate_declined is False
 
 
 @pytest.mark.asyncio
@@ -444,8 +618,8 @@ def test_upload_jobs_do_not_claim_declining_still_runs_them(project):
     assert "Declining still runs the job" not in prompt.question
     assert "UPLOADS to Hugging Face" in prompt.question
     assert "/hf_login" in prompt.question
-    # ...and the decline OPTION cannot claim it either.
-    assert prompt.options[-1] == "No — don't send it (needs a token stored via /hf_login)"
+    # ...and the plain decline OPTION cannot claim it either.
+    assert prompt.options[2] == "No — don't send it (needs a token stored via /hf_login)"
 
 
 def test_ordinary_jobs_keep_the_reassuring_wording(project):
@@ -457,7 +631,7 @@ def test_ordinary_jobs_keep_the_reassuring_wording(project):
 
     assert "Declining still runs the job" in prompt.question
     assert "UPLOADS" not in prompt.question
-    assert prompt.options[-1] == "No — run this job without it"
+    assert prompt.options[2] == "No — run this job without it"
 
 
 @pytest.mark.asyncio

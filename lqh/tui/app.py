@@ -162,6 +162,9 @@ class LqhApp:
         self._job_watcher_task: asyncio.Task | None = None
         self._progress_refresh_task: asyncio.Task | None = None
         self._update_check_task: asyncio.Task[None] | None = None
+        # Held only so the scheduled refresh isn't garbage-collected
+        # mid-flight; nothing waits on it. See _on_hf_donation_recorded.
+        self._hf_refresh_task: asyncio.Task[None] | None = None
         self._supervisor = JobSupervisor(
             project_dir,
             hooks=SupervisorHooks(
@@ -1878,6 +1881,7 @@ class LqhApp:
             on_background_task_started=self._on_background_task_started,
             on_await_background=self._await_background,
             on_auto_stage=self._on_auto_stage,
+            on_hf_donation_recorded=self._on_hf_donation_recorded,
         )
         agent = Agent(
             self.project_dir,
@@ -1888,6 +1892,19 @@ class LqhApp:
         )
         self._apply_startup_facts(agent)
         return agent
+
+    async def _on_hf_donation_recorded(self) -> None:
+        """A standing HF-donation answer was just written — re-derive the 🤗 bar.
+
+        Scheduled rather than awaited. This fires between the user
+        answering the prompt and the tool being re-invoked, and
+        _refresh_hf_status can spend up to 15s on the stored-token round
+        trip; blocking the agent there would turn a slow backend into a
+        visible stall on the one path the user just interacted with. The
+        answer is already on disk, so a refresh that lands a moment late
+        costs only an indicator.
+        """
+        self._hf_refresh_task = asyncio.create_task(self._refresh_hf_status())
 
     def _on_auto_stage(self, stage: str, note: str | None) -> None:
         """Auto-mode: agent reported a stage transition."""

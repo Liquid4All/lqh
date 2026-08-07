@@ -486,6 +486,13 @@ class AgentCallbacks:
     # Appended to preserve positional compatibility for existing callback
     # bundles while offering an explicit, inspection-free protocol switch.
     legacy_pipeline_progress_callback: bool = True
+    # A "don't ask again" answer to the HF-donation prompt was just written
+    # to disk. Surfaces that render the standing answer (the TUI's 🤗
+    # indicator) recompute it here; the answer is already persisted, so
+    # this is display-only and may fail without consequence. Appended for
+    # the same positional-compatibility reason as the field above — this
+    # dataclass is public API of a published package.
+    on_hf_donation_recorded: Callable[[], Awaitable[None]] | None = None
 
 
 def _strip_thinking(msg: dict[str, Any]) -> dict[str, Any]:
@@ -1875,6 +1882,24 @@ class Agent:
             },
         )
 
+    async def _hf_donation_recorded(self) -> None:
+        """Tell the surface that a standing donation answer just changed.
+
+        The 🤗 status indicator is computed from that answer and is
+        otherwise only recomputed at startup, on /hf_login, and after the
+        startup question — so a "no, don't ask again" given mid-workflow
+        would leave the bar advertising a token no job will receive for
+        the rest of the session. Best-effort: a surface that cannot
+        refresh must not break the answer that was already written.
+        """
+        cb = self.callbacks.on_hf_donation_recorded
+        if cb is None:
+            return
+        try:
+            await cb()
+        except Exception:
+            pass
+
     async def _handle_permission_response(
         self, response: str, tool_name: str, tool_args: dict,
         permission_key: str | None = None,
@@ -1892,7 +1917,10 @@ class Agent:
         # express that (indistinguishable from "not asked yet"), so the
         # decline travels back as an explicit _hf_donate=False.
         if permission_key and permission_key.startswith("hf_donate:"):
-            from lqh.tools.permissions import grant_hf_donate_permission
+            from lqh.tools.permissions import (
+                deny_hf_donate_permission,
+                grant_hf_donate_permission,
+            )
 
             # Fail CLOSED: donate only on an explicit affirmative. Every
             # offered yes-option starts with "Yes"; the TUI additionally
@@ -1902,7 +1930,27 @@ class Agent:
             # answer. Declining costs the user a re-run; the inverse
             # mistake is unrecoverable.
             lowered = response.strip().lower()
+            # A standing answer is persisted only on an explicit "don't
+            # ask again" typed by a person. Neither headless surface
+            # reaches here today (donation is settled before the
+            # auto-grant branch), so this is belt-and-braces against a
+            # future one — which is exactly why it names both of them
+            # rather than only auto mode.
+            durable = "don't ask again" in lowered and not (
+                self.policy.auto_grant_permissions or self.policy.no_user
+            )
             if not lowered.startswith("yes"):
+                # A plain "no" stays scoped to this job — declining one
+                # job is not declining the project. "No, and don't ask
+                # again" is, and without it the same offer reappears at
+                # every cloud submit in a pipeline. Matched the same way
+                # as the yes-side (own prefix AND the phrase) so that a
+                # "don't ask again" answer synthesized for some *other*
+                # domain can't land here and silence donation
+                # project-wide.
+                if durable and lowered.startswith("no"):
+                    deny_hf_donate_permission(self.project_dir)
+                    await self._hf_donation_recorded()
                 return await self._reinvoke_tool(
                     tool_name, tool_args,
                     internal_kwargs={
@@ -1910,12 +1958,9 @@ class Agent:
                         "_permissions": self._chain_grants(tool_name),
                     },
                 )
-            # Persist only on an explicit "don't ask again" from a human.
-            # Auto mode never reaches here (donation is declined before
-            # the auto-grant branch), so this is belt-and-braces against
-            # a future surface that synthesizes an answer.
-            if not self.policy.auto_grant_permissions and "don't ask again" in lowered:
+            if durable:
                 grant_hf_donate_permission(self.project_dir)
+                await self._hf_donation_recorded()
             return await self._reinvoke_tool(
                 tool_name, tool_args,
                 internal_kwargs={
