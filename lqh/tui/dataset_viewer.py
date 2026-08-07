@@ -80,6 +80,10 @@ _SCORE_FIELDS = ("score", "reasoning", "kept", "scorer")
 # Body indent for message content, in cells.
 _CONTENT_INDENT = 4
 
+# Left marker on every line of the score block, so the scorer's rationale
+# reads as an annotation rather than as part of the conversation.
+_SCORE_BAR = "▌"
+
 
 class ViewMode(Enum):
     CHAT = "chat"
@@ -90,7 +94,15 @@ class ViewMode(Enum):
 def _make_console(width: int) -> tuple[StringIO, Console]:
     buf = StringIO()
     console = Console(
-        file=buf, force_terminal=True, width=width, color_system="truecolor"
+        file=buf,
+        force_terminal=True,
+        width=width,
+        # `height` matters even though nothing here paginates: rich honours an
+        # explicit width only when height is set too, otherwise a dumb terminal
+        # (TERM=dumb) falls back to 80x25 and every line wraps at the wrong
+        # column. Any value works; this one can't clip a capped body.
+        height=_MAX_BODY_LINES,
+        color_system="truecolor",
     )
     return buf, console
 
@@ -437,9 +449,16 @@ class DatasetViewer:
             console.print()
             return
 
+        failed = _is_scoring_error(row.get("reasoning"))
+        accent = "red" if failed else "bright_yellow"
+
+        # Styling hierarchy inside the card, loudest first: the bar (bold
+        # accent, on every line) marks the block; the score (bold) is the
+        # headline; the scorer name (accent, unbolded) is metadata; the
+        # rationale itself is unstyled so it reads at full contrast.
         badge = Text()
         score = row.get("score")
-        if _is_scoring_error(row.get("reasoning")):
+        if failed:
             badge.append("⚠ scoring failed", style="bold red")
         elif score is not None:
             if isinstance(score, (int, float)):
@@ -455,13 +474,48 @@ class DatasetViewer:
             )
         scorer = row.get("scorer")
         if scorer:
-            badge.append(f"  scorer: {scorer}", style="dim")
-        console.print(badge)
+            badge.append(f"  scorer: {scorer}", style=accent)
+        if badge.plain.strip():
+            # A row carrying only `reasoning` has nothing to badge — printing
+            # it anyway leaves a bar hanging on an otherwise blank line.
+            self._print_scored(console, badge, accent)
 
         reasoning = row.get("reasoning")
         if reasoning:
-            console.print(Padding(Text(str(reasoning), style="dim italic"), (0, 0, 0, 2)))
+            # Full-contrast text (the rationale is the point of a review
+            # pass); the accent bar — not dimming — is what separates it
+            # from conversation text.
+            self._print_scored(console, Text(str(reasoning)), accent)
         console.print()
+
+    @staticmethod
+    def _print_scored(console: Console, text: Text, accent: str) -> None:
+        """Print `text` with a colored left bar on every wrapped line.
+
+        A left bar only: the module contract forbids right-edge boxes
+        (emoji width disagreements break them), and wrapping stays rich's
+        so the bar never desyncs from the text it marks.
+
+        The bar and its indent are budgeted against the console width, so a
+        very narrow terminal sheds the indent (and, in the extreme, the bar)
+        rather than overflowing into a second, unmarked wrap.
+        """
+        bar_cells = len(_SCORE_BAR) + 1
+        if console.width >= _CONTENT_INDENT + bar_cells + 2:
+            indent = _CONTENT_INDENT - bar_cells
+        elif console.width >= bar_cells + 1:
+            indent = 0  # too tight for the indent; keep the marker
+        else:
+            indent, bar_cells = 0, 0  # narrower than the marker itself
+        avail = max(1, console.width - indent - bar_cells)
+        for line in text.wrap(console, avail):
+            row = Text()
+            if bar_cells:
+                # Bar style is a span, not the Text's base style — a base
+                # style would repaint the wrapped content too.
+                row.append(f"{_SCORE_BAR} ", style=f"bold {accent}")
+            row.append_text(line)
+            console.print(Padding(row, (0, 0, 0, indent)))
 
     def _render_chat(self, console: Console, row: dict, width: int) -> None:
         extra = row.get("extra")

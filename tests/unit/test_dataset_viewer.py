@@ -492,6 +492,196 @@ def test_inline_scored_results_parquet(tmp_path):
     assert "3 samples scored" in v.get_summary()
 
 
+# ---------------------------------------------------------------------------
+# Score-block presentation (feedback #39: the rationale must be readable)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def ansi_color(monkeypatch):
+    """Force rich's color output on for tests that assert on color.
+
+    Colors are correctly suppressed under NO_COLOR (this workspace sets it),
+    which would otherwise make every accent assertion fail on a rendering
+    that is exactly right. `test_score_block_survives_no_color` covers the
+    other side.
+    """
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+
+
+def ansi_segments(line: str) -> list[tuple[str, str]]:
+    """Split an ANSI line into (active SGR params, text) runs.
+
+    Params accumulate across escape sequences and reset on 0/empty, so
+    `\\x1b[1m\\x1b[93m` and `\\x1b[1;93m` both report {1, 93}. Style is
+    asserted through this rather than through substring matches on raw
+    escapes, so a rich release that splits, merges, or reorders its codes
+    does not fail the test for a rendering that is still correct.
+    """
+    segments: list[tuple[str, str]] = []
+    active: list[str] = []
+    pos = 0
+    for m in _ANSI_RE.finditer(line):
+        if m.start() > pos:
+            segments.append((";".join(active), line[pos:m.start()]))
+        for param in (m.group(0)[2:-1] or "0").split(";"):
+            if param in ("", "0"):
+                active.clear()
+            elif param not in active:
+                active.append(param)
+        pos = m.end()
+    if pos < len(line):
+        segments.append((";".join(active), line[pos:]))
+    return segments
+
+
+def score_block(viewer, width: int) -> list[str]:
+    """Rendered score-card lines: everything up to the first blank line."""
+    lines = viewer.body_lines(width)
+    end = next((i for i, l in enumerate(lines) if not strip_ansi(l).strip()), len(lines))
+    return lines[:end]
+
+
+def bar_and_prose(line: str) -> tuple[str, list[tuple[str, str]]]:
+    """(SGR params on the bar, the remaining styled runs on that line).
+
+    Does not assume the bar occupies a run of its own: with color and bold
+    both stripped (NO_COLOR on a terminal without bold) the whole line is a
+    single unstyled run, and the bar is split off here.
+    """
+    segments = [(c, t) for c, t in ansi_segments(line) if t.strip()]
+    assert segments, f"blank line {line!r}"
+    style, text = segments[0]
+    assert text.lstrip().startswith("▌"), f"no leading bar in {line!r}"
+    rest = text.lstrip()[1:].lstrip()
+    return style, ([(style, rest)] if rest else []) + segments[1:]
+
+
+def prose_of(line: str) -> str:
+    return "".join(t for _, t in bar_and_prose(line)[1])
+
+
+def write_scored_chat(path, reasoning, score=7.0, scorer="judge-v2"):
+    cols = {
+        "sample_index": [0],
+        "messages": [json.dumps([{"role": "user", "content": "hi"}])],
+        "reasoning": [reasoning],
+    }
+    if score is not None:
+        cols["score"] = [score]
+    if scorer is not None:
+        cols["scorer"] = [scorer]
+    pq.write_table(pa.table(cols), path)
+    return path
+
+
+RATIONALE = (
+    "近い translation keeps the casual register 😄 and the emoji, but "
+    "最近怎么样 reads more formal than 'what's up' — 咋样啊 lands closer. "
+) * 3
+
+
+def test_ansi_segments_accumulates_split_codes():
+    # The style assertions below are only meaningful if the parser tracks
+    # active SGR state rather than the last escape seen.
+    split = ansi_segments("\x1b[1m\x1b[93m▌ \x1b[0mtext")
+    assert split == [("1;93", "▌ "), ("", "text")]
+    assert ansi_segments("\x1b[1;93m▌ \x1b[0mtext") == split
+
+
+@pytest.mark.parametrize("width", [30, 76, 80, 120])
+def test_score_rationale_is_full_contrast_and_bar_marked(tmp_path, width, ansi_color):
+    # A dimmed rationale is unreadable during a review pass. It must render
+    # in the default foreground, set apart by the accent bar instead — on
+    # every wrapped line, so long rationales stay marked.
+    write_scored_chat(tmp_path / "results.parquet", RATIONALE)
+    v = DatasetViewer(tmp_path / "results.parquet")
+
+    block = score_block(v, width)
+    assert len(block) > 2  # badge + a wrapped, multi-line rationale
+    assert "★ 7.00" in strip_ansi(block[0])
+    for line in block:
+        bar_style, _ = bar_and_prose(line)
+        assert {"1", "93"} <= set(bar_style.split(";"))  # bold bright yellow
+        assert cell_width(line) <= width
+    # The rationale runs carry no styling of their own — no dim (2), no
+    # italic (3), no color.
+    for line in block[1:]:
+        assert all(style == "" for style, _ in bar_and_prose(line)[1])
+    # Nothing dropped by the wrap (compared whitespace-free: rich may break
+    # inside a CJK run at any cell).
+    rendered = "".join(prose_of(l) for l in block[1:])
+    assert "".join(rendered.split()) == "".join(RATIONALE.split())
+
+
+@pytest.mark.parametrize("width", [4, 5, 6, 7, 8, 9])
+def test_score_block_stays_bar_marked_on_tiny_terminals(tmp_path, width):
+    # The bar plus its indent must be budgeted against the width; otherwise
+    # rich re-wraps the marked line and emits unmarked prose lines below it.
+    write_scored_chat(tmp_path / "results.parquet", "alpha beta gamma delta")
+    v = DatasetViewer(tmp_path / "results.parquet")
+
+    block = score_block(v, width)
+    prose = ""
+    for line in block:
+        prose += prose_of(line)  # asserts the bar leads every line
+        assert cell_width(line) <= width
+    # Words break mid-token at these widths; the text must still be intact.
+    assert "alphabetagammadelta" in "".join(prose.split())
+
+
+def test_score_block_survives_no_color(tmp_path, monkeypatch):
+    # Under NO_COLOR rich drops every accent — the bar glyph is what keeps
+    # the rationale distinguishable, so the block must still be marked.
+    monkeypatch.setenv("NO_COLOR", "1")
+    write_scored_chat(tmp_path / "results.parquet", RATIONALE)
+    v = DatasetViewer(tmp_path / "results.parquet")
+
+    block = score_block(v, 60)
+    assert len(block) > 2
+    color_params = {str(n) for n in [*range(30, 50), *range(90, 108)]}
+    for line in block:
+        for style, _ in ansi_segments(line):
+            assert not set(style.split(";")) & color_params  # bold may remain
+        assert strip_ansi(line).lstrip().startswith("▌")
+
+
+def test_failed_score_row_uses_a_red_bar(tmp_path, ansi_color):
+    write_scored_chat(
+        tmp_path / "results.parquet",
+        "[Scoring error] judge returned no JSON after 3 attempts",
+        score=None,
+    )
+    v = DatasetViewer(tmp_path / "results.parquet")
+
+    block = score_block(v, 60)
+    assert "⚠ scoring failed" in strip_ansi(block[0])
+    for line in block:
+        bar_style, _ = bar_and_prose(line)
+        assert "31" in bar_style.split(";")  # red, not the yellow accent
+
+
+def test_rationale_only_row_has_no_empty_badge_line(tmp_path):
+    # Nothing to badge (no score/kept/scorer) must not leave a bar hanging
+    # on a blank line above the rationale.
+    write_scored_chat(tmp_path / "results.parquet", "just a rationale", score=None, scorer=None)
+    v = DatasetViewer(tmp_path / "results.parquet")
+
+    block = score_block(v, 60)
+    assert [strip_ansi(l).strip() for l in block] == ["▌ just a rationale"]
+
+
+def test_width_is_honored_on_a_dumb_terminal(tmp_path, monkeypatch):
+    # rich obeys an explicit console width only when height is set too;
+    # without it, TERM=dumb silently renders everything at 80 columns.
+    monkeypatch.setenv("TERM", "dumb")
+    write_scored_chat(tmp_path / "results.parquet", RATIONALE)
+    v = DatasetViewer(tmp_path / "results.parquet")
+
+    for line in v.body_lines(40):
+        assert cell_width(line) <= 40
+
+
 def test_inline_scores_preferred_over_sibling(tmp_path):
     rows = make_chat_rows()
     pq.write_table(pa.table({
