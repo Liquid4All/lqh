@@ -35,6 +35,15 @@ DPO_HELD_OUT_SHARE = 0.10
 DEFAULT_DPO_ITERATIONS = 5
 DPO_JUDGING_SHARE = DPO_PREFERENCE_SHARE * 2 / 3
 
+# ETA warm-up gates: how much movement must be on the record before a number
+# is worth quoting. Deliberately expressed only in terms of the sample window
+# itself — every caller feeds this a truncated history (256 rows), so a gate
+# comparing the window against the size of the job silently becomes a fixed
+# wall-clock horizon on a long run and hides the ETA for hours.
+ETA_MIN_ADVANCES = 4
+ETA_MIN_WINDOW_S = 20.0
+ETA_PENDING_LABEL = "ETA soon"
+
 
 @dataclass(frozen=True)
 class FinalScoringContext:
@@ -463,15 +472,35 @@ def percent_for(event: ProgressEvent | dict[str, Any]) -> int | None:
     return min(99, max(0, math.floor(float(fraction) * 100)))
 
 
-def estimate_eta_seconds(
+@dataclass(frozen=True)
+class EtaEstimate:
+    """A whole-job ETA, or the reason there isn't one yet.
+
+    ``warming_up`` separates "this phase is moving, an estimate is coming"
+    from "this phase is stalled, finished, or never reported movement".
+    Only the first deserves a placeholder in the status bar; promising an
+    ETA for a stalled job would be a lie the age indicator has to unwind.
+    """
+
+    seconds: float | None = None
+    warming_up: bool = False
+
+
+def estimate_eta(
     events: Iterable[ProgressEvent | dict[str, Any]],
     *,
     now: float | None = None,
-) -> float | None:
-    """Return a conservative ETA from stable, recent whole-job movement.
+) -> EtaEstimate:
+    """Project whole-job completion from recent movement in the current phase.
 
     A phase change starts a fresh sample window.  This avoids carrying an
     optimizer rate into model inference or judge scoring.
+
+    The rate is the *aggregate* over the window (and over its recent half),
+    not the median of per-interval rates.  Concurrent producers land work in
+    bursts, so instantaneous rates stay noisy even when throughput is
+    perfectly steady; rejecting that noise used to blank the ETA for most of
+    a data-gen or scoring run instead of letting it settle.
     """
     parsed: list[tuple[float, float, str]] = []
     for event in events:
@@ -487,7 +516,7 @@ def estimate_eta_seconds(
         ):
             parsed.append((ts, float(fraction), phase))
     if not parsed:
-        return None
+        return EtaEstimate()
 
     # Keep the contiguous current phase, then distinct advances.
     current_phase = parsed[-1][2]
@@ -501,32 +530,60 @@ def estimate_eta_seconds(
     for ts, fraction, _ in phase_rows:
         if not advances or fraction > advances[-1][1]:
             advances.append((ts, fraction))
-    if len(advances) < 5:
-        return None
-    elapsed = advances[-1][0] - advances[0][0]
-    if elapsed < 15.0 or advances[-1][1] <= advances[0][1]:
-        return None
 
-    rates: list[float] = []
-    intervals: list[float] = []
-    for (t0, f0), (t1, f1) in zip(advances, advances[1:]):
-        dt = t1 - t0
-        df = f1 - f0
-        if dt > 0 and df > 0:
-            rates.append(df / dt)
-            intervals.append(dt)
-    if len(rates) < 4:
-        return None
-    median_rate = statistics.median(rates)
-    deviations = [abs(rate - median_rate) for rate in rates]
-    if median_rate <= 0 or statistics.median(deviations) / median_rate > 0.35:
-        return None
+    if len(advances) < 2:
+        # A phase that has reported a single event — setup, model load, a
+        # download with no byte-level reporting — has shown no movement to
+        # extrapolate from, and may never show any. Promise nothing.
+        return EtaEstimate()
 
+    intervals = [
+        t1 - t0 for (t0, _), (t1, _) in zip(advances, advances[1:]) if t1 > t0
+    ]
     wall_now = now if now is not None else time.time()
-    stale_after = max(30.0, 3 * statistics.median(intervals))
+    stale_after = (
+        max(30.0, 3 * statistics.median(intervals)) if intervals else 30.0
+    )
     if wall_now - advances[-1][0] > stale_after:
-        return None
-    return max(0.0, (1.0 - advances[-1][1]) / median_rate)
+        # Stalled: no ETA, and no promise of one either. The status bar's
+        # "↑Xm" age is the honest signal for a run that stopped moving.
+        return EtaEstimate()
+
+    # A phase is announced at its baseline fraction *before* the slow part of
+    # starting it — loading a model, creating a client, importing the user's
+    # pipeline. The gap from that opening event to the first real advance is
+    # setup, not throughput, so measure from the first advance instead: left
+    # in, a one-minute setup stall quoted several times the true remaining.
+    window = advances[1:]
+    elapsed = window[-1][0] - window[0][0]
+    gain = window[-1][1] - window[0][1]
+    if len(window) < ETA_MIN_ADVANCES or elapsed < ETA_MIN_WINDOW_S:
+        # Moving, but not yet over a long enough window to project from. Time
+        # always resolves this for a phase that keeps advancing, so the label
+        # is a promise the phase can keep.
+        return EtaEstimate(warming_up=True)
+
+    rate = gain / elapsed
+    cutoff = window[-1][0] - elapsed / 2
+    recent = [row for row in window if row[0] >= cutoff]
+    if len(recent) >= 2:
+        recent_elapsed = recent[-1][0] - recent[0][0]
+        recent_gain = recent[-1][1] - recent[0][1]
+        if recent_elapsed > 0 and recent_gain > 0:
+            # Conservative on both sides: a run that has sped up still quotes
+            # the slower whole-window rate, while one that has slowed down
+            # quotes the new, worse one.
+            rate = min(rate, recent_gain / recent_elapsed)
+    return EtaEstimate(seconds=max(0.0, (1.0 - window[-1][1]) / rate))
+
+
+def estimate_eta_seconds(
+    events: Iterable[ProgressEvent | dict[str, Any]],
+    *,
+    now: float | None = None,
+) -> float | None:
+    """The ETA alone, for callers that don't distinguish warm-up from stalled."""
+    return estimate_eta(events, now=now).seconds
 
 
 def format_duration(seconds: float) -> str:
@@ -562,9 +619,12 @@ def format_event_oneline(
             # Rates use producer timestamps; staleness uses the local time at
             # which the latest advance was observed, avoiding machine skew.
             eta_now = last_ts + max(0.0, time.time() - observed_at)
-    eta = estimate_eta_seconds(history, now=eta_now)
-    if eta is not None and pct not in (None, 100):
-        parts.append(f"ETA {format_duration(eta)} at current rate")
+    estimate = estimate_eta(history, now=eta_now)
+    if pct not in (None, 100):
+        if estimate.seconds is not None:
+            parts.append(f"ETA {format_duration(estimate.seconds)} at current rate")
+        elif estimate.warming_up:
+            parts.append(ETA_PENDING_LABEL)
     detail = data.get("detail")
     if isinstance(detail, str) and detail:
         parts.append(detail)
