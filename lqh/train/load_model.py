@@ -46,10 +46,35 @@ __all__ = [
     "Modality",
     "detect_kind",
     "detect_modality",
+    "display_model_ref",
     "resolve_base_model",
     "load_for_inference",
     "load_for_training",
 ]
+
+
+def display_model_ref(ref: str | Path, run_dir: Path | None = None) -> str:
+    """Render a model reference for a log line.
+
+    Sandbox stdout is a user-facing surface: the agent reads ``stdout.log``
+    back and quotes it. An absolute in-sandbox checkpoint path exposes the
+    host's mount layout for no benefit — what matters is *which* checkpoint,
+    which the run-relative tail already says. So paths under *run_dir* are
+    rendered relative to it; hub ids (``LiquidAI/LFM2.5-1.2B``) and paths on
+    the user's own machine are left exactly as they are.
+    """
+    text = str(ref)
+    if run_dir is None or not text.startswith("/"):
+        return text
+    path = Path(text)
+    for root in (Path(run_dir), Path(run_dir).resolve()):
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        # "." (ref *is* the run dir) says nothing — keep the original.
+        return text if rel == "." else rel
+    return text
 
 
 def detect_kind(path_or_id: str) -> ModelKind:

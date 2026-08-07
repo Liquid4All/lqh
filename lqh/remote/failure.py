@@ -128,8 +128,8 @@ def _classify_from_error(error: str) -> str:
     """Fallback classifier over the backend's error strings.
 
     Ordered: the first match wins. These are the literal strings the Go
-    side emits (internal/cloud/reconciler.go, terminal_gate.go,
-    modal_runner.go), so keep them in sync when those change.
+    side emits (internal/cloud/reconciler.go, terminal_gate.go, and the
+    sandbox runner), so keep them in sync when those change.
     """
     text = (error or "").lower()
     if not text:

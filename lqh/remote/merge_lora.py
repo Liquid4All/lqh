@@ -67,7 +67,7 @@ def _tokenizer_source(base_model: str, adapter_dir: Path, modality: str) -> str:
     Prefer files shipped WITH the adapter — a fine-tune may carry an
     updated tokenizer or chat template, and evaluating/serving with the
     base's would silently change behavior. Falls back to the base. Same
-    rule the inference pod applies (modal_inference_pod.py, kind=merge).
+    rule the backend's inference pod applies (kind=merge).
     """
     marker = ("preprocessor_config.json" if modality == "vision"
               else "tokenizer_config.json")
@@ -143,7 +143,7 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as td:
             work = Path(td)
             tar_path = work / "adapter.tar.gz"
-            print("merge: downloading adapter from R2 ...", flush=True)
+            print("merge: downloading adapter ...", flush=True)
             _download(adapter_url, tar_path)
             adapter_dir = _extract_flat(tar_path, work / "adapter")
 

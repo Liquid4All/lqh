@@ -167,7 +167,7 @@ def _stamp_real_metric(run_dir: Path, summary: Any) -> None:
     if not pred_lineage.exists():
         print(
             "eval_hf: WARNING — no lineage sidecar at "
-            f"{pred_lineage}; can't stamp real_metric.",
+            f"{pred_lineage.name}; can't stamp real_metric.",
             flush=True,
         )
         return

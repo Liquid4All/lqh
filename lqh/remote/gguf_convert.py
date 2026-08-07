@@ -24,7 +24,7 @@ Two sides live here, mirroring ``lqh.remote.transfer``:
 
   Bytes go R2 → sandbox → (HF) directly; nothing round-trips through the
   laptop or the backend. The llama.cpp toolchain is baked into the
-  ``gguf`` Modal image (see backend/scripts/modal_build_image.py).
+  ``gguf`` cloud image (see the backend's image build script).
 """
 
 from __future__ import annotations
@@ -179,7 +179,9 @@ def _download(url: str, dest: Path, *, chunk: int = 1 << 20) -> None:
     with httpx.stream("GET", url, timeout=httpx.Timeout(600.0)) as resp:
         if resp.status_code != 200:
             body = resp.read()
-            raise RuntimeError(f"R2 download failed ({resp.status_code}): {body[:200]!r}")
+            raise RuntimeError(
+                f"artifact download failed ({resp.status_code}): {body[:200]!r}"
+            )
         with dest.open("wb") as fh:
             for piece in resp.iter_bytes(chunk):
                 fh.write(piece)
@@ -298,7 +300,7 @@ def run_gguf(
             break
     stem = stem or "model"
 
-    print("gguf: downloading source checkpoint from R2 ...", flush=True)
+    print("gguf: downloading source checkpoint ...", flush=True)
     tar_path = work / "source.tar.gz"
     _download(source_url, tar_path)
     src_dir = work / "src"

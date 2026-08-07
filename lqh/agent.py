@@ -154,6 +154,19 @@ vs. instruct/no-suffix): at large SFT dataset sizes the difference is small \
 grows. For smaller datasets or zero-shot use, the instruct/no-suffix model is the \
 safer pick. Note: `-Thinking` models are a poor base for fine-tuning on non-thinking data.
 
+## Pool models (the utility LLMs you call, not the models you train)
+
+`small`, `medium`, `large`, `random:<size>`, `judge:small|medium|large` and \
+`orchestration` are **pools**, not model names. The platform maps each pool to a \
+concrete model based on the task, cost, complexity and other factors; which model \
+that is, is not exposed and can change. Describe them to the user exactly that way \
+and do not speculate about specific model identities or providers. (Pool *selection* \
+is still stable where documented: a bare size or `judge:<size>` resolves consistently, \
+`random:<size>` varies per request, `random:<size>:<seed>` is fixed per seed.) The \
+same goes for the compute backend: jobs run on LQH Cloud, and what that runs on \
+underneath is not something to guess at. The models you *train and evaluate* are the \
+Liquid checkpoints in `list_models` — those are always named explicitly.
+
 ## Where training and GPU eval run
 
 **The compute target is fixed per project, not chosen per call.** When \
@@ -180,7 +193,7 @@ machine, walk the user through `remote_add` → `remote_bind` → \
 
 ### Evaluating cloud-trained checkpoints
 
-Cloud-trained model weights live in R2 as artifacts, NOT on the \
+Cloud-trained model weights live in cloud artifact storage, NOT on the \
 local filesystem. To evaluate one, prefer the cloud path:
 
   1. `hf_push(...)` — publish the trained model to HuggingFace.
@@ -359,7 +372,7 @@ Data quality scores are co-located with datasets: datasets/{name}/scores.parquet
 To score data quality: create a scorer .md file, then use run_scoring with mode='data_quality'. \
 To evaluate a Liquid checkpoint: use eval_hf_model (cloud, by HuggingFace id) or start_local_eval \
 (local/SSH checkpoint dir) — the router.liquid.ai API is retired, so run_scoring mode='model_eval' \
-is reserved for non-Liquid frontier/pool baselines (small/medium/large/orchestration). \
+is reserved for pool baselines (small/medium/large/orchestration). \
 IMPORTANT: when evaluating a base/zero-shot model, ALWAYS pass a well-structured system \
 prompt (task instructions + expected output format); without one the base model is confused \
 and scores near zero, giving a misleading baseline.\

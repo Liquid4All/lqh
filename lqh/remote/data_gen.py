@@ -1,7 +1,7 @@
 """In-sandbox entry point for cloud data-gen jobs.
 
 ``python -m lqh.remote.data_gen <config.json>`` — launched by the
-backend's default bundle launcher inside a CPU Modal sandbox
+backend's default bundle launcher inside a CPU cloud sandbox
 (CLOUD_OFFLOAD_PLAN.md §2). The launcher has already:
 
 * extracted the submit bundle (project-relative layout: the pipeline
@@ -68,7 +68,7 @@ def main() -> None:
     run_dir = config_path.parent
     inputs_dir = run_dir / "inputs"
     if not inputs_dir.is_dir():
-        print(f"No inputs/ dir under {run_dir} — bundle missing?", file=sys.stderr)
+        print("No inputs/ dir under the run dir — bundle missing?", file=sys.stderr)
         sys.exit(1)
     # The launcher already runs us with cwd=inputs; chdir defensively —
     # lqh.sources helpers resolve every path against Path.cwd().

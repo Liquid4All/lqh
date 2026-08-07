@@ -105,11 +105,13 @@ Wrap the step with `@step(retries=3)` so `GenerationError` triggers a retry tran
 
 The `client` is an `AsyncOpenAI` instance pointed at `api.lqh.ai`. Use these model strings:
 
+These are **pools**, not model names: the platform maps each pool to a concrete model based on the task, cost, complexity and other factors, and which model that is is not exposed and can change (the selection semantics per pool name are in the table below). If the user asks what the generator or judge model is, describe it that way rather than guessing at identities or providers.
+
 | Model | When to Use | Cost/Speed |
 |---|---|---|
 | `random:small` | **Default for most steps.** Single-turn generation, simple Q&A, persona creation, reformulations, extracting/rephrasing text. Use for ~80% of pipeline steps. | Cheapest, fastest |
 | `random:medium` | Multi-turn generation in a single call, complex reasoning, structured JSON with nested objects, tool-call generation. ~15% of pipeline steps. | Moderate |
-| `random:large` | Use sparingly. Only when the user explicitly requests it or for tasks requiring frontier-level quality. ~5% at most. | Expensive, slow |
+| `random:large` | Use sparingly. Only when the user explicitly requests it or for tasks requiring top-tier quality. ~5% at most. | Expensive, slow |
 | `small` / `medium` / `large` | Non-random default model from each pool. Use when you need **consistency** (e.g., a validation/grading step where the same model every time matters). | Same cost |
 | `random:<size>:<seed>` | Deterministic random: same seed = same model. Use for consistency **within** a sample (e.g., all turns in one conversation use the same model) while diversity **across** samples. | Same cost |
 
@@ -580,9 +582,9 @@ class AnnotateFromHF(Pipeline):
 ```
 
 Private repositories use `HF_TOKEN`. In cloud execution the donated or
-account-stored token is intentionally available to the approved pipeline's
-Python process as a Modal secret; this matches the local trusted-code model and
-allows `streaming=True` without copying the dataset through R2. Prefer a
+account-stored token is intentionally injected into the approved pipeline's
+Python process as a secret; this matches the local trusted-code model and
+allows `streaming=True` without copying the dataset through artifact storage. Prefer a
 fine-grained, read-only token and pin `revision=<commit SHA>` for reproducible
 long-running jobs and continuations.
 

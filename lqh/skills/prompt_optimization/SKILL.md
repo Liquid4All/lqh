@@ -78,7 +78,7 @@ run_scoring(
     scorer="evals/scorers/{task}_v1.md",
     mode="model_eval",
     run_name="{task}_prompt_v1_iter1",
-    inference_model="small",  # pool/frontier baseline only — NOT a Liquid id
+    inference_model="small",  # pool name only — NOT a Liquid id
     system_prompt_path="prompts/{task}_v1.md"
 )
 ```

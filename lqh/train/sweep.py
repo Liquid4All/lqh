@@ -93,6 +93,7 @@ from pathlib import Path
 from typing import Any
 
 from lqh.train.dpo_metrics import read_held_out_mean
+from lqh.train.load_model import display_model_ref
 from lqh.train.progress import write_progress, write_status
 from lqh.train.resume import is_continuation
 
@@ -624,6 +625,21 @@ def _build_eval_config(
     return cfg
 
 
+def _log_safe(obj: Any, run_dir: Path) -> str:
+    """Render *obj* for the job log with run-dir-absolute paths trimmed.
+
+    Sweep summaries carry model/dataset/scorer paths, and job stdout is a
+    user-visible surface the agent reads back — the sandbox's mount layout
+    has no business in it. Display only: the returned dict (which the
+    status payload consumes) is untouched. See
+    :func:`lqh.train.load_model.display_model_ref`.
+    """
+    text = str(obj)
+    for root in (str(run_dir), str(run_dir.resolve())):
+        text = text.replace(root + "/", "")
+    return text
+
+
 def _run_eval_of_best(run_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
     """Run ``lqh.infer`` against the sweep's winner and surface the
     predictions at the run-dir level so the watcher scores them.
@@ -676,7 +692,11 @@ def _run_eval(
     cfg_path = eval_dir / "config.json"
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
 
-    print(f"sweep: starting {label} ({cfg['base_model']})", flush=True)
+    print(
+        f"sweep: starting {label} "
+        f"({display_model_ref(cfg['base_model'], eval_dir.parent)})",
+        flush=True,
+    )
     if progress_run_dir is not None:
         write_progress(
             progress_run_dir,
@@ -1494,7 +1514,10 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
     eval_summary: dict[str, Any] = {}
     if sweep_config.get("eval_best", True):
         eval_summary = _run_eval_of_best(run_dir, base)
-        print(f"sweep: eval-of-best summary: {eval_summary}", flush=True)
+        print(
+            f"sweep: eval-of-best summary: {_log_safe(eval_summary, run_dir)}",
+            flush=True,
+        )
 
     expects_eval_result = bool(
         sweep_config.get("eval_best", True)

@@ -108,8 +108,10 @@ def is_liquid_model_name(name: str | None) -> bool:
       - the legacy ``lfm`` short-name prefix (e.g. ``lfm2.5-1.2b-instruct``).
 
     Pool/utility names (``small``, ``medium``, ``large``, ``judge:*``,
-    ``orchestration``, ``random:*``) are NOT Liquid models — they are
-    OpenRouter-backed baselines/judges served by api.lqh.ai.
+    ``orchestration``, ``random:*``) are not Liquid checkpoints — they are
+    baseline/judge pools served by api.lqh.ai; the platform maps each pool
+    to a concrete model by task, cost and complexity, and which model that
+    is is not exposed to callers.
     """
     if not name:
         return False

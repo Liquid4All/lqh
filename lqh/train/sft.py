@@ -368,7 +368,12 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         config["modality"] = modality
     is_vision = modality == "vision"
 
-    print(f"Loading model: {base_model} (modality={modality})")
+    from lqh.train.load_model import display_model_ref
+
+    print(
+        f"Loading model: {display_model_ref(base_model, run_dir)} "
+        f"(modality={modality})"
+    )
 
     # GPU info
     num_gpus = torch.cuda.device_count()
@@ -750,7 +755,7 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         training_method="lora" if saving_adapter else "full",
     )
 
-    print(f"Model saved to {final_model_dir}")
+    print(f"Model saved to {display_model_ref(final_model_dir, run_dir)}")
 
     # Final eval if requested
     if config.get("eval_on_checkpoints") and config.get("eval_dataset"):

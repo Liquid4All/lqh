@@ -41,6 +41,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from lqh.train.load_model import display_model_ref
+
 SGLANG_PORT = 30000
 SGLANG_BASE_URL = f"http://127.0.0.1:{SGLANG_PORT}/v1"
 SERVED_MODEL_NAME = "lqh-eval"
@@ -57,7 +59,9 @@ def sglang_available() -> bool:
     return importlib.util.find_spec("sglang") is not None
 
 
-def _prepare_model_path(config: dict) -> tuple[str, tempfile.TemporaryDirectory | None]:
+def _prepare_model_path(
+    config: dict, run_dir: Path | None = None,
+) -> tuple[str, tempfile.TemporaryDirectory | None]:
     """Resolve the on-disk weights sglang will serve.
 
     Full checkpoints (and hub ids) pass through untouched. A LoRA
@@ -91,7 +95,10 @@ def _prepare_model_path(config: dict) -> tuple[str, tempfile.TemporaryDirectory 
     # large bf16 base, but the planner-selected GPU fits it by
     # construction. The child process exits before the server starts,
     # so the GPU is clean when sglang claims it.
-    print(f"Merging LoRA adapter onto {base} (gpu child process) ...")
+    print(
+        f"Merging LoRA adapter onto {display_model_ref(base, run_dir)} "
+        f"(gpu child process) ..."
+    )
     code = (
         "import sys; from pathlib import Path; "
         "from lqh.remote.merge_lora import _merge; "
@@ -143,7 +150,11 @@ class _SglangServer:
             cmd += ["--tool-call-parser", tool_call_parser]
         if extra_args:
             cmd += shlex.split(extra_args)
-        print(f"Starting sglang server: {' '.join(cmd)}")
+        # Logged run-relative: the absolute path is the sandbox mount
+        # layout, which is not the reader's business (see
+        # display_model_ref). The server itself still gets the real path.
+        printable = [display_model_ref(a, run_dir) for a in cmd]
+        print(f"Starting sglang server: {' '.join(printable)}")
         self._log_fh = open(self.log_path, "ab")
         self.proc = subprocess.Popen(cmd, stdout=self._log_fh, stderr=self._log_fh)
 
@@ -363,7 +374,7 @@ def run_inference_sglang(run_dir: Path, config: dict) -> None:
 
     from lqh.train.tool_format import get_tool_formatter
 
-    model_path, merged_tmp = _prepare_model_path(config)
+    model_path, merged_tmp = _prepare_model_path(config, run_dir)
     server = _SglangServer(
         model_path, run_dir,
         extra_args=str(config.get("sglang_extra_args", "")),

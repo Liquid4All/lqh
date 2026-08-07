@@ -8,11 +8,11 @@ You are now in **model evaluation** mode. Your goal is to benchmark different Li
 
 You will:
 1. Discover the Liquid model catalog with `list_models`
-2. Benchmark Liquid checkpoints with `eval_hf_model` (their HuggingFace ids) and, optionally, run non-Liquid frontier/pool baselines with `run_scoring` (mode=model_eval), **always passing a baseline system prompt** (see "System prompts" below)
+2. Benchmark Liquid checkpoints with `eval_hf_model` (their HuggingFace ids) and, optionally, run pool baselines with `run_scoring` (mode=model_eval), **always passing a baseline system prompt** (see "System prompts" below)
 3. Compare results and present a recommendation
 4. Suggest next steps: prompt optimization or fine-tuning
 
-**Important:** Liquid models are evaluated via the **HuggingFace inference path** (`eval_hf_model` for cloud, `start_local_eval` for a local/SSH checkpoint dir). The old `router.liquid.ai` API has been retired, so `run_scoring` mode=`model_eval` no longer accepts a Liquid model as `inference_model` — it is reserved for the pool/frontier baselines (`small`/`medium`/`large`/`orchestration`).
+**Important:** Liquid models are evaluated via the **HuggingFace inference path** (`eval_hf_model` for cloud, `start_local_eval` for a local/SSH checkpoint dir). The old `router.liquid.ai` API has been retired, so `run_scoring` mode=`model_eval` no longer accepts a Liquid model as `inference_model` — it is reserved for the pool baselines (`small`/`medium`/`large`/`orchestration`).
 
 ## System prompts for baseline eval
 
@@ -66,7 +66,7 @@ eval_hf_model(
 
 For a checkpoint that lives on a local/SSH filesystem (e.g. a fresh fine-tune), use `start_local_eval(model_path=..., dataset=..., scorer=...)` instead.
 
-Optionally include a **non-Liquid frontier/pool baseline** via `run_scoring` (mode=`model_eval`) for context:
+Optionally include a **pool baseline** via `run_scoring` (mode=`model_eval`) for context:
 
 ```
 run_scoring(
@@ -74,7 +74,7 @@ run_scoring(
     scorer="evals/scorers/{task}_v1.md",
     mode="model_eval",
     run_name="baseline_small",
-    inference_model="small",                   # pool/frontier only — NOT a Liquid id
+    inference_model="small",                   # pool name only — NOT a Liquid id
     system_prompt_path="prompts/{task}_v0.md",  # or inference_system_prompt="..."
 )
 ```

@@ -2629,7 +2629,12 @@ async def handle_list_models(**kwargs: Any) -> ToolResult:
     lines.append("  random:<size>                  — random model from pool (different each request)")
     lines.append("  random:<size>:<seed>           — deterministic model from pool")
     lines.append("  judge:small, judge:medium, judge:large — dedicated scoring models")
-    lines.append("  orchestration                  — frontier agent model with tool calling")
+    lines.append("  orchestration                  — agent-grade model with tool calling")
+    lines.append("")
+    lines.append("Pool names are not model identities: the platform maps each pool to")
+    lines.append("a concrete model based on the task, cost, complexity and other")
+    lines.append("factors, and which model that is is not exposed and can change.")
+    lines.append("Only the Liquid catalog above names specific models.")
 
     return ToolResult(content="\n".join(lines))
 
@@ -2826,7 +2831,7 @@ async def handle_run_scoring(
                         "HuggingFace inference path instead:\n"
                         "  - eval_hf_model  — cloud eval of a HuggingFace repo id / revision\n"
                         "  - start_local_eval — local or SSH-remote GPU eval of a checkpoint dir\n"
-                        "run_scoring mode='model_eval' remains available for non-Liquid "
+                        "run_scoring mode='model_eval' remains available for the pool "
                         "baselines (small / medium / large / orchestration)."
                     ),
                 )
@@ -3450,7 +3455,7 @@ async def _push_lqh_to_hf(
     return ToolResult(
         content=(
             f"🚚 Transferring lqh:{artifact_id} → hf:{target_repo} via a CPU sandbox "
-            f"(job {job_id}). The checkpoint is uploaded from R2 directly; check "
+            f"(job {job_id}). The checkpoint is uploaded from cloud storage directly; check "
             "training_status or the artifact's hf_repo once it completes."
         ),
     )
@@ -3546,7 +3551,7 @@ async def handle_gguf_convert(
     return ToolResult(
         content=(
             f"🧱 Converting lqh:{artifact_id} → GGUF ({quants}){push} via a CPU sandbox "
-            f"(job {job_id}). Each quant is converted from R2 directly and smoke-tested; "
+            f"(job {job_id}). Each quant is converted from cloud storage directly and smoke-tested; "
             "the produced .gguf files register as new artifacts (kind 'gguf'). Check "
             "training_status for progress, then 'artifacts' (action=list) to download them."
             + (" The HF push uses whichever token applied to this job — the one "
@@ -3605,7 +3610,7 @@ async def handle_artifacts(
             return ToolResult(content=f"Unpinned {artifact_id} — per-kind expiry re-armed.")
         if act == "delete":
             await store.delete(artifact_id)
-            return ToolResult(content=f"Deleted {artifact_id} (R2 bytes purged on the next retention tick).")
+            return ToolResult(content=f"Deleted {artifact_id} (stored bytes purged on the next retention tick).")
         return ToolResult.fail("validation", f"Error: unknown action '{act}' (use list/pin/unpin/delete)")
     except ArtifactError as e:
         return ToolResult.fail("upstream", f"Error: {e}")
@@ -6617,8 +6622,8 @@ async def handle_eval_hf_model(
             "validation",
             f"Error: judge_size must be small/medium/large, got {judge_size!r}",
         )
-    # Same clamp the backend picker applies ([10, Modal's 24h sandbox
-    # max]) so the consent prompt and the submitted job agree.
+    # Same clamp the backend picker applies ([10, the 24h sandbox max])
+    # so the consent prompt and the submitted job agree.
     timeout_minutes = max(10, min(int(timeout_minutes or 120), 1440))
 
     # Eval dataset(s) — one path or a list of held-out sources, scored

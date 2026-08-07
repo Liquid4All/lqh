@@ -563,7 +563,7 @@ async def publish_run(
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m lqh.remote.publish",
-        description="Publish a finished run's artifacts to api.lqh.ai (R2).",
+        description="Publish a finished run's artifacts to api.lqh.ai.",
     )
     parser.add_argument("run_dir", type=Path)
     parser.add_argument(

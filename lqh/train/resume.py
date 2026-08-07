@@ -61,11 +61,14 @@ def train_with_checkpoint_fallback(
     candidates = checkpoint_candidates(checkpoint_root)
     for ckpt in candidates:
         try:
-            print(f"{label}: resuming from {ckpt}", flush=True)
+            # ckpt.name, not the path: job stdout is user-visible and the
+            # sandbox mount layout adds nothing. trainer gets the real path.
+            print(f"{label}: resuming from {ckpt.name}", flush=True)
             return trainer.train(resume_from_checkpoint=str(ckpt))
         except Exception as exc:  # noqa: BLE001
             print(
-                f"{label}: resume from {ckpt} failed ({exc}); trying older checkpoint",
+                f"{label}: resume from {ckpt.name} failed ({exc}); "
+                f"trying older checkpoint",
                 flush=True,
             )
 

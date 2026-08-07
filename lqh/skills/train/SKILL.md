@@ -426,7 +426,7 @@ When helping the user with training:
    Before training, evaluate the Liquid base model to establish a score baseline:
    use `eval_hf_model` (cloud, by its HuggingFace id) or `start_local_eval`
    (local/SSH checkpoint dir). The router.liquid.ai API is retired, so
-   `run_scoring` mode=`model_eval` is reserved for non-Liquid frontier/pool
+   `run_scoring` mode=`model_eval` is reserved for the pool
    baselines, not the Liquid base model itself. **VERY IMPORTANT: always pass a system prompt for
    this baseline.** A small base model with no system prompt does not know what the
    task is, produces confused output, and scores near zero — a meaningless baseline

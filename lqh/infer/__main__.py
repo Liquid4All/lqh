@@ -38,7 +38,7 @@ def main() -> None:
 
 
 # Incremental predictions: each completed sample is appended to this
-# JSONL in the run dir (the durable Modal volume for cloud jobs), so a
+# JSONL in the run dir (a durable cloud volume for cloud jobs), so a
 # worker continuation after a SIGKILL/timeout resumes from the last
 # completed sample instead of regenerating everything. Mirrors the
 # data_gen partial pattern in lqh/engine.py. Deleted once the canonical
@@ -250,7 +250,7 @@ def _run_inference_hf(run_dir: Path, config: dict) -> None:
 
     from lqh.progress import ProgressReporter
     from lqh.train.data_utils import load_eval_sources_with_tools
-    from lqh.train.load_model import load_for_inference
+    from lqh.train.load_model import display_model_ref, load_for_inference
     from lqh.train.progress import write_eval_request, write_progress, write_status
     from lqh.train.tool_format import get_tool_formatter
 
@@ -278,7 +278,7 @@ def _run_inference_hf(run_dir: Path, config: dict) -> None:
         overall_fraction=progress_start, unit="samples", force=True,
     )
 
-    print(f"Loading model: {base_model}")
+    print(f"Loading model: {display_model_ref(base_model, run_dir)}")
     # load_for_inference transparently handles hub ids, merged dirs,
     # and adapter dirs (the latter via base+PeftModel+merge_and_unload).
     # For vision (LFM-VL) models it returns the AutoProcessor in the

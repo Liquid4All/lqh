@@ -565,7 +565,7 @@ def hf_dataset(
         streaming=streaming,
         revision=revision,
         # Explicit rather than relying on implicit library discovery: cloud
-        # jobs receive HF_TOKEN as a Modal secret under the trusted-pipeline
+        # jobs receive HF_TOKEN as an injected secret under the trusted-pipeline
         # contract, including direct streaming of private datasets. Local
         # runs additionally pick up a project env file (never by mutating
         # os.environ — see lqh.hf_token).

@@ -963,7 +963,7 @@ class JobSupervisor:
 
         The local artifacts.json manifest only sees artifact events that
         were streamed over SSE — after a backend restart the reattached
-        pump never replays them (Modal reattach doesn't re-stream
+        pump never replays them (sandbox reattach doesn't re-stream
         stdout), so a missing local entry is NOT proof of failure. When
         the manifest has no entry, ask the backend artifact API before
         rendering a verdict. verified=False means the API couldn't be

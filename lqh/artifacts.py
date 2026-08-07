@@ -342,7 +342,7 @@ class BackendArtifactStore:
             )
             if put.status_code not in (200, 201):
                 raise ArtifactError(
-                    f"R2 upload failed ({put.status_code}): {put.text[:200]}"
+                    f"artifact upload failed ({put.status_code}): {put.text[:200]}"
                 )
             # Register with its own retry, reusing the SAME r2_key: the
             # bytes are already in R2, so a register-phase blip (or a
@@ -398,7 +398,7 @@ class BackendArtifactStore:
                 if resp.status_code != 200:
                     body = await resp.aread()
                     raise ArtifactError(
-                        f"R2 download failed ({resp.status_code}): {body[:200]!r}"
+                        f"artifact download failed ({resp.status_code}): {body[:200]!r}"
                     )
                 with tmp.open("wb") as fh:
                     async for chunk in resp.aiter_bytes(_CHUNK):

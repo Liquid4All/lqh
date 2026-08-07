@@ -486,7 +486,9 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             "'eval_dataset' fallbacks were removed; set 'dataset'."
         )
 
-    print(f"Loading model: {base_model}")
+    from lqh.train.load_model import display_model_ref
+
+    print(f"Loading model: {display_model_ref(base_model, run_dir)}")
 
     # GPU info
     num_gpus = torch.cuda.device_count()
@@ -1559,18 +1561,21 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                 f"partial model saved to {final_model_dir.name}/"
             ),
         )
-        print(f"DPO training interrupted. Partial model saved to {final_model_dir}")
+        print(
+            "DPO training interrupted. Partial model saved to "
+            f"{display_model_ref(final_model_dir, run_dir)}"
+        )
     elif early_stopped:
         write_status(run_dir, "completed")
         print(
             "DPO training stopped early on held-out quality and restored the "
-            f"best checkpoint. Model saved to {final_model_dir}"
+            f"best checkpoint. Model saved to {display_model_ref(final_model_dir, run_dir)}"
         )
     elif final_eval_failed:
         write_status(run_dir, "completed")
         print(
             "DPO training completed, but final evaluation failed. "
-            f"Model saved to {final_model_dir}"
+            f"Model saved to {display_model_ref(final_model_dir, run_dir)}"
         )
     elif not final_scoring_expected:
         from lqh.progress import ProgressEvent, write_progress_event
@@ -1585,12 +1590,15 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             ),
         )
         write_status(run_dir, "completed")
-        print(f"DPO training completed. Model saved to {final_model_dir}")
+        print(
+            "DPO training completed. Model saved to "
+            f"{display_model_ref(final_model_dir, run_dir)}"
+        )
     else:
         write_status(run_dir, "completed")
         print(
             "DPO training completed; final evaluation is ready for scoring. "
-            f"Model saved to {final_model_dir}"
+            f"Model saved to {display_model_ref(final_model_dir, run_dir)}"
         )
 
 

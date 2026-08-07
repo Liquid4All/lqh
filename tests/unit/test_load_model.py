@@ -418,3 +418,37 @@ def test_explicit_modality_skips_detection(stub_torch_transformers_peft):
 
     s.AutoConfig.from_pretrained.assert_not_called()
     s.AutoModelForCausalLM.from_pretrained.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# display_model_ref
+# ---------------------------------------------------------------------------
+
+
+def test_display_model_ref_strips_sandbox_mount():
+    """Job stdout is read back by the agent — it must not carry the
+    sandbox's absolute mount layout (feedback #45)."""
+    from lqh.train.load_model import display_model_ref
+
+    run_dir = Path("/mnt-xyz/volumes/vol-abc/runs/02f85493")
+    ref = str(run_dir / "hf_checkpoints" / "LiquidAI__LFM2.5-1.2B-Instruct@main")
+
+    assert display_model_ref(ref, run_dir) == (
+        "hf_checkpoints/LiquidAI__LFM2.5-1.2B-Instruct@main"
+    )
+
+
+def test_display_model_ref_passes_through_hub_ids_and_foreign_paths():
+    from lqh.train.load_model import display_model_ref
+
+    run_dir = Path("/mnt-xyz/volumes/vol-abc/runs/02f85493")
+
+    # Hub id: not a path at all.
+    assert display_model_ref("LiquidAI/LFM2.5-1.2B", run_dir) == "LiquidAI/LFM2.5-1.2B"
+    # The user's own machine: their path, shown as-is.
+    assert display_model_ref("/home/me/ckpt", run_dir) == "/home/me/ckpt"
+    # Relative refs and a missing run_dir are left alone.
+    assert display_model_ref("runs/x/model", run_dir) == "runs/x/model"
+    assert display_model_ref("/abs/path", None) == "/abs/path"
+    # Degenerate: ref *is* the run dir — "." would say nothing.
+    assert display_model_ref(str(run_dir), run_dir) == str(run_dir)
