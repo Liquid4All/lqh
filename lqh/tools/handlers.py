@@ -1480,14 +1480,39 @@ async def _submit_cloud_data_gen(
             # donation itself is consented separately (hf_donate, below);
             # this line only sets expectations about what the pipeline
             # needs, since it streams a Hugging Face dataset.
-            from lqh.hf_token import hf_token_origin
+            from lqh.hf_token import (
+                DONATE_ALWAYS,
+                DONATE_NEVER,
+                hf_token_origin,
+                resolve_hf_donate_decision,
+            )
 
             origin = hf_token_origin(project_dir)
             if origin is not None and origin.donation_enabled:
+                # Three states, not two: the donation question is normally
+                # already answered up front, and promising a prompt that
+                # will not come is how a user ends up waiting for one.
+                decision = resolve_hf_donate_decision(project_dir)
+                if decision == DONATE_ALWAYS:
+                    outcome = (
+                        f"the token from {origin.label} is sent with it "
+                        "(you allowed this up front)"
+                    )
+                elif decision == DONATE_NEVER:
+                    outcome = (
+                        f"the token from {origin.label} is NOT sent (you declined "
+                        "up front) — a private dataset needs a stored account "
+                        "token or the job will fail"
+                    )
+                else:
+                    outcome = (
+                        f"you'll be asked whether to send the token from "
+                        f"{origin.label} with it"
+                    )
                 hf_line = (
-                    "  HF:      pipeline streams a Hugging Face dataset — you'll be "
-                    f"asked whether to send the token from {origin.label} with it "
-                    "(available to the trusted pipeline Python process)\n"
+                    "  HF:      pipeline streams a Hugging Face dataset — "
+                    f"{outcome} (available to the trusted pipeline Python "
+                    "process)\n"
                 )
             else:
                 hf_line = (
@@ -3066,15 +3091,19 @@ def _resolve_hf_donation(
     they get told what declining actually costs.
 
     The prompt only fires when a token was actually found, so users
-    without one never see it, and at most once per project for anyone who
-    picks "don't ask again".
+    without one never see it — and normally it does not fire at all,
+    because the question is put up front (interactive startup, see
+    ``TuiApp._settle_hf_donation``) and the standing answer is what this
+    function reads. What is left here is the fallback for the cases the
+    up-front question cannot cover: a token that appeared mid-session, a
+    startup prompt the user quit out of, and the headless surfaces.
 
     Provenance only in this function — no plaintext. See lqh.hf_token.
     """
     if hf_donate is False:
         return False, None
 
-    from lqh.hf_token import hf_token_origin
+    from lqh.hf_token import DONATE_ALWAYS, hf_token_origin, resolve_hf_donate_decision
 
     origin = hf_token_origin(project_dir)
     if origin is None or not origin.donation_enabled:
@@ -3082,15 +3111,28 @@ def _resolve_hf_donation(
         # no donation, job proceeds.
         return False, None
 
-    # Default rather than skip when no invocation context was supplied.
-    # `allows_hf_donate` consults the DURABLE per-project grant as well
-    # as the invocation grants, and a tool's first call normally carries
-    # no _permissions at all — so gating the whole check on "is there a
-    # context" meant "Accept, and don't ask again for this project" was
-    # honoured on the re-invocation and forgotten on every submit after
-    # that. The option read as broken.
-    if (permissions or PermissionContext()).allows_hf_donate(project_dir):
+    # Default rather than skip when no invocation context was supplied:
+    # a tool's first call normally carries no _permissions at all.
+    perms = permissions or PermissionContext()
+
+    # An invocation-scoped grant is checked FIRST, ahead of anything on
+    # disk. `--allow-hf-donate` (or the agent loop re-invoking after a
+    # "yes") is the user saying yes about this run, right now; a stored
+    # "no" from some earlier session must not veto it. The env opt-out
+    # still wins over both — it was checked above.
+    if "hf_donate" in perms.grants:
         return True, None
+
+    # A standing answer settles it silently, in both directions. Asking
+    # again mid-pipeline is the complaint this path exists to remove: a
+    # credential question arriving between two stages of a run the user
+    # is watching reads as "something needs my token *now*", when in fact
+    # nothing here does. The durable per-project grant written by "don't
+    # ask again" is one of the answers this reads, so that option keeps
+    # working exactly as before.
+    decision = resolve_hf_donate_decision(project_dir)
+    if decision is not None:
+        return decision == DONATE_ALWAYS, None
 
     where = origin.label
     if origin.path:
@@ -3160,10 +3202,16 @@ def _get_hf_token(project_dir: Path | None = None) -> str:
     token = local_hf_token(project_dir)
     if not token:
         raise ValueError(
-            "No Hugging Face token found. Looked at: HF_TOKEN and "
-            "HUGGING_FACE_HUB_TOKEN in the environment, .env.local/.env in the "
-            "project, and ~/.cache/huggingface/token (huggingface-cli login). "
-            "Get a token at https://huggingface.co/settings/tokens"
+            "No Hugging Face credentials on this machine. This tool talks to "
+            "the Hub from here, so it needs a local token — looked at: HF_TOKEN "
+            "and HUGGING_FACE_HUB_TOKEN in the environment, .env.local/.env in "
+            "the project, and ~/.cache/huggingface/token (huggingface-cli "
+            "login).\n"
+            "Get one at https://huggingface.co/settings/tokens, then either "
+            "export HF_TOKEN=... or add HF_TOKEN=... to the project .env.\n"
+            "Note: a token stored with /hf_login lives on the LQH backend and is "
+            "used by CLOUD jobs only — it is deliberately never sent back to "
+            "this machine, so it cannot serve this call."
         )
     return token
 

@@ -71,6 +71,10 @@ That's it. The agent takes it from there — it interviews you about requirement
 
 > [!TIP]
 > Run `/hf_login` (or set `HF_TOKEN`) to enable private HuggingFace dataset access and publishing.
+> If a token is already on the machine (`HF_TOKEN`, a project `.env`, or
+> `huggingface-cli login`), LQH asks **once at startup** whether cloud jobs may
+> use it, and remembers the answer — per project, or for the whole machine.
+> `LQH_HF_DONATE=0` keeps a local token out of cloud jobs without being asked.
 
 ## 🔁 The pipeline
 

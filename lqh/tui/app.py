@@ -1265,9 +1265,10 @@ class LqhApp:
             "will use it for private models/datasets and pushes, with no dependency "
             "on this machine.\n"
             "If this machine ALSO has a token (shell, project .env, or "
-            "`huggingface-cli login`), you'll still be asked once per job whether to "
-            "send that one instead — it takes precedence for that job. Answer "
-            "\"don't ask again\" or set LQH_HF_DONATE=0 to settle it.\n"
+            "`huggingface-cli login`), LQH asks once — at startup — whether cloud "
+            "jobs may use that one instead; if you allowed it, it takes precedence "
+            "for those jobs. Set LQH_HF_DONATE=0 to keep the local one out of "
+            "cloud jobs entirely.\n"
             "Either way the token is available to the trusted pipeline Python "
             "process during cloud data generation — use a fine-grained, read-only "
             "token when possible."
@@ -1369,13 +1370,22 @@ class LqhApp:
             # green ✓env there described a token the job would never
             # receive.
             donatable = origin is not None and origin.donation_enabled
-            if donatable and self._agent is not None and self._agent.policy.auto_grant_permissions:
-                from lqh.tools.permissions import check_hf_donate_permission
-
-                donatable = (
-                    self._agent.policy.allow_hf_donate
-                    or check_hf_donate_permission(self.project_dir)
+            if donatable:
+                from lqh.hf_token import (
+                    DONATE_ALWAYS,
+                    DONATE_NEVER,
+                    resolve_hf_donate_decision,
                 )
+
+                decision = resolve_hf_donate_decision(self.project_dir)
+                if decision == DONATE_NEVER:
+                    # A standing "no" is as final as the env opt-out.
+                    donatable = False
+                elif decision != DONATE_ALWAYS and (
+                    self._agent is not None
+                    and self._agent.policy.auto_grant_permissions
+                ):
+                    donatable = self._agent.policy.allow_hf_donate
             self._status_bar.hf_local_donatable = donatable
         except Exception:
             self._status_bar.hf_local_source = None
@@ -1395,6 +1405,162 @@ class LqhApp:
             # the fact it described.
             self._status_bar.hf_cloud_configured = None
         self._invalidate()
+
+    # Answers to the startup donation question, matched by prefix below.
+    # Order matters only for display; the mapping is explicit.
+    _HF_DONATE_ANSWERS = [
+        ("Yes — send it with cloud jobs from this project", "project_yes"),
+        ("Yes — and for every project on this machine", "global_yes"),
+        ("No — not for this project", "project_no"),
+        ("No — never, on any project (I'll use /hf_login instead)", "global_no"),
+    ]
+
+    async def _settle_hf_donation(self) -> None:
+        """Ask, once and up front, whether a local HF token may go with cloud jobs.
+
+        This question used to arrive at the first cloud submit — that is,
+        in the middle of a pipeline the user was watching, phrased as
+        though something in that job needed the credential. Nothing did:
+        it is an *offer*, triggered only by a token happening to sit on
+        this machine, and the honest moment to make an offer is before the
+        work starts, not between two stages of it.
+
+        Silent when there is nothing to ask: no token on the machine, an
+        answer already on record, or ``LQH_HF_DONATE=0``. Never raises into
+        startup — failing to record an answer only means asking again next
+        time.
+
+        Deliberately NOT gated on the project's compute target. Only
+        training follows that setting; data-gen, eval, GGUF conversion and
+        HF transfers submit to our cloud sandbox whatever a project pins
+        its training compute to. Gating here would have left exactly the
+        bring-your-own-compute users unasked at startup and still
+        interrupted mid-pipeline — the bug this exists to remove.
+        """
+        try:
+            from lqh.hf_token import hf_donate_question_due
+
+            origin = hf_donate_question_due(self.project_dir)
+        except Exception:
+            return
+        if origin is None:
+            return
+
+        where = origin.label
+        if origin.path:
+            where += f" ({origin.path})"
+        provenance = (
+            "This is the token `huggingface-cli login` saved on this machine — "
+            "you didn't set it up for LQH specifically.\n"
+            if origin.is_hub_cache
+            else ""
+        )
+        await self._emit(render_system_message(
+            f"🤗 Found a Hugging Face token in {where}.\n"
+            f"{provenance}"
+            "Cloud jobs (data generation, training, eval, GGUF conversion) run in "
+            "a sandbox on our infrastructure. Sending this token along lets those "
+            "jobs read gated or private models and datasets from the Hub, and push "
+            "to your repos. Jobs that touch nothing gated work fine without it.\n"
+            "If you say yes: the token is encrypted and scoped to each job, then "
+            "deleted when the job ends — it is not added to your LQH account, and "
+            "it is available to the trusted Python process running your pipeline.\n"
+            "If you say no: jobs still run, they just can't reach anything gated. "
+            "A token stored with /hf_login is a separate, account-level "
+            "credential and is unaffected either way.\n"
+            "Answering here means you won't be interrupted about it mid-run."
+        ))
+        choice = await self._wait_for_user_response(
+            options=[label for label, _ in self._HF_DONATE_ANSWERS],
+        )
+        # Ctrl+C at the prompt resolves it with the shutdown sentinel.
+        # Recording nothing is the safe outcome: the question simply
+        # reappears next start.
+        if self._shutdown_requested:
+            return
+        answer = next(
+            (key for label, key in self._HF_DONATE_ANSWERS if choice.startswith(label)),
+            None,
+        )
+        if answer is None:
+            # "Other" free text, or an unrecognised reply. Treat it as
+            # unanswered rather than guessing at consent for a credential.
+            await self._emit(render_system_message(
+                "No answer recorded — you'll be asked again next time (or set "
+                "LQH_HF_DONATE=0 to settle it permanently)."
+            ))
+            return
+
+        from lqh.config import update_config
+        from lqh.tools.permissions import (
+            deny_hf_donate_permission,
+            grant_hf_donate_permission,
+        )
+
+        # Where the answer lives is also where it is undone, and telling
+        # someone to edit the wrong file is worse than telling them
+        # nothing: they follow the instruction, the credential keeps
+        # going out, and the question never returns to let them correct
+        # it. Machine-wide answers name the config file too.
+        project_scoped = "in .lqh/permissions.json"
+        machine_scoped = (
+            "in .lqh/permissions.json (this project) and ~/.lqh/config.json "
+            "(\"hf_donate\", every project)"
+        )
+        try:
+            if answer == "project_yes":
+                grant_hf_donate_permission(self.project_dir)
+                note = ("✅ Your Hugging Face token will be sent with cloud jobs "
+                        "from this project.")
+                stored = project_scoped
+            elif answer == "global_yes":
+                grant_hf_donate_permission(self.project_dir)
+                update_config(lambda c: setattr(c, "hf_donate", "always"))
+                note = ("✅ Your Hugging Face token will be sent with cloud jobs from "
+                        "every project on this machine.")
+                stored = machine_scoped
+            elif answer == "project_no":
+                deny_hf_donate_permission(self.project_dir)
+                note = ("🚫 Your Hugging Face token stays on this machine for this "
+                        "project. Cloud jobs won't be able to reach gated repos.")
+                stored = project_scoped
+            else:
+                deny_hf_donate_permission(self.project_dir)
+                update_config(lambda c: setattr(c, "hf_donate", "never"))
+                note = ("🚫 Your Hugging Face token stays on this machine, on every "
+                        "project. Use /hf_login if you want cloud jobs to have "
+                        "Hub access via an account-level token.")
+                stored = machine_scoped
+        except Exception as exc:
+            # A machine-wide answer is two writes, so "nothing was
+            # recorded" is a guess. Ask the resolver what actually stands
+            # now and say that instead — a user told they'll be asked
+            # again, who then never is, has no way to reach the decision.
+            from lqh.hf_token import resolve_hf_donate_decision
+
+            try:
+                settled = resolve_hf_donate_decision(self.project_dir)
+            except Exception:
+                settled = None
+            tail = (
+                "You'll be asked again next time."
+                if settled is None
+                else (
+                    f"It was recorded only in part — this project now resolves to "
+                    f"\"{settled}\", and you won't be asked again. Fix or remove it "
+                    f"{machine_scoped}."
+                )
+            )
+            await self._emit(render_error(
+                f"Could not record the Hugging Face answer: {type(exc).__name__}: "
+                f"{exc}\n{tail}"
+            ))
+            return
+        await self._emit(render_system_message(
+            f"{note} Stored {stored} — change it there any time, or set "
+            "LQH_HF_DONATE=0 to disable donation everywhere."
+        ))
+        await self._refresh_hf_status()
 
     async def _refresh_startup_state(self) -> None:
         """One-shot startup refresh, BEFORE any context/signals are built.
@@ -2587,6 +2753,14 @@ class LqhApp:
                 await self._emit(render_error(
                     f"Cloud identity migration failed: {type(exc).__name__}: {exc}"
                 ))
+
+        # Credentials before work: the HF-donation question belongs with
+        # login and project identity, not halfway through a pipeline.
+        if not self.auto_mode:
+            await self._settle_hf_donation()
+            if self._shutdown_requested:
+                await self._teardown(app_task)
+                return
 
         await self._refresh_startup_state()
 

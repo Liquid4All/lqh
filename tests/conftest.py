@@ -94,6 +94,12 @@ def _no_ambient_hf_token(monkeypatch, request, tmp_path_factory):
     for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "LQH_ENV_FILE", "LQH_HF_DONATE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr("lqh.hf_token._hub_cached_token", lambda: None)
+    # The installation-wide donation answer in ~/.lqh/config.json is the
+    # fourth source, and it is the developer's, not the test's: someone
+    # who answered the startup question "never for any project" on their
+    # own machine would otherwise see every donation-consent test pass
+    # for the wrong reason.
+    monkeypatch.setattr("lqh.hf_token._global_hf_donate", lambda: None)
     # Env FILES are the third source, and deleting variables does nothing
     # about them: a test that passes the repo root (or any other real
     # directory) as its project_dir reads whatever .env the developer

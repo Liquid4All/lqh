@@ -40,6 +40,13 @@ class PermissionStore:
     # doesn't vary per run. A one-time "yes" is carried out-of-band for
     # that invocation instead of being written here.
     hf_donate_allow_all: bool = False
+    # The recorded "no" to that same question. Only the up-front startup
+    # question writes this — a mid-job decline stays one-time (it rides
+    # the invocation as _hf_donate=False), because "not this job" and
+    # "not ever" are different answers and only the startup prompt offers
+    # the second one. Set means: never ask again in this project, never
+    # donate from it.
+    hf_donate_declined: bool = False
 
 
 def _permissions_lock(project_dir: Path):
@@ -62,6 +69,7 @@ def load_permissions(project_dir: Path) -> PermissionStore:
             cloud_data_gen_allow_all=data.get("cloud_data_gen_allow_all", False),
             cloud_eval_hf_allow_all=data.get("cloud_eval_hf_allow_all", False),
             hf_donate_allow_all=data.get("hf_donate_allow_all", False),
+            hf_donate_declined=data.get("hf_donate_declined", False),
         )
     except (json.JSONDecodeError, OSError):
         return PermissionStore()
@@ -162,6 +170,25 @@ def grant_hf_donate_permission(project_dir: Path) -> None:
     with _permissions_lock(project_dir):
         perms = load_permissions(project_dir)
         perms.hf_donate_allow_all = True
+        # A project cannot be both. Answering the startup question again
+        # (after `lqh config`-style edits, or a token that reappeared)
+        # must actually move the answer, not leave a contradiction on
+        # disk for the resolver to arbitrate.
+        perms.hf_donate_declined = False
+        save_permissions(project_dir, perms)
+
+
+def deny_hf_donate_permission(project_dir: Path) -> None:
+    """Project-wide "no" — recorded by the startup question only.
+
+    Distinct from the mid-job decline, which is deliberately not
+    persisted (see PermissionStore.hf_donate_declined): declining one job
+    is not the same statement as declining the project.
+    """
+    with _permissions_lock(project_dir):
+        perms = load_permissions(project_dir)
+        perms.hf_donate_declined = True
+        perms.hf_donate_allow_all = False
         save_permissions(project_dir, perms)
 
 
@@ -276,8 +303,23 @@ class PermissionContext:
         something the invocation implies. Surfaces that want it say so
         explicitly: ``lqh tool call --allow-hf-donate``, ``lqh run
         --allow-hf-donate``, or a durable grant from the TUI prompt.
+
+        The stored half is delegated to
+        :func:`lqh.hf_token.resolve_hf_donate_decision` rather than read
+        off this project's file directly, so this helper cannot drift
+        from the gate that actually decides (``handlers.
+        _resolve_hf_donation``) as answers gain sources — an
+        installation-wide answer and ``LQH_HF_DONATE=0`` are both invisible
+        to ``hf_donate_allow_all`` alone.
         """
-        return (
-            "hf_donate" in self.grants
-            or check_hf_donate_permission(project_dir)
+        from lqh.hf_token import (
+            DONATE_ALWAYS,
+            donation_opted_out,
+            resolve_hf_donate_decision,
         )
+
+        if donation_opted_out():
+            return False
+        if "hf_donate" in self.grants:
+            return True
+        return resolve_hf_donate_decision(project_dir) == DONATE_ALWAYS

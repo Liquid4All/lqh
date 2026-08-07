@@ -321,7 +321,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Permit sending a locally-found Hugging Face token (env, project "
             ".env, or huggingface-cli login) with this run's cloud jobs. "
             "Without it the run proceeds without the token rather than "
-            "stopping for consent."
+            "stopping for consent — unless you already allowed donation for "
+            "this project or machine-wide when LQH asked at startup."
         ),
     )
     run.add_argument(

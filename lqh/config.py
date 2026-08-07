@@ -40,6 +40,12 @@ class LqhConfig:
     # ``"cloud"`` (LQH Cloud), ``"ssh:<name>"`` (a configured SSH remote),
     # or ``None`` (not yet chosen → first-run picker fires).
     default_compute: str | None = None
+    # Installation-wide answer to "may a locally-found Hugging Face token
+    # be sent with cloud jobs". ``"always"`` / ``"never"`` / None (not yet
+    # asked → the startup question fires). Per-project answers live in
+    # ``.lqh/permissions.json`` and win over this; LQH_HF_DONATE=0 wins
+    # over both. See lqh.hf_token.resolve_hf_donate_decision.
+    hf_donate: str | None = None
     # First-party, operational CLI telemetry. Environment variable
     # LQH_TELEMETRY has final precedence; see telemetry_enabled().
     telemetry_enabled: bool = True
@@ -74,6 +80,14 @@ def _load_config_unlocked() -> LqhConfig:
         api_key=data.get("api_key"),  # type: ignore[arg-type]
         api_base_url=data.get("api_base_url", default_api_base_url()),  # type: ignore[arg-type]
         default_compute=data.get("default_compute"),  # type: ignore[arg-type]
+        # Unknown values are treated as "not answered" rather than as a
+        # silent yes: a config file hand-edited to a typo must not decide
+        # that a credential leaves the machine.
+        hf_donate=(
+            data.get("hf_donate")  # type: ignore[arg-type]
+            if data.get("hf_donate") in ("always", "never")
+            else None
+        ),
         telemetry_enabled=bool(data.get("telemetry_enabled", True)),
         telemetry_consent_epoch=max(int(data.get("telemetry_consent_epoch", 0)), 0),
     )

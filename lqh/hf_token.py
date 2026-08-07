@@ -64,12 +64,17 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DONATE_ALWAYS",
+    "DONATE_NEVER",
     "HFTokenOrigin",
     "donatable_hf_token",
+    "donation_opted_out",
     "hf_disclosure_line",
+    "hf_donate_question_due",
     "hf_token_origin",
     "local_hf_token",
     "redact",
+    "resolve_hf_donate_decision",
 ]
 
 # Environment variables, in precedence order. HF_TOKEN is ours and
@@ -343,6 +348,84 @@ def _donation_disabled() -> bool:
     return raw in {"0", "false", "no", "off"}
 
 
+def donation_opted_out() -> bool:
+    """Public name for the ``LQH_HF_DONATE=0`` opt-out.
+
+    It outranks every other answer — stored, per-invocation, or otherwise
+    — so consent helpers outside this module check it first rather than
+    re-deriving the variable's spelling.
+    """
+    return _donation_disabled()
+
+
+# Settled answers to "may a locally-found token ride along with cloud
+# jobs". Anything else (None) means the question has not been answered
+# and the up-front prompt is still due.
+DONATE_ALWAYS = "always"
+DONATE_NEVER = "never"
+
+
+def resolve_hf_donate_decision(project_dir: Path | None) -> str | None:
+    """The standing donation answer, or None if nobody has answered yet.
+
+    Precedence, narrowest first: ``LQH_HF_DONATE=0`` (absolute), then the
+    per-project record in ``.lqh/permissions.json``, then the
+    installation-wide ``hf_donate`` in ``~/.lqh/config.json``.
+
+    The point of a *standing* answer is that the per-job prompt stops
+    firing: a credential question belongs at the start of the work, not
+    halfway through a pipeline the user is in the middle of watching.
+    Provenance/policy only — no plaintext ever passes through here.
+    """
+    if _donation_disabled():
+        return DONATE_NEVER
+    if project_dir is not None:
+        from lqh.tools.permissions import load_permissions
+
+        try:
+            perms = load_permissions(project_dir)
+        except Exception:
+            perms = None
+        if perms is not None:
+            if perms.hf_donate_allow_all:
+                return DONATE_ALWAYS
+            if perms.hf_donate_declined:
+                return DONATE_NEVER
+    return _global_hf_donate()
+
+
+def _global_hf_donate() -> str | None:
+    """Installation-wide answer from ``~/.lqh/config.json``, or None.
+
+    Its own function so the unit suite can neutralize the developer's real
+    config the same way it neutralizes their real HF token — otherwise
+    whether a consent test sees a prompt would depend on how the machine
+    running it answered this question once.
+    """
+    from lqh.config import load_config
+
+    try:
+        return load_config().hf_donate
+    except Exception:
+        # An unreadable config is "not answered", never "yes".
+        return None
+
+
+def hf_donate_question_due(project_dir: Path | None) -> HFTokenOrigin | None:
+    """The origin to ask about, or None when there is nothing to ask.
+
+    Nothing to ask means: no token on this machine, donation switched off
+    by env, or an answer already on record. Callers get the origin back so
+    the prompt can name where the token came from.
+    """
+    origin = hf_token_origin(project_dir)
+    if origin is None or not origin.donation_enabled:
+        return None
+    if resolve_hf_donate_decision(project_dir) is not None:
+        return None
+    return origin
+
+
 def hf_token_origin(project_dir: Path | None) -> HFTokenOrigin | None:
     """Where a local HF token would come from, without reading its value.
 
@@ -408,15 +491,27 @@ def hf_disclosure_line(project_dir: Path | None, *, indent: str = "  ") -> str:
         "held only for this job, then deleted — it is not added to your LQH "
         "account (LQH_HF_DONATE=0 stops us offering)"
     )
-    if origin.is_hub_cache:
-        # Distinct wording: this token was created for the Hub CLI, not for us.
-        return (
-            f"{indent}HF:      you'll be asked whether to send the token from your "
-            f"`huggingface-cli login` with this job — {tail}\n"
-        )
     where = origin.label
     if origin.path:
         where += f" ({origin.path})"
+    if origin.is_hub_cache:
+        # Distinct wording: this token was created for the Hub CLI, not for us.
+        where = "your `huggingface-cli login`"
+    # With a standing answer on record the per-job prompt does not fire,
+    # so promising one would be a prompt the user then waits for in vain
+    # — and, on the "always" side, would understate what this submit does.
+    decision = resolve_hf_donate_decision(project_dir)
+    if decision == DONATE_ALWAYS:
+        return (
+            f"{indent}HF:      the Hugging Face token from {where} is sent with "
+            f"this job (you allowed this up front) — {tail}\n"
+        )
+    if decision == DONATE_NEVER:
+        return (
+            f"{indent}HF:      the Hugging Face token from {where} is NOT sent "
+            "(you declined up front); any token stored via /hf_login still "
+            "applies\n"
+        )
     return (
         f"{indent}HF:      you'll be asked whether to send a Hugging Face token "
         f"from {where} with this job — {tail}\n"

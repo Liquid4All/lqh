@@ -177,6 +177,21 @@ async def test_interactive_mode_is_green_because_it_will_ask(cloud_project):
 
 
 @pytest.mark.asyncio
+async def test_a_standing_decline_is_not_green(cloud_project):
+    """Answering "no" to the startup donation question is as final as
+    LQH_HF_DONATE=0 — the token is found, but nothing will send it, and a
+    green ✓env would promise the sandbox HF access it won't have."""
+    from lqh.tools.permissions import deny_hf_donate_permission
+
+    deny_hf_donate_permission(cloud_project)
+    app = _StubApp(cloud_project, agent=_StubAgent(auto=False))
+    await app._refresh_hf_status()
+
+    assert app._status_bar.hf_local_source is not None
+    assert app._status_bar.hf_local_donatable is False
+
+
+@pytest.mark.asyncio
 async def test_stale_cloud_status_is_cleared(cloud_project, monkeypatch):
     """hf_cloud_configured had no path back to unknown: a True from an
     earlier cloud project kept rendering ✓acct after a logout or a switch

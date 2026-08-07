@@ -498,3 +498,181 @@ async def test_gguf_only_warns_when_it_actually_pushes(
     )
 
     assert seen.get("token_required") is required
+
+
+# ---------------------------------------------------------------------------
+# standing answers — the up-front question is what normally settles this,
+# so the per-job gate must read it and stay quiet
+# ---------------------------------------------------------------------------
+
+# Captured before conftest's isolation fixture swaps it out, so the tests
+# below can exercise the real ~/.lqh/config.json read against a redirected
+# home rather than the developer's own.
+from lqh.hf_token import _global_hf_donate as _REAL_GLOBAL_LOOKUP  # noqa: E402
+from lqh.hf_token import (  # noqa: E402
+    DONATE_ALWAYS,
+    DONATE_NEVER,
+    hf_donate_question_due,
+    resolve_hf_donate_decision,
+)
+from lqh.tools.permissions import deny_hf_donate_permission  # noqa: E402
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    """Redirect ~/.lqh so installation-wide answers are test-local."""
+    root = tmp_path / "home" / ".lqh"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("lqh.config.config_dir", lambda: root)
+    monkeypatch.setattr("lqh.config.config_path", lambda: root / "config.json")
+    monkeypatch.setattr("lqh.hf_token._global_hf_donate", _REAL_GLOBAL_LOOKUP)
+    return root
+
+
+def _set_global(value):
+    from lqh.config import update_config
+
+    update_config(lambda c: setattr(c, "hf_donate", value))
+
+
+def test_project_decline_skips_the_prompt(project):
+    """The startup question's "no" is durable — unlike a mid-job decline."""
+    deny_hf_donate_permission(project)
+    donate, prompt = _resolve_hf_donation(project, PermissionContext(), None, "data-gen")
+    assert donate is False
+    assert prompt is None
+
+
+def test_installation_yes_donates_without_asking(project, home):
+    _set_global("always")
+    donate, prompt = _resolve_hf_donation(project, PermissionContext(), None, "data-gen")
+    assert donate is True
+    assert prompt is None
+
+
+def test_installation_no_skips_the_prompt(project, home):
+    _set_global("never")
+    donate, prompt = _resolve_hf_donation(project, PermissionContext(), None, "training")
+    assert donate is False
+    assert prompt is None
+
+
+def test_project_answer_beats_the_installation_default(project, home):
+    _set_global("never")
+    grant_hf_donate_permission(project)
+    assert resolve_hf_donate_decision(project) == DONATE_ALWAYS
+
+    _set_global("always")
+    deny_hf_donate_permission(project)
+    assert resolve_hf_donate_decision(project) == DONATE_NEVER
+
+
+def test_env_opt_out_beats_every_stored_answer(project, home, monkeypatch):
+    _set_global("always")
+    grant_hf_donate_permission(project)
+    monkeypatch.setenv("LQH_HF_DONATE", "0")
+    assert resolve_hf_donate_decision(project) == DONATE_NEVER
+    donate, prompt = _resolve_hf_donation(project, PermissionContext(), None, "eval")
+    assert donate is False
+    assert prompt is None
+
+
+def test_invocation_opt_in_beats_a_stored_no(project):
+    """`--allow-hf-donate` is the user saying yes about THIS run; a "no"
+    they recorded in some earlier session must not veto it."""
+    deny_hf_donate_permission(project)
+    donate, prompt = _resolve_hf_donation(
+        project, PermissionContext.granting("hf_donate"), None, "training",
+    )
+    assert donate is True
+    assert prompt is None
+
+
+def test_env_opt_out_still_beats_the_invocation_opt_in(project, monkeypatch):
+    monkeypatch.setenv("LQH_HF_DONATE", "0")
+    donate, prompt = _resolve_hf_donation(
+        project, PermissionContext.granting("hf_donate"), None, "training",
+    )
+    assert donate is False
+    assert prompt is None
+
+
+def test_granting_after_declining_clears_the_decline(project):
+    deny_hf_donate_permission(project)
+    grant_hf_donate_permission(project)
+    perms = load_permissions(project)
+    assert perms.hf_donate_allow_all is True
+    assert perms.hf_donate_declined is False
+    assert resolve_hf_donate_decision(project) == DONATE_ALWAYS
+
+
+def test_a_garbage_config_value_is_not_a_yes(project, home):
+    """A hand-edited config must not decide that a credential leaves the
+    machine — anything but the two known answers reads as unanswered."""
+    (home / "config.json").write_text('{"hf_donate": "yes please"}')
+    assert resolve_hf_donate_decision(project) is None
+
+
+# hf_donate_question_due — what the startup prompt asks itself
+
+
+def test_question_is_due_when_a_token_is_found_and_unanswered(project):
+    origin = hf_donate_question_due(project)
+    assert origin is not None
+    assert ".env" in (origin.path or "")
+
+
+@pytest.mark.parametrize("record", [grant_hf_donate_permission, deny_hf_donate_permission])
+def test_question_is_not_due_once_answered(project, record):
+    record(project)
+    assert hf_donate_question_due(project) is None
+
+
+def test_question_is_not_due_without_a_token(tmp_path):
+    (tmp_path / ".lqh").mkdir()
+    assert hf_donate_question_due(tmp_path) is None
+
+
+def test_question_is_not_due_when_donation_is_switched_off(project, monkeypatch):
+    monkeypatch.setenv("LQH_HF_DONATE", "0")
+    assert hf_donate_question_due(project) is None
+
+
+# the disclosure line in the surrounding consent prompts must agree
+
+
+@pytest.mark.parametrize(
+    "record,expected",
+    [(grant_hf_donate_permission, "is sent with this job"),
+     (deny_hf_donate_permission, "is NOT sent")],
+)
+def test_disclosure_reflects_a_standing_answer(project, record, expected):
+    """Once answered, promising "you'll be asked" would describe a prompt
+    that never comes."""
+    from lqh.hf_token import hf_disclosure_line
+
+    record(project)
+    line = hf_disclosure_line(project)
+    assert expected in line
+    assert "you'll be asked" not in line
+
+
+def test_the_context_helper_cannot_drift_from_the_gate(project, home, monkeypatch):
+    """PermissionContext.allows_hf_donate reads the same resolver the gate
+    does. Reading only hf_donate_allow_all left it blind to the
+    installation-wide answer and to LQH_HF_DONATE=0."""
+    ctx = PermissionContext()
+    assert ctx.allows_hf_donate(project) is False
+
+    _set_global("always")
+    assert ctx.allows_hf_donate(project) is True
+
+    deny_hf_donate_permission(project)
+    assert ctx.allows_hf_donate(project) is False
+    # ...and an explicit invocation grant still overrides that stored no,
+    # exactly as it does in _resolve_hf_donation.
+    assert PermissionContext.granting("hf_donate").allows_hf_donate(project) is True
+
+    # The env opt-out outranks even the grant, on both surfaces.
+    monkeypatch.setenv("LQH_HF_DONATE", "0")
+    assert PermissionContext.granting("hf_donate").allows_hf_donate(project) is False
