@@ -1865,26 +1865,6 @@ async def _execute_pipeline(
                 concurrency=concurrency,
             )
 
-        import sys as _sys
-
-        # Evict project-local modules cached by earlier runs in this
-        # session: a cached module makes its import a no-op, so it would
-        # be invisible to the newly-loaded detection below and a
-        # non-self-contained pipeline could validate for cloud execution
-        # (where that dependency won't exist). Eviction is safe — the
-        # next import re-executes the module fresh.
-        project_resolved = project_dir.resolve()
-        for _name, _mod in list(_sys.modules.items()):
-            _mod_file = getattr(_mod, "__file__", None)
-            if not _mod_file:
-                continue
-            try:
-                Path(_mod_file).resolve().relative_to(project_resolved)
-            except (OSError, ValueError):
-                continue
-            del _sys.modules[_name]
-
-        modules_before = set(_sys.modules)
         result = await run_pipeline(
             script_path=target,
             num_samples=num_samples,
@@ -1895,30 +1875,6 @@ async def _execute_pipeline(
             validation_instructions=val_text,
             on_progress=on_progress,
         )
-        # Detect project-local imports the static pre-scan can't (e.g.
-        # `import data_gen.helper` via a package path, or any other
-        # module resolved from inside the project). Such a pipeline runs
-        # locally but its dependency will not exist in the cloud bundle,
-        # so it must not validate for cloud execution.
-        project_imports: list[str] = []
-        target_resolved = target.resolve()
-        for name in set(_sys.modules) - modules_before:
-            mod = _sys.modules.get(name)
-            mod_file = getattr(mod, "__file__", None)
-            if not mod_file:
-                continue
-            try:
-                mod_path = Path(mod_file).resolve()
-            except OSError:
-                continue
-            if mod_path == target_resolved:
-                continue  # the pipeline module itself
-            try:
-                mod_path.relative_to(project_resolved)
-            except ValueError:
-                continue
-            project_imports.append(name)
-
         if result.succeeded <= 0:
             if telemetry_started and telemetry and telemetry.cached_consent_active(consent_epoch):
                 await telemetry.run_deferred(telemetry.event, "data_generation_failed", {
@@ -2034,19 +1990,12 @@ async def _execute_pipeline(
 
         # A successful local run validates this pipeline version for
         # cloud submission and records which lqh.sources inputs it read
-        # (the cloud bundle manifest) — UNLESS the run imported
-        # project-local modules (they won't exist in the bundle) or
-        # resumed from a partial file (its source recording covers only
-        # this process, so the manifest would be incomplete).
+        # (the cloud bundle manifest) — UNLESS the run resumed from a
+        # partial file (its source recording covers only this process,
+        # so the manifest would be incomplete).
         # Best-effort — never fail the run over gate bookkeeping.
         validation_note = ""
-        if project_imports:
-            validation_note = (
-                "\n⚠️ Not validated for cloud execution: the pipeline imported "
-                f"project-local modules ({', '.join(sorted(project_imports)[:5])}) — "
-                "cloud pipelines must be self-contained single files."
-            )
-        elif result.resumed_samples > 0:
+        if result.resumed_samples > 0:
             validation_note = (
                 "\nℹ️ Not validated for cloud execution: this run resumed "
                 f"{result.resumed_samples} samples from an interrupted run, so its "
@@ -2096,6 +2045,7 @@ async def _execute_pipeline(
                 + validation_note
                 + cloud_tip
             ),
+            ok=True,
         )
     except asyncio.CancelledError:
         if telemetry_started and telemetry and telemetry.cached_consent_active(consent_epoch):

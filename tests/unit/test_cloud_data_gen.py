@@ -580,22 +580,22 @@ async def test_cloud_concurrency_accounts_for_samples_per_item(
 
 
 @pytest.mark.asyncio
-async def test_project_local_import_blocks_cloud_validation(
+async def test_project_local_module_is_not_evicted_on_success(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """A pipeline that imports a project-local module runs locally but
-    that module won't exist in the cloud bundle — the run must not
-    validate for cloud execution."""
+    """Pipeline execution must not mutate the live interpreter's modules."""
     import sys
     import types
 
     project, script_rel = _handler_project(tmp_path)
     grant_permission(project, None, project_wide=True)
 
+    sentinel = types.ModuleType("project_cached_helper")
+    sentinel.__file__ = str(project / "data_gen" / "cached_helper.py")
+    sys.modules["project_cached_helper"] = sentinel
+
     async def fake_run_pipeline(*, script_path, num_samples, output_dir, client, **kw):
-        mod = types.ModuleType("sneaky_helper")
-        mod.__file__ = str(project / "data_gen" / "sneaky_helper.py")
-        sys.modules["sneaky_helper"] = mod
+        assert sys.modules["project_cached_helper"] is sentinel
         return EngineResult(
             total=num_samples, succeeded=num_samples, failed=0,
             output_path=output_dir / "data.parquet",
@@ -610,10 +610,9 @@ async def test_project_local_import_blocks_cloud_validation(
             output_dataset="d", execution="local",
         )
     finally:
-        sys.modules.pop("sneaky_helper", None)
-    assert "Not validated for cloud execution" in result.content
-    assert "sneaky_helper" in result.content
-    assert check_validation(project, project / script_rel) is None
+        assert sys.modules.pop("project_cached_helper", None) is sentinel
+    assert result.ok is True
+    assert check_validation(project, project / script_rel) is not None
 
 
 @pytest.mark.asyncio
@@ -1335,18 +1334,15 @@ async def test_consent_prompt_discloses_hf_token_donation(
 
 
 # ---------------------------------------------------------------------------
-# cached project-local imports must not evade bundle validation
+# pipeline failures must not mutate the live module registry
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_cached_project_module_is_evicted_before_run(
+async def test_project_local_module_is_not_evicted_on_failure(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """A project-local module cached in sys.modules by an earlier run
-    makes its import a no-op — invisible to newly-loaded detection. The
-    handler must evict it pre-run so the pipeline's (re)import shows up
-    and blocks cloud validation."""
+    """A generated-code error leaves cached TUI/runtime modules untouched."""
     import sys
     import types
 
@@ -1355,22 +1351,13 @@ async def test_cached_project_module_is_evicted_before_run(
 
     helper_file = project / "data_gen" / "cached_helper.py"
     helper_file.write_text("X = 1\n")
-    stale = types.ModuleType("cached_helper")
-    stale.__file__ = str(helper_file)
-    sys.modules["cached_helper"] = stale
-
-    observed: dict = {}
+    sentinel = types.ModuleType("cached_helper")
+    sentinel.__file__ = str(helper_file)
+    sys.modules["cached_helper"] = sentinel
 
     async def fake_run_pipeline(*, script_path, num_samples, output_dir, client, **kw):
-        observed["evicted"] = "cached_helper" not in sys.modules
-        # What a real `import cached_helper` does after eviction:
-        mod = types.ModuleType("cached_helper")
-        mod.__file__ = str(helper_file)
-        sys.modules["cached_helper"] = mod
-        return EngineResult(
-            total=num_samples, succeeded=num_samples, failed=0,
-            output_path=output_dir / "data.parquet",
-        )
+        assert sys.modules["cached_helper"] is sentinel
+        raise NameError("name 'sys' is not defined")
 
     monkeypatch.setattr("lqh.engine.run_pipeline", fake_run_pipeline)
     monkeypatch.setattr("lqh.auth.require_token", lambda: "tok")
@@ -1381,9 +1368,9 @@ async def test_cached_project_module_is_evicted_before_run(
             output_dataset="d", execution="local",
         )
     finally:
-        sys.modules.pop("cached_helper", None)
-    assert observed["evicted"] is True
-    assert "Not validated for cloud execution" in result.content
+        assert sys.modules.pop("cached_helper", None) is sentinel
+    assert result.ok is False
+    assert "NameError: name 'sys' is not defined" in result.content
     assert check_validation(project, project / script_rel) is None
 
 

@@ -58,6 +58,11 @@ lqh
 
 `uv tool install` puts the `lqh` command on your PATH in its own isolated environment — no virtualenv to create or activate, and uv downloads a compatible Python automatically if your system one is too old. Upgrade later with `uv tool upgrade lqh`. On Windows, install uv with `winget install astral-sh.uv`.
 
+If you run bare `lqh` directly from your Home folder, it offers to start in
+`~/lqh-projects/<name>` so generated files stay organized. You can press Enter
+to use Home anyway. `lqh --resume <id>` stays in Home so existing conversations
+remain reachable.
+
 If you already manage your own Python environments, `pipx install lqh` or `pip install lqh` work just as well.
 
 Inside the TUI:
@@ -182,7 +187,10 @@ That's it. Your agent learns how to drive lqh, checks where your project stands,
 
 ## 📁 Your project is just a directory
 
-`cd` into any directory and run `lqh` — the agent reads what's there to understand current state. No init command, no project marker file.
+`cd` into any project directory and run `lqh` — the agent reads what's there
+to understand current state. A directory below Home, such as
+`~/some_project_name`, opens directly with no setup prompt. No init command is
+needed.
 
 ```
 my-task/

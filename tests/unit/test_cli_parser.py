@@ -12,7 +12,13 @@ from pathlib import Path
 import pytest
 
 from lqh import __version__
-from lqh.cli import main
+from lqh.cli import _project_name_error, main
+
+
+def _set_test_home(monkeypatch, home: Path, *, interactive: bool = True) -> None:
+    """Platform-independent Home/TTY setup for startup-routing tests."""
+    monkeypatch.setattr("lqh.cli._home_dir", lambda: home)
+    monkeypatch.setattr("lqh.cli._stdin_is_interactive", lambda: interactive)
 
 
 def test_bare_invocation_routes_to_tui(monkeypatch, tmp_path: Path) -> None:
@@ -24,6 +30,275 @@ def test_bare_invocation_routes_to_tui(monkeypatch, tmp_path: Path) -> None:
     )
     main()
     assert calls == [(tmp_path, False, None, None)]
+
+
+def test_bare_invocation_from_fresh_home_creates_named_project(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    _set_test_home(monkeypatch, home)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(sys, "argv", ["lqh"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: "Support Assistant")
+    calls: list = []
+    monkeypatch.setattr(
+        "lqh.cli._launch_tui",
+        lambda *args: calls.append((args, Path.cwd())),
+    )
+
+    main()
+
+    project = (home / "lqh-projects" / "Support Assistant").resolve()
+    assert project.is_dir()
+    assert calls == [((project, False, None, None), project)]
+
+
+def test_bare_invocation_below_home_does_not_prompt(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = home / "some_project_name"
+    project.mkdir(parents=True)
+    _set_test_home(monkeypatch, home)
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(sys, "argv", ["lqh"])
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _prompt: pytest.fail("a Home subdirectory must not prompt"),
+    )
+    calls: list = []
+    monkeypatch.setattr("lqh.cli._launch_tui", lambda *args: calls.append(args))
+
+    main()
+
+    assert calls == [(project, False, None, None)]
+
+
+def test_global_home_config_does_not_suppress_prompt(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    global_config = home / ".lqh"
+    global_config.mkdir(parents=True)
+    (global_config / "config.json").write_text("{}\n")
+    _set_test_home(monkeypatch, home)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(sys, "argv", ["lqh"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: "new-project")
+    calls: list = []
+    monkeypatch.setattr("lqh.cli._launch_tui", lambda *args: calls.append(args))
+
+    main()
+
+    project = (home / "lqh-projects" / "new-project").resolve()
+    assert calls == [(project, False, None, None)]
+
+
+def test_home_prompt_can_explicitly_use_home(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "SPEC.md").write_text("# Existing Home project\n")
+    _set_test_home(monkeypatch, home)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(sys, "argv", ["lqh"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: "")
+    calls: list = []
+    monkeypatch.setattr("lqh.cli._launch_tui", lambda *args: calls.append(args))
+
+    main()
+
+    assert calls == [(home.resolve(), False, None, None)]
+
+
+def test_resume_from_home_skips_project_prompt(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    _set_test_home(monkeypatch, home)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(sys, "argv", ["lqh", "--resume", "conversation-id"])
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _prompt: pytest.fail("resume must stay in its project"),
+    )
+    calls: list = []
+    monkeypatch.setattr("lqh.cli._launch_tui", lambda *args: calls.append(args))
+
+    main()
+
+    assert calls == [(home, False, None, "conversation-id")]
+
+
+def test_spec_from_home_uses_selected_project(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    _set_test_home(monkeypatch, home)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(sys, "argv", ["lqh", "--spec", "support replies"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: "support-project")
+    calls: list = []
+    monkeypatch.setattr("lqh.cli._launch_tui", lambda *args: calls.append(args))
+
+    main()
+
+    project = (home / "lqh-projects" / "support-project").resolve()
+    assert calls == [(project, False, "support replies", None)]
+
+
+def test_home_project_prompt_retries_invalid_names_and_reuses_directory(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    projects = home / "lqh-projects"
+    existing = projects / "existing"
+    existing.mkdir(parents=True)
+    (projects / "taken").write_text("not a directory\n")
+    answers = iter([".hidden", "../escape", "taken", "existing"])
+    _set_test_home(monkeypatch, home)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(sys, "argv", ["lqh"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    calls: list = []
+    monkeypatch.setattr("lqh.cli._launch_tui", lambda *args: calls.append(args))
+
+    main()
+
+    assert calls == [((existing.resolve()), False, None, None)]
+
+
+def test_home_project_prompt_rejects_escaping_symlink(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    projects = home / "lqh-projects"
+    outside = tmp_path / "outside"
+    projects.mkdir(parents=True)
+    outside.mkdir()
+    try:
+        (projects / "escape").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+    answers = iter(["escape", "safe"])
+    _set_test_home(monkeypatch, home)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(sys, "argv", ["lqh"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    calls: list = []
+    monkeypatch.setattr("lqh.cli._launch_tui", lambda *args: calls.append(args))
+
+    main()
+
+    safe = (projects / "safe").resolve()
+    assert calls == [(safe, False, None, None)]
+
+
+def test_home_project_mkdir_failure_reprompts(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    _set_test_home(monkeypatch, home)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(sys, "argv", ["lqh"])
+    answers = iter(["blocked", "safe"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    original_mkdir = Path.mkdir
+
+    def flaky_mkdir(path: Path, *args, **kwargs) -> None:
+        if path.name == "blocked":
+            raise OSError("name rejected by filesystem")
+        original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", flaky_mkdir)
+    calls: list = []
+    monkeypatch.setattr("lqh.cli._launch_tui", lambda *args: calls.append(args))
+
+    main()
+
+    project = (home / "lqh-projects" / "safe").resolve()
+    assert calls == [(project, False, None, None)]
+
+
+def test_home_project_prompt_eof_cancels_without_launch(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    _set_test_home(monkeypatch, home)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(sys, "argv", ["lqh"])
+
+    def end_input(_prompt: str) -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", end_input)
+    monkeypatch.setattr(
+        "lqh.cli._launch_tui", lambda *_args: pytest.fail("must not launch")
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 130
+
+
+def test_home_project_noninteractive_stdin_has_clear_error(
+    monkeypatch, tmp_path: Path, capsys,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    _set_test_home(monkeypatch, home, interactive=False)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(sys, "argv", ["lqh"])
+    monkeypatch.setattr(
+        "builtins.input", lambda _prompt: pytest.fail("must not read piped stdin")
+    )
+    monkeypatch.setattr(
+        "lqh.cli._launch_tui", lambda *_args: pytest.fail("must not launch")
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 2
+    assert "interactive terminal" in capsys.readouterr().err
+
+
+def test_home_project_open_failure_exits_without_launch(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    _set_test_home(monkeypatch, home)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(sys, "argv", ["lqh"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: "project")
+
+    def fail_chdir(_path: Path) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("lqh.cli.os.chdir", fail_chdir)
+    monkeypatch.setattr(
+        "lqh.cli._launch_tui", lambda *_args: pytest.fail("must not launch")
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".hidden",
+        "~scratch",
+        "trailing.",
+        "trailing ",
+        "bad:name",
+        "CON",
+        "con.txt",
+        "control\x01name",
+        "x" * 81,
+        "../escape",
+    ],
+)
+def test_home_project_names_are_portable(name: str) -> None:
+    assert _project_name_error(name)
+
+
+def test_home_project_name_accepts_spaces_and_unicode() -> None:
+    assert _project_name_error("Résumé Assistant 研究") is None
 
 
 def test_spec_passthrough(monkeypatch, tmp_path: Path) -> None:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -25,6 +26,110 @@ for AI agents and harnesses (Claude Code, Codex, ...):
   commands (`lqh run`, `lqh tool ...`), their JSON contracts, and the
   project conventions (NOTES.md, manifests, immutable outputs).
 """
+
+_PROJECTS_DIRNAME = "lqh-projects"
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _home_dir() -> Path:
+    """Indirection keeps Home routing testable on every platform."""
+    return Path.home()
+
+
+def _stdin_is_interactive() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, OSError):
+        return False
+
+
+def _project_name_error(name: str) -> str | None:
+    """Return a user-facing reason when *name* is not a portable folder name."""
+    if not name:
+        return None  # Blank explicitly means "use Home".
+    if len(name) > 80:
+        return "Keep the project name to 80 characters or fewer."
+    if name in {".", ".."} or Path(name).is_absolute() or "/" in name or "\\" in name:
+        return "Enter a single folder name (for example: support-assistant)."
+    if name.startswith((".", "~")):
+        return "Project names cannot start with '.' or '~'."
+    if name.endswith((".", " ")):
+        return "Project names cannot end with a dot or space."
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        return "Project names cannot contain control characters."
+    if any(char in '<>:"|?*' for char in name):
+        return 'Project names cannot contain any of: < > : " | ? *'
+    if name.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
+        return f"{name!r} is reserved by Windows; choose another name."
+    return None
+
+
+def _choose_home_project(home: Path) -> Path:
+    """Choose Home explicitly or create/select a project below ``~/lqh-projects``."""
+    if not _stdin_is_interactive():
+        print(
+            "❌ Bare lqh requires an interactive terminal. "
+            "Open a terminal and run lqh again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    projects_root = home / _PROJECTS_DIRNAME
+    print(
+        "You started LQH in your Home folder. "
+        "Let's keep this work in its own project folder."
+    )
+
+    while True:
+        try:
+            name = input("Project name (press Enter to use Home): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nProject setup cancelled.", file=sys.stderr)
+            raise SystemExit(130) from None
+
+        error = _project_name_error(name)
+        if error:
+            print(error)
+            continue
+        if not name:
+            print(f"Using Home as the project folder: {home}")
+            return home
+
+        target = projects_root / name
+        if target.is_symlink():
+            print(f"A symbolic link already exists at {target}; choose another name.")
+            continue
+        if target.exists() and not target.is_dir():
+            print(f"A file already exists at {target}; choose another name.")
+            continue
+
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"Could not create project folder {target}: {exc}")
+            print("Choose another name, or press Enter to use Home.")
+            continue
+
+        root_resolved = projects_root.resolve()
+        target_resolved = target.resolve()
+        try:
+            target_resolved.relative_to(root_resolved)
+        except ValueError:
+            print("That folder points outside lqh-projects; choose another name.")
+            continue
+
+        try:
+            os.chdir(target_resolved)
+        except OSError as exc:
+            print(f"❌ Could not open project folder {target}: {exc}", file=sys.stderr)
+            raise SystemExit(1) from None
+
+        print(f"Using project folder: {target_resolved}")
+        return target_resolved
 
 
 def _configure_logging(project_dir: Path) -> None:
@@ -489,6 +594,9 @@ def main() -> None:
     else:
         project_dir = Path.cwd()
         auto_mode = False
+        home = _home_dir().resolve()
+        if project_dir.resolve() == home and args.resume_session is None:
+            project_dir = _choose_home_project(home)
 
     _launch_tui(project_dir, auto_mode, args.spec, args.resume_session)
 
