@@ -134,11 +134,13 @@ def main() -> None:
         concurrency=concurrency, force=True,
     )
 
-    def on_progress(completed: int, total: int) -> None:
+    def on_progress(done: int, total: int) -> None:
+        # `done` is samples in hand, not attempts finished — it advances
+        # only on success (see run_pipeline's on_progress contract).
         reporter.update(
             phase="generation", phase_label="generating",
-            completed=completed, total=total, unit="samples",
-            overall_fraction=completed / max(total, 1),
+            completed=done, total=total, unit="samples",
+            overall_fraction=done / max(total, 1),
             concurrency=concurrency,
         )
 
@@ -188,7 +190,10 @@ def main() -> None:
         "completed" if ok else "failed",
         total=result.total,
         succeeded=result.succeeded,
+        # `failed` is the shortfall; `sample_failures` counts every
+        # permanent failure, including ones an over-commit spare covered.
         failed=result.failed,
+        sample_failures=result.sample_failures,
         **({} if ok else {"error": "no successful samples"}),
     )
     # Sample counts for the client: the SSE status mirror rewrites the
@@ -199,11 +204,15 @@ def main() -> None:
         "total": result.total,
         "succeeded": result.succeeded,
         "failed": result.failed,
+        "sample_failures": result.sample_failures,
     })
     reporter.update(
         phase="completed" if ok else "failed",
         phase_label="dataset ready" if ok else "no samples generated",
-        completed=result.total, total=result.total, unit="samples",
+        # Rows produced, not rows asked for, so a short run reads
+        # "58/60". (The fraction is pinned to 1.0 by result_ready — the
+        # job is done; the counts are what carry the shortfall.)
+        completed=result.succeeded, total=result.total, unit="samples",
         overall_fraction=1.0, result_ready=ok, force=True,
     )
     print(

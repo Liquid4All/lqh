@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -1854,11 +1855,13 @@ async def _execute_pipeline(
             val_path = _validate_path(project_dir, validation_instructions)
             val_text = val_path.read_text(encoding="utf-8")
 
-        def on_progress(completed: int, total: int) -> None:
+        def on_progress(done: int, total: int) -> None:
+            # `done` is samples in hand, not attempts finished — it advances
+            # only on success (see run_pipeline's on_progress contract).
             reporter.update(
                 phase="generation", phase_label="generating",
-                completed=completed, total=total, unit="samples",
-                overall_fraction=completed / max(total, 1),
+                completed=done, total=total, unit="samples",
+                overall_fraction=done / max(total, 1),
                 concurrency=concurrency,
             )
 
@@ -1925,6 +1928,7 @@ async def _execute_pipeline(
                     "active_duration_ms":int(max(telemetry.state_snapshot()[2]-started_active, 0)*1000),
                     "requested_count":num_samples, "succeeded_count":0,
                     "failed_count":result.failed, "sample_count":result.total,
+                    "sample_failures":result.sample_failures,
                 }, workflow_id)
 
             from lqh.project_log import append_event, file_hash_prefix
@@ -1937,6 +1941,7 @@ async def _execute_pipeline(
                 script_hash=file_hash_prefix(project_dir / script_path),
                 output_dataset=output_dataset,
                 num_samples=num_samples,
+                sample_failures=result.sample_failures,
                 error="no successful samples",
             )
             reporter.update(
@@ -1958,7 +1963,12 @@ async def _execute_pipeline(
                 "wall_duration_ms":int((time.monotonic()-started_mono)*1000),
                 "active_duration_ms":int(max(telemetry.state_snapshot()[2]-started_active, 0)*1000),
                 "requested_count":num_samples,"succeeded_count":result.succeeded,
+                # failed_count is the shortfall (what the caller didn't get);
+                # sample_failures is every permanent per-sample failure,
+                # including ones an over-commit spare made up for. Only the
+                # latter tracks pipeline reliability.
                 "failed_count":result.failed,"sample_count":result.total,
+                "sample_failures":result.sample_failures,
             }, workflow_id)
 
         from lqh.project_log import append_event, file_hash_prefix
@@ -1973,10 +1983,15 @@ async def _execute_pipeline(
             num_samples=num_samples,
             succeeded=result.succeeded,
             failed=result.failed,
+            sample_failures=result.sample_failures,
         )
         reporter.update(
             phase="completed", phase_label="dataset ready",
-            completed=result.total, total=result.total, unit="samples",
+            # The rows produced, not the rows asked for, so a short run
+            # reads "58/60" rather than claiming the full count. (The
+            # fraction is pinned to 1.0 by result_ready — the *job* is
+            # done; the counts are what carry the shortfall.)
+            completed=result.succeeded, total=result.total, unit="samples",
             overall_fraction=1.0, result_ready=True, force=True,
         )
 

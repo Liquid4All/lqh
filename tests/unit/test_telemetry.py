@@ -198,7 +198,7 @@ async def test_zero_success_pipeline_emits_failure(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("lqh.client.create_client", lambda *_args: object())
 
     async def failed_pipeline(**_kwargs):
-        return SimpleNamespace(succeeded=0, failed=2, total=2)
+        return SimpleNamespace(succeeded=0, failed=2, total=2, sample_failures=2)
 
     monkeypatch.setattr("lqh.engine.run_pipeline", failed_pipeline)
     from lqh.tools.handlers import _execute_pipeline

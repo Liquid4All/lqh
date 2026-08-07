@@ -12,6 +12,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -92,6 +93,11 @@ def load_pipeline(script_path: Path) -> type[Pipeline]:
 class EngineResult:
     """Summary of a pipeline run."""
 
+    # Sample accounting always adds up: `total` is what the caller asked
+    # for, `succeeded` is the rows written, and `failed` is the shortfall
+    # (`total - succeeded`) — samples that were requested and not
+    # delivered. Failures an over-commit spare made up for are therefore
+    # NOT counted here; `sample_failures` below has the raw count.
     total: int
     succeeded: int
     failed: int
@@ -108,6 +114,10 @@ class EngineResult:
     # callers must not treat it as a complete observation (the cloud
     # validation gate skips recording when this is non-zero).
     resumed_samples: int = 0
+    # Every work item that failed permanently, over-commit spares
+    # included — the pipeline-reliability signal, which `failed` hides
+    # once a spare has covered the loss. Always >= `failed`.
+    sample_failures: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -216,10 +226,32 @@ def _append_partial(path: Path, index: int, row: dict[str, str | None]) -> None:
         f.write(line + "\n")
 
 
+def _append_failure(path: Path, index: int) -> None:
+    """Record a permanently failed sample.
+
+    Only successes are resumable, so this line exists purely to carry the
+    failure count across an interruption — without it, a continuation
+    reports a clean run when the first attempt failed samples. Written
+    with no ``index`` key so older readers skip it instead of mistaking
+    it for a completed sample.
+    """
+    with open(path, "a") as f:
+        f.write(json.dumps({"_failed": index}) + "\n")
+
+
 def _load_partial(
-    path: Path, total: int, digest: str | None = None
-) -> tuple[set[int], list[dict[str, Any] | None], int]:
-    """Read partial JSONL, return (done_indices, results, succeeded_count).
+    path: Path,
+    total: int,
+    digest: str | None = None,
+    *,
+    header_total: int | None = None,
+) -> tuple[set[int], list[dict[str, Any] | None], int, int]:
+    """Read partial JSONL: (done_indices, results, succeeded, failures).
+
+    *total* sizes the result list (the full work list, spares included);
+    *header_total* is what the ``_meta`` header must say — the requested
+    sample count, which is stable across engine versions and independent
+    of the over-commit margin. They differ only for over-committed runs.
 
     If the meta header's total doesn't match — or the header's pipeline
     digest differs from *digest* — returns empty state (start fresh).
@@ -228,8 +260,10 @@ def _load_partial(
     older version's leftover partial samples without executing them.
     Handles truncated last lines and duplicate indices gracefully.
     """
+    expected_total = total if header_total is None else header_total
     results: list[dict[str, Any] | None] = [None] * total
     seen: dict[int, dict[str, Any]] = {}
+    failures = 0
 
     for line in path.read_text().splitlines():
         line = line.strip()
@@ -240,19 +274,22 @@ def _load_partial(
         except json.JSONDecodeError:
             continue  # truncated last line
         if "_meta" in entry:
-            if entry.get("total") != total:
+            if entry.get("total") != expected_total:
                 logger.warning(
                     "Partial file total (%s) doesn't match current (%d), starting fresh",
-                    entry.get("total"), total,
+                    entry.get("total"), expected_total,
                 )
-                return set(), [None] * total, 0
+                return set(), [None] * total, 0, 0
             if digest is not None and entry.get("digest") != digest:
                 # Strict: a digest-less legacy header also restarts —
                 # resumed samples must be attributable to THIS version.
                 logger.warning(
                     "Partial file was written by a different pipeline version, starting fresh",
                 )
-                return set(), [None] * total, 0
+                return set(), [None] * total, 0, 0
+            continue
+        if "_failed" in entry:
+            failures += 1
             continue
         idx = entry.pop("index", None)
         if idx is not None and 0 <= idx < total:
@@ -270,7 +307,7 @@ def _load_partial(
             "tools": json.loads(tools_raw) if isinstance(tools_raw, str) and tools_raw else tools_raw,
         }
 
-    return done, results, len(done)
+    return done, results, len(done), failures
 
 
 def _partial_has_samples(path: Path) -> bool:
@@ -289,6 +326,126 @@ def _partial_has_samples(path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Straggler handling
+# ---------------------------------------------------------------------------
+
+# A run finishes no faster than its slowest sample. A couple of items stuck
+# in the retry ladder (each attempt can burn the client's 300 s timeout)
+# leaves a 200-sample run sitting at "198/200" for many minutes with an
+# otherwise idle worker pool. So queue a few spare samples and stop as soon
+# as the requested count is in hand, cancelling whatever is still crawling.
+_OVERCOMMIT_MIN_TOTAL = 50   # below this the tail *is* the run — no margin
+_OVERCOMMIT_FRACTION = 0.03  # ~3% spares
+_OVERCOMMIT_MAX = 10         # cap the wasted spend on large runs
+
+# Watchdog on one generate() attempt. The client bounds each LLM call at
+# 300 s and a sample may legitimately chain several, so this sits far
+# above any healthy run and exists only to break a wedged pipeline.
+_SAMPLE_TIMEOUT_S = 1800.0
+
+# How long to wait for cancelled samples to actually stop before giving
+# up on them. Generous — a healthy pipeline unwinds in milliseconds.
+_CANCEL_SETTLE_S = 60.0
+
+
+async def _run_until_enough(
+    tasks: list[asyncio.Task[None]], enough: asyncio.Event,
+) -> None:
+    """Await *tasks*, cutting the run short once *enough* is set.
+
+    Cancelling the stragglers is the point: past the requested count the
+    remaining items are spares nobody is waiting for, and a sample deep
+    in its retry ladder would otherwise hold the run open for minutes.
+    """
+    if not tasks:
+        return
+
+    gathered = asyncio.gather(*tasks)
+    # Read the gather's outcome however it ends — an unread CancelledError
+    # makes asyncio log "_GatheringFuture exception was never retrieved"
+    # with a traceback, and this future is abandoned on every early finish.
+    # A done callback covers the paths where nothing awaits it, including
+    # a cancellation landing while the samples are still unwinding.
+    gathered.add_done_callback(lambda f: None if f.cancelled() else f.exception())
+    waiter = asyncio.create_task(enough.wait())
+    try:
+        await asyncio.wait({gathered, waiter}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        # asyncio.wait() leaves what it waits on running, so without this
+        # an interrupted run (Ctrl-C, tool cancellation) would keep every
+        # sample task alive — still spending, still appending to the
+        # partial file — after the caller has unwound. Awaiting a gather()
+        # directly used to do this for us.
+        await _stop_all(tasks)
+        raise
+    finally:
+        waiter.cancel()
+
+    still_running = [t for t in tasks if not t.done()]
+    if gathered.done():
+        exc = gathered.exception()
+        if exc is None:
+            return
+        # gather() reports the first exception without touching its
+        # siblings; stop them so nothing writes after we unwind — and so
+        # the error surfaces now rather than behind the slowest straggler.
+        await _stop_all(tasks)
+        raise exc
+
+    # Samples already recorded under the lock stand; the cancelled ones
+    # simply never happened.
+    await _stop_all(tasks)
+    if still_running:
+        logger.info(
+            "Requested sample count reached — cancelled %d unfinished sample(s)",
+            len(still_running),
+        )
+
+
+async def _stop_all(tasks: list[asyncio.Task[None]]) -> None:
+    """Cancel every task and wait for the cancellations to settle.
+
+    Cancels the tasks themselves rather than the gather wrapping them: a
+    gather that has already finished (first sample exception) ignores
+    ``cancel()``, which would leave the stragglers running.
+
+    Cancellation is cooperative, so the deadline here returns *this*
+    coroutine — it cannot stop a task that swallows ``CancelledError``,
+    and nothing at this layer can preempt one that blocks the event loop.
+    An abandoned task keeps running until the loop shuts down (where
+    ``asyncio.run`` waits for it) and may still spend, but it can no
+    longer affect the dataset: the run's bookkeeping is closed to it (see
+    ``closed`` in ``_run_one``). Handing control back beats blocking the
+    caller on a pipeline that refuses to stop.
+    """
+    for task in tasks:
+        task.cancel()
+    settle = asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        await asyncio.wait_for(asyncio.shield(settle), _CANCEL_SETTLE_S)
+    except TimeoutError:
+        settle.add_done_callback(lambda f: None if f.cancelled() else f.exception())
+        logger.warning(
+            "%d sample(s) ignored cancellation for %.0fs; continuing without "
+            "them. They are excluded from the dataset but may still be "
+            "running (and spending) until the event loop shuts down.",
+            sum(1 for t in tasks if not t.done()), _CANCEL_SETTLE_S,
+        )
+
+
+def _overcommit_margin(total: int) -> int:
+    """Extra samples to queue beyond *total* so stragglers can be dropped.
+
+    Zero for small runs: a draft/validation run of 1-3 samples must
+    surface every failure, and at that size the spares would be a large
+    fraction of the cost.
+    """
+    if total < _OVERCOMMIT_MIN_TOTAL:
+        return 0
+    return min(_OVERCOMMIT_MAX, max(2, math.ceil(total * _OVERCOMMIT_FRACTION)))
+
+
+# ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
 
@@ -301,6 +458,7 @@ async def run_pipeline(
     max_retries: int = 3,
     concurrency: int = 100,
     samples_per_item: int = 1,
+    sample_timeout: float | None = _SAMPLE_TIMEOUT_S,
     validation_instructions: str | None = None,
     on_progress: Callable[[int, int], Any] | None = None,
 ) -> EngineResult:
@@ -312,7 +470,10 @@ async def run_pipeline(
         Path to the ``.py`` pipeline file.
     num_samples:
         Maximum number of source items to consume (pure-generation mode) or
-        cap on source items (bring-your-data mode).
+        cap on source items (bring-your-data mode). Pure-generation runs
+        may *attempt* a few more than this — see ``_overcommit_margin`` —
+        but never write more rows, and never read past the cap in
+        bring-your-data mode.
     output_dir:
         Directory where ``data.parquet`` will be written.
     client:
@@ -325,11 +486,20 @@ async def run_pipeline(
     samples_per_item:
         How many times ``generate()`` is called per source item (only relevant
         in bring-your-data mode).
+    sample_timeout:
+        Watchdog on a single ``generate()`` attempt, in seconds (``None``
+        disables it). Deliberately far above any healthy sample — the HTTP
+        client already bounds each LLM call — so it only fires on a wedged
+        pipeline. A timed-out attempt is retried like any other failure.
     validation_instructions:
         Optional text with LLM validation criteria (reserved for future use).
     on_progress:
-        Optional callback invoked as ``on_progress(completed, total)`` after
-        each sample finishes (success or permanent failure).
+        Optional callback invoked as ``on_progress(done, total)`` after each
+        sample finishes (success or permanent failure), where *done* is the
+        samples in hand so far and *total* is ``num_samples``. *done* only
+        advances on success, so it repeats after a failure and a run that
+        can't deliver the full count ends below *total* — the honest signal
+        that the caller got fewer samples than it asked for.
     """
     # Record every lqh.sources path the pipeline touches — across both
     # source() and generate() (helpers like seed_data are commonly
@@ -344,6 +514,7 @@ async def run_pipeline(
             max_retries=max_retries,
             concurrency=concurrency,
             samples_per_item=samples_per_item,
+            sample_timeout=sample_timeout,
             validation_instructions=validation_instructions,
             on_progress=on_progress,
         )
@@ -362,6 +533,7 @@ async def _run_pipeline_inner(
     max_retries: int,
     concurrency: int,
     samples_per_item: int,
+    sample_timeout: float | None,
     validation_instructions: str | None,
     on_progress: Callable[[int, int], Any] | None,
 ) -> EngineResult:
@@ -388,6 +560,22 @@ async def _run_pipeline_inner(
         # Pure generation mode: num_samples tasks, each with input=None.
         work = [None] * num_samples
 
+    # What the caller asked for. Anything past this is a spare, queued
+    # only so the run can stop at *target* instead of waiting out a
+    # straggler; surplus successes are trimmed from the output below.
+    #
+    # Spares exist only in pure-generation mode, where samples are
+    # interchangeable. Bring-your-data runs treat num_samples as a hard
+    # cap on source items consumed (see the docstring and the data-
+    # generation skill), and their items aren't interchangeable: reading
+    # past the cap would silently swap a requested record for a later
+    # one, and could abort a run on a deterministic bug in an item the
+    # caller never asked to process.
+    target = len(work)
+    margin = 0 if source_items is not None else _overcommit_margin(target)
+    if margin > 0:
+        work.extend([None] * margin)
+
     total = len(work)
     results: list[dict[str, Any] | None] = [None] * total
     succeeded = 0
@@ -395,6 +583,13 @@ async def _run_pipeline_inner(
     completed = 0
     sem = asyncio.Semaphore(concurrency)
     lock = asyncio.Lock()
+    # Set once *target* samples are in hand — the signal to stop.
+    enough = asyncio.Event()
+    # Set once the run is within *margin* of done — the signal to release
+    # the spares. Nothing to wait for when there are none.
+    tail = asyncio.Event()
+    if margin == 0:
+        tail.set()
 
     # Incremental saves: write each completed sample to a JSONL file so
     # progress survives process kills.  On restart, already-done samples
@@ -414,10 +609,12 @@ async def _run_pipeline_inner(
     done_indices: set[int] = set()
 
     if partial_path.exists():
-        done_indices, results, succeeded = _load_partial(partial_path, total, digest)
+        done_indices, results, succeeded, failed = _load_partial(
+            partial_path, total, digest, header_total=target,
+        )
         completed = len(done_indices)
         if done_indices:
-            logger.info("Resuming: %d/%d samples already completed", len(done_indices), total)
+            logger.info("Resuming: %d/%d samples already completed", len(done_indices), target)
         else:
             # Invalidated (or empty) partial — rewrite the header so the
             # digest/total on disk match this run. If the old file holds
@@ -429,37 +626,74 @@ async def _run_pipeline_inner(
                 stale_path = output_dir / "data.partial.stale.jsonl"
                 partial_path.replace(stale_path)
                 logger.warning(
-                    "Existing partial doesn't match this pipeline version; "
-                    "its samples were preserved at %s (not counted toward this run)",
+                    "Existing partial doesn't match this run (pipeline version "
+                    "or sample count); its samples were preserved at %s "
+                    "(not counted toward this run)",
                     stale_path,
                 )
             with open(partial_path, "w") as f:
-                f.write(json.dumps({"_meta": True, "total": total, "digest": digest}) + "\n")
+                f.write(json.dumps({"_meta": True, "total": target, "digest": digest}) + "\n")
     else:
         with open(partial_path, "w") as f:
-            f.write(json.dumps({"_meta": True, "total": total, "digest": digest}) + "\n")
+            f.write(json.dumps({"_meta": True, "total": target, "digest": digest}) + "\n")
 
     # Set when a deterministic code bug is detected — signals all tasks to abort.
     abort_error: Exception | None = None
+    # Set once the run stops accepting results, so a sample that outlives
+    # its cancellation can't write into a finished run.
+    closed = False
 
     async def _run_one(index: int, input_item: Any) -> None:
         nonlocal succeeded, failed, completed, abort_error
+        if index >= target:
+            # A spare. Hold it outside the semaphore until the run reaches
+            # its tail: a healthy run should not pay for spares it will
+            # only cancel, and a merely-slow sample deserves the whole
+            # tail to finish before a spare can overtake it.
+            await tail.wait()
         async with sem:
             if abort_error is not None:
                 return  # another sample already hit a fatal bug
+            if enough.is_set():
+                return  # target already reached — don't start new work
 
             result: dict[str, Any] | None = None
             for attempt in range(max_retries + 1):
+                if attempt and (enough.is_set() or abort_error is not None):
+                    # Abandoned mid-ladder — not a failure, just work the
+                    # run no longer needs.
+                    return
                 instance = pipeline_cls()
                 try:
                     # Pass input positionally to tolerate pipelines that
                     # omit the ``input`` parameter from their signature.
-                    if input_item is not None:
-                        conv = await instance.generate(client, input_item)
-                    else:
-                        conv = await instance.generate(client)
+                    async with asyncio.timeout(sample_timeout) as watchdog:
+                        if input_item is not None:
+                            conv = await instance.generate(client, input_item)
+                        else:
+                            conv = await instance.generate(client)
                     result = _serialize_conversation(conv)
                     break
+                except TimeoutError:
+                    # The watchdog is not a tuning knob: the HTTP client
+                    # already bounds each call at 300 s, so it only fires on
+                    # a pipeline wedged on something else. Without it a
+                    # single hung sample pins its slot forever. A
+                    # TimeoutError raised by the pipeline itself is a
+                    # different animal — don't report it as the watchdog.
+                    if watchdog.expired():
+                        logger.warning(
+                            "Sample %d timed out after %ss (attempt %d/%d)",
+                            index, sample_timeout, attempt + 1, max_retries + 1,
+                        )
+                    else:
+                        logger.warning(
+                            "Sample %d raised TimeoutError (attempt %d/%d)",
+                            index, attempt + 1, max_retries + 1,
+                        )
+                    if attempt >= max_retries:
+                        break
+                    continue
                 except GenerationError as exc:
                     if attempt < max_retries:
                         logger.warning(
@@ -496,6 +730,11 @@ async def _run_pipeline_inner(
                         break
 
             async with lock:
+                if closed:
+                    # A sample that outlived its cancellation. The run has
+                    # moved on: touching the counters or the partial file
+                    # now would corrupt a dataset nobody is waiting for.
+                    return
                 if result is not None:
                     results[index] = result
                     row = {
@@ -506,17 +745,41 @@ async def _run_pipeline_inner(
                     _append_partial(partial_path, index, row)
                     succeeded += 1
                 else:
+                    # Persisted so an interrupted run's failures still show
+                    # up in the continuation's reliability count.
+                    _append_failure(partial_path, index)
                     failed += 1
                 completed += 1
+                if completed >= target - margin:
+                    tail.set()
+                if succeeded >= target:
+                    enough.set()
                 if on_progress is not None:
-                    on_progress(completed, total)
+                    # Report against what was requested, not the
+                    # over-committed work list: spares are an internal
+                    # detail, and "samples in hand" is the number the
+                    # user is waiting on.
+                    on_progress(min(succeeded, target), target)
 
-    tasks = [
-        asyncio.create_task(_run_one(i, item))
-        for i, item in enumerate(work)
-        if i not in done_indices
-    ]
-    await asyncio.gather(*tasks)
+    # A resume can already be in the tail — re-check before starting, or
+    # the spares wait on a gate that only a *new* completion would open.
+    # (Resume 58 of 60 with two hung originals left: nothing ever
+    # completes, so nothing would release the spares that exist to
+    # replace them.)
+    if completed >= target - margin:
+        tail.set()
+
+    tasks: list[asyncio.Task[None]] = []
+    if succeeded < target:
+        tasks = [
+            asyncio.create_task(_run_one(i, item))
+            for i, item in enumerate(work)
+            if i not in done_indices
+        ]
+    try:
+        await _run_until_enough(tasks, enough)
+    finally:
+        closed = True
 
     # If a deterministic bug aborted the run, raise it so the caller
     # (tool handler) gets a clear error message immediately.
@@ -532,9 +795,18 @@ async def _run_pipeline_inner(
     messages_col: list[str] = []
     audio_col: list[str | None] = []
     tools_col: list[str | None] = []
+    spares_used = 0
     for i, r in enumerate(results):
         if r is None:
             continue
+        if len(messages_col) >= target:
+            # Over-commit surplus: a couple of spares can land before the
+            # cancellation reaches them. The caller asked for *target*
+            # samples, so that's what the dataset holds.
+            results[i] = None
+            continue
+        if i >= target:
+            spares_used += 1  # a spare that filled in for a lost sample
         messages_col.append(json.dumps(r["messages"], ensure_ascii=False))
         audio_col.append(
             json.dumps(r["audio"], ensure_ascii=False) if r["audio"] is not None else None
@@ -558,12 +830,23 @@ async def _run_pipeline_inner(
     pq.write_table(table, output_path)
     partial_path.unlink(missing_ok=True)
 
+    # Report against the requested count, not the over-committed work
+    # list: `total` is what callers show as the denominator, `succeeded`
+    # must match the rows actually written, and `failed` is the gap
+    # between them so the three never contradict each other.
+    written = len(messages_col)
+    if failed:
+        logger.info(
+            "%d sample(s) failed permanently; %d spare(s) filled in",
+            failed, spares_used,
+        )
     return EngineResult(
-        total=total,
-        succeeded=succeeded,
-        failed=failed,
+        total=target,
+        succeeded=written,
+        failed=target - written,
         output_path=output_path,
-        resumed_samples=len(done_indices),
+        resumed_samples=min(len(done_indices), target),
+        sample_failures=failed,
     )
 
 

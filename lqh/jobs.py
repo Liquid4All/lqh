@@ -1244,10 +1244,16 @@ class JobSupervisor:
             return None
 
         counts = ""
+        # Permanent per-sample failures (over-commit spares included) —
+        # the pipeline-reliability signal, worth keeping in the project
+        # log even when spares made the run whole.
+        sample_failures: int | None = None
         try:
             status = json.loads((run_dir / "status.json").read_text())
             if "succeeded" in status:
                 counts = f" ({status['succeeded']}/{status.get('total', '?')} samples ok)"
+            if isinstance(status.get("sample_failures"), int):
+                sample_failures = int(status["sample_failures"])
         except Exception:
             pass
         if not counts:
@@ -1260,6 +1266,8 @@ class JobSupervisor:
                     row = json.loads(line)
                     if "succeeded" in row:
                         counts = f" ({row['succeeded']}/{row.get('total', '?')} samples ok)"
+                        if isinstance(row.get("sample_failures"), int):
+                            sample_failures = int(row["sample_failures"])
                         break
             except Exception:
                 pass
@@ -1458,6 +1466,8 @@ class JobSupervisor:
                 f"Cloud data gen {run_name} completed; dataset at datasets/{output_dataset}/",
                 run_name=run_name,
                 output_dataset=output_dataset,
+                **({} if sample_failures is None
+                   else {"sample_failures": sample_failures}),
             )
         except Exception:
             pass
