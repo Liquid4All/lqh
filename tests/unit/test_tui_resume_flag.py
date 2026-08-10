@@ -279,13 +279,18 @@ async def test_input_is_held_for_the_whole_startup_not_just_the_refresh(
     )
 
     gate = asyncio.Event()
+    locked_at_mount: list[bool] = []
 
     async def _hold() -> None:
         await gate.wait()
 
-    app._start_application_task = (  # type: ignore[method-assign]
-        lambda: asyncio.get_event_loop().create_task(_hold())
-    )
+    def _mount() -> asyncio.Task:
+        # The input row goes live on the next event-loop turn, so the lock has
+        # to be in place already — nothing typed can arrive unheld.
+        locked_at_mount.append(app._processing)
+        return asyncio.get_event_loop().create_task(_hold())
+
+    app._start_application_task = _mount  # type: ignore[method-assign]
     app._show_update_notice = _noop_async  # type: ignore[method-assign]
     app._refresh_hf_status = _noop_async  # type: ignore[method-assign]
     app._settle_hf_donation = _noop_async  # type: ignore[method-assign]
@@ -320,7 +325,10 @@ async def test_input_is_held_for_the_whole_startup_not_just_the_refresh(
     gate.set()
     await asyncio.wait_for(task, timeout=5)
 
-    # Held from the very first output, released once the replay is on screen.
+    # Held from before the prompt exists, released once the replay is on
+    # screen — no window in between where a keystroke could slip through.
+    # (The main loop re-mounts the app on its way out, hence [0].)
+    assert locked_at_mount[0] is True
     assert locked_at_welcome == [True]
     assert app._processing is False
     # The typed message was refused and kept, not queued behind the replay.

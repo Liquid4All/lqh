@@ -2750,16 +2750,18 @@ class LqhApp:
         self._telemetry_heartbeat_task = asyncio.create_task(self._telemetry_heartbeat())
         self._status_bar.session_id = self._session.id
         self._agent = self._create_agent()
+        if self._resume_session_id:
+            # BEFORE the prompt is mounted, not after: a resumed conversation
+            # is only replayed at the end of startup, so submissions are held
+            # for the WHOLE of it — anything sent earlier would be queued and
+            # then run after the flood. Mounting the app hands the terminal a
+            # live input row on the very next event-loop turn, so locking
+            # after it leaves a window where a keystroke lands unheld. The
+            # interactive startup prompts below are unaffected (the guard in
+            # _on_accept yields whenever an ask_user question owns Enter).
+            self._lock_input()
         app_task = self._start_application_task()
         await asyncio.sleep(0)
-        if self._resume_session_id:
-            # The prompt is visible from here, but a resumed conversation is
-            # only replayed at the end of startup — so hold submissions for the
-            # WHOLE of it, not just the slow refresh: anything sent earlier
-            # would be queued and then run after the flood. The interactive
-            # startup prompts below are unaffected (the guard in _on_accept
-            # yields whenever an ask_user question owns the Enter key).
-            self._lock_input()
 
         await self._emit(render_welcome())
         if notice_needed():
