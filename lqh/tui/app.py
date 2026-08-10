@@ -1789,7 +1789,10 @@ class LqhApp:
         would be worse than starting a new conversation.
         """
         ref = self._resume_session_id
-        if not ref:
+        if not ref or self._shutdown_requested:
+            # Quitting mid-load must leave the requested session ALONE: adopting
+            # it claims it and hands it to _teardown, which marks it completed —
+            # an interrupted conversation would stop being offered next start.
             return False
         try:
             session_id = Session.resolve_id(self.project_dir, ref)
@@ -1836,14 +1839,15 @@ class LqhApp:
         resumed session's included — is built with.)
         """
         restoring = bool(self._resume_session_id)
-        if restoring:
-            # Lock first: _emit detaches and re-attaches the bottom app across
-            # several event-loop turns, and input is submittable meanwhile.
-            self._lock_input()
-            await self._emit(render_system_message(
-                "⏳ Loading previous conversation…"
-            ))
         try:
+            if restoring:
+                # Already locked by run() since the prompt appeared; this only
+                # names what the wait is for. Inside the try because _emit
+                # writes to the terminal and can fail.
+                self._lock_input()
+                await self._emit(render_system_message(
+                    "⏳ Loading previous conversation…"
+                ))
             await self._refresh_startup_state()
             # Explicit `lqh --resume ID` wins over the interrupted-session
             # offer, and applies in auto mode too (a killed --auto run can be
@@ -2748,6 +2752,14 @@ class LqhApp:
         self._agent = self._create_agent()
         app_task = self._start_application_task()
         await asyncio.sleep(0)
+        if self._resume_session_id:
+            # The prompt is visible from here, but a resumed conversation is
+            # only replayed at the end of startup — so hold submissions for the
+            # WHOLE of it, not just the slow refresh: anything sent earlier
+            # would be queued and then run after the flood. The interactive
+            # startup prompts below are unaffected (the guard in _on_accept
+            # yields whenever an ask_user question owns the Enter key).
+            self._lock_input()
 
         await self._emit(render_welcome())
         if notice_needed():

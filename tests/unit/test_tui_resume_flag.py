@@ -7,12 +7,24 @@ existing session machinery (Session.resolve_id / _adopt_session).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 from lqh.session import Session
 from lqh.tui.app import LqhApp
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(chunks: list[str]) -> str:
+    """Emitted text with styling and line wrapping normalized away.
+
+    Assertions on rendered output must survive the renderer deciding to break
+    a sentence across lines.
+    """
+    return " ".join(_ANSI.sub("", "".join(chunks)).split())
 
 
 def _app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resume: str | None) -> LqhApp:
@@ -30,6 +42,10 @@ def _app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resume: str | None) ->
     instance._invalidate = lambda: None  # type: ignore[method-assign]
     instance._session = Session.create(tmp_path)
     return instance
+
+
+async def _noop_async(*args: object, **kwargs: object) -> None:
+    return None
 
 
 def _prior_session(project_dir: Path) -> Session:
@@ -190,26 +206,130 @@ async def test_startup_releases_input_when_resume_blows_up(
     assert app._processing is False
 
 
-async def test_quitting_during_the_load_skips_the_replay(
+async def test_startup_releases_input_when_the_banner_cannot_be_printed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Ctrl+C while the conversation loads must not dump it on the way out.
+    """The banner writes to the terminal, so it too must be inside the guard."""
+    prior = _prior_session(tmp_path)
+    app = _app(tmp_path, monkeypatch, prior.id)
 
-    Once the application is gone _emit writes straight to stdout, so replaying
-    then floods the user's real terminal after they asked to leave.
+    async def _boom(text: str) -> None:
+        raise RuntimeError("terminal is gone")
+
+    app._emit = _boom  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError):
+        await app._restore_startup_state()
+    assert app._processing is False
+
+
+async def test_quitting_during_the_load_leaves_the_session_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl+C while the conversation loads must not resume it at all.
+
+    Two ways this hurt: _emit writes straight to stdout once the application
+    is gone, so the replay floods the real terminal after the user asked to
+    leave; and adopting the session hands it to _teardown, which marks it
+    completed — an interrupted conversation would stop being offered.
     """
     prior = _prior_session(tmp_path)
     app = _app(tmp_path, monkeypatch, prior.id)
+    fresh_id = app._session.id
+    claimed: list[str] = []
+    monkeypatch.setattr(
+        Session, "claim_active", lambda self: claimed.append(self.id) or True
+    )
 
     async def _refresh() -> None:
         app._shutdown_requested = True
 
     app._refresh_startup_state = _refresh  # type: ignore[method-assign]
 
-    assert await app._restore_startup_state() is True
-    joined = "".join(app._emitted)
-    assert "earlier question" not in joined
-    assert "earlier answer" not in joined
+    assert await app._restore_startup_state() is False
+    printed = _plain(app._emitted)
+    assert "earlier question" not in printed
+    assert "earlier answer" not in printed
+    assert "Resumed session" not in printed
+    # Never claimed, never adopted: teardown marks the throwaway startup
+    # session completed, not the conversation the user was getting back to.
+    assert claimed == []
+    assert app._session.id == fresh_id
+
+
+async def test_input_is_held_for_the_whole_startup_not_just_the_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drives the real run(): the lock must start when the prompt appears.
+
+    The replay lands at the END of startup, so a message typed during the
+    earlier (also network-bound) steps would be queued and then delivered
+    after the flood — the exact confusion the banner exists to prevent.
+    """
+    import asyncio
+
+    from prompt_toolkit.buffer import Buffer
+
+    from lqh.tui.app import _SHUTDOWN_SENTINEL
+
+    prior = _prior_session(tmp_path)
+    app = _app(tmp_path, monkeypatch, prior.id)
+    monkeypatch.setattr(
+        "lqh.project_identity.migrate_cloud_identity", _noop_async
+    )
+
+    gate = asyncio.Event()
+
+    async def _hold() -> None:
+        await gate.wait()
+
+    app._start_application_task = (  # type: ignore[method-assign]
+        lambda: asyncio.get_event_loop().create_task(_hold())
+    )
+    app._show_update_notice = _noop_async  # type: ignore[method-assign]
+    app._refresh_hf_status = _noop_async  # type: ignore[method-assign]
+    app._settle_hf_donation = _noop_async  # type: ignore[method-assign]
+    app._refresh_startup_state = _noop_async  # type: ignore[method-assign]
+    app._prepare_agent_context = _noop_async  # type: ignore[method-assign]
+    app._watch_jobs = _noop_async  # type: ignore[method-assign]
+    app._finish_telemetry = _noop_async  # type: ignore[method-assign]
+    app._telemetry_heartbeat = _noop_async  # type: ignore[method-assign]
+    app._start_telemetry_flush = lambda: None  # type: ignore[method-assign]
+
+    # A user typing into the prompt as soon as it appears — i.e. during the
+    # welcome/login/identity steps, well before the refresh.
+    buffer = Buffer(accept_handler=app._on_accept)
+    locked_at_welcome: list[bool] = []
+    plain_emit = app._emit
+
+    async def _emit(text: str) -> None:
+        if not locked_at_welcome:
+            locked_at_welcome.append(app._processing)
+            buffer.text = "can you retrain that model?"
+            buffer.validate_and_handle()
+        await plain_emit(text)
+
+    app._emit = _emit  # type: ignore[method-assign]
+
+    task = asyncio.create_task(app.run())
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if app._processing is False and app._agent is not None:
+            break
+    app._input_queue.put_nowait(_SHUTDOWN_SENTINEL)
+    gate.set()
+    await asyncio.wait_for(task, timeout=5)
+
+    # Held from the very first output, released once the replay is on screen.
+    assert locked_at_welcome == [True]
+    assert app._processing is False
+    # The typed message was refused and kept, not queued behind the replay.
+    assert buffer.text == "can you retrain that model?"
+    printed = _plain(app._emitted)
+    assert "Please wait" in printed
+    assert printed.index("Loading previous conversation") < printed.index(
+        "earlier question"
+    )
 
 
 async def test_input_typed_while_held_is_refused_but_kept(
@@ -232,7 +352,7 @@ async def test_input_typed_while_held_is_refused_but_kept(
     buffer.validate_and_handle()
     await asyncio.sleep(0)
 
-    printed = "".join(app._emitted)
+    printed = _plain(app._emitted)
     assert "Please wait" in printed
     # Input held at startup has nothing to interrupt — don't offer the keys.
     assert "Esc" not in printed
@@ -259,7 +379,7 @@ async def test_wait_message_offers_interrupt_during_an_agent_turn(
     finally:
         turn.cancel()
 
-    assert "Esc / Ctrl+C to interrupt" in "".join(app._emitted)
+    assert "Esc / Ctrl+C to interrupt" in _plain(app._emitted)
 
 
 async def test_resume_hint_prints_full_id(
