@@ -380,6 +380,11 @@ async def _run_async(
     async def _on_agent_message(text: str) -> None:
         events.emit("agent_message", text=text)
 
+    async def _on_transient_error(text: str) -> None:
+        # An unattended run is where a stalled API call is hardest to
+        # diagnose after the fact — put the retry in the event stream.
+        events.emit("api_retry", text=text)
+
     async def _on_tool_call(tool: str, args: dict) -> None:
         events.emit("tool_call", tool=tool, args=args)
 
@@ -441,6 +446,7 @@ async def _run_async(
 
     callbacks = AgentCallbacks(
         on_agent_message=_on_agent_message,
+        on_transient_error=_on_transient_error,
         on_tool_call=_on_tool_call,
         on_tool_result=_on_tool_result,
         on_auto_stage=_on_auto_stage,

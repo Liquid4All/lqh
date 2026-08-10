@@ -37,6 +37,19 @@ logger = logging.getLogger("lqh.agent")
 # agent loop for recovery when that happens.
 ORCHESTRATION_MAX_TOKENS = 62_000
 
+# Retries the agent loop performs per orchestration call when nothing above it
+# will retry. This is the standalone figure — headless `lqh run`, the SDK, the
+# benchmark harness — where a transient 502 that escapes ends the run.
+ORCHESTRATION_API_RETRIES = 3
+# What a surface that has its OWN retry ladder should set instead. The TUI
+# wraps every turn in `_run_agent_with_reconnect` (4 attempts, 3/20/60s
+# backoff), and the two ladders nest multiplicatively — at the standalone
+# figure that is 4 x 4 attempts, each able to spend minutes on a large
+# reasoning turn before failing. One in-place retry absorbs a blip; anything
+# worse belongs to the outer ladder, which at least narrates what is happening
+# and ends at an actionable "/reconnect".
+ORCHESTRATION_API_RETRIES_NESTED = 1
+
 
 SYSTEM_PROMPT = """\
 You are LQH, an AI agent that helps users customize Liquid AI's \
@@ -521,6 +534,12 @@ class AgentCallbacks:
     # the same positional-compatibility reason as the field above — this
     # dataclass is public API of a published package.
     on_hf_donation_recorded: Callable[[], Awaitable[None]] | None = None
+    # A transient API failure (502/504/connection drop) is about to be
+    # retried. Surfaces are expected to show this as a notice, not as agent
+    # prose — the point is that a stalled spinner stops being the only
+    # evidence that something went wrong. Appended for the same positional-
+    # compatibility reason as the fields above.
+    on_transient_error: Callable[[str], Awaitable[None]] | None = None
 
 
 def _strip_thinking(msg: dict[str, Any]) -> dict[str, Any]:
@@ -578,6 +597,11 @@ class Agent:
         # (default). The E2E harness sets a strict integer cap explicitly.
         self.max_tool_calls_per_turn: int | None = None
         self.max_empty_tool_call_retries: int = 2
+        # Retries per orchestration API call. Surfaces that retry a whole turn
+        # themselves lower this to ORCHESTRATION_API_RETRIES_NESTED so the two
+        # ladders don't multiply; standalone drivers leave it alone, because
+        # for them an escaped 502 ends the run.
+        self.api_retries: int = ORCHESTRATION_API_RETRIES
         self._client = None
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
@@ -693,8 +717,33 @@ class Agent:
                 raise RuntimeError(
                     "Not logged in. Please run /login to authenticate."
                 )
-            self._client = create_client(token, config.api_base_url)
+            # max_retries=0: the SDK's silent 5xx replay would sit *below*
+            # chat_with_retry, so the first thing the user hears about a 502
+            # would arrive three long attempts late. All retrying for the
+            # agent loop happens in chat_with_retry, which can narrate it.
+            self._client = create_client(token, config.api_base_url, max_retries=0)
         return self._client
+
+    async def _notify_transient_error(
+        self, detail: str, attempt: int, total: int, wait: float
+    ) -> None:
+        """Tell the user an API call failed and is being retried.
+
+        Without this the retry ladder is invisible: on a long reasoning turn a
+        single failed attempt can take minutes, so a stalled spinner was the
+        only signal that anything had happened. The message also answers the
+        question users actually have at that moment — whether the turn's work
+        so far survives. It does: every tool result already produced is in the
+        session, and the retry re-sends that history rather than redoing it.
+        """
+        if self.callbacks.on_transient_error is None:
+            return
+        await self.callbacks.on_transient_error(
+            f"API call failed ({detail}) — attempt {attempt} of {total}, "
+            f"retrying in {wait:.0f}s. Nothing is lost: the conversation and "
+            f"every tool result from this turn are kept, and only the "
+            f"in-flight model response is redone."
+        )
 
     def _build_messages(self) -> list[dict]:
         """Build the messages list for the API call."""
@@ -832,8 +881,13 @@ class Agent:
 
             client = self._get_client()
             self._llm_calls_made += 1
+            # Same ladder policy as the main loop: compaction is an ordinary
+            # orchestration call, and a surface that retries turns itself must
+            # not have this one quietly retrying four times underneath it.
             response = await chat_with_retry(
                 client, model=self.orchestration_model, messages=summary_msgs,
+                max_retries=self.api_retries,
+                on_retry=self._notify_transient_error,
                 max_tokens=ORCHESTRATION_MAX_TOKENS,
                 temperature=0.0,
             )
@@ -975,6 +1029,8 @@ class Agent:
                 self._llm_calls_made += 1
                 response = await chat_with_retry(
                     client,
+                    max_retries=self.api_retries,
+                    on_retry=self._notify_transient_error,
                     model=self.orchestration_model,
                     messages=self._build_messages(),
                     tools=get_all_tools(auto_mode=self.policy.terminal_tools),

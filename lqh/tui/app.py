@@ -23,7 +23,11 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style
 
-from lqh.agent import Agent, AgentCallbacks
+from lqh.agent import (
+    ORCHESTRATION_API_RETRIES_NESTED,
+    Agent,
+    AgentCallbacks,
+)
 from lqh.auth import LoginExpired, get_token, login_device_code
 from lqh.project_identity import cloud_project_key as _ckey
 from lqh.session import Session
@@ -1079,11 +1083,16 @@ class LqhApp:
         action = start
         last_error: Exception | None = None
 
-        for attempt in range(len(self._reconnect_backoffs) + 1):
+        total = len(self._reconnect_backoffs) + 1
+        for attempt in range(total):
             if attempt > 0:
                 delay = self._reconnect_backoffs[attempt - 1]
                 await self._emit(render_system_message(
-                    f"Connection interrupted. Retrying in {delay:.0f}s..."
+                    f"Connection interrupted ({self._describe_error(last_error)}). "
+                    f"Resuming this turn in {delay:.0f}s "
+                    f"(attempt {attempt + 1} of {total}). Your conversation and "
+                    f"every completed tool call are saved — only the model "
+                    f"response that was in flight is redone."
                 ))
                 await asyncio.sleep(delay)
 
@@ -1104,12 +1113,37 @@ class LqhApp:
         self._pending_reconnect_error = (
             f"{type(last_error).__name__}: {last_error}" if last_error else "Unknown error"
         )
+        # Persist before telling the user their work survived — not every
+        # caller of this helper saves on the way out (the /skill path does
+        # not), and a paused turn is exactly when someone quits and reopens.
+        self._save_session()
         await self._emit(render_error(
-            "Connection interrupted and automatic reconnect attempts failed. "
-            "Run /reconnect to try again.\n"
-            f"{self._pending_reconnect_error}"
+            f"The API kept failing after {total} attempts, so this turn is "
+            "paused.\n"
+            f"  Last error: {self._pending_reconnect_error}\n"
+            "\n"
+            "  Kept: the whole conversation, every tool call that already ran, "
+            "and any file it wrote. The session is saved to disk, so quitting "
+            "and reopening this project resumes from here too.\n"
+            "  Lost: only the model response that was in flight — it is redone "
+            "from the same history, not repeated work.\n"
+            "\n"
+            "  Run /reconnect to resume the turn, or just send a new message "
+            "to continue the conversation."
         ))
         return False
+
+    @staticmethod
+    def _describe_error(exc: Exception | None) -> str:
+        """Short human label for the failure driving a reconnect."""
+        if exc is None:
+            return "unknown error"
+        try:
+            from lqh.client import describe_api_error
+
+            return describe_api_error(exc)
+        except Exception:
+            return type(exc).__name__
 
     async def _do_reconnect(self) -> None:
         """Retry the last interrupted agent operation, if any."""
@@ -1875,6 +1909,7 @@ class LqhApp:
             on_spinner_stop=self._on_spinner_stop,
             on_token_update=self._on_token_update,
             on_skill_loaded=self._on_skill_loaded,
+            on_transient_error=self._on_transient_error,
             on_pipeline_progress=self._on_pipeline_progress,
             legacy_pipeline_progress_callback=False,
             on_pipeline_done=self._on_pipeline_done,
@@ -1890,6 +1925,10 @@ class LqhApp:
             auto_mode=self.auto_mode,
             extra_spec=self.extra_spec,
         )
+        # This surface retries whole turns itself (_run_agent_with_reconnect),
+        # so the agent's in-place ladder stays shallow — otherwise the two
+        # multiply into tens of minutes of silent retrying on a 502.
+        agent.api_retries = ORCHESTRATION_API_RETRIES_NESTED
         self._apply_startup_facts(agent)
         return agent
 
@@ -2136,6 +2175,10 @@ class LqhApp:
 
     async def _on_agent_message(self, text: str) -> None:
         await self._emit(render_agent_message(text))
+
+    async def _on_transient_error(self, text: str) -> None:
+        # A system notice, not agent prose — the model did not say this.
+        await self._emit(render_system_message(f"⚠️  {text}"))
 
     async def _on_tool_call(self, name: str, args: dict) -> None:
         await self._emit(render_tool_call(name, args))

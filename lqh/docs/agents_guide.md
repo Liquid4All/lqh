@@ -134,7 +134,9 @@ likewise `"reported"` — corroborate against eval artifacts yourself).
 Progress events stream on stderr as NDJSON
 (`{"schema_version","run_id","seq","event",…}` with events `start`,
 `agent_message`, `tool_call`, `tool_result`, `progress`, `job_running`,
-`stage`, `end`) — but stderr is a MIXED stream: log lines, warnings, and
+`stage`, `api_retry`, `end`; `api_retry` carries a `text` field describing a
+transient API failure the run is retrying through — informational, the run is
+still live) — but stderr is a MIXED stream: log lines, warnings, and
 redirected library output appear between events, so parse only lines
 that start with `{` and JSON-decode. `--resume <session_id>` continues a
 prior run contextually — e.g. after granting `--allow-publish`. It takes

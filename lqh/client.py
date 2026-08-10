@@ -5,6 +5,7 @@ import contextvars
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from openai import (
@@ -68,6 +69,7 @@ def _record_attempt(entry: dict[str, Any]) -> None:
 def create_client(
     api_key: str,
     base_url: str | None = None,
+    max_retries: int | None = None,
 ) -> AsyncOpenAI:
     """Create an AsyncOpenAI client pointed at api.lqh.ai.
 
@@ -75,11 +77,18 @@ def create_client(
     that don't pass one (notably user-authored data-gen pipelines) don't
     get truncated by the API's lower default. Callers that pass an explicit
     ``max_tokens`` or ``max_completion_tokens`` are untouched.
+
+    *max_retries* overrides the SDK's own retry layer, which by default
+    replays every 5xx twice before raising. That layer is invisible: it
+    cannot tell the user anything, and on a long reasoning turn each of its
+    attempts can spend minutes, so a caller that wants to narrate its retries
+    (``chat_with_retry`` with ``on_retry``) should pass 0 and own them.
     """
     client = AsyncOpenAI(
         api_key=api_key,
         base_url=base_url if base_url is not None else default_api_base_url(),
         timeout=300.0,
+        **({} if max_retries is None else {"max_retries": max_retries}),
     )
     _install_default_max_tokens(client)
     return client
@@ -119,21 +128,72 @@ def is_transient_upstream_error(exc: object) -> bool:
     return "rejected by upstream" in text or "upstream model" in text
 
 
+# Awaited before each backoff sleep: (description, attempt, total_attempts,
+# wait_seconds). ``attempt`` is 1-based and counts the attempt that just failed.
+OnRetry = Callable[[str, int, int, float], Awaitable[None]] | None
+
+# HTTP statuses worth re-sending the same payload for. 502 covers both an
+# upstream model that ran out of time and a proxy that could not reach the
+# API; 504/408 are the same story told by an intermediary. 429 is absent
+# because ``RateLimitError`` is handled on its own branch (it honours
+# Retry-After). This must stay a SUBSET of the statuses
+# ``lqh.tui.app._is_reconnectable_error`` accepts — that function decides the
+# same question one layer up, and a status retried here but not there would
+# strand a turn the outer ladder refuses to resume.
+RETRYABLE_STATUS = frozenset({408, 500, 502, 503, 504})
+
+
+def describe_api_error(exc: BaseException) -> str:
+    """One short line naming what went wrong, for a user-facing notice."""
+    if isinstance(exc, APIStatusError):
+        detail = ""
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            detail = str(body.get("message") or "")
+        if not detail:
+            detail = str(getattr(exc, "message", "") or "")
+        detail = detail.strip().replace("\n", " ")
+        if len(detail) > 160:
+            detail = detail[:157] + "..."
+        return f"HTTP {exc.status_code}" + (f": {detail}" if detail else "")
+    if isinstance(exc, APIConnectionError):
+        return "connection to api.lqh.ai failed"
+    return f"{type(exc).__name__}: {str(exc)[:160]}"
+
+
 async def chat_with_retry(
     client: AsyncOpenAI,
     max_retries: int = 3,
+    on_retry: OnRetry = None,
     **kwargs: object,
 ) -> ChatCompletion:
     """Call chat completions with retry logic for transient errors.
 
     Retries on:
       - 429 (rate limit): honours Retry-After header, falls back to 2^attempt seconds.
-      - 502/503/connection errors: exponential backoff up to *max_retries*.
+      - ``RETRYABLE_STATUS`` / connection errors: exponential backoff up to
+        *max_retries*.
     All other errors are raised immediately.
+
+    *on_retry* is awaited before each backoff sleep with ``(description,
+    attempt, total_attempts, wait_seconds)``. Retrying silently is what made
+    these failures feel like a hang: a 502 on a long reasoning turn can burn
+    minutes per attempt, and without this the caller has nothing to show for
+    it. Callers that have no user to tell (pipelines, scoring) leave it None.
 
     When metrics capture is enabled via ``capture_api_metrics``, records each
     attempt (success or failure) with timing, error type, and response shape.
     """
+    total_attempts = max_retries + 1
+
+    async def _notify(exc: BaseException, attempt: int, wait: float) -> None:
+        if on_retry is None:
+            return
+        try:
+            await on_retry(describe_api_error(exc), attempt + 1, total_attempts, wait)
+        except Exception:  # a broken notifier must not eat the retry
+            logger.debug("on_retry callback failed", exc_info=True)
+
     for attempt in range(max_retries + 1):
         start = time.monotonic()
         entry: dict[str, Any] = {"attempt": attempt}
@@ -170,6 +230,7 @@ async def chat_with_retry(
             retry_after = _parse_retry_after(exc)
             wait = retry_after if retry_after is not None else 2**attempt
             logger.warning("chat_with_retry: 429 on attempt %d, sleeping %.1fs", attempt, wait)
+            await _notify(exc, attempt, wait)
             await asyncio.sleep(wait)
         except APIConnectionError as exc:
             entry.update({
@@ -182,6 +243,7 @@ async def chat_with_retry(
                 raise
             wait = 2**attempt
             logger.warning("chat_with_retry: connection error on attempt %d, sleeping %.1fs", attempt, wait)
+            await _notify(exc, attempt, wait)
             await asyncio.sleep(wait)
         except APIStatusError as exc:
             entry.update({
@@ -191,10 +253,14 @@ async def chat_with_retry(
                 "status_code": exc.status_code,
             })
             _record_attempt(entry)
-            retryable = exc.status_code in (502, 503) or is_transient_upstream_error(exc)
+            retryable = (
+                exc.status_code in RETRYABLE_STATUS
+                or is_transient_upstream_error(exc)
+            )
             if retryable and attempt < max_retries:
                 wait = 2**attempt
                 logger.warning("chat_with_retry: %d on attempt %d, sleeping %.1fs", exc.status_code, attempt, wait)
+                await _notify(exc, attempt, wait)
                 await asyncio.sleep(wait)
             else:
                 raise
