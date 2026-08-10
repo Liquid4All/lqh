@@ -146,6 +146,36 @@ class TestPromptSession:
         assert result == "typed response"
         assert app._managed_ansi == ""
 
+    async def test_ask_user_parks_a_typed_draft_and_gives_it_back(
+        self, app: LqhApp,
+    ) -> None:
+        """A half-written message must not become the answer to a question.
+
+        Input left in the row (composed mid-turn, or refused by the "please
+        wait" guard, which keeps the text) would otherwise be read by
+        _resolve_ask_user as free-text and silently replace the selection.
+        """
+        app._create_application()
+        assert app._input_buffer is not None
+        app._input_buffer.text = "half-written message"
+
+        emitted: list[str] = []
+
+        async def _emit(text: str) -> None:
+            emitted.append(text)
+
+        app._emit = _emit  # type: ignore[method-assign]
+
+        task = asyncio.create_task(
+            app._wait_for_user_response(options=["alpha", "beta"])
+        )
+        await asyncio.sleep(0)
+        assert app._input_buffer.text == ""
+
+        app._resolve_ask_user("")  # Enter on the highlighted row
+        assert await asyncio.wait_for(task, timeout=2) == "alpha"
+        assert app._input_buffer.text == "half-written message"
+
     async def test_multi_select_empty_enter_guards_before_none(self, app: LqhApp) -> None:
         """First Enter with nothing toggled warns instead of answering none."""
         future: asyncio.Future[str] = asyncio.get_event_loop().create_future()

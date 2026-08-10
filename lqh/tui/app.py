@@ -701,13 +701,22 @@ class LqhApp:
         text = buff.text.strip()
 
         if self._processing and self._ask_user_future is None:
+            # The interrupt keys only apply to an in-flight agent turn; input
+            # is also held during startup (e.g. while a resumed conversation
+            # loads), where offering them would be a lie.
+            hint = (
+                " (or press Esc / Ctrl+C to interrupt it)"
+                if self._agent_busy() else ""
+            )
             asyncio.get_event_loop().create_task(
                 self._emit(render_system_message(
-                    "⏳ Please wait for the current operation to finish "
-                    "(or press Esc / Ctrl+C to interrupt it)."
+                    f"⏳ Please wait for the current operation to finish{hint}."
                 ))
             )
-            return False
+            # True is prompt_toolkit's "keep_text": the submission is refused,
+            # so the text stays in the buffer for the user to send again
+            # instead of being wiped by the buffer's post-accept reset.
+            return True
 
         buff.reset()
 
@@ -839,6 +848,13 @@ class LqhApp:
         self._ask_user_checked = set()
         self._ask_user_confirm_none = False
         self._ask_user_selected = 0
+        # A draft left in the input row (composed mid-turn, or refused by the
+        # "please wait" guard, which keeps the text) must not be handed to
+        # _resolve_ask_user as the answer to a question the user has not read
+        # yet. Park it for the duration of the prompt and give it back after.
+        draft = self._input_buffer.text if self._input_buffer else ""
+        if draft and self._input_buffer:
+            self._input_buffer.reset()
         # Snapshot options for "Other" flow in multi-select
         if multi_select and options:
             self._ask_user_options_snapshot = list(options)
@@ -871,6 +887,11 @@ class LqhApp:
                 self._ask_user_selected = 0
             if self._ask_user_future is None:
                 self._set_managed_text("")
+            if draft and self._input_buffer and not self._input_buffer.text:
+                # Only if the user has not started typing something else.
+                self._input_buffer.text = draft
+                self._input_buffer.cursor_position = len(draft)
+                self._invalidate()
 
     async def _emit(self, ansi_text: str) -> None:
         """Print ANSI output above the live application."""
@@ -1729,10 +1750,17 @@ class LqhApp:
             )
 
     async def _render_session_history(self, limit: int = 200) -> None:
-        """Re-render the resumed conversation from the raw transcript."""
-        if self._session is None:
+        """Re-render the resumed conversation from the raw transcript.
+
+        Stops on a shutdown request: once the application is gone _emit writes
+        straight to stdout, so replaying on the way out would dump the whole
+        conversation into the user's terminal after they asked to leave.
+        """
+        if self._session is None or self._shutdown_requested:
             return
         for message in self._session.read_log(limit=limit):
+            if self._shutdown_requested:
+                return
             role = message.get("role")
             content = message.get("content", "")
             if role == "user" and isinstance(content, str) and not content.startswith("[System:"):
@@ -1792,6 +1820,38 @@ class LqhApp:
         await self._emit(render_system_message(f"Resumed session {session_id[:8]}"))
         await self._render_session_history()
         return True
+
+    async def _restore_startup_state(self) -> bool:
+        """Refresh startup facts, then adopt an explicitly resumed session.
+
+        Returns True when `lqh --resume ID` adopted its session.
+
+        The two steps are one unit because of what the user sees: the replay
+        of a resumed conversation lands only *after* the startup refresh (job
+        scan + cloud snapshot), which can take seconds. An idle-looking prompt
+        in that window invites the user to start typing and then be flooded by
+        the replay, so a resume announces itself up front and holds input
+        until the history is on screen. (The order itself is fixed: the
+        refresh publishes the startup facts every later-created agent — the
+        resumed session's included — is built with.)
+        """
+        restoring = bool(self._resume_session_id)
+        if restoring:
+            # Lock first: _emit detaches and re-attaches the bottom app across
+            # several event-loop turns, and input is submittable meanwhile.
+            self._lock_input()
+            await self._emit(render_system_message(
+                "⏳ Loading previous conversation…"
+            ))
+        try:
+            await self._refresh_startup_state()
+            # Explicit `lqh --resume ID` wins over the interrupted-session
+            # offer, and applies in auto mode too (a killed --auto run can be
+            # picked up).
+            return await self._resume_requested_session()
+        finally:
+            if restoring:
+                self._unlock_input()
 
     async def _emit_resume_hint(self) -> None:
         """Print the `lqh --resume ID` shortcut on the way out.
@@ -2822,11 +2882,7 @@ class LqhApp:
                 await self._teardown(app_task)
                 return
 
-        await self._refresh_startup_state()
-
-        # Explicit `lqh --resume ID` wins over the interrupted-session offer,
-        # and applies in auto mode too (a killed --auto run can be picked up).
-        resumed = await self._resume_requested_session()
+        resumed = await self._restore_startup_state()
 
         # Auto mode: skip the interactive welcome / resume flow and run the
         # pipeline non-interactively. The agent's auto skill (sticky system
