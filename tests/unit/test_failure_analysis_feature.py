@@ -446,6 +446,200 @@ class TestRunContext:
         assert lines == ["  Final eval: mean=6.80, scored=50"]
 
 
+class TestTrainingHealthBlock:
+    """The mechanical training signals (steps, loss trajectory, token accuracy,
+    LR) that separate "the run didn't learn" from "the data is bad"."""
+
+    def _history(self, tmp_path: Path, rows: list[dict[str, Any]]) -> None:
+        (tmp_path / "eval_history.json").write_text(json.dumps(rows))
+
+    def _config(self, tmp_path: Path, training: dict[str, Any]) -> None:
+        (tmp_path / "config.json").write_text(
+            json.dumps({"type": "sft", "training": training})
+        )
+
+    def test_absent_or_malformed_history_renders_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        from lqh.tools.handlers import _format_training_health_block
+
+        assert _format_training_health_block(tmp_path) == []
+        (tmp_path / "eval_history.json").write_text("{not json")
+        assert _format_training_health_block(tmp_path) == []
+        # Well-formed JSON of the wrong shape, and an empty history.
+        (tmp_path / "eval_history.json").write_text(json.dumps({"loss": 1.0}))
+        assert _format_training_health_block(tmp_path) == []
+        (tmp_path / "eval_history.json").write_text(json.dumps([]))
+        assert _format_training_health_block(tmp_path) == []
+
+    def test_renders_the_full_line(self, tmp_path: Path) -> None:
+        from lqh.tools.handlers import _format_training_health_block
+
+        self._config(tmp_path, {"learning_rate": 2e-4})
+        self._history(tmp_path, [
+            {"step": 50, "loss": 3.74, "mean_token_accuracy": 0.38},
+            {"step": 100, "loss": 2.40, "mean_token_accuracy": 0.54},
+            {"step": 100, "eval_loss": 2.51},
+            {"step": 100, "train_runtime": 900.0, "train_loss": 3.0},
+        ])
+        lines = _format_training_health_block(tmp_path)
+        assert lines == [
+            "  Training health: 100 steps · loss 3.74 → 2.40 · "
+            "eval_loss 2.51 · token_acc 54% · lr 2.0e-04"
+        ]
+
+    def test_warns_when_the_run_took_too_few_steps(self, tmp_path: Path) -> None:
+        """The 21-step run that read as 'the dataset is bad'."""
+        from lqh.tools.handlers import _format_training_health_block
+
+        self._history(tmp_path, [{"step": 21, "loss": 3.7}])
+        lines = _format_training_health_block(tmp_path)
+        assert "21 steps" in lines[0]
+        assert len(lines) == 2
+        assert "Only 21 optimizer updates" in lines[1]
+        # The advice must name levers start_training actually accepts — there
+        # is no batch-size parameter, so suggesting one would be a no-op call.
+        assert "num_epochs" in lines[1]
+        assert "batch" not in lines[1]
+
+    def test_no_warning_on_a_healthy_step_count(self, tmp_path: Path) -> None:
+        from lqh.tools.handlers import _format_training_health_block
+
+        self._history(tmp_path, [{"step": 120, "loss": 3.7}])
+        assert len(_format_training_health_block(tmp_path)) == 1
+
+    def test_partial_history_renders_what_it_has(self, tmp_path: Path) -> None:
+        """A run whose loss logged once (the old logging_steps=50 against 54
+        total steps) still has to render — that run is the one being diagnosed.
+        """
+        from lqh.tools.handlers import _format_training_health_block
+
+        self._history(tmp_path, [{"step": 54, "loss": 3.7}])
+        assert _format_training_health_block(tmp_path) == [
+            "  Training health: 54 steps · loss 3.70"
+        ]
+
+    def test_falls_back_to_the_end_of_training_summary_loss(
+        self, tmp_path: Path
+    ) -> None:
+        from lqh.tools.handlers import _format_training_health_block
+
+        self._history(tmp_path, [{"step": 60, "train_loss": 2.25}])
+        assert _format_training_health_block(tmp_path) == [
+            "  Training health: 60 steps · loss 2.25"
+        ]
+
+    def test_prefers_eval_token_accuracy(self, tmp_path: Path) -> None:
+        from lqh.tools.handlers import _format_training_health_block
+
+        self._config(tmp_path, {"learning_rate": 3e-4})
+        self._history(tmp_path, [
+            {"step": 100, "mean_token_accuracy": 0.5},
+            {"step": 100, "eval_mean_token_accuracy": 0.61},
+        ])
+        line = _format_training_health_block(tmp_path)[0]
+        assert "token_acc 61%" in line
+        assert "lr 3.0e-04" in line
+
+    def test_sweep_reads_the_winning_child_run(self, tmp_path: Path) -> None:
+        """A sweep writes no eval_history.json at the run root — each grid
+        point trains in sweep_<config_id>/. Reporting the parent's base config
+        would also report the wrong LR: the base deliberately omits the swept
+        hyperparameters."""
+        from lqh.tools.handlers import _format_training_health_block
+
+        (tmp_path / "config.json").write_text(json.dumps({
+            "type": "sweep",
+            "base_config": {"training": {"max_seq_length": 2048}},
+        }))
+        (tmp_path / "sweep_summary.json").write_text(json.dumps({
+            "mode": "sft",
+            "rows": [
+                {"config_id": "sft_lr0.0003_e3", "primary": 1.9},
+                {"config_id": "sft_lr0.001_e3", "primary": 2.4},
+            ],
+            "winner": {"config_id": "sft_lr0.0003_e3", "primary": 1.9},
+        }))
+        winner = tmp_path / "sweep_sft_lr0.0003_e3"
+        winner.mkdir()
+        (winner / "config.json").write_text(
+            json.dumps({"type": "sft", "training": {"learning_rate": 3e-4}})
+        )
+        self._history(winner, [
+            {"step": 55, "loss": 3.6},
+            {"step": 110, "loss": 2.1},
+            {"step": 110, "eval_loss": 1.9},
+        ])
+        assert _format_training_health_block(tmp_path) == [
+            "  Training health: 110 steps · loss 3.60 → 2.10 · "
+            "eval_loss 1.90 · lr 3.0e-04"
+        ]
+
+    def test_sweep_without_a_winner_renders_nothing(self, tmp_path: Path) -> None:
+        """Every config collapsed / failed: no winner, so there is no run to
+        report — better empty than the wrong child's numbers."""
+        from lqh.tools.handlers import _format_training_health_block
+
+        (tmp_path / "sweep_summary.json").write_text(
+            json.dumps({"mode": "sft", "rows": [], "winner": None})
+        )
+        (tmp_path / "sweep_sft_lr0.001_e3").mkdir()
+        self._history(tmp_path / "sweep_sft_lr0.001_e3", [{"step": 9, "loss": 4.0}])
+        assert _format_training_health_block(tmp_path) == []
+
+    def test_hydrate_pulls_the_sweep_winners_history(self, tmp_path: Path) -> None:
+        """Two-pass hydration: the leaderboard has to land before we know which
+        child dir to fetch."""
+        import asyncio
+
+        import lqh.tools.handlers as handlers
+
+        (tmp_path / "sweep_summary.json").write_text(
+            json.dumps({"winner": {"config_id": "sft_lr0.0003_e3"}})
+        )
+        fetched: list[str] = []
+
+        async def fake_fetch(target: Path) -> bool:
+            fetched.append(target.name if target.parent == tmp_path
+                           else f"{target.parent.name}/{target.name}")
+            return False
+
+        with patch.object(handlers, "_fetch_run_artifact", fake_fetch):
+            asyncio.run(handlers._hydrate_run_eval_artifacts(tmp_path))
+        assert "sweep_sft_lr0.0003_e3/eval_history.json" in fetched
+        assert "sweep_sft_lr0.0003_e3/config.json" in fetched
+
+    def test_ignores_non_numeric_and_boolean_fields(self, tmp_path: Path) -> None:
+        """log_history carries strings and bools; a bool is not a loss."""
+        from lqh.tools.handlers import _format_training_health_block
+
+        self._config(tmp_path, {"learning_rate": "fast"})
+        self._history(tmp_path, [
+            {"step": 100, "loss": True, "eval_loss": "n/a"},
+            {"step": 100, "loss": 1.5},
+        ])
+        assert _format_training_health_block(tmp_path) == [
+            "  Training health: 100 steps · loss 1.50"
+        ]
+
+    def test_hydrate_pulls_the_history_for_cloud_runs(self, tmp_path: Path) -> None:
+        """Published as an artifact but never downloaded → the block was empty
+        for every cloud run, i.e. for every real run."""
+        import lqh.tools.handlers as handlers
+
+        fetched: list[str] = []
+
+        async def fake_fetch(target: Path) -> bool:
+            fetched.append(target.name)
+            return False
+
+        with patch.object(handlers, "_fetch_run_artifact", fake_fetch):
+            import asyncio
+
+            asyncio.run(handlers._hydrate_run_eval_artifacts(tmp_path))
+        assert "eval_history.json" in fetched
+
+
 class TestCompletionNotice:
     async def test_notice_includes_percentile_snippet(self, tmp_path: Path) -> None:
         from lqh.jobs import JobSupervisor

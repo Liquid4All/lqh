@@ -268,8 +268,22 @@ arguments** — the harness detects the VL base and switches automatically:
 | DPO | **sweeps** | Far more sensitive to learning rate and β, and its defaults are not covered by the SFT calibration study. Searching is still the safer bet. |
 
 **Do not ask the user about hyperparameters, and do not pass `learning_rate` /
-`num_epochs` / `dpo_beta` yourself.** The defaults are a single source of truth
-(`lqh/train/defaults.py`, `PROVENANCE` records where they came from).
+`num_epochs` / `dpo_beta` yourself** to chase a fraction of a point. The
+defaults are a single source of truth (`lqh/train/defaults.py`, `PROVENANCE`
+records where they came from).
+
+**One exception: a run that did not learn at all.** Read the "Training health"
+line in `training_status` on a finished run:
+
+- train loss barely moved, with a healthy step count → retrain at **5× the
+  learning rate**;
+- the line warns about **too few optimizer updates** → retrain with a higher
+  **`num_epochs`** (or more rows). The effective batch is derived from
+  `rows × epochs`, so epochs buy updates; a higher learning rate does not.
+
+Either is cheaper than scaling the data or stepping up the model, and is the
+lever those two cannot substitute for. See the `failure_analysis` skill's
+"training isn't working" branch, step 1. That is a diagnosis, not tuning.
 
 **When to turn the SFT sweep on** (`enable_sweep=true`) — all of these should hold:
 1. The data pipeline is settled (scaling the dataset again is no longer buying much).
@@ -278,11 +292,13 @@ arguments** — the harness detects the VL base and switches automatically:
    rescuing a run that isn't learning.
 
 That is a `/improve` decision, not a `/train` one — see the `failure_analysis`
-skill's ladder. If training is *not* working, a sweep is the wrong tool: fix the
-data or step up the model.
+skill's ladder. If training is *not* working, a sweep is the wrong tool: check
+the "Training health" line first (a run that took too few optimizer steps or
+whose loss never moved needs one rerun at a higher learning rate, not a
+six-config search), then fix the data or step up the model.
 
 **Default grids** (6 configs each):
-- SFT: `lr ∈ {2e-5, 5e-5, 1e-4} × epochs ∈ {2, 3}`
+- SFT: `lr ∈ {1e-4, 3e-4, 1e-3} × epochs ∈ {2, 3}` — centred on the 2e-4 default
 - DPO: `lr ∈ {3e-7, 1e-6, 2e-6} × β ∈ {0.05, 0.10}`
 
 **Cost**: roughly `2–3×` a single-config training, so plan for ~2-3h on a single GPU. For calibration: in the validation experiment on `ar_to_de` (2026-05-11), the swept winner beat the *then*-default hyperparameters by +0.44 mean judge score for SFT. Treat that as an upper bound on what a sweep buys today, not an expectation — it measured a sweep against untuned defaults.
@@ -320,7 +336,13 @@ Defaults live in `lqh/train/defaults.py`; a sweep overrides `learning_rate` /
 - **`lora`** (default: true) — use LoRA for parameter-efficient fine-tuning.
 - **`num_epochs`** (default: 3) — SFT only. Training keeps the best checkpoint by
   eval loss, so this is a ceiling rather than a target.
-- **`learning_rate`** (default: 2e-5 for SFT, 1e-6 for DPO, 5e-4 for vision LoRA).
+- **`learning_rate`** (default: 2e-4 for SFT LoRA, 2e-5 for full-fine-tuning
+  SFT, 1e-6 for DPO, 5e-4 for vision LoRA). LoRA and full fine-tuning want
+  genuinely different rates — only the adapter moves under LoRA.
+- **batch size** is not a knob you pass: for SFT LoRA the effective batch is
+  derived from the dataset (`train_rows × epochs / 100`, clamped to 16–256) so
+  the run always takes ~100 optimizer updates. A fixed batch made small
+  datasets train for ~20 updates and look like bad data.
 - **`num_iterations`** (default: 5) — DPO only.
 - **`dpo_beta`** (default: 0.1) — DPO KL anchor strength.
 
@@ -446,10 +468,13 @@ When helping the user with training:
 
 4. **Do NOT ask the user whether to hyperparameter-tune, and do not pass
    hyperparameters.** Omit `enable_sweep`, `learning_rate` and `num_epochs`
-   entirely: SFT runs once at the validated defaults, DPO sweeps. Just kick off
+   entirely: SFT runs once at the shipped defaults, DPO sweeps. Just kick off
    the run. When a DPO sweep might surprise the user, inform them in one sentence
    *after* starting: *"I'm running a 6-config sweep — this will pick the best
    hyperparameters automatically."* Do **not** gate the run on confirmation.
+   **The one exception is a finished run that did not learn at all** — see
+   *Hyperparameter sweeping* → "One exception" below: there you set
+   `learning_rate` or `num_epochs` yourself on the retry, without asking.
 
 5. **Honor an explicit override either way.** "don't tune" / "skip the sweep" /
    "just one run" / a concrete `learning_rate=…` → `enable_sweep=false` (and you

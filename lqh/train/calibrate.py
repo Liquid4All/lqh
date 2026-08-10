@@ -141,17 +141,30 @@ def _post_profile(
 
 
 def _apply(training_cfg: dict[str, Any], micro: int, target_effective: int) -> int:
-    """Set per_device_batch_size to ``micro`` and adjust grad accumulation
-    to preserve at least the configured effective batch size. Returns
-    grad_accum."""
+    """Set per_device_batch_size to ``micro`` and adjust grad accumulation so
+    the true optimizer batch is as close to ``target_effective`` as ``micro``
+    allows without exceeding it. Returns grad_accum.
+
+    ``effective_batch_size`` is rewritten to the realized value, because
+    ``micro`` rarely divides the target and the difference is load-bearing: the
+    SFT batch is derived from the dataset to guarantee an optimizer-step count
+    (``lqh.train.defaults.sft_effective_batch``), and both that guarantee and
+    the step-count diagnostic in sft.py read this field.
+    """
     # A micro-batch larger than the requested effective batch silently raises
     # the true optimizer batch because accumulation cannot be below one. This
     # mattered for DPO's target of 16 when a cached/probed GPU profile said
     # 128 or 256 was memory-safe.
     micro = min(max(1, micro), max(1, target_effective))
-    accum = max(1, math.ceil(target_effective / micro))
+    # Round the accumulation DOWN, not up. Up (ceil) overshoots the target by
+    # up to 2x whenever micro does not divide it — target 53 with a probed
+    # micro of 48 became a true batch of 96, halving the step count the target
+    # existed to guarantee. Down costs at most one micro-batch of gradient
+    # averaging and errs toward more updates, which is the safe direction.
+    accum = max(1, target_effective // micro)
     training_cfg["per_device_batch_size"] = micro
     training_cfg["gradient_accumulation_steps"] = accum
+    training_cfg["effective_batch_size"] = micro * accum
     return accum
 
 
@@ -316,6 +329,12 @@ def _probe_micro_batch(
             # OOM (torch.cuda.OutOfMemoryError) or any probe error — the
             # previous safe batch stands.
             print(f"calibrate: probe micro_batch={b} failed ({type(exc).__name__}); stopping", flush=True)
+            # Release this candidate's tensors before the finally-clause
+            # empty_cache(). `out` holds rows x seq x vocab logits plus a live
+            # autograd graph; leaving it bound to the frame means the failing
+            # candidate's memory is still reserved when the training run that
+            # follows starts allocating. The success path already dels these.
+            input_ids = attn = out = opt = None  # noqa: F841
             break
         finally:
             model.zero_grad(set_to_none=True)
@@ -408,12 +427,23 @@ def maybe_autotune_batch_size(
             )
             return
 
-        # Probe beyond the configured micro-batch up to the requested
-        # effective-batch target. The target is a hard ceiling: a micro-batch
-        # above it would silently increase the true optimizer batch.
-        probe_cap = min(admin_cap or max(_PROBE_BATCHES), target_effective)
+        # Probe what MEMORY allows, not what this run's effective-batch target
+        # happens to be. The profile the probe writes back is shared across runs
+        # and keyed on model/GPU/modality/seq-len/rank/dtype/image only — it has
+        # no batch-target component — so capping the probe at the target would
+        # record "this dataset was small" as "this model cannot fit more than
+        # 16 per device", and every later run of that model on that GPU would
+        # inherit it from the cache. The target still bounds what is APPLIED,
+        # in _apply, which is where the "a micro-batch above the effective
+        # target silently raises the true optimizer batch" rule belongs.
+        probe_cap = admin_cap or max(_PROBE_BATCHES)
+        if not grad_ckpt:
+            # Checkpointing-off runs neither read nor write the shared profile
+            # (their activation footprint is a different regime), so measuring
+            # above what this run can apply would be discarded work.
+            probe_cap = min(probe_cap, target_effective)
         headroom = float(training_cfg.get("batch_headroom", _DEFAULT_HEADROOM))
-        safe, peak = _probe_micro_batch(
+        measured, peak = _probe_micro_batch(
             model,
             tokenizer,
             seq_len=seq_len,
@@ -422,15 +452,18 @@ def maybe_autotune_batch_size(
             gradient_checkpointing=grad_ckpt,
             pair_batch=method.startswith("dpo"),
         )
-        if not safe:
+        if not measured:
             print("calibrate: probe found no safe batch; keeping configured default", flush=True)
             return
-        safe = min(int(safe), probe_cap, target_effective)
-        accum = _apply(training_cfg, safe, target_effective)
+        measured = min(int(measured), probe_cap)
+        accum = _apply(training_cfg, measured, target_effective)
+        applied = int(training_cfg["per_device_batch_size"])
         if grad_ckpt:
+            # micro_batch is the measured memory ceiling (what the cache is
+            # for); grad_accum is this run's, and informational.
             _post_profile(
                 key,
-                micro_batch=safe,
+                micro_batch=measured,
                 grad_accum=accum,
                 peak_mem_mb=peak,
                 headroom=headroom,
@@ -438,7 +471,8 @@ def maybe_autotune_batch_size(
                 stable=True,
             )
         print(
-            f"calibrate: probed micro_batch={safe} grad_accum={accum} peak={peak}MB "
+            f"calibrate: probed micro_batch={measured} (applied {applied}) "
+            f"grad_accum={accum} peak={peak}MB "
             f"(effective {target_effective}, gpu={gpu_type})",
             flush=True,
         )
@@ -613,9 +647,12 @@ def main() -> int:
     if not safe:
         print("calibrate: probe found no safe micro-batch", flush=True)
         return 1
-    # Default effective-batch targets per objective — keep in sync with
-    # the submit defaults in lqh/tools/handlers.py and the
-    # ensure_batch_defaults calls in sft.py / dpo.py.
+    # Default effective-batch targets per objective, used only to report a
+    # representative grad_accum alongside the measured micro-batch. Real runs
+    # derive their own target (text SFT LoRA scales it with the dataset —
+    # lqh.train.defaults.sft_effective_batch; DPO with the pair count) and
+    # recompute grad_accum from it in maybe_autotune_batch_size, so these are
+    # upper bounds for reporting, not the values any run trains at.
     target_effective = {"lora": 256, "dpo_lora": 256, "full": 16, "dpo_full": 2}[method]
     accum = max(1, math.ceil(target_effective / safe))
     if not _post_profile(

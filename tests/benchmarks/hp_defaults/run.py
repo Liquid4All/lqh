@@ -198,6 +198,7 @@ def _job_specs(
                 scorer_rel=scorer_rel,
                 grid_override=[p.to_override() for p in chunk],
                 max_new_tokens=max_new_tokens,
+                train_rows=cell.train_size,
             ),
         ))
     return specs

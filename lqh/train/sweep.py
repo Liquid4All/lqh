@@ -132,14 +132,21 @@ _CHILD_PROGRESS_CONTEXT: ContextVar[_ChildProgressContext | None] = ContextVar(
 
 
 def sft_grid_small() -> list[SweepPoint]:
-    """SFT grid: lr ∈ {2e-5, 5e-5, 1e-4} × epochs ∈ {2, 3} = 6 configs.
+    """SFT grid: lr ∈ {1e-4, 3e-4, 1e-3} × epochs ∈ {2, 3} = 6 configs.
 
-    Pushes above lr=5e-5/epochs=3 (the config that won the validation
-    grid at its top edge — optimum was likely higher than the tested
-    range).
+    Centred on the shipped LoRA default (2e-4, see
+    ``lqh.train.defaults.recommended``) with one step down and one up, so a
+    sweep can bracket the optimum from both sides.
+
+    The previous grid was {2e-5, 5e-5, 1e-4}, which sat entirely at or below
+    the default — every config in it was a step *down*, so the sweep could only
+    confirm the default, never improve on it. That grid was inherited from an
+    era when 2e-5 was the default; its own docstring already conceded the
+    optimum "was likely higher than the tested range", which a customer then
+    paid three flat runs to discover (feedback item 47).
     """
     points: list[SweepPoint] = []
-    for lr in (2e-5, 5e-5, 1e-4):
+    for lr in (1e-4, 3e-4, 1e-3):
         for epochs in (2, 3):
             points.append(
                 SweepPoint(

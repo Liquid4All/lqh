@@ -17,6 +17,7 @@ Never route on the score alone. Collect all of these first:
 | Fact | Where to find it |
 |---|---|
 | Latest score + distribution | `training_status(run_name=...)` — the "Final eval" block (mean, percentiles, histogram); raw JSON in `runs/<name>/eval_result.json` |
+| How the run trained | `training_status` — the "Training health" line: optimizer steps, train-loss start → end, eval loss, token accuracy, learning rate. A flat score with a flat loss is a *training* problem; a flat score with a falling loss is a data or capacity problem. |
 | Zero-shot baseline | The pre-training eval run of the same base model on the same eval set (`evals/runs/*/summary.json` or `runs/<baseline>/eval_result.json`). Did SFT actually improve the model? |
 | Model size | `runs/<name>/config.json` → `base_model`. Text ladder: 230M / 350M / 1.2B / 2.6B / 8B-A1B; VLM ladder: 450M / 1.6B (see `list_models`). |
 | Training-set size | `training_status` "Data:" line, or `runs/<name>/config.json` → `dataset_rows` (`train`, `train_effective`, `eval`). Older runs: use `summary` to read dataset row counts. |
@@ -75,22 +76,61 @@ Two numbers decide the route, in this order:
 
 ## Routing: training isn't working (Δ < ~0.5 or regression)
 
-Check these in order — each is cheap to verify from the Step 0 context:
+**This branch is ordered by cost, cheapest first.** A rerun at a different
+learning rate is ~40 min on the same GPU; scaling the data adds a data-gen
+pipeline run plus a longer training run; a model step-up moves to a bigger,
+more expensive GPU. Spending the expensive levers first is what turns a
+two-attempt fix into a six-attempt one — check these in order:
 
-1. **Training-set size < 2k rows?** Fix this first. 2–5k good samples should
+1. **Did the model actually train?** Read the "Training health" line from
+   `training_status` before anything else — it is free. Two distinct failures
+   live here and they have *different* fixes:
+   - **Too few optimizer updates** (the line warns below ~50): the run barely
+     stepped, so nothing about the data or the learning rate is testable yet.
+     The effective batch is derived from `rows × epochs`, so the fix is more
+     of either: `start_training(..., num_epochs=<2× the run's epochs>)` on the
+     same data, or more rows. **A higher learning rate does not create
+     updates** — do not reach for it here.
+   - **Enough updates but the train loss barely moved** (e.g. 3.7 → 3.6):
+     the adapter isn't learning at the configured rate. Retrain the *same data
+     on the same model* at **5× the learning rate**
+     (`start_training(..., learning_rate=<5 × the run's lr>)` — read the run's
+     lr from the same line; if the line shows no `lr`, do **not** take it from
+     the run-root `config.json` on a swept run, that is the pre-grid value —
+     read `runs/<name>/sweep_<winner_config_id>/config.json`).
+   - Both cases are the one place where you override a hyperparameter yourself
+     without asking: a run that didn't learn is a broken run, not a tuning
+     opportunity.
+   - **Loss fell steadily but the score didn't move**: the run trained fine
+     and the problem is downstream — continue to 2.
+2. **Training-set size < 2k rows?** Fix this next. 2–5k good samples should
    already produce a measurable improvement; below ~2k, no other conclusion
    is safe. Scale the data-gen pipeline to ≥ 2k (reuse it with a higher
    `num_samples`), retrain, re-eval.
-2. **≥ 2k rows but the model is at the small end of its ladder** (≤ 350M
+3. **≥ 2k rows but the model is at the small end of its ladder** (≤ 350M
    text, 450M VLM)? Very small models lack capacity for complex tasks.
    Step up one size (within budget — see below): zero-shot the larger
    model first to gauge headroom, then train it on the same dataset.
-3. **Large model still flat?** The dataset itself is the suspect: not
+4. **Large model still flat?** The dataset itself is the suspect: not
    diverse enough, or not representative of the task. Go back to
    `/datagen` — review sample diversity, scorer quality, and the dataset's
    own score distribution (the data-generation skill's distribution-shape
    guidance applies to the *dataset*; this skill applies the same reading
    to the *model's* eval scores).
+
+**After two consecutive Δ ≈ 0 runs, stop advancing one lever per round.**
+Single-variable isolation is the right default for the *first* retry — it is
+what makes the result interpretable — but each round costs the user 40–70
+minutes of wall clock and a decision. Once two rounds have bought nothing,
+`ask_user` with a **combined jump** as the recommended option (e.g. 5× learning
+rate *and* 3× the data *and* the next model size up), and single-variable
+isolation as the alternative for a user who wants to know which lever mattered.
+Say what each option costs in time and money.
+
+**Grad norm is not a diagnostic here.** Small `grad_norm` values (0.02, 0.008)
+appear in both healthy and flat runs — a successful +1.30 run logged a *lower*
+grad norm than the two flat runs it replaced. Read the train-loss trajectory and
+`mean_token_accuracy` against the optimizer-step count instead.
 
 ## Routing: training works, but the score isn't there yet (Δ ≥ ~0.5)
 
@@ -103,12 +143,13 @@ clears the deployment bar above:
 2. **Step up the model size** (within budget). Same dataset, next size up.
 3. **Sweep the SFT hyperparameters** — `start_training(..., enable_sweep=true)`
    on the settled dataset and model size. **This is the first lever that is
-   purely about tuning, and it belongs here, not earlier.** SFT runs at
-   validated defaults (`lqh/train/defaults.py`), so a sweep is chasing what
+   purely about tuning, and it belongs here, not earlier.** SFT runs at the
+   shipped defaults (`lqh/train/defaults.py`), so a sweep is chasing what
    those defaults left on the table: expect a fraction of a point, for
    several times the wall-clock of one run. It only makes sense once levers
    1 and 2 have stopped paying — a sweep cannot rescue a run that is short
-   on data or on model capacity.
+   on data or on model capacity. (A run that isn't learning at all is the
+   other branch's step 1, and a single rerun there, not a sweep.)
 4. **On-policy DPO** on the best SFT checkpoint (text models only — VLMs
    skip this lever). DPO polishes consistent failure modes; it is
    task-dependent and much slower than SFT — follow the train skill's DPO

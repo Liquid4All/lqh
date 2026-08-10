@@ -4,18 +4,19 @@ Axes are learning rate × epochs — the two the product's sweep already varies,
 so the study's answer is directly installable in ``lqh/train/defaults.py``.
 
 The learning-rate range is deliberately **wider than the product grid**
-(`{2e-5, 5e-5, 1e-4}`). The shipped default of 2e-5 is a full-fine-tuning-style
-rate applied to a LoRA adapter, where the literature generally wants
-considerably more; 2e-4 is included to test the top of that range and 1e-5 to
-confirm the bottom is not better. A study that only searched inside the current
-grid could not discover that the whole grid sits in the wrong place.
+(`{1e-4, 3e-4, 1e-3}`), and brackets the shipped LoRA default of 2e-4 on both
+sides: 2e-5 confirms the full-fine-tuning-style rate the product used to ship
+(and which a customer's flat runs argued against) is genuinely worse, and 1e-3
+tests whether the correction went far enough. A study that only searched inside
+the product grid could not discover that the whole grid sits in the wrong place
+— which is exactly what happened when the default was 2e-5.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-LEARNING_RATES: tuple[float, ...] = (1e-5, 2e-5, 5e-5, 1e-4, 2e-4)
+LEARNING_RATES: tuple[float, ...] = (2e-5, 1e-4, 2e-4, 5e-4, 1e-3)
 EPOCHS: tuple[int, ...] = (1, 2, 3)
 
 

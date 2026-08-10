@@ -134,16 +134,33 @@ def build_launch_config(
     scorer_rel: str,
     grid_override: list[dict],
     max_new_tokens: int = 512,
+    train_rows: int | None = None,
 ) -> dict[str, Any]:
     """The sweep payload for one cell chunk.
 
     Deliberately mirrors what ``handle_start_training`` builds, minus the
     hyperparameters the grid is going to override anyway, so the study
     measures the configuration the product actually ships.
+
+    ``train_rows`` is the cell's dataset size: the shipped effective batch is
+    derived from it, so passing it keeps the study measuring the product's real
+    batch instead of the no-rows-known fallback. The batch is pinned at the
+    *shipped default* epoch count for the whole cell, not per grid point: it has
+    to be constant across a cell's configs (otherwise the batch moves with the
+    LR axis and the result is uninterpretable), and the value the study's
+    recommendation gets pasted into is the default-epoch one. Consequence: the
+    grid's 1-epoch row trains at ~1/3 of the target optimizer-step count. That
+    is the honest comparison for "what should the default be" — the alternative
+    confounds two axes.
     """
     from lqh.train import defaults
 
-    recommended = defaults.recommended(run_type="sft", lora=True)
+    recommended = defaults.recommended(
+        run_type="sft",
+        lora=True,
+        train_rows=train_rows,
+        num_epochs=defaults.DEFAULT_SFT_EPOCHS if train_rows else None,
+    )
     training = recommended.training_config()
     # The grid owns these two.
     training.pop("learning_rate", None)

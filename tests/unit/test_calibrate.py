@@ -40,16 +40,62 @@ def test_apply_preserves_effective_batch():
     assert cfg["per_device_batch_size"] == 4
     assert accum == 4
     assert cfg["gradient_accumulation_steps"] == 4
+    assert cfg["effective_batch_size"] == 16
     # safe micro = 8 → accum 2
     calibrate._apply(cfg, 8, 16)
     assert cfg["gradient_accumulation_steps"] == 2
+    assert cfg["effective_batch_size"] == 16
     # safe micro larger than effective → accum floors at 1
     calibrate._apply(cfg, 32, 16)
     assert cfg["gradient_accumulation_steps"] == 1
-    # non-divisible micro-batches should not undershoot the requested
-    # effective batch.
-    calibrate._apply(cfg, 48, 256)
-    assert cfg["gradient_accumulation_steps"] == 6
+    assert cfg["effective_batch_size"] == 16
+
+
+def test_apply_rounds_down_and_records_the_realized_batch():
+    """A micro-batch that does not divide the target must UNDER-shoot it.
+
+    Rounding up overshot by up to 2x (target 53, probed micro 48 → true batch
+    96), which halved the optimizer-step count the SFT target is derived to
+    guarantee (lqh.train.defaults.sft_effective_batch). The realized value is
+    written back because sft.py's step accounting reads these fields.
+    """
+    cfg: dict = {}
+    calibrate._apply(cfg, 48, 53)
+    assert cfg["per_device_batch_size"] == 48
+    assert cfg["gradient_accumulation_steps"] == 1
+    assert cfg["effective_batch_size"] == 48
+
+    for micro, target in ((96, 256), (128, 132), (64, 75), (24, 53)):
+        cfg = {}
+        accum = calibrate._apply(cfg, micro, target)
+        realized = cfg["per_device_batch_size"] * accum
+        assert realized == cfg["effective_batch_size"]
+        assert realized <= target
+        # Never collapse to a fraction of the target either.
+        assert realized > target // 2
+
+
+def test_derived_sft_batches_survive_the_probe_ladder():
+    """End-to-end on the real numbers: every batch the SFT derivation can
+    produce, against every micro-batch the probe can pick, still clears the
+    step floor the derivation promised."""
+    from lqh.train import defaults
+
+    for rows, epochs in ((1_790, 3), (4_433, 3), (500, 3), (8_000, 2), (300, 3)):
+        target = defaults.sft_effective_batch(rows, epochs)
+        for micro in calibrate._PROBE_BATCHES:
+            if micro > target:
+                continue
+            cfg: dict = {}
+            calibrate._apply(cfg, micro, target)
+            steps = defaults.optimizer_steps(
+                train_rows=rows,
+                num_epochs=epochs,
+                effective_batch_size=cfg["effective_batch_size"],
+            )
+            assert steps >= defaults.SFT_MIN_HEALTHY_OPTIMIZER_STEPS, (
+                rows, epochs, target, micro, cfg, steps,
+            )
 
 
 def test_ensure_batch_defaults_targets_effective_batch():
@@ -173,8 +219,16 @@ def test_autotune_cached_value_respects_admin_cap(monkeypatch):
     assert cfg["per_device_batch_size"] == 16
 
 
-def test_autotune_probes_up_to_effective_target_despite_small_micro(monkeypatch):
-    """The probe can exceed configured micro, but not effective batch."""
+def test_autotune_probes_memory_not_the_effective_target(monkeypatch):
+    """The probe measures the MEMORY ceiling; the effective target only caps
+    what gets applied.
+
+    The batch profile it writes back is shared across runs and keyed on
+    model/GPU/seq-len/rank/dtype/image with no batch component. Capping the
+    probe at this run's target would publish "this dataset was small" as "this
+    model cannot fit more than N per device", and every later run of that model
+    on that GPU would inherit it from the cache — which matters now that the
+    text SFT LoRA target scales with the dataset."""
     _patch_torch(monkeypatch)
     monkeypatch.setattr(calibrate, "_get_cached_profile", lambda key: None)
     seen = {}
@@ -200,11 +254,15 @@ def test_autotune_probes_up_to_effective_target_despite_small_micro(monkeypatch)
     calibrate.maybe_autotune_batch_size(
         cfg, model=object(), tokenizer=object(), base_model="m", method="lora", lora_rank=32
     )
-    assert seen["max_micro_batch"] == 64
+    # Probed to the top of the ladder, not to this run's target of 64.
+    assert seen["max_micro_batch"] == max(calibrate._PROBE_BATCHES)
     assert seen["pair_batch"] is False
+    # Applied: capped at the target, so the true optimizer batch stays 64.
     assert cfg["per_device_batch_size"] == 64
     assert cfg["gradient_accumulation_steps"] == 1
-    assert posted["micro_batch"] == 64
+    assert cfg["effective_batch_size"] == 64
+    # Cached: the measurement (96), which is what the profile column means.
+    assert posted["micro_batch"] == 96
     assert posted["source"] == "probe"
 
 

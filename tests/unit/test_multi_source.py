@@ -92,6 +92,54 @@ class TestNormalizeSources:
         with pytest.raises(ValueError):
             normalize_sources([{"repeat": 2}], allow_repeat=True)
 
+    def test_json_encoded_list_is_decoded(self) -> None:
+        """Smaller pool models emit the array JSON-encoded inside the string
+        field despite the oneOf schema. Treating that as a path produced
+        "not found at [...]/data.parquet" and cost a customer a third of their
+        training data (feedback item 47)."""
+        from lqh.train.data_utils import normalize_sources
+
+        out = normalize_sources(
+            '["datasets/a/data.parquet", "datasets/b/data.parquet"]',
+            allow_repeat=True,
+        )
+        assert [e["source"] for e in out] == ["a", "b"]
+        assert all(e["repeat"] == 1 for e in out)
+
+    def test_json_encoded_object_list_keeps_repeat(self) -> None:
+        from lqh.train.data_utils import normalize_sources
+
+        out = normalize_sources(
+            '[{"path": "datasets/a/data.parquet", "repeat": 3}]', allow_repeat=True
+        )
+        assert out == [
+            {"path": "datasets/a/data.parquet", "repeat": 3, "source": "a"}
+        ]
+
+    def test_malformed_json_array_still_fails_as_a_path(self) -> None:
+        """The repair must not turn a broken string into a silent success —
+        it falls through to the ordinary single-path handling."""
+        from lqh.train.data_utils import normalize_sources
+
+        out = normalize_sources('["datasets/a", ', allow_repeat=True)
+        assert [e["path"] for e in out] == ['["datasets/a", ']
+
+    def test_empty_source_list_is_rejected(self) -> None:
+        """`"[]"` decodes to no sources at all — returning [] would train on
+        nothing, silently. Same for the bare empty list."""
+        from lqh.train.data_utils import normalize_sources
+
+        with pytest.raises(ValueError, match="empty"):
+            normalize_sources("[]", allow_repeat=True)
+        with pytest.raises(ValueError, match="empty"):
+            normalize_sources([], allow_repeat=True)
+
+    def test_json_scalar_is_not_treated_as_a_list(self) -> None:
+        from lqh.train.data_utils import normalize_sources
+
+        out = normalize_sources("datasets/a/data.parquet", allow_repeat=True)
+        assert out[0]["path"] == "datasets/a/data.parquet"
+
 
 # ---------------------------------------------------------------------------
 # load_chatml_datasets / load_eval_sources

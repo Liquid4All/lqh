@@ -7,11 +7,13 @@ handler. There are two reasons this is worth its own module:
    SFT by default (see ``lqh/skills/train/SKILL.md``) — the first run is a
    single run at these values, and the sweep is the late-stage "squeeze out
    more" lever. A default that is merely plausible is no longer good enough.
-2. **They are measured, not guessed.** ``tests/benchmarks/hp_defaults`` runs a
-   factorial study over task × dataset size × model (base/instruct) × model
-   size and reports the config with the lowest mean regret against each cell's
-   oracle. Its output is a data-only edit to this file plus a ``PROVENANCE``
-   update — nothing else moves.
+2. **They are meant to be measured, not guessed.**
+   ``tests/benchmarks/hp_defaults`` runs a factorial study over task × dataset
+   size × model (base/instruct) × model size and reports the config with the
+   lowest mean regret against each cell's oracle. Its output is a data-only
+   edit to this file plus a ``PROVENANCE`` update — nothing else moves. It has
+   not been run yet, so ``PROVENANCE`` currently reads "literals" — check it
+   before treating any number here as validated.
 
 ``recommended()`` is the only entry point. It returns the full hyperparameter
 set for a run; callers must not re-derive any part of it.
@@ -19,6 +21,7 @@ set for a run; callers must not re-derive any part of it.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,8 +30,16 @@ from typing import Any
 # nobody can safely revisit.
 PROVENANCE = (
     "unvalidated pre-study literals, carried over verbatim from "
-    "handle_start_training (2026-08). The hp_defaults calibration study "
-    "(tests/benchmarks/hp_defaults) has not been run yet; when it is, replace "
+    "handle_start_training (2026-08), with two field-driven corrections in "
+    "2026-08 (feedback item 47): (a) the text LoRA learning rate was split "
+    "off from the full-fine-tuning rate and raised 2e-5 -> 2e-4, after a "
+    "customer's trilingual-translation task moved +1.30 judge points from a "
+    "hand-set 5e-4 while three runs at 2e-5 produced nothing; (b) the LoRA "
+    "effective batch size is now derived from the dataset so a run always "
+    "takes enough optimizer steps to learn (the fixed 256 gave a 1,790-row "
+    "3-epoch run 21 updates in total). Both are still literals, not "
+    "measurements: the hp_defaults calibration study "
+    "(tests/benchmarks/hp_defaults) has not been run yet. When it is, replace "
     "the values below with its report's recommendation block and cite the run "
     "id here."
 )
@@ -53,6 +64,27 @@ VISION_TARGET_MODULES: tuple[str, ...] = (
 VISION_MAX_IMAGE_TOKENS = 256
 
 MAX_SEQ_LENGTH = 2048
+
+DEFAULT_SFT_EPOCHS = 3
+
+# How many optimizer updates a text SFT run should get. A LoRA adapter at a
+# fixed effective batch of 256 gets ~20 updates out of a 2k-row 3-epoch run,
+# which is not enough for the adapter to move regardless of the learning rate —
+# and the symptom (flat judge score) looks exactly like "the dataset is bad".
+# The batch is therefore derived from the dataset, the same reasoning the DPO
+# branch in ``recommended()`` already applies to preference sets.
+SFT_TARGET_OPTIMIZER_STEPS = 100
+
+# Bounds on that derivation. The floor keeps gradients from getting noisy on
+# tiny datasets; the ceiling is the throughput-oriented value LoRA runs used
+# unconditionally before, so a large dataset trains exactly as it did.
+SFT_MIN_EFFECTIVE_BATCH = 16
+SFT_MAX_EFFECTIVE_BATCH = 256
+
+# Below this many total updates, a run is worth warning about at train time
+# (see lqh/train/sft.py) even after the derivation above — e.g. a caller who
+# passed an explicit tiny batch, or a dataset small enough to hit the floor.
+SFT_MIN_HEALTHY_OPTIMIZER_STEPS = 50
 
 _DPO_TYPES = frozenset({"dpo", "on_policy_dpo"})
 
@@ -104,6 +136,44 @@ class HParams:
         return training
 
 
+def optimizer_steps(
+    *,
+    train_rows: int | None,
+    num_epochs: int | None,
+    effective_batch_size: int,
+) -> int:
+    """Total optimizer updates a run will take, or 0 when unknowable.
+
+    Mirrors HF Trainer's arithmetic: the last partial batch of each epoch is
+    still a step (``dataloader_drop_last`` is off), so it is
+    ``ceil(rows / batch) * epochs``. Slightly optimistic when the run splits an
+    internal eval slice off the training set (``eval_split_ratio``, default
+    10%) — the reader wants the order of magnitude, not the exact count.
+    """
+    if not train_rows or train_rows <= 0 or effective_batch_size <= 0:
+        return 0
+    per_epoch = max(1, math.ceil(train_rows / effective_batch_size))
+    return per_epoch * max(1, num_epochs or 1)
+
+
+def sft_effective_batch(
+    train_rows: int | None = None,
+    num_epochs: int | None = None,
+) -> int:
+    """Effective batch for a text LoRA SFT run, floored on optimizer steps.
+
+    Returns the largest batch (capped at ``SFT_MAX_EFFECTIVE_BATCH``) that
+    still buys ``SFT_TARGET_OPTIMIZER_STEPS`` updates over the whole run, never
+    going below ``SFT_MIN_EFFECTIVE_BATCH``. With no row count available the
+    answer is the ceiling — the pre-derivation behaviour.
+    """
+    if not train_rows or train_rows <= 0:
+        return SFT_MAX_EFFECTIVE_BATCH
+    epochs = max(1, num_epochs or DEFAULT_SFT_EPOCHS)
+    batch = int(train_rows * epochs) // SFT_TARGET_OPTIMIZER_STEPS
+    return max(SFT_MIN_EFFECTIVE_BATCH, min(SFT_MAX_EFFECTIVE_BATCH, batch))
+
+
 def recommended(
     *,
     run_type: str,
@@ -111,16 +181,22 @@ def recommended(
     modality: str = "text",
     base_model: str | None = None,
     train_rows: int | None = None,
+    num_epochs: int | None = None,
 ) -> HParams:
     """Return the recommended hyperparameters for a run.
 
-    ``base_model`` and ``train_rows`` are accepted but currently unused: the
-    hp_defaults study exists precisely to determine whether model size /
-    base-vs-instruct / dataset scale deserve their own defaults. Until it says
-    they do, one default covers every cell — and the study reports that finding
-    explicitly rather than leaving it assumed. Keeping the parameters in the
-    signature now means adopting a conditional default later is a change to
-    this function's body alone.
+    ``train_rows`` (the number of training rows the run will actually see,
+    including ``repeat`` weighting) and ``num_epochs`` (the caller's explicit
+    epoch override, if any) size the text LoRA batch so the run takes enough
+    optimizer steps — see :func:`sft_effective_batch`. Pass them whenever they
+    are known; omitting them keeps the old fixed-256 batch.
+
+    ``base_model`` is accepted but currently unused: the hp_defaults study
+    exists precisely to determine whether model size / base-vs-instruct deserve
+    their own defaults. Until it says they do, one default covers every cell —
+    and the study reports that finding explicitly rather than leaving it
+    assumed. Keeping the parameter in the signature now means adopting a
+    conditional default later is a change to this function's body alone.
     """
     is_dpo = run_type in _DPO_TYPES
     is_vision = modality == "vision"
@@ -129,6 +205,12 @@ def recommended(
         learning_rate = 5e-4  # Liquid VLM LoRA recipe
     elif is_dpo:
         learning_rate = 1e-6
+    elif lora:
+        # LoRA wants 1e-4–5e-4, not a full-fine-tuning rate: only the adapter
+        # moves, so the same 2e-5 that suits every weight in the model barely
+        # moves a rank-32 adapter (see PROVENANCE — three customer runs at
+        # 2e-5 were flat, the same data at 5e-4 gained +1.30).
+        learning_rate = 2e-4
     else:
         learning_rate = 2e-5
 
@@ -142,7 +224,10 @@ def recommended(
         # updates per on-policy iteration (see DPO_FIX.md).
         micro_batch, effective_batch = 16, 16
     elif lora:
-        micro_batch, effective_batch = 256, 256
+        # Same failure mode as DPO's, one branch up: derive the batch from the
+        # dataset instead of pinning 256 and hoping the dataset is big enough.
+        effective_batch = sft_effective_batch(train_rows, num_epochs)
+        micro_batch = effective_batch
     else:
         micro_batch = 1
         effective_batch = 2 if is_dpo else 16
@@ -159,7 +244,7 @@ def recommended(
 
     return HParams(
         learning_rate=learning_rate,
-        num_epochs=None if is_dpo else 3,
+        num_epochs=None if is_dpo else (num_epochs or DEFAULT_SFT_EPOCHS),
         per_device_batch_size=micro_batch,
         effective_batch_size=effective_batch,
         max_seq_length=MAX_SEQ_LENGTH,

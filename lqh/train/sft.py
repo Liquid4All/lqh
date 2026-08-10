@@ -7,6 +7,7 @@ the main lqh process.  All torch/transformers/trl imports happen here.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -550,6 +551,10 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
             default_effective_batch=16,
         )
     else:
+        # Fallback for a config that carries no batch fields at all (older
+        # bundles, hand-written configs). Submission normally derives the LoRA
+        # target from the dataset (lqh.train.defaults.sft_effective_batch) and
+        # writes both fields, in which case these values are unused.
         ensure_batch_defaults(
             training_cfg,
             default_micro_batch=256 if lora_enabled else 1,
@@ -578,8 +583,56 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
             if hasattr(model, "_hf_peft_config_loaded"):
                 model._hf_peft_config_loaded = False
 
+    # How many optimizer updates this run will actually take. Two consumers:
+    # a warning when that number is too small for the adapter to move (the
+    # failure that reads as "training doesn't work on this dataset" —
+    # submission derives the batch to avoid it, but an explicit batch or a
+    # tiny dataset can still land here), and the log cadence below.
+    from lqh.train.defaults import (
+        SFT_MIN_HEALTHY_OPTIMIZER_STEPS,
+        optimizer_steps,
+    )
+
+    # micro x accumulation, never the config's effective_batch_size field: the
+    # calibration probe above may have lowered the micro-batch for memory, and
+    # these two are what HF Trainer actually uses. Reading the field would
+    # report a step count the run does not do — same arithmetic dpo.py uses for
+    # its own step-starvation warning.
+    effective_batch = max(
+        1,
+        int(training_cfg.get("per_device_batch_size", 1))
+        * int(training_cfg.get("gradient_accumulation_steps", 1)),
+    )
+    total_steps = optimizer_steps(
+        train_rows=len(train_dataset),
+        num_epochs=int(training_cfg.get("num_epochs", 3)),
+        effective_batch_size=effective_batch,
+    )
+    if total_steps:
+        print(
+            f"  optimizer steps: ~{total_steps} "
+            f"({len(train_dataset)} rows x {training_cfg.get('num_epochs', 3)} "
+            f"epochs / effective batch {effective_batch})"
+        )
+        if total_steps < SFT_MIN_HEALTHY_OPTIMIZER_STEPS:
+            print(
+                f"  WARNING: only ~{total_steps} optimizer updates for the whole "
+                f"run (healthy is >= {SFT_MIN_HEALTHY_OPTIMIZER_STEPS}). A flat "
+                f"eval score after this is far more likely to mean too few "
+                f"updates than a bad dataset — more rows or more epochs before "
+                f"blaming the data."
+            )
+
     # Checkpoints dir
     checkpoint_output = str(run_dir / "checkpoints")
+
+    # Log often enough to see a loss *curve* rather than a single point: at
+    # ~20 log rows per run, capped at the old fixed cadence of 50 steps. A
+    # short run (54 total steps at logging_steps=50) printed loss once, which
+    # is exactly the diagnostic a flat run needs and cannot get.
+    default_logging_steps = 50
+    if total_steps:
+        default_logging_steps = max(1, min(50, math.ceil(total_steps / 20)))
 
     # Eval cadence is shared with save cadence so load_best_model_at_end
     # has matching checkpoints to choose from. When eval_dataset is
@@ -594,7 +647,7 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 4),
         learning_rate=training_cfg.get("learning_rate", 2e-5),
         warmup_ratio=training_cfg.get("warmup_ratio", 0.1),
-        logging_steps=training_cfg.get("logging_steps", 50),
+        logging_steps=training_cfg.get("logging_steps", default_logging_steps),
         gradient_checkpointing=training_cfg.get("gradient_checkpointing", True),
         bf16=training_cfg.get("bf16", True),
         max_length=training_cfg.get("max_seq_length", 2048),

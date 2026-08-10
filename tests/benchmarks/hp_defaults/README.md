@@ -38,13 +38,15 @@ otherwise, regret does not.
 | task | `translation`, `extraction`, `classification`, `voice_satisfaction` |
 | train size | 500, 2000, 8000 |
 | model | 350M / 1.2B × base / instruct |
-| **hyperparameters** | lr ∈ {1e-5, 2e-5, 5e-5, 1e-4, 2e-4} × epochs ∈ {1, 2, 3} |
+| **hyperparameters** | lr ∈ {2e-5, 1e-4, 2e-4, 5e-4, 1e-3} × epochs ∈ {1, 2, 3} |
 
 48 cells × 15 configs. The learning-rate range is deliberately **wider than the
-product's sweep grid** (`{2e-5, 5e-5, 1e-4}`): the shipped default of 2e-5 is a
-full-fine-tuning-style rate applied to a LoRA adapter, and a search confined to
-the current grid could never discover that the whole grid sits in the wrong
-place.
+product's sweep grid** (`{1e-4, 3e-4, 1e-3}`) and brackets the shipped LoRA
+default of 2e-4 on both sides: 2e-5 is the full-fine-tuning-style rate the
+product shipped until a customer's flat runs argued against it, and 1e-3 tests
+whether that correction went far enough. A search confined to the product grid
+could never discover that the whole grid sits in the wrong place — which is
+exactly what happened while the default was 2e-5.
 
 Tasks come from `base_vs_instruct/pipelines/`. `voice_satisfaction` is the
 non-saturating one — the others reach >8/10 after SFT, which compresses the
@@ -92,20 +94,20 @@ for base models.
 # Smoke first — local GPU, no cloud spend, proves the whole path.
 uv run python -m tests.benchmarks.hp_defaults.run --compute local \
     --tasks translation --models 350M-Instruct --sizes 100 \
-    --grid-points lr=2e-5:e1,lr=1e-4:e1 --eval-size 20 --yes
+    --grid-points lr=2e-4:e1,lr=1e-3:e1 --eval-size 20 --yes
 
 # Stage A — screen.
 uv run python -m tests.benchmarks.hp_defaults.run --anchors-only --yes
 
 # Stage B — confirm the finalists everywhere, with a stronger judge.
 uv run python -m tests.benchmarks.hp_defaults.run \
-    --grid-points lr=5e-5:e2,lr=1e-4:e2,lr=1e-4:e3,lr=2e-4:e2 \
+    --grid-points lr=1e-4:e2,lr=2e-4:e2,lr=2e-4:e3,lr=5e-4:e2 \
     --judge-size large --yes
 
 # Noise floor.
 uv run python -m tests.benchmarks.hp_defaults.run \
     --tasks translation,extraction --sizes 2000 \
-    --grid-points lr=5e-5:e2,lr=1e-4:e2 --replicate-seeds 1,2,3 --yes
+    --grid-points lr=2e-4:e2,lr=5e-4:e2 --replicate-seeds 1,2,3 --yes
 ```
 
 `run.py` prints the cell/run count and a cost estimate and refuses to launch

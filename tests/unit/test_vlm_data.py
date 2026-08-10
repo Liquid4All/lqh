@@ -412,7 +412,11 @@ def test_vlm_base_gets_vision_config(training_project) -> None:
 
 
 def test_text_base_config_unchanged(training_project) -> None:
-    """Golden regression: a text base must produce the exact pre-VLM config."""
+    """Golden regression: a text base must keep the text recipe, distinct from
+    the vision one above (LoRA lr, r=32, the wider text target-module list).
+
+    The literals track ``lqh/train/defaults.py``; the batch is dataset-derived
+    (this fixture writes a 1-row parquet, so it lands on the floor)."""
     import lqh.tools.handlers as handlers
 
     project, recorded = training_project
@@ -430,8 +434,8 @@ def test_text_base_config_unchanged(training_project) -> None:
     config = _launched_training_config(recorded)
     assert "modality" not in config
     assert "max_image_tokens" not in config["training"]
-    assert config["training"]["learning_rate"] == 2e-5
-    assert config["training"]["per_device_batch_size"] == 256
+    assert config["training"]["learning_rate"] == 2e-4
+    assert config["training"]["per_device_batch_size"] == 16
     assert config["lora"]["r"] == 32
     assert config["lora"]["alpha"] == 64
     assert config["lora"]["target_modules"] == [

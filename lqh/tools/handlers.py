@@ -2325,7 +2325,8 @@ async def _fetch_results_parquet_artifact(run_dir: Path) -> bool:
 
 
 async def _hydrate_run_eval_artifacts(run_dir: Path) -> None:
-    """Pull a completed cloud run's eval outputs into the local mirror.
+    """Pull a completed cloud run's eval + training-metric outputs into the
+    local mirror.
 
     Cloud sync records artifact descriptors, not contents — without this,
     a finished cloud sweep can have its results published while
@@ -2338,8 +2339,25 @@ async def _hydrate_run_eval_artifacts(run_dir: Path) -> None:
         "results.parquet",
         "checkpoints/final/eval_result.json",
         "checkpoints/final/results.parquet",
+        # HF log_history: steps, loss trajectory, token accuracy. Published as
+        # a "metrics" artifact but never pulled, so the training-health block
+        # was empty for every cloud run — i.e. for every real run.
+        "eval_history.json",
+        # A sweep's per-config training output is in sweep_<id>/, so the
+        # leaderboard has to come down first to learn which child won.
+        "sweep_summary.json",
     ):
         await _fetch_run_artifact(run_dir / rel)
+
+    # Second pass, sweeps only: the winner's own training metrics + config
+    # (which carries the swept learning rate the base config omits).
+    if not (run_dir / "eval_history.json").exists():
+        if config_id := _sweep_winner_config_id(run_dir):
+            for rel in (
+                f"sweep_{config_id}/eval_history.json",
+                f"sweep_{config_id}/config.json",
+            ):
+                await _fetch_run_artifact(run_dir / rel)
 
 
 async def handle_get_eval_failures(
@@ -5181,6 +5199,22 @@ async def handle_start_training(
             ),
         )
 
+    from lqh.project_meta import compute_spec_sha256
+
+    # Dataset scale is a first-class input for post-eval routing (the
+    # failure_analysis skill decides "scale data vs model" from it), so
+    # record row counts in the run config where training_status can
+    # surface them. It also sizes the LoRA batch below, which is why this
+    # runs before the defaults are resolved. Parquet metadata only — no data
+    # is loaded.
+    train_rows = 0
+    train_rows_effective = 0
+    for src_entry, src_path in zip(dataset_sources, train_resolved):
+        rows = _parquet_metadata(src_path)[0] or 0
+        train_rows += rows
+        train_rows_effective += rows * (src_entry.get("repeat") or 1)
+    eval_rows = sum((_parquet_metadata(p)[0] or 0) for p in eval_resolved)
+
     # Build config. Every hyperparameter default comes from one place
     # (lqh/train/defaults.py) so the hp_defaults calibration study can update
     # them with a data-only edit; explicit tool arguments still win.
@@ -5191,24 +5225,14 @@ async def handle_start_training(
         lora=lora,
         modality="vision" if is_vision else "text",
         base_model=base_model,
-        train_rows=None,
+        # Effective (repeat-weighted) rows and the caller's epoch override are
+        # what the run actually trains on — they set the batch so the run takes
+        # enough optimizer steps to learn.
+        train_rows=train_rows_effective,
+        num_epochs=num_epochs,
     )
     lr = learning_rate if learning_rate is not None else recommended.learning_rate
     epochs = num_epochs if num_epochs is not None else recommended.num_epochs
-
-    from lqh.project_meta import compute_spec_sha256
-
-    # Dataset scale is a first-class input for post-eval routing (the
-    # failure_analysis skill decides "scale data vs model" from it), so
-    # record row counts in the run config where training_status can
-    # surface them. Parquet metadata only — no data is loaded.
-    train_rows = 0
-    train_rows_effective = 0
-    for src_entry, src_path in zip(dataset_sources, train_resolved):
-        rows = _parquet_metadata(src_path)[0] or 0
-        train_rows += rows
-        train_rows_effective += rows * (src_entry.get("repeat") or 1)
-    eval_rows = sum((_parquet_metadata(p)[0] or 0) for p in eval_resolved)
 
     config: dict[str, Any] = {
         "type": type,
@@ -5761,6 +5785,9 @@ async def _training_status_remote(
 
     # Final eval from the local mirror (empty until eval_result.json syncs).
     lines.extend(_format_final_eval_block(run_dir))
+    # Steps / loss trajectory / token accuracy / LR — how the run trained, not
+    # just what it scored. The half of the diagnosis a judge mean can't give.
+    lines.extend(_format_training_health_block(run_dir))
 
     chosen_summary = run_dir / "chosen_pool_summary.json"
     if chosen_summary.exists():
@@ -5951,6 +5978,146 @@ def _format_final_eval_block(run_dir: Path) -> list[str]:
     return lines
 
 
+def _run_config_training_block(run_dir: Path) -> dict[str, Any]:
+    """A run's ``config.json`` → ``training`` block ({} when unreadable).
+
+    Unwraps a sweep's ``base_config`` the same way :func:`_training_data_line`
+    does. Note that a sweep's base block carries the *pre-grid* hyperparameters
+    — the grid overrides learning rate and epochs per config — so for a sweep,
+    read the winner's own sub-dir instead (see :func:`_sweep_winner_config_id`).
+    """
+    try:
+        cfg = json.loads((run_dir / "config.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    inner = cfg.get("base_config", cfg) if cfg.get("type") == "sweep" else cfg
+    training = inner.get("training") if isinstance(inner, dict) else None
+    return training if isinstance(training, dict) else {}
+
+
+def _sweep_winner_config_id(run_dir: Path) -> str | None:
+    """The winning config id from ``sweep_summary.json``, or None.
+
+    A sweep's per-config training output lives in ``sweep_<config_id>/``; the
+    run root has no ``eval_history.json`` of its own, so anything reading
+    training metrics off a swept run has to go through the winner.
+    """
+    try:
+        summary = json.loads((run_dir / "sweep_summary.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    winner = summary.get("winner") if isinstance(summary, dict) else None
+    config_id = winner.get("config_id") if isinstance(winner, dict) else None
+    return config_id if isinstance(config_id, str) and config_id else None
+
+
+def _training_metrics_dir(run_dir: Path) -> Path:
+    """Where this run's ``eval_history.json`` lives.
+
+    The run root for a single training run; the winner's ``sweep_<id>/`` for a
+    sweep (each grid point trains in its own child dir). Falls back to the run
+    root when there is no identifiable winner, which yields an empty health
+    block rather than a wrong one.
+    """
+    if (run_dir / "eval_history.json").exists():
+        return run_dir
+    config_id = _sweep_winner_config_id(run_dir)
+    if config_id:
+        candidate = run_dir / f"sweep_{config_id}"
+        if candidate.is_dir():
+            return candidate
+    return run_dir
+
+
+def _format_training_health_block(run_dir: Path) -> list[str]:
+    """Render the mechanical training signals from ``eval_history.json``.
+
+    A judge mean alone cannot distinguish "the dataset is bad" from "the run
+    took 21 optimizer steps at a learning rate too low to move the adapter" —
+    and that distinction is the difference between a $35 model step-up and a
+    40-minute rerun. All of this is already dumped by ``lqh/train/sft.py``
+    (HF Trainer's ``log_history``); the only thing missing was showing it, so
+    diagnosing a flat run meant paging through raw ``stderr.log`` tqdm output.
+
+    For a sweep this reports the *winner's* child run — the config the run
+    actually produced a checkpoint from, and the only one whose hyperparameters
+    are worth reading.
+
+    Best-effort: any missing field is simply omitted, and an unreadable or
+    unexpected file yields no lines rather than an error.
+    """
+    metrics_dir = _training_metrics_dir(run_dir)
+    try:
+        history = json.loads((metrics_dir / "eval_history.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    rows = [r for r in history if isinstance(r, dict)] if isinstance(history, list) else []
+    if not rows:
+        return []
+
+    def _num(row: dict[str, Any], key: str) -> float | None:
+        value = row.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    def _first(key: str) -> float | None:
+        return next((v for r in rows if (v := _num(r, key)) is not None), None)
+
+    def _last(key: str) -> float | None:
+        return next((v for r in reversed(rows) if (v := _num(r, key)) is not None), None)
+
+    steps = max((int(v) for r in rows if (v := _num(r, "step")) is not None), default=0)
+    first_loss, last_loss = _first("loss"), _last("loss")
+    if last_loss is None:
+        # A run that logged no per-step loss row still has the end-of-training
+        # summary row, whose train_loss is the mean over the run.
+        last_loss = _last("train_loss")
+    eval_loss = _last("eval_loss")
+    token_acc = _last("eval_mean_token_accuracy")
+    if token_acc is None:
+        token_acc = _last("mean_token_accuracy")
+    # For a sweep, the LR that matters is the winning grid point's, which lives
+    # in the child's own config.json. Deliberately NO fallback to the run root:
+    # a sweep's base_config carries the *pre-grid* learning rate, so falling
+    # back would report a plausible wrong number — and the skill tells the agent
+    # to retrain at 5x this value. Omitting it is the safe failure.
+    lr = _run_config_training_block(metrics_dir).get("learning_rate")
+
+    parts: list[str] = []
+    if steps:
+        parts.append(f"{steps} steps")
+    if first_loss is not None and last_loss is not None and first_loss != last_loss:
+        parts.append(f"loss {first_loss:.2f} → {last_loss:.2f}")
+    elif last_loss is not None:
+        parts.append(f"loss {last_loss:.2f}")
+    if eval_loss is not None:
+        parts.append(f"eval_loss {eval_loss:.2f}")
+    if token_acc is not None:
+        parts.append(f"token_acc {token_acc * 100:.0f}%")
+    if isinstance(lr, (int, float)) and not isinstance(lr, bool):
+        parts.append(f"lr {lr:.1e}")
+    if not parts:
+        return []
+
+    lines = [f"  Training health: {' · '.join(parts)}"]
+    from lqh.train.defaults import SFT_MIN_HEALTHY_OPTIMIZER_STEPS
+
+    if steps and steps < SFT_MIN_HEALTHY_OPTIMIZER_STEPS:
+        # Deliberately names levers `start_training` actually accepts: the
+        # batch is derived, not a parameter, so "lower the batch" would be a
+        # tool call that silently changes nothing.
+        lines.append(
+            f"    ⚠️  Only {steps} optimizer updates — too few to conclude "
+            f"anything about the data. Retrain with more rows (or a higher "
+            f"num_epochs on the same data) before changing the dataset or the "
+            f"model size."
+        )
+    return lines
+
+
 def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
     """Format a RunStatus as a readable string."""
     state_emoji = {
@@ -6031,6 +6198,7 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
     # Final eval (run-root eval_result.json): eval-of-best for training
     # runs, headline for standalone eval runs — with score distribution.
     lines.extend(_format_final_eval_block(run_dir))
+    lines.extend(_format_training_health_block(run_dir))
 
     # Chosen-pool ceiling — the harness scores the training set once
     # upfront and stashes the mean here. The model can't exceed this

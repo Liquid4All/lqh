@@ -21,14 +21,14 @@ import pyarrow.parquet as pq
 import pytest
 
 
-def _make_dataset(project: Path, name: str = "ds") -> str:
+def _make_dataset(project: Path, name: str = "ds", rows: int = 1) -> str:
     ds_dir = project / "datasets" / name
     ds_dir.mkdir(parents=True, exist_ok=True)
     table = pa.table({
         "messages": [json.dumps([
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"},
-        ])],
+        ])] * rows,
     })
     pq.write_table(table, ds_dir / "data.parquet")
     return f"datasets/{name}"
@@ -120,11 +120,61 @@ def test_default_hyperparameters_come_from_the_defaults_module(launch):
 
     rec = launch(type="sft")
     training = rec["config"]["training"]
-    expected = defaults.recommended(run_type="sft", lora=True)
+    # The batch is dataset-derived, so the expectation must be built with the
+    # same row count the handler counted (this fixture writes a 1-row parquet).
+    rows = rec["config"]["dataset_rows"]["train_effective"]
+    expected = defaults.recommended(run_type="sft", lora=True, train_rows=rows)
     assert training["learning_rate"] == expected.learning_rate
     assert training["num_epochs"] == expected.num_epochs
     assert training["per_device_batch_size"] == expected.per_device_batch_size
     assert rec["config"]["lora"]["r"] == expected.lora["r"]
+
+
+def test_batch_size_is_derived_from_the_dataset(launch):
+    """The step floor is only real if the handler passes the row count through:
+    a tiny dataset must not train at the 256-row throughput batch."""
+    from lqh.train import defaults
+
+    training = launch(type="sft")["config"]["training"]
+    assert training["effective_batch_size"] == defaults.SFT_MIN_EFFECTIVE_BATCH
+    assert training["per_device_batch_size"] <= training["effective_batch_size"]
+
+
+def test_batch_size_scales_with_rows_and_honours_the_epoch_override(
+    launch, tmp_path
+):
+    """Row count AND the caller's epochs must both reach the derivation — with
+    fewer epochs the same rows need a smaller batch to keep the step count."""
+    from lqh.train import defaults
+
+    project = tmp_path / "proj"
+    big = _make_dataset(project, "big", rows=3_000)
+
+    three = launch(type="sft", dataset=big)["config"]["training"]
+    assert three["effective_batch_size"] == defaults.sft_effective_batch(3_000, 3)
+    assert three["effective_batch_size"] == 90
+
+    one = launch(type="sft", dataset=big, num_epochs=1)["config"]["training"]
+    assert one["effective_batch_size"] == defaults.sft_effective_batch(3_000, 1)
+    assert one["effective_batch_size"] == 30
+    assert one["num_epochs"] == 1
+
+
+def test_repeat_weighted_rows_size_the_batch(launch, tmp_path):
+    """`repeat` multiplies what the run actually trains on, so the batch must
+    be derived from the effective count, not the raw one."""
+    from lqh.train import defaults
+
+    project = tmp_path / "proj"
+    _make_dataset(project, "small_src", rows=1_000)
+    rec = launch(
+        type="sft",
+        dataset=[{"path": "datasets/small_src", "repeat": 4}],
+    )
+    assert rec["config"]["dataset_rows"]["train_effective"] == 4_000
+    assert rec["config"]["training"]["effective_batch_size"] == (
+        defaults.sft_effective_batch(4_000, 3)
+    )
 
 
 def test_explicit_hyperparameters_win_over_the_defaults(launch):

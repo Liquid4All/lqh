@@ -1496,9 +1496,15 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "fixed per project and chosen once via a system picker — do NOT ask the "
                 "user where to train and do NOT pass any compute/remote argument; just "
                 "call start_training and it routes automatically. "
-                "SFT runs ONCE at validated default hyperparameters — do not pass "
+                "SFT runs ONCE at the default hyperparameters — do not pass "
                 "`learning_rate`, `num_epochs` or `enable_sweep` unless the user asks "
-                "for specific values. A hyperparameter sweep trains its configs "
+                "for specific values, or a finished run did not learn at all (flat "
+                "train loss / very few optimizer steps on the `training_status` "
+                "Training-health line) — then retraining at 5x the learning rate (or, "
+                "when the warning is about too few optimizer updates, at a higher "
+                "`num_epochs`) is the correct and cheapest next step. "
+                "A hyperparameter sweep "
+                "trains its configs "
                 "sequentially inside one job, so it multiplies the wait on the very "
                 "first run after a dataset is ready; it belongs later, once the data "
                 "and model size are settled and only a small gain is left to find "
@@ -1687,8 +1693,10 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                             "default comes from lqh/train/defaults.py (currently 3) and "
                             "training stops on the best checkpoint by eval loss, so a "
                             "generous epoch count does not overtrain. Under a sweep the "
-                            "grid overrides it. Set it only when the user asks for a "
-                            "specific number."
+                            "grid overrides it. Set it when the user asks for a "
+                            "specific number, or to raise the optimizer-step count "
+                            "after a run whose `training_status` Training-health line "
+                            "flagged it as update-starved (too few optimizer updates)."
                         ),
                     },
                     "override_budget": {
@@ -1706,10 +1714,13 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "type": "number",
                         "description": (
                             "Learning rate. Omit it — the default comes from "
-                            "lqh/train/defaults.py (currently 2e-5 for SFT, 1e-6 for "
-                            "DPO, 5e-4 for vision LoRA). Under a sweep the grid "
-                            "overrides it. Set it only when the user prescribes a value "
-                            "or a previous sweep on this dataset found a better one."
+                            "lqh/train/defaults.py (currently 2e-4 for SFT LoRA, 2e-5 "
+                            "for full-fine-tuning SFT, 1e-6 for DPO, 5e-4 for vision "
+                            "LoRA). Under a sweep the grid overrides it. Set it when "
+                            "the user prescribes a value, when a previous sweep on this "
+                            "dataset found a better one, or to rerun at 5x after a run "
+                            "whose train loss barely moved (see the failure_analysis "
+                            "skill's 'training isn't working' branch)."
                         ),
                     },
                     "num_iterations": {

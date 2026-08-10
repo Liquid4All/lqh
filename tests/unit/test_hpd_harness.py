@@ -204,6 +204,42 @@ def test_launch_config_keeps_the_product_defaults_for_everything_else():
     assert cfg["lora"]["target_modules"] == expected.lora["target_modules"]
 
 
+def test_launch_config_derives_the_batch_from_the_cell_size():
+    """The product derives the effective batch from the dataset, so a study
+    that pinned 256 would measure a recipe the product does not ship."""
+    from lqh.train import defaults
+
+    cfg = runner.build_launch_config(
+        base_model="LiquidAI/LFM2.5-350M",
+        dataset_rel="datasets/t_train_n500/data.parquet",
+        eval_rel="datasets/t_eval/data.parquet",
+        scorer_rel="scorers/t.md",
+        grid_override=[GridPoint(5e-5, 2).to_override()],
+        train_rows=500,
+    )
+    assert cfg["base_config"]["training"]["effective_batch_size"] == (
+        defaults.sft_effective_batch(500, defaults.DEFAULT_SFT_EPOCHS)
+    )
+
+
+def test_launch_config_batch_is_invariant_to_the_epochs_axis():
+    """The batch must be constant across a cell's configs: if it moved with the
+    grid's epochs axis, an LR difference and a batch difference would be
+    confounded and the study's answer would be uninterpretable."""
+    batches = set()
+    for epochs in (1, 2, 3):
+        cfg = runner.build_launch_config(
+            base_model="LiquidAI/LFM2.5-350M",
+            dataset_rel="datasets/t_train_n8000/data.parquet",
+            eval_rel="datasets/t_eval/data.parquet",
+            scorer_rel="scorers/t.md",
+            grid_override=[GridPoint(5e-5, epochs).to_override()],
+            train_rows=8_000,
+        )
+        batches.add(cfg["base_config"]["training"]["effective_batch_size"])
+    assert len(batches) == 1
+
+
 def test_launch_config_disables_checkpoint_eval():
     """eval_on_checkpoints would judge-score at every save on top of the
     per-config eval — the same cost again, for data nothing reads."""

@@ -57,6 +57,14 @@ def normalize_sources(
     - a list of ``{"path": ..., "repeat": N}`` objects → ``repeat``-weighted
       sources.
 
+    A string that is itself a JSON array (``'["datasets/a", "datasets/b"]'``)
+    is decoded first. The tool schema declares ``oneOf [string, array]``, but
+    smaller pool models routinely emit the array JSON-encoded inside the string
+    field; treating that as a path produced a baffling "not found at
+    ["datasets/a", "datasets/b"]/data.parquet" and cost one customer a third of
+    their training data (feedback item 47). No real path starts with ``[``, so
+    the repair cannot swallow a legitimate one.
+
     Returns ``[{"path": str, "repeat": int, "source": str}, ...]``. ``repeat``
     defaults to 1 and is forced to 1 when *allow_repeat* is False (eval
     sources, where over-sampling would only distort the score). ``source`` is
@@ -66,12 +74,26 @@ def normalize_sources(
     """
     if isinstance(spec, str):
         raw_items: list[Any] = [spec]
+        if spec.lstrip().startswith("["):
+            try:
+                decoded = json.loads(spec)
+            except json.JSONDecodeError:
+                pass  # Malformed — fall through and fail as a path, as before.
+            else:
+                if isinstance(decoded, list):
+                    raw_items = decoded
     elif isinstance(spec, list):
         raw_items = spec
     else:
         raise ValueError(
             f"dataset source spec must be a string or list, got {type(spec).__name__}"
         )
+
+    if not raw_items:
+        # An empty list is not "no sources requested", it is a caller that lost
+        # its paths — including the `"[]"` shape the decode above produces.
+        # Returning [] would train (or eval) on nothing, silently.
+        raise ValueError("dataset source list is empty")
 
     entries: list[dict[str, Any]] = []
     for item in raw_items:
