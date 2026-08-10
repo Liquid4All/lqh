@@ -152,13 +152,17 @@ def sft_grid_small() -> list[SweepPoint]:
     an in-job control so the leaderboard shows what the alternatives were
     beaten against.
 
-    A grid must never sit entirely on one side of the default. The pre-item-47
-    grid {2e-5, 5e-5, 1e-4} was all at-or-below a 2e-5 default, so a sweep
-    could only confirm it — a customer paid three flat runs to discover the
-    optimum was above the whole grid. 5e-4 is the top edge because that is the
-    value a customer's 1.2B task gained +1.30 from, and the study's cells were
-    almost all 350M: on a bigger model the optimum may genuinely be higher than
-    the measured default, and this is the lever that finds out.
+    The defect in the pre-item-47 grid {2e-5, 5e-5, 1e-4} was its **top edge**,
+    not its direction: it did search upward from the 2e-5 default, but stopped
+    5x below the 5e-4 that a customer's 1.2B translation task gained +1.30 from,
+    so no sweep on that grid could reach the fix for that task. (Its bottom edge
+    was the then-default, which the hp_defaults study later measured at 0.523
+    mean regret — the grid's floor was the known-bad value.)
+
+    5e-4 is therefore the new top edge. Note it is **not** a measured value: the
+    stage-A study never tested above 2e-4, and its cells were almost all 350M.
+    It is in the grid precisely because a bigger model's optimum may sit above
+    the measured default and a sweep is the lever that finds out.
     """
     points: list[SweepPoint] = []
     for lr in (5e-5, 1e-4, 5e-4):
@@ -394,6 +398,46 @@ def _pick_winner(
 # ---------------------------------------------------------------------------
 # Child subprocess driver
 # ---------------------------------------------------------------------------
+
+
+def _rederive_sft_batch(config: dict[str, Any]) -> None:
+    """Re-derive a text LoRA SFT child's effective batch for ITS epoch count.
+
+    Submission derives the batch once, from the dataset and the *default* epoch
+    count (``lqh.train.defaults.sft_effective_batch``), and stores it in
+    ``base_config``. A grid point that overrides ``num_epochs`` would otherwise
+    inherit that batch, so its optimizer-step count would scale with epochs
+    instead of staying at the target: for 2,000 rows the parent's batch of 60
+    gives the 1-epoch child ~34 updates, the 2-epoch child ~68 and the 3-epoch
+    child ~102. Two things break as a result — the epochs axis measures update
+    count rather than epochs, and ``num_epochs=2`` inside a sweep does not mean
+    what it means in a standalone run, so the winning config is not reproducible
+    outside the sweep.
+
+    Recomputing here gives every child the batch the product would give it, and
+    leaves the learning-rate axis clean (the batch depends on epochs only).
+    No-op when the row count is unknown, for DPO, for vision, and for full
+    fine-tuning — none of those derive a batch from the dataset.
+    """
+    if config.get("type") != "sft" or config.get("modality") == "vision":
+        return
+    if not (config.get("lora") or {}).get("enabled", True):
+        return
+    training = config.get("training")
+    rows = (config.get("dataset_rows") or {}).get("train_effective")
+    if not isinstance(training, dict) or not isinstance(rows, int) or rows <= 0:
+        return
+
+    from lqh.train.defaults import sft_effective_batch
+
+    epochs = training.get("num_epochs")
+    batch = sft_effective_batch(rows, epochs if isinstance(epochs, int) else None)
+    # Respect a micro-batch the caller pinned below the target (memory); the
+    # calibration probe may lower it further at train time either way.
+    micro = min(int(training.get("per_device_batch_size") or batch), batch)
+    training["effective_batch_size"] = batch
+    training["per_device_batch_size"] = max(1, micro)
+    training["gradient_accumulation_steps"] = max(1, batch // max(1, micro))
 
 
 def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -1310,6 +1354,10 @@ def sweep_loop(run_dir: Path, sweep_config: dict[str, Any]) -> None:
     for i, point in enumerate(grid):
         sub_run_dir = run_dir / f"sweep_{point.id}"
         sub_config = _deep_merge(base, point.overrides)
+        # A grid point that changes num_epochs changes how many optimizer
+        # updates the derived batch buys — resize it so this child trains the
+        # way a standalone run at these hyperparameters would.
+        _rederive_sft_batch(sub_config)
         # Child runs MUST not recurse into another sweep.
         sub_config.pop("enable_sweep", None)
         # Disable ordinary checkpoint eval. DPO still runs its explicit fixed

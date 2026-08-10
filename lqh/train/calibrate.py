@@ -100,6 +100,16 @@ def _get_cached_profile(key: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
+def _profile_writes_enabled() -> bool:
+    """Whether a measured profile can actually reach the shared cache.
+
+    Same precondition ``_post_profile`` enforces, named so the probe can decide
+    how far to measure: measuring above what this run can apply only pays off if
+    the result is published for later runs.
+    """
+    return bool(_api_base()) and bool(os.environ.get("LQH_API_TOKEN"))
+
+
 def _post_profile(
     key: dict[str, Any],
     *,
@@ -420,9 +430,14 @@ def maybe_autotune_batch_size(
                 micro = min(micro, admin_cap)
             accum = _apply(training_cfg, micro, target_effective)
             micro = int(training_cfg["per_device_batch_size"])
+            realized = int(training_cfg["effective_batch_size"])
+            requested = (
+                f", requested {target_effective}"
+                if realized != target_effective else ""
+            )
             print(
                 f"calibrate: cached micro_batch={micro} grad_accum={accum} "
-                f"(effective {target_effective}, gpu={gpu_type})",
+                f"(effective {realized}{requested}, gpu={gpu_type})",
                 flush=True,
             )
             return
@@ -437,10 +452,14 @@ def maybe_autotune_batch_size(
         # in _apply, which is where the "a micro-batch above the effective
         # target silently raises the true optimizer batch" rule belongs.
         probe_cap = admin_cap or max(_PROBE_BATCHES)
-        if not grad_ckpt:
-            # Checkpointing-off runs neither read nor write the shared profile
-            # (their activation footprint is a different regime), so measuring
-            # above what this run can apply would be discarded work.
+        # Measuring above what this run can apply only pays for itself if the
+        # measurement can be published to the shared cache. Two cases where it
+        # cannot, and where the extra candidates would be re-measured and thrown
+        # away on every run: checkpointing-off runs (a different activation
+        # regime, deliberately excluded from the cache) and runs with no backend
+        # to POST to (local / SSH-direct without a job token).
+        can_publish = grad_ckpt and _profile_writes_enabled()
+        if not can_publish:
             probe_cap = min(probe_cap, target_effective)
         headroom = float(training_cfg.get("batch_headroom", _DEFAULT_HEADROOM))
         measured, peak = _probe_micro_batch(
@@ -458,9 +477,11 @@ def maybe_autotune_batch_size(
         measured = min(int(measured), probe_cap)
         accum = _apply(training_cfg, measured, target_effective)
         applied = int(training_cfg["per_device_batch_size"])
-        if grad_ckpt:
+        if can_publish:
             # micro_batch is the measured memory ceiling (what the cache is
-            # for); grad_accum is this run's, and informational.
+            # for); grad_accum is this run's, and informational. When the probe
+            # was capped at the target because it could not publish, this branch
+            # is skipped — a truncated probe is a lower bound, not a measurement.
             _post_profile(
                 key,
                 micro_batch=measured,
@@ -470,10 +491,14 @@ def maybe_autotune_batch_size(
                 source="probe",
                 stable=True,
             )
+        realized = int(training_cfg["effective_batch_size"])
+        requested = (
+            f", requested {target_effective}" if realized != target_effective else ""
+        )
         print(
             f"calibrate: probed micro_batch={measured} (applied {applied}) "
             f"grad_accum={accum} peak={peak}MB "
-            f"(effective {target_effective}, gpu={gpu_type})",
+            f"(effective {realized}{requested}, gpu={gpu_type})",
             flush=True,
         )
     except Exception as exc:  # noqa: BLE001 — telemetry must never crash the run

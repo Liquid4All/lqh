@@ -393,3 +393,100 @@ def test_judge_std_absent_when_no_source_has_enough_samples():
         "a": {"num_scored": 1, "scores": {"std": 0.0}},
     }}}
     assert "judge_std" not in sweep._judge_mean_from_summary(summary)
+
+
+# ---------------------------------------------------------------------------
+# Per-child batch re-derivation
+# ---------------------------------------------------------------------------
+
+
+class TestRederiveSftBatch:
+    """A grid point that overrides num_epochs must get the batch a standalone
+    run at those hyperparameters would get.
+
+    Submission derives the batch once, from the dataset and the DEFAULT epoch
+    count. Inheriting it means the epochs axis silently becomes an
+    optimizer-update axis (for 2,000 rows the 3-epoch batch of 60 gives a
+    1-epoch child ~34 updates against ~102), and the winning config is not
+    reproducible outside the sweep.
+    """
+
+    def _base(self, rows: int = 2_000, epochs: int = 3) -> dict:
+        from lqh.train import defaults
+
+        batch = defaults.sft_effective_batch(rows, epochs)
+        return {
+            "type": "sft",
+            "base_model": "LiquidAI/LFM2.5-1.2B-Instruct",
+            "dataset_rows": {"train": rows, "train_effective": rows},
+            "lora": {"enabled": True, "r": 32},
+            "training": {
+                "num_epochs": epochs,
+                "per_device_batch_size": batch,
+                "effective_batch_size": batch,
+                "gradient_accumulation_steps": 1,
+            },
+        }
+
+    def test_child_batch_tracks_its_own_epoch_count(self) -> None:
+        from lqh.train import defaults
+        from lqh.train.sweep import _rederive_sft_batch
+
+        for epochs in (1, 2, 3, 8):
+            cfg = self._base()
+            cfg["training"]["num_epochs"] = epochs
+            _rederive_sft_batch(cfg)
+            expected = defaults.sft_effective_batch(2_000, epochs)
+            assert cfg["training"]["effective_batch_size"] == expected
+            steps = defaults.optimizer_steps(
+                train_rows=2_000,
+                num_epochs=epochs,
+                effective_batch_size=expected,
+            )
+            assert steps >= defaults.SFT_MIN_HEALTHY_OPTIMIZER_STEPS, (epochs, steps)
+
+    def test_unchanged_epochs_is_a_noop(self) -> None:
+        from lqh.train.sweep import _rederive_sft_batch
+
+        cfg = self._base()
+        before = dict(cfg["training"])
+        _rederive_sft_batch(cfg)
+        assert cfg["training"] == before
+
+    def test_a_pinned_small_micro_batch_is_respected(self) -> None:
+        """A caller who lowered the micro-batch for memory keeps it; only the
+        target and the accumulation move."""
+        from lqh.train.sweep import _rederive_sft_batch
+
+        cfg = self._base()
+        cfg["training"]["num_epochs"] = 1
+        cfg["training"]["per_device_batch_size"] = 4
+        _rederive_sft_batch(cfg)
+        training = cfg["training"]
+        assert training["per_device_batch_size"] == 4
+        assert training["effective_batch_size"] == 20
+        assert training["gradient_accumulation_steps"] == 5
+
+    def test_noop_without_rows_or_for_dpo_vision_and_full_finetune(self) -> None:
+        from lqh.train.sweep import _rederive_sft_batch
+
+        # No row count: nothing to derive from (older configs, the study's
+        # pre-fix launch payloads).
+        cfg = self._base()
+        cfg.pop("dataset_rows")
+        cfg["training"]["num_epochs"] = 1
+        before = dict(cfg["training"])
+        _rederive_sft_batch(cfg)
+        assert cfg["training"] == before
+
+        for mutate in (
+            lambda c: c.update(type="on_policy_dpo"),
+            lambda c: c.update(modality="vision"),
+            lambda c: c.update(lora={"enabled": False}),
+        ):
+            cfg = self._base()
+            cfg["training"]["num_epochs"] = 1
+            mutate(cfg)
+            before = dict(cfg["training"])
+            _rederive_sft_batch(cfg)
+            assert cfg["training"] == before

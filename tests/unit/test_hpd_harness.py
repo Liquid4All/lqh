@@ -222,22 +222,45 @@ def test_launch_config_derives_the_batch_from_the_cell_size():
     )
 
 
-def test_launch_config_batch_is_invariant_to_the_epochs_axis():
-    """The batch must be constant across a cell's configs: if it moved with the
-    grid's epochs axis, an LR difference and a batch difference would be
-    confounded and the study's answer would be uninterpretable."""
-    batches = set()
-    for epochs in (1, 2, 3):
-        cfg = runner.build_launch_config(
-            base_model="LiquidAI/LFM2.5-350M",
-            dataset_rel="datasets/t_train_n8000/data.parquet",
-            eval_rel="datasets/t_eval/data.parquet",
-            scorer_rel="scorers/t.md",
-            grid_override=[GridPoint(5e-5, epochs).to_override()],
-            train_rows=8_000,
+def test_launch_config_carries_rows_so_children_resize_their_batch():
+    """The epochs axis is only interpretable if each config aims at the same
+    optimizer-step count — which means the sweep child has to re-derive its batch
+    from its own epoch count. That needs the row count in the config.
+
+    Stage A shipped without this: one batch derived for 3 epochs, epochs then
+    overridden per config, so the 1-epoch configs took a third of the updates.
+    Its epoch conclusion is confounded as a result.
+    """
+    from lqh.train import defaults
+    from lqh.train.sweep import _rederive_sft_batch
+
+    cfg = runner.build_launch_config(
+        base_model="LiquidAI/LFM2.5-350M",
+        dataset_rel="datasets/t_train_n8000/data.parquet",
+        eval_rel="datasets/t_eval/data.parquet",
+        scorer_rel="scorers/t.md",
+        grid_override=[GridPoint(5e-5, e).to_override() for e in (1, 2, 3)],
+        train_rows=8_000,
+    )
+    base = cfg["base_config"]
+    assert base["dataset_rows"]["train_effective"] == 8_000
+
+    steps = set()
+    for point in cfg["grid_override"]:
+        child = json.loads(json.dumps(base))
+        child["training"].update(point["overrides"]["training"])
+        _rederive_sft_batch(child)
+        epochs = child["training"]["num_epochs"]
+        assert child["training"]["effective_batch_size"] == (
+            defaults.sft_effective_batch(8_000, epochs)
         )
-        batches.add(cfg["base_config"]["training"]["effective_batch_size"])
-    assert len(batches) == 1
+        steps.add(defaults.optimizer_steps(
+            train_rows=8_000,
+            num_epochs=epochs,
+            effective_batch_size=child["training"]["effective_batch_size"],
+        ))
+    # Every config lands on the same step target, so the axis measures epochs.
+    assert max(steps) - min(steps) <= 2, steps
 
 
 def test_launch_config_disables_checkpoint_eval():

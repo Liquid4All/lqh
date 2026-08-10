@@ -303,14 +303,19 @@ six-config search), then fix the data or step up the model.
 
 **Cost**: roughly `2–3×` a single-config training, so plan for ~2-3h on a single GPU.
 
-**What it buys, measured**: the hp_defaults study (hpd-stageA) judge-scored all
-15 configs in each of 6 cells. Tuning per cell instead of using the shipped
-default was worth **0.015 mean judge points** (worst case 0.05) — i.e. the SFT
-sweep now buys approximately nothing on the cells it covers (350M-heavy, 500–8k
-rows). The older `ar_to_de` figure of +0.44 measured a sweep against *untuned*
-defaults and no longer applies. Two situations still justify one: a model class
-the study barely covered (its 1.2B cells were largely lost, and a customer's
-1.2B task gained +1.30 from 5e-4 — the grid's top edge), or a user who asks.
+**What it buys — an upper bound, not a measurement.** The hp_defaults study
+(hpd-stageA) judge-scored all 15 configs in each of 6 cells and found the shipped
+default gives up only **0.015 mean judge points** against the best config *in the
+same cell*. That oracle was chosen with judge scores, which a sweep does not
+have: a sweep picks by `eval_loss`, and its top-1 agreement with the judge was
+0/6. So 0.015 bounds what *perfect* per-cell tuning could buy on those cells —
+what the actual sweep delivers is **unmeasured, and could be zero or negative**.
+Either way it is not where the score comes from. The older `ar_to_de` figure of
++0.44 measured a sweep against *untuned* defaults and no longer applies.
+
+Two situations still justify one: a model class the study barely covered (its
+1.2B cells were largely lost, and a customer's 1.2B task gained +1.30 from 5e-4,
+which is the grid's top edge and was never in the study), or a user who asks.
 
 ### Why a proxy?
 
@@ -322,7 +327,7 @@ So a sweep trains cheaply, picks a winner using an in-training proxy that costs 
 
 ### The proxy
 
-- **SFT** uses HF's `eval_loss` on a held-out 10% split. This is reliable (Pearson r = −0.90 with judge_mean, top-1 picked correctly). It also drives ordinary (non-sweep) runs: training keeps the best checkpoint by `eval_loss`, not the last one, so a generous `num_epochs` does not overtrain.
+- **SFT** uses HF's `eval_loss` on a held-out 10% split. It **ranks well but picks badly**: Pearson r = −0.90 with judge_mean on the ar_to_de validation and mean Spearman −0.787 across the hp_defaults cells, but in that study the lowest-`eval_loss` config was the highest-judge config in **0 of 6 cells**. So treat the sweep's winner as *a good config*, not *the best config* — and if which one matters, judge-score the top few rather than trusting rank 1. The same metric also drives ordinary (non-sweep) runs, where it picks between this run's own checkpoints rather than between configs: training keeps the best checkpoint by `eval_loss` instead of the last one, so a generous `num_epochs` does not overtrain.
 
 - **DPO** ranks configs by their **held-out judge score** on one fixed validation set, shared across every config and iteration. The `sweep_summary.json` `primary` column holds the *negated* mean (so lower is better everywhere); `training_status` shows it directly.
 
@@ -344,16 +349,19 @@ Defaults live in `lqh/train/defaults.py`; a sweep overrides `learning_rate` /
 
 - **`lora`** (default: true) — use LoRA for parameter-efficient fine-tuning.
 - **`num_epochs`** (default: 3) — SFT only. Training keeps the best checkpoint by
-  eval loss, so a generous count cannot overtrain — but it is not *only* a
-  ceiling: the hp_defaults study found 3 epochs beat 2 and 1 at every learning
-  rate, and only 10% of runs kept a pre-final-epoch checkpoint.
+  eval loss, so a generous count cannot overtrain (only ~10% of hp_defaults runs
+  kept one from before the final epoch). The study's epoch axis was confounded by
+  optimizer-step count, so it does not establish that 3 is intrinsically better
+  than 1 or 2 — see `DEFAULT_SFT_EPOCHS` in `lqh/train/defaults.py`.
 - **`learning_rate`** (default: 1e-4 for SFT LoRA, 2e-5 for full-fine-tuning
   SFT, 1e-6 for DPO, 5e-4 for vision LoRA). LoRA and full fine-tuning want
   genuinely different rates — only the adapter moves under LoRA.
 - **batch size** is not a knob you pass: for SFT LoRA the effective batch is
-  derived from the dataset (`train_rows × epochs / 100`, clamped to 16–256) so
-  the run always takes ~100 optimizer updates. A fixed batch made small
-  datasets train for ~20 updates and look like bad data.
+  derived from the dataset (`train_rows × epochs / 100`, clamped to 16–256) so a
+  run *aims* at ~100 optimizer updates. A fixed batch made small datasets train
+  for ~20 updates and look like bad data. Two caveats: the 16 floor means a
+  few-hundred-row dataset still lands below the target, and the ~100 target is a
+  judgement call rather than a measured optimum (see `defaults.py`).
 - **`num_iterations`** (default: 5) — DPO only.
 - **`dpo_beta`** (default: 0.1) — DPO KL anchor strength.
 
@@ -502,7 +510,7 @@ When helping the user with training:
 
 7. **Filter the data before training** — pipeline-generated training (and eval) data must be passed through `run_data_filter` with the scorer before it is used, and training must point at the `*_filtered` dataset. Filtering both checks quality and removes the low-scoring tail; low-quality training data = low-quality fine-tuned model. Skip only for human-curated data or when the user explicitly opts out.
 
-8. **Wait with a single `training_status` call — never poll.** After starting a run, call `training_status(run_name=...)` **once** when you need the result, then stop. In headless/auto runs that one call parks until the run is terminal and spends zero LLM cycles while waiting. In the TUI it returns the current state and the harness wakes the session with a `[System: ...]` notification the moment the run finishes — so if it says "running", end your turn without another tool call. Never call it twice in a row, never loop, never invent your own wait. The sweep table in `training_status` shows per-config results with the validated selection metric (`eval_loss` for SFT, the held-out judge score for DPO). It is intentional that DPO `eval_loss` and `eval_rewards/margins` are NOT shown — those metrics would mislead you (they can look great when the model has actually collapsed). Trust the sweep's chosen winner.
+8. **Wait with a single `training_status` call — never poll.** After starting a run, call `training_status(run_name=...)` **once** when you need the result, then stop. In headless/auto runs that one call parks until the run is terminal and spends zero LLM cycles while waiting. In the TUI it returns the current state and the harness wakes the session with a `[System: ...]` notification the moment the run finishes — so if it says "running", end your turn without another tool call. Never call it twice in a row, never loop, never invent your own wait. The sweep table in `training_status` shows per-config results with the validated selection metric (`eval_loss` for SFT, the held-out judge score for DPO). It is intentional that DPO `eval_loss` and `eval_rewards/margins` are NOT shown — those metrics would mislead you (they can look great when the model has actually collapsed). Take the sweep's winner as the run's result; do not present it as *the* best of the grid, since for SFT the proxy that chose it agreed with the judge in 0 of 6 measured cells (see *The proxy*).
 
 9. **Suggest next steps** — after a sweep completes:
    - Run local eval to compare the winner with baseline.

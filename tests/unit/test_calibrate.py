@@ -230,6 +230,9 @@ def test_autotune_probes_memory_not_the_effective_target(monkeypatch):
     on that GPU would inherit it from the cache — which matters now that the
     text SFT LoRA target scales with the dataset."""
     _patch_torch(monkeypatch)
+    # A probe only measures past the target when the measurement can be
+    # published, so this path needs a reachable backend (as a cloud sandbox has).
+    monkeypatch.setattr(calibrate, "_profile_writes_enabled", lambda: True)
     monkeypatch.setattr(calibrate, "_get_cached_profile", lambda key: None)
     seen = {}
 
@@ -293,6 +296,7 @@ def test_autotune_dpo_method_keys_separately_and_probes_pairs(monkeypatch):
     """DPO must not consume an SFT-cached batch: its key is dpo-prefixed
     and its probe is pair-shaped."""
     _patch_torch(monkeypatch)
+    monkeypatch.setattr(calibrate, "_profile_writes_enabled", lambda: True)
     seen_key = {}
 
     def fake_get(key):
@@ -400,3 +404,32 @@ def test_autotune_no_cache_io_when_checkpointing_disabled(monkeypatch):
     # The cached 256 (measured WITH checkpointing) must not apply; the
     # local probe result does.
     assert cfg["per_device_batch_size"] == 8
+
+
+def test_autotune_caps_the_probe_when_it_cannot_publish(monkeypatch):
+    """No backend to POST to (local / SSH-direct without a job token) means a
+    measurement above the target is measured, discarded, and re-measured next
+    run. Cap the probe at what this run can apply, and skip the write-back —
+    a truncated probe is a lower bound, not a measurement."""
+    _patch_torch(monkeypatch)
+    monkeypatch.setattr(calibrate, "_profile_writes_enabled", lambda: False)
+    monkeypatch.setattr(calibrate, "_get_cached_profile", lambda key: None)
+    seen: dict = {}
+    posted: dict = {}
+
+    def fake_probe(model, tokenizer, *, max_micro_batch, **kwargs):
+        seen["max_micro_batch"] = max_micro_batch
+        return min(96, max_micro_batch), 25_000
+
+    monkeypatch.setattr(calibrate, "_probe_micro_batch", fake_probe)
+    monkeypatch.setattr(
+        calibrate, "_post_profile", lambda key, **kw: posted.update(kw) or True
+    )
+    cfg = {"per_device_batch_size": 4, "effective_batch_size": 64}
+    calibrate.maybe_autotune_batch_size(
+        cfg, model=object(), tokenizer=object(), base_model="m", method="lora",
+        lora_rank=32,
+    )
+    assert seen["max_micro_batch"] == 64
+    assert cfg["per_device_batch_size"] == 64
+    assert posted == {}

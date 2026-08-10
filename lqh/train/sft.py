@@ -57,10 +57,19 @@ def _write_checkpoint_lineage(
     """Write metadata consumed by lqh.remote.publish for checkpoint artifacts."""
     training_cfg = config.get("training", {})
     lora_cfg = config.get("lora", {})
+    # Batch fields are recorded post-calibration: the probe can lower the
+    # micro-batch and _apply rewrites the effective target to what it realized,
+    # and config.json still carries the *requested* values. Without these, what
+    # a checkpoint actually trained at is not recoverable from any artifact —
+    # and the optimizer-step count (hence "did this run get enough updates?")
+    # follows from them.
     hyperparams: dict[str, Any] = {
         "learning_rate": training_cfg.get("learning_rate"),
         "num_epochs": training_cfg.get("num_epochs"),
         "max_seq_length": training_cfg.get("max_seq_length"),
+        "per_device_batch_size": training_cfg.get("per_device_batch_size"),
+        "gradient_accumulation_steps": training_cfg.get("gradient_accumulation_steps"),
+        "effective_batch_size": training_cfg.get("effective_batch_size"),
     }
     if lora_cfg.get("enabled", True):
         hyperparams.update(
@@ -591,7 +600,19 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     from lqh.train.defaults import (
         SFT_MIN_HEALTHY_OPTIMIZER_STEPS,
         optimizer_steps,
+        recommended,
     )
+
+    # A config with no learning_rate reaches here from an older bundle, a
+    # hand-written config, or a direct `python -m lqh.train` invocation. Its
+    # fallback must come from the same source of truth the tool uses, not a
+    # hardcoded literal — this one was 2e-5, the value item 47 was about, so a
+    # config missing the field trained at the known-bad rate.
+    fallback_lr = recommended(
+        run_type="sft",
+        lora=lora_enabled,
+        modality="vision" if is_vision else "text",
+    ).learning_rate
 
     # micro x accumulation, never the config's effective_batch_size field: the
     # calibration probe above may have lowered the micro-batch for memory, and
@@ -645,7 +666,7 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         num_train_epochs=training_cfg.get("num_epochs", 3),
         per_device_train_batch_size=training_cfg.get("per_device_batch_size", 4),
         gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 4),
-        learning_rate=training_cfg.get("learning_rate", 2e-5),
+        learning_rate=training_cfg.get("learning_rate", fallback_lr),
         warmup_ratio=training_cfg.get("warmup_ratio", 0.1),
         logging_steps=training_cfg.get("logging_steps", default_logging_steps),
         gradient_checkpointing=training_cfg.get("gradient_checkpointing", True),
@@ -683,9 +704,14 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         # (unlike DPO, where we disabled it — see lqh/train/dpo.py).
         # SFT cross-entropy directly measures the absolute probability
         # the policy assigns to the gold continuation; there is no
-        # hackable chosen-vs-rejected ratio. The proxy-validation run
-        # on ar_to_de (2026-05-11) confirmed Pearson r = -0.90 between
-        # eval_loss and judge_mean, with top-1 picked correctly.
+        # hackable chosen-vs-rejected ratio. eval_loss tracks judge score
+        # well enough to pick a checkpoint: Pearson r = -0.90 on the
+        # ar_to_de proxy validation (2026-05-11), mean Spearman -0.787
+        # across the hp_defaults cells. It is a good *ranker* and a poor
+        # *picker* — that study's top-1 agreement was 0/6 (see the module
+        # docstring in lqh/train/sweep.py), which matters for choosing
+        # between configs, not for choosing between this run's own
+        # checkpoints, where the alternative is "take the last one".
         sft_kwargs.update(
             eval_strategy="steps",
             eval_steps=eval_steps,

@@ -7,14 +7,16 @@ handler. There are two reasons this is worth its own module:
    SFT by default (see ``lqh/skills/train/SKILL.md``) — the first run is a
    single run at these values, and the sweep is the late-stage "squeeze out
    more" lever. A default that is merely plausible is no longer good enough.
-2. **The learning rate and epoch count are measured, not guessed.**
+2. **The learning rate is measured; everything else is not.**
    ``tests/benchmarks/hp_defaults`` runs a factorial study over task × dataset
    size × model (base/instruct) × model size and reports the config with the
    lowest mean regret against each cell's oracle. Its output is a data-only
    edit to this file plus a ``PROVENANCE`` update — nothing else moves. Its
-   stage-A screen has run; ``PROVENANCE`` records the run id, the regret, and
-   the three limits on how far that result generalises. Everything else in this
-   file (batch sizes, LoRA shape, DPO knobs) is still an unmeasured literal.
+   stage-A screen has run and set the text LoRA learning rate; ``PROVENANCE``
+   records the run, the regret, and four limits on how far that generalises —
+   including that its report is not archived here. Everything else in this file
+   (epoch count, batch sizes, LoRA shape, DPO knobs) is an unmeasured literal,
+   and the per-value comments say which is which.
 
 ``recommended()`` is the only entry point. It returns the full hyperparameter
 set for a run; callers must not re-derive any part of it.
@@ -30,26 +32,33 @@ from typing import Any
 # changes any value below — a default whose provenance is unknown is a default
 # nobody can safely revisit.
 PROVENANCE = (
-    "learning_rate + num_epochs: hp_defaults study run hpd-stageA (2026-08) — "
-    "lr1e-4_e3 won on mean regret 0.015 judge points (95% CI 0.002-0.032) over "
-    "6 cells x 15 configs, and it is an interior optimum (5e-5 below and 2e-4 "
-    "above are both worse). No dimension earned its own default. THREE LIMITS "
-    "on that number: (1) stage A only — the anchor screen, 6 cells, not the "
-    "48-cell confirm, and 6 chunks were lost to orphaned cloud jobs; (2) no "
-    "seed replicates, so the 0.127-point noise floor is a lower bound and the "
-    "top five configs (regret 0.015-0.097, i.e. 1e-4/2e-4 either way) are "
-    "statistically tied — what the study establishes firmly is the size of the "
-    "old default's error, not the winner's precise value; (3) 5 of the 6 cells "
-    "are 350M models, so this is close to a 350M result. The prior default "
-    "2e-5 measures at 0.523-0.960 mean regret, up to 2.61 worst-case: that is "
-    "what feedback item 47's customer paid over six iterations, and a customer "
-    "task on a 1.2B model gained +1.30 from a hand-set 5e-4. Run stage B and "
-    "--replicate-seeds, and re-check the 1.2B cells, before treating 1e-4 as "
+    "learning_rate (text LoRA SFT, 1e-4): reported by hp_defaults study run "
+    "hpd-stageA (2026-08) — lr1e-4_e3 won on mean regret 0.015 judge points "
+    "(95% CI 0.002-0.032) over 6 cells x 15 configs, as an interior optimum "
+    "(5e-5 below and 2e-4 above both worse). No dimension earned its own "
+    "default. FOUR LIMITS. (1) NOT INDEPENDENTLY AUDITABLE: the report was "
+    "read from the run's output, but neither report/results.json nor "
+    "report/report.md is archived in this repo and the hpd-stageA workdir on "
+    "the dev machine holds no run records — every number here is a transcript, "
+    "not a reproducible artifact. Commit the report before treating this "
+    "provenance as complete. (2) Stage A only: the anchor screen, 6 cells, not "
+    "the 48-cell confirm, with 6 chunks lost to orphaned cloud jobs. (3) No "
+    "seed replicates, so the 0.127-point noise floor is a LOWER bound (judge "
+    "sampling error only, not training variance) and the top five configs "
+    "(regret 0.015-0.097) are statistically tied — 1e-4 vs 2e-4 is a coin "
+    "flip. What the study establishes firmly is the size of the OLD default's "
+    "error, not the winner's precise value: lr2e-5_e3, the value actually "
+    "shipped before item 47, measured 0.523 mean / 1.17 worst-case regret (the "
+    "2e-5 row reached 0.960 mean / 2.61 worst at 1 epoch, which was never the "
+    "shipped config). A customer's 1.2B task separately gained +1.30 from a "
+    "hand-set 5e-4, a value the study never tested. (4) 5 of the 6 contributing "
+    "cells were 350M models, so this is close to a 350M-only result. Run stage "
+    "B with --replicate-seeds and working 1.2B cells before treating 1e-4 as "
     "settled above 350M. "
-    "effective_batch_size: NOT from the study — derived from the dataset "
-    "(item 47) so a run always takes enough optimizer steps to learn; the "
-    "fixed 256 gave a 1,790-row 3-epoch run 21 updates in total. The study "
-    "measured at the derived batch, not at 256."
+    "num_epochs (3) and effective_batch_size: NOT from the study — see their "
+    "own comments below. The batch is derived from the dataset (item 47) so a "
+    "run always takes enough optimizer steps to learn; the fixed 256 gave a "
+    "1,790-row 3-epoch run 21 updates in total."
 )
 
 # Text LFM attention + FFN projections. LFM2 names its FFN projections
@@ -73,29 +82,45 @@ VISION_MAX_IMAGE_TOKENS = 256
 
 MAX_SEQ_LENGTH = 2048
 
-# Measured (hpd-stageA): 3 epochs beat 2 and 1 at every learning rate — the
-# 1-epoch configs carry 0.28-1.27 mean regret. The axis is NOT redundant with
-# load_best_model_at_end: only 10% of runs kept a checkpoint from before the
-# last epoch, so epochs are still buying training, not just a ceiling.
+# NOT measured — carried over unchanged, and the study cannot settle it.
+# hpd-stageA's 3-epoch configs did win, but that comparison is confounded: its
+# sweep derived one batch from the 3-epoch default and then overrode epochs
+# without resizing it, so the 1- and 2-epoch configs ran at roughly a third and
+# two thirds of the optimizer updates they would get as an installed default.
+# "More updates won" is not "more epochs won". (lqh/train/sweep.py now resizes a
+# child's batch for its own epoch count, so a re-run measures the axis properly.)
+# The downside of 3 is bounded either way: load_best_model_at_end keeps the best
+# checkpoint by eval_loss, and only ~10% of study runs kept one from before the
+# final epoch.
 DEFAULT_SFT_EPOCHS = 3
 
-# How many optimizer updates a text SFT run should get. A LoRA adapter at a
+# How many optimizer updates a text SFT run should aim for. A LoRA adapter at a
 # fixed effective batch of 256 gets ~20 updates out of a 2k-row 3-epoch run,
 # which is not enough for the adapter to move regardless of the learning rate —
 # and the symptom (flat judge score) looks exactly like "the dataset is bad".
 # The batch is therefore derived from the dataset, the same reasoning the DPO
 # branch in ``recommended()`` already applies to preference sets.
+#
+# 100 is a JUDGEMENT CALL, not a measurement: it is round, comfortably above the
+# ~20 that demonstrably failed for a customer (feedback item 47), and below the
+# point where a small dataset's batch would collapse to noise. No study has
+# swept it across tasks and model sizes — hp_defaults did not vary it. Treat it
+# as "enough to rule out update starvation as a cause", not as an optimum.
 SFT_TARGET_OPTIMIZER_STEPS = 100
 
 # Bounds on that derivation. The floor keeps gradients from getting noisy on
 # tiny datasets; the ceiling is the throughput-oriented value LoRA runs used
-# unconditionally before, so a large dataset trains exactly as it did.
+# unconditionally before, so a large dataset trains exactly as it did. Note the
+# floor wins on small datasets: below ~270 effective rows at 3 epochs the target
+# above is unreachable, so those runs take fewer updates by design.
 SFT_MIN_EFFECTIVE_BATCH = 16
 SFT_MAX_EFFECTIVE_BATCH = 256
 
-# Below this many total updates, a run is worth warning about at train time
-# (see lqh/train/sft.py) even after the derivation above — e.g. a caller who
-# passed an explicit tiny batch, or a dataset small enough to hit the floor.
+# Below this many total updates, a run is worth warning about at train time (see
+# lqh/train/sft.py) even after the derivation above — e.g. a caller who passed an
+# explicit tiny batch, or a dataset small enough to hit the floor. Also a
+# judgement call (half the target), and the same caveat applies: it flags a
+# plausible cause, it does not establish one.
 SFT_MIN_HEALTHY_OPTIMIZER_STEPS = 50
 
 _DPO_TYPES = frozenset({"dpo", "on_policy_dpo"})

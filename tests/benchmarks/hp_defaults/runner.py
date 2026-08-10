@@ -142,16 +142,20 @@ def build_launch_config(
     hyperparameters the grid is going to override anyway, so the study
     measures the configuration the product actually ships.
 
-    ``train_rows`` is the cell's dataset size: the shipped effective batch is
-    derived from it, so passing it keeps the study measuring the product's real
-    batch instead of the no-rows-known fallback. The batch is pinned at the
-    *shipped default* epoch count for the whole cell, not per grid point: it has
-    to be constant across a cell's configs (otherwise the batch moves with the
-    LR axis and the result is uninterpretable), and the value the study's
-    recommendation gets pasted into is the default-epoch one. Consequence: the
-    grid's 1-epoch row trains at ~1/3 of the target optimizer-step count. That
-    is the honest comparison for "what should the default be" — the alternative
-    confounds two axes.
+    ``train_rows`` is the cell's dataset size, and it goes into the config as
+    ``dataset_rows.train_effective`` so ``lqh.train.sweep`` re-derives each grid
+    point's batch for **its own** epoch count, exactly as a standalone product
+    run would. That is what keeps the epochs axis interpretable: every config
+    aims at the same optimizer-step target, so the axis measures epochs rather
+    than update count, and the learning-rate axis stays clean because the batch
+    depends only on epochs.
+
+    Stage A (hpd-stageA) ran BEFORE that fix: it derived one batch from the
+    3-epoch default and let the grid override epochs without resizing it, so its
+    1- and 2-epoch configs took ~1/3 and ~2/3 of the updates they should have.
+    Its epoch conclusion is therefore confounded and must not be quoted; its
+    learning-rate conclusion is not (all LRs shared one epoch count, hence one
+    batch).
     """
     from lqh.train import defaults
 
@@ -180,6 +184,15 @@ def build_launch_config(
         "lora": recommended.lora,
         "manifest": ["base_model", "dataset", "eval_dataset", "scorer"],
     }
+    if train_rows:
+        # What lqh.train.sweep._rederive_sft_batch reads to resize each grid
+        # point's batch for its own epoch count (the product does the same at
+        # submission). Without it every config inherits the 3-epoch batch and
+        # the epochs axis becomes an update-count axis.
+        base_config["dataset_rows"] = {
+            "train": train_rows,
+            "train_effective": train_rows,
+        }
     return {
         "type": "sweep",
         "base_config": base_config,

@@ -86,21 +86,37 @@ two-attempt fix into a six-attempt one — check these in order:
    `training_status` before anything else — it is free. Two distinct failures
    live here and they have *different* fixes:
    - **Too few optimizer updates** (the line warns below ~50): the run barely
-     stepped, so nothing about the data or the learning rate is testable yet.
-     The effective batch is derived from `rows × epochs`, so the fix is more
-     of either: `start_training(..., num_epochs=<2× the run's epochs>)` on the
-     same data, or more rows. **A higher learning rate does not create
-     updates** — do not reach for it here.
-   - **Enough updates but the train loss barely moved** (e.g. 3.7 → 3.6):
-     the adapter isn't learning at the configured rate. Retrain the *same data
-     on the same model* at **5× the learning rate**
-     (`start_training(..., learning_rate=<5 × the run's lr>)` — read the run's
-     lr from the same line; if the line shows no `lr`, do **not** take it from
-     the run-root `config.json` on a swept run, that is the pre-grid value —
-     read `runs/<name>/sweep_<winner_config_id>/config.json`).
-   - Both cases are the one place where you override a hyperparameter yourself
+     stepped, which makes any conclusion about the data or the learning rate
+     weak — 20-odd updates is what a customer's flat runs took (feedback #47).
+     Treat ~50 as a rule of thumb, not a validated threshold: no study has
+     measured where "enough" sits per task and model size. The effective batch
+     is derived from `rows × epochs`, so the fix is more of either:
+     `start_training(..., num_epochs=<2× the run's epochs>)` on the same data,
+     or more rows. **A higher learning rate does not create updates** — do not
+     reach for it here. A dataset of a few hundred rows cannot reach ~50 even at
+     the minimum batch; there, more data is the only real answer.
+   - **Enough updates but the train loss barely moved.** "Barely moved" means
+     the loss fell by **less than ~10% of its starting value** over the whole
+     run (e.g. 3.74 → 3.50); a 3.74 → 2.40 fall is a run that learned. A low
+     learning rate is the *likeliest* cause, not the only one — glance at the
+     `token_acc` on the same line first: if it is also flat and near zero, the
+     problem is more likely mechanical (labels masked out, adapter not attached,
+     wrong `target_modules` for this architecture) than a rate that is too low,
+     and a higher rate will not fix it. Report that instead of retraining.
+     Otherwise retrain the *same data on the same model* at **5× the learning
+     rate**: `start_training(..., learning_rate=<5 × the run's lr>)`, reading
+     the run's lr from the same line. If the line shows no `lr`, do **not** take
+     it from the run-root `config.json` on a swept run — that is the pre-grid
+     value; read `runs/<name>/sweep_<winner_config_id>/config.json`.
+   - **Cap it at 5e-4 and do it once.** 5e-4 is the highest rate with any
+     evidence behind it (a customer's 1.2B task gained +1.30 there); the
+     calibration study never tested above 2e-4. If 5× would exceed 5e-4, or a
+     5× retry was already tried and stayed flat, **stop escalating the rate** —
+     `ask_user` with what you have. Compounding 5× twice lands at 2.5e-3, where
+     LoRA training is unstable and a flat result tells you nothing.
+   - Those are the one place where you override a hyperparameter yourself
      without asking: a run that didn't learn is a broken run, not a tuning
-     opportunity.
+     opportunity. One step, within the cap, then back to the user.
    - **Loss fell steadily but the score didn't move**: the run trained fine
      and the problem is downstream — continue to 2.
 2. **Training-set size < 2k rows?** Fix this next. 2–5k good samples should
@@ -143,17 +159,19 @@ clears the deployment bar above:
 2. **Step up the model size** (within budget). Same dataset, next size up.
 3. **Sweep the SFT hyperparameters** — `start_training(..., enable_sweep=true)`
    on the settled dataset and model size. **This is the first lever that is
-   purely about tuning, and it belongs here, not earlier — and it is now the
-   weakest lever on the list.** The SFT defaults are measured
-   (`lqh/train/defaults.py` `PROVENANCE`), and the study that measured them
-   priced per-project tuning at **0.015 mean judge points** (0.05 worst case)
-   against those defaults, for several times the wall-clock of one run. Expect
-   nothing and be right most of the time. Two cases still justify it: the model
-   is larger than 350M (the study's cells were almost all 350M, and one
-   customer's 1.2B task gained +1.30 from the grid's top learning rate), or the
-   user asked. A sweep cannot rescue a run that is short on data or capacity,
-   and a run that isn't learning at all is the other branch's step 1 — one
-   targeted rerun, not a six-config search.
+   purely about tuning, and it belongs here, not earlier — and it is probably
+   the weakest lever on the list.** The SFT learning rate is now measured
+   (`lqh/train/defaults.py` `PROVENANCE`), and on the cells that measured it,
+   even a *perfect* per-cell choice would have beaten the shipped default by only
+   **0.015 mean judge points**. That is an upper bound on the upside, not the
+   sweep's yield: a sweep picks by `eval_loss`, which agreed with the judge in
+   0 of 6 cells, so what it actually returns is unmeasured and could be nothing.
+   Two cases still justify it: the model is larger than 350M (the study's cells
+   were almost all 350M, and one customer's 1.2B task gained +1.30 at the grid's
+   top learning rate, which the study never tested), or the user asked. A sweep
+   cannot rescue a run that is short on data or capacity, and a run that isn't
+   learning at all is the other branch's step 1 — one targeted rerun, not a
+   six-config search.
 4. **On-policy DPO** on the best SFT checkpoint (text models only — VLMs
    skip this lever). DPO polishes consistent failure modes; it is
    task-dependent and much slower than SFT — follow the train skill's DPO

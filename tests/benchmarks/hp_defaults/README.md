@@ -48,8 +48,22 @@ happened while the default was 2e-5.
 
 **Stage A has run** (`hpd-stageA`, 2026-08) on the earlier axis
 `{1e-5, 2e-5, 5e-5, 1e-4, 2e-4}`: `lr1e-4_e3` won at 0.015 mean regret, no
-dimension earned its own default, and the shipped defaults were updated from it.
-What it did **not** settle, and what a follow-up should target:
+dimension earned its own default, and the shipped learning rate was updated from
+it. What it did **not** settle, and what a follow-up should target:
+
+- **Its own auditability.** Neither `report/results.json` nor `report/report.md`
+  from that run is committed here, and the run's workdir on the dev machine holds
+  no run records — the numbers quoted in `defaults.PROVENANCE` are a transcript
+  of the report, not something a reader can re-derive. Commit the report
+  directory with the next run.
+- **The epochs axis, which its numbers cannot support.** Stage A derived one
+  batch from the 3-epoch default and then overrode `num_epochs` per config
+  without resizing it, so its 1- and 2-epoch configs took roughly a third and two
+  thirds of the optimizer updates they would get as a shipped default. `lqh.train
+  .sweep` now re-derives each child's batch for its own epoch count (and this
+  harness passes `dataset_rows` so it does), which makes the axis measurable —
+  but only from the next run onward. The learning-rate conclusion is unaffected:
+  all LRs shared one epoch count, hence one batch.
 
 - **Model size.** 5 of the 6 contributing cells were 350M — the 1.2B cells were
   mostly lost to orphaned cloud jobs (see "Jobs that did not complete" in its
