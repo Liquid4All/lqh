@@ -2733,7 +2733,10 @@ async def handle_run_scoring(
     try:
         config = load_config()
         token = require_token()
-        client = create_client(token, config.api_base_url)
+        # max_retries=0: scoring owns its own retry ladder and bounds each
+        # sample with a deadline. The SDK's invisible replay layer would sit
+        # underneath both and multiply every timeout by three.
+        client = create_client(token, config.api_base_url, max_retries=0)
     except Exception as e:
         return ToolResult.fail("auth", f"Error: {e}")
 
@@ -2807,6 +2810,9 @@ async def handle_run_scoring(
             )
 
             distribution = _format_score_distribution(data_path.parent / "scores.parquet")
+            from lqh.scoring import failure_warning
+
+            warning = failure_warning(result.failed, result.total)
             return ToolResult(
                 content=(
                     f"✅ Data quality scoring complete\n"
@@ -2818,6 +2824,7 @@ async def handle_run_scoring(
                     )
                     + f"\n  Mean score: {result.mean_score:.1f}/10"
                     f"\n  Median score: {result.median_score:.1f}/10"
+                    + (f"\n{warning}" if warning else "")
                     + (f"\n{distribution}" if distribution else "")
                     + f"\n  Output: {dataset}/scores.parquet"
                 )
@@ -2950,6 +2957,9 @@ async def handle_run_scoring(
             )
 
             distribution = _format_score_distribution(output_dir / "results.parquet")
+            from lqh.scoring import failure_warning
+
+            warning = failure_warning(result.failed, result.total)
             return ToolResult(
                 content=(
                     f"✅ Model evaluation complete\n"
@@ -2962,6 +2972,7 @@ async def handle_run_scoring(
                     )
                     + f"\n  Mean score: {result.mean_score:.1f}/10"
                     f"\n  Median score: {result.median_score:.1f}/10"
+                    + (f"\n{warning}" if warning else "")
                     + (f"\n{distribution}" if distribution else "")
                     + f"\n  Results: evals/runs/{run_name}/"
                     + _eval_manifest_warn
@@ -7712,7 +7723,9 @@ async def handle_run_data_filter(
 
     config = load_config()
     token = require_token()
-    client = create_client(token, config.api_base_url)
+    # max_retries=0 — see handle_run_scoring: the SDK's replay layer would
+    # sit under scoring's own ladder and multiply every timeout.
+    client = create_client(token, config.api_base_url, max_retries=0)
 
     from lqh.progress import ProgressReporter
 
@@ -7795,6 +7808,9 @@ async def handle_run_data_filter(
     )
 
     distribution = _format_score_distribution(output_dir / "scores.parquet")
+    from lqh.scoring import failure_warning
+
+    warning = failure_warning(result.failed, result.total)
     return ToolResult(
         content=(
             f"✅ Filtered dataset written\n"
@@ -7802,8 +7818,14 @@ async def handle_run_data_filter(
             f"  Threshold: {threshold} (judge: {model_size})\n"
             f"  Kept:      {result.kept} / {result.total} ({result.kept / max(result.total, 1):.0%})\n"
             f"  Dropped:   {result.dropped}\n"
-            f"  Failed:    {result.failed}\n"
-            f"  Mean score: {result.mean_score:.2f}\n"
+            f"  Failed:    {result.failed}"
+            + (
+                " (kept unjudged — the judge could not score them, so they were "
+                "NOT dropped; re-run the filter to vet them)"
+                if result.kept_unjudged else ""
+            )
+            + f"\n  Mean score: {result.mean_score:.2f}\n"
+            + (f"{warning}\n" if warning else "")
             + (f"\n{distribution}\n" if distribution else "")
             + f"  Output:    datasets/{output_dataset}/ (data.parquet, scores.parquet, summary.json)"
             + manifest_warning

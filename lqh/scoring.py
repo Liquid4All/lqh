@@ -17,17 +17,23 @@ from typing import Any, Callable
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 
+from lqh.client import _parse_retry_after
 from lqh.config import default_api_base_url
 from lqh.runner import APIModelRunner, ModelRunner
 
 __all__ = [
     "DEFAULT_JUDGE_MODEL_SIZE",
+    "DEFAULT_MAX_RETRIES",
+    "FAILURE_WARN_FRACTION",
     "JUDGE_MODELS",
+    "JUDGE_TIMEOUT_S",
+    "MODEL_EVAL_TIMEOUT_S",
     "FilterResult",
     "ScoringResult",
     "extract_failures",
+    "failure_warning",
     "run_data_filter",
     "run_scoring",
     "run_data_scoring",
@@ -71,6 +77,57 @@ SCORE_RESPONSE_SCHEMA = {
 }
 
 
+# Per-sample deadline, in seconds. The bound covers a whole sample — every
+# retry inside it — rather than each attempt, so a wedged sample cannot
+# multiply the retry ladder by the upstream budget (270 s per call). A judge
+# call is short structured JSON at temperature 0, so healthy is single-digit
+# seconds and this is still ~20x p99. Expiry takes the ordinary judge-failure
+# path: score 0.0 with an is_scoring_error reasoning, excluded from
+# mean/median and counted in ``failed``.
+JUDGE_TIMEOUT_S = 120.0
+# The backend bounds a single upstream call at LQH_UPSTREAM_BUDGET (270 s) and
+# surfaces the overrun as a 504. model_eval makes two such calls back to back —
+# the generation, then the judge — so its deadline is their sum. Anything less
+# would turn a slow-but-correct generation into a scored failure: the sample
+# answers at 275 s, the judge never gets to run, and the run records a 0.
+_UPSTREAM_BUDGET_S = 270.0
+MODEL_EVAL_TIMEOUT_S = _UPSTREAM_BUDGET_S + JUDGE_TIMEOUT_S
+
+# Attempts per sample = DEFAULT_MAX_RETRIES + 1. One retry absorbs a
+# disconnect or a single upstream glitch; needing more than that means
+# something is actually wrong, and every extra attempt is another
+# upstream-budget's worth of waiting for the user. The clients these runners
+# are given must set the OpenAI SDK's own ``max_retries=0`` — that layer is
+# invisible and silently multiplies this ladder (see lqh.client.create_client).
+DEFAULT_MAX_RETRIES = 1
+
+# Share of a run that may fail to score before the result is suspect rather
+# than merely unlucky. Above it, callers surface a warning: at that rate the
+# cause is usually the judge, the scorer, or API access, not bad luck.
+FAILURE_WARN_FRACTION = 0.10
+
+
+def failure_warning(failed: int, total: int) -> str | None:
+    """One-line warning when more than :data:`FAILURE_WARN_FRACTION` of a run
+    could not be scored, else ``None``.
+
+    A handful of judge errors is noise — they're already reported inline and
+    excluded from the statistics. A large share is a broken run wearing the
+    costume of a finished one, so it gets said out loud.
+    """
+    if total <= 0 or failed <= 0:
+        return None
+    share = failed / total
+    if share <= FAILURE_WARN_FRACTION:
+        return None
+    return (
+        f"  ⚠️  {failed}/{total} samples ({share:.0%}) could not be scored — "
+        f"above {FAILURE_WARN_FRACTION:.0%}, which usually means the judge, "
+        "the scorer, or API access is at fault rather than transient errors. "
+        "Treat the scores below as provisional."
+    )
+
+
 @dataclass
 class ScoringResult:
     """Summary of a scoring run."""
@@ -97,6 +154,10 @@ class FilterResult:
     output_dataset_dir: Path
     scores_path: Path
     summary_path: Path
+    # Rows kept without a verdict because the judge failed on them. Counted in
+    # both ``kept`` and ``failed`` — see ``run_data_filter`` for why the filter
+    # fails open.
+    kept_unjudged: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +441,119 @@ def _parse_score_response(text: str) -> tuple[float, str]:
         return 0.0, f"[Parse error] {text[:500]}"
 
 
+# A 429 is the server pacing us, not a failed attempt, so it does not consume
+# the retry budget — the per-sample deadline is what bounds the waiting. The
+# cap only matters when that deadline is disabled, so a sample can't spin.
+_MAX_RATE_LIMIT_WAITS = 5
+_RATE_LIMIT_WAIT_CAP_S = 30.0
+
+
+def _rate_limit_wait(exc: BaseException, waits_so_far: int) -> float:
+    """How long to wait after a 429: the server's ``Retry-After`` if it sent
+    one, else exponential backoff. Clamped so we neither busy-loop nor sleep
+    past a sample's usefulness."""
+    try:
+        retry_after = _parse_retry_after(exc)  # type: ignore[arg-type]
+    except Exception:
+        # Header parsing must never be the thing that kills a run: this runs
+        # inside an ``except`` clause, so anything raised here escapes the
+        # per-sample handling entirely and aborts every other sample with it.
+        retry_after = None
+    wait = retry_after if retry_after is not None else 2 ** (waits_so_far - 1)
+    return max(1.0, min(float(wait), _RATE_LIMIT_WAIT_CAP_S))
+
+
+async def _judge_sample(
+    client: AsyncOpenAI,
+    scoring_model: str,
+    scoring_prompt: list[dict],
+    *,
+    max_retries: int,
+    index: int,
+    label: str,
+) -> tuple[float, str, bool]:
+    """Run the judge on one prepared prompt. Returns ``(score, reasoning, ok)``.
+
+    Shared by all three runners so the retry ladder cannot drift between them.
+    A parseable judge response is a real score — including 0, which is the
+    rubric's worst grade (empty/refusal/unrelated), NOT an infrastructure
+    failure. Only parse/API errors (flagged by :func:`is_scoring_error`) are
+    retried, and when the last attempt still fails the caller gets
+    ``ok=False`` with the failure recorded in *reasoning*.
+
+    Rate limits are handled separately from failures: scoring runs with the
+    OpenAI SDK's own retry layer switched off (it would multiply the deadline
+    below), so this is the only thing left that honours ``Retry-After``.
+    Without it a 429 burst — 100-wide concurrency against a per-minute limit —
+    would burn both attempts in a second and fail a large share of the run.
+
+    No deadline of its own: callers bound the whole sample (see
+    :data:`JUDGE_TIMEOUT_S`), which is what keeps the ladder from multiplying.
+    """
+    score = 0.0
+    reasoning = ""
+    attempt = 0
+    rate_limit_waits = 0
+    while True:
+        last_attempt = attempt >= max_retries
+        try:
+            response = await client.chat.completions.create(
+                model=scoring_model,
+                messages=scoring_prompt,
+                temperature=0.0,
+                response_format=SCORE_RESPONSE_SCHEMA,
+            )
+            if not response.choices:
+                raise ValueError("Empty choices in scoring response")
+            raw = response.choices[0].message.content or ""
+            score, reasoning = _parse_score_response(raw)
+            if not is_scoring_error(reasoning):
+                return score, reasoning, True
+        except RateLimitError as exc:
+            if rate_limit_waits >= _MAX_RATE_LIMIT_WAITS:
+                reasoning = f"[Scoring error] {exc}"
+                break
+            rate_limit_waits += 1
+            wait = _rate_limit_wait(exc, rate_limit_waits)
+            logger.warning(
+                "%s: sample %d rate-limited (wait %d/%d), sleeping %.1fs",
+                label, index, rate_limit_waits, _MAX_RATE_LIMIT_WAITS, wait,
+            )
+            await asyncio.sleep(wait)
+            continue  # not a failed attempt — don't spend the retry budget
+        except Exception as exc:
+            logger.warning(
+                "%s: sample %d attempt %d/%d failed: %s",
+                label, index, attempt + 1, max_retries + 1, exc,
+            )
+            if last_attempt:
+                reasoning = f"[Scoring error] {exc}"
+        if last_attempt:
+            break
+        await asyncio.sleep(2 ** attempt)
+        attempt += 1
+    return 0.0, reasoning, False
+
+
+def _timeout_reasoning(seconds: float) -> str:
+    """Reasoning string for a sample that blew its deadline.
+
+    Carries the ``[Scoring error]`` marker so it flows through the existing
+    failure path — excluded from mean/median, counted in ``failed``.
+    """
+    return f"[Scoring error] sample timed out after {seconds:.0f}s"
+
+
+def _resolve_sample_timeout(
+    sample_timeout: float | None, *, run_inference: bool = False
+) -> float | None:
+    """Resolve the per-sample deadline. ``None`` picks the default for the
+    mode; a non-positive value disables the bound entirely."""
+    if sample_timeout is None:
+        return MODEL_EVAL_TIMEOUT_S if run_inference else JUDGE_TIMEOUT_S
+    return sample_timeout if sample_timeout > 0 else None
+
+
 # ---------------------------------------------------------------------------
 # Scoring runners
 # ---------------------------------------------------------------------------
@@ -392,7 +566,8 @@ async def run_scoring(
     *,
     model_size: str = "small",
     concurrency: int = 100,
-    max_retries: int = 2,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    sample_timeout: float | None = None,
     run_inference: bool = False,
     inference_model: str | None = None,
     inference_system_prompt: str | None = None,
@@ -421,7 +596,14 @@ async def run_scoring(
     concurrency:
         Max parallel scoring calls.
     max_retries:
-        Retries per sample on scoring failure.
+        Retries per sample on scoring failure (attempts = this + 1).
+    sample_timeout:
+        Per-sample deadline in seconds, covering the sample as a whole
+        including its retries. ``None`` (default) picks
+        :data:`JUDGE_TIMEOUT_S`, or :data:`MODEL_EVAL_TIMEOUT_S` when
+        *run_inference* is set; a non-positive value disables the bound.
+        A sample that blows it is recorded as a judge failure, so the run
+        finishes in bounded time instead of waiting out one straggler.
     run_inference:
         If True, strip trailing assistant turns and run model inference
         before scoring (for model evaluation).
@@ -450,131 +632,170 @@ async def run_scoring(
 
     # Results storage
     results: list[dict[str, Any] | None] = [None] * total
+    # Which samples have already been counted. Not the same as ``results[i] is
+    # not None``: the inference-failure paths below count a sample without
+    # writing a row for it, and the deadline can expire in the instant between
+    # the body finishing and the watchdog being checked. Without this the
+    # sample would be counted twice.
+    recorded: list[bool] = [False] * total
+    # What each sample is actually being judged on, published before the judge
+    # call. In model_eval that's the model's own output, and it is exactly the
+    # evidence you want kept when the judge is the thing that timed out — both
+    # for the results row and for the debug replay script.
+    judged: list[dict[str, Any] | None] = [None] * total
     debug_log: list[dict[str, Any]] = []  # low-scoring samples for debugging
     scored = 0
     failed_count = 0
     completed = 0
     sem = asyncio.Semaphore(concurrency)
     lock = asyncio.Lock()
+    deadline = _resolve_sample_timeout(sample_timeout, run_inference=run_inference)
 
     async def _score_one(index: int, messages: list[dict], sample_tools: list[dict] | None) -> None:
+        nonlocal failed_count, completed
+
+        # The deadline starts once the sample actually has a slot — queueing
+        # behind the semaphore is not the sample's fault and must not count
+        # against it.
+        async with sem:
+            try:
+                async with asyncio.timeout(deadline):
+                    await _score_one_body(index, messages, sample_tools)
+            except TimeoutError:
+                logger.warning(
+                    "Scoring timed out for sample %d after %ss", index, deadline,
+                )
+                async with lock:
+                    if recorded[index]:
+                        return  # the body counted it before the deadline landed
+                    recorded[index] = True
+                    ctx = judged[index]
+                    reasoning = _timeout_reasoning(deadline or 0.0)
+                    results[index] = {
+                        "sample_index": index,
+                        "messages": json.dumps(
+                            ctx["scored_messages"] if ctx else messages,
+                            ensure_ascii=False,
+                        ),
+                        "score": 0.0,
+                        "reasoning": reasoning,
+                    }
+                    failed_count += 1
+                    completed += 1
+                    if on_progress:
+                        on_progress(completed, total)
+
+                    # A sample that hung is precisely the one a user chasing a
+                    # slow run wants to replay by hand, so it gets a debug
+                    # entry like any other. Only reachable once inference has
+                    # produced something to replay.
+                    if run_inference and ctx is not None:
+                        debug_log.append({
+                            "sample_index": index,
+                            "score": 0.0,
+                            "reasoning": reasoning,
+                            "inference_model": inference_model or "orchestration",
+                            "inference_messages_sent": ctx["inf_messages"],
+                            "model_response": ctx["assistant_content"],
+                            "reference_messages": ctx["original_messages"],
+                        })
+
+    async def _score_one_body(index: int, messages: list[dict], sample_tools: list[dict] | None) -> None:
         nonlocal scored, failed_count, completed
 
-        async with sem:
-            original_messages = messages
-            scored_messages = messages
-            inf_messages: list[dict] | None = None
-            assistant_content: str | None = None
+        original_messages = messages
+        scored_messages = messages
+        inf_messages: list[dict] | None = None
+        assistant_content: str | None = None
 
-            # Optionally run inference
-            if run_inference:
-                unlabelled = _strip_trailing_assistant(messages)
-                if not unlabelled:
-                    async with lock:
-                        failed_count += 1
-                        completed += 1
-                        if on_progress:
-                            on_progress(completed, total)
-                    return
+        # Optionally run inference
+        if run_inference:
+            unlabelled = _strip_trailing_assistant(messages)
+            if not unlabelled:
+                async with lock:
+                    recorded[index] = True
+                    failed_count += 1
+                    completed += 1
+                    if on_progress:
+                        on_progress(completed, total)
+                return
 
-                # Run model inference via runner
-                # Always strip existing system messages — the system prompt
-                # is managed separately (via inference_system_prompt / prompts/).
-                inf_messages = [m for m in unlabelled if m.get("role") != "system"]
-                if inference_system_prompt:
-                    inf_messages.insert(0, {"role": "system", "content": inference_system_prompt})
+            # Run model inference via runner
+            # Always strip existing system messages — the system prompt
+            # is managed separately (via inference_system_prompt / prompts/).
+            inf_messages = [m for m in unlabelled if m.get("role") != "system"]
+            if inference_system_prompt:
+                inf_messages.insert(0, {"role": "system", "content": inference_system_prompt})
 
-                runner = inference_runner or APIModelRunner(client)
-                try:
-                    inf_response = await runner.complete(
-                        inf_messages,
-                        model=inference_model or "orchestration",
-                        temperature=0.0,
-                        response_format=inference_response_format,
-                        tools=sample_tools,
-                    )
-                    assistant_content = inf_response.content
-                    scored_messages = unlabelled + [{"role": "assistant", "content": assistant_content}]
-                except Exception as exc:
-                    logger.error("Inference failed for sample %d: %s", index, exc)
-                    async with lock:
-                        failed_count += 1
-                        completed += 1
-                        if on_progress:
-                            on_progress(completed, total)
-                    return
+            runner = inference_runner or APIModelRunner(client)
+            try:
+                inf_response = await runner.complete(
+                    inf_messages,
+                    model=inference_model or "orchestration",
+                    temperature=0.0,
+                    response_format=inference_response_format,
+                    tools=sample_tools,
+                )
+                assistant_content = inf_response.content
+                scored_messages = unlabelled + [{"role": "assistant", "content": assistant_content}]
+            except Exception as exc:
+                logger.error("Inference failed for sample %d: %s", index, exc)
+                async with lock:
+                    recorded[index] = True
+                    failed_count += 1
+                    completed += 1
+                    if on_progress:
+                        on_progress(completed, total)
+                return
 
-            # Score the sample
-            scoring_prompt = _build_scoring_prompt(
-                scorer_text,
-                scored_messages,
-                reference_messages=original_messages if run_inference else None,
-                tools=sample_tools,
-            )
+        # Score the sample
+        scoring_prompt = _build_scoring_prompt(
+            scorer_text,
+            scored_messages,
+            reference_messages=original_messages if run_inference else None,
+            tools=sample_tools,
+        )
+        judged[index] = {
+            "scored_messages": scored_messages,
+            "inf_messages": inf_messages,
+            "assistant_content": assistant_content,
+            "original_messages": original_messages,
+        }
 
-            score = 0.0
-            reasoning = ""
-            success = False
+        score, reasoning, success = await _judge_sample(
+            client, scoring_model, scoring_prompt,
+            max_retries=max_retries, index=index, label="run_scoring",
+        )
 
-            for attempt in range(max_retries + 1):
-                try:
-                    response = await client.chat.completions.create(
-                        model=scoring_model,
-                        messages=scoring_prompt,
-                        temperature=0.0,
-                        response_format=SCORE_RESPONSE_SCHEMA,
-                    )
-                    if not response.choices:
-                        raise ValueError("Empty choices in scoring response")
-                    raw = response.choices[0].message.content or ""
-                    score, reasoning = _parse_score_response(raw)
-                    # A parseable judge response is a real score — including 0,
-                    # which is the rubric's worst-quality grade (empty/refusal/
-                    # unrelated), NOT an infrastructure failure. Only parse/API
-                    # errors (flagged by is_scoring_error) are retried/dropped.
-                    if not is_scoring_error(reasoning):
-                        success = True
-                        break
-                    if attempt < max_retries:
-                        await asyncio.sleep(2 ** attempt)
-                except Exception as exc:
-                    logger.warning(
-                        "Scoring failed for sample %d (attempt %d/%d): %s",
-                        index, attempt + 1, max_retries + 1, exc,
-                    )
-                    if attempt < max_retries:
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        reasoning = f"[Scoring error] {exc}"
+        async with lock:
+            recorded[index] = True
+            final_score = score if success else 0.0
+            results[index] = {
+                "sample_index": index,
+                "messages": json.dumps(scored_messages, ensure_ascii=False),
+                "score": final_score,
+                "reasoning": reasoning,
+            }
+            if success:
+                scored += 1
+            else:
+                failed_count += 1
+            completed += 1
+            if on_progress:
+                on_progress(completed, total)
 
-            async with lock:
-                final_score = score if success else 0.0
-                results[index] = {
+            # Debug log for low-scoring samples (< 6/10)
+            if final_score < 6.0 and run_inference:
+                debug_entry = {
                     "sample_index": index,
-                    "messages": json.dumps(scored_messages, ensure_ascii=False),
                     "score": final_score,
                     "reasoning": reasoning,
+                    "inference_model": inference_model or "orchestration",
+                    "inference_messages_sent": inf_messages if run_inference else None,
+                    "model_response": assistant_content if run_inference else None,
+                    "reference_messages": original_messages,
                 }
-                if success:
-                    scored += 1
-                else:
-                    failed_count += 1
-                completed += 1
-                if on_progress:
-                    on_progress(completed, total)
-
-                # Debug log for low-scoring samples (< 6/10)
-                if final_score < 6.0 and run_inference:
-                    debug_entry = {
-                        "sample_index": index,
-                        "score": final_score,
-                        "reasoning": reasoning,
-                        "inference_model": inference_model or "orchestration",
-                        "inference_messages_sent": inf_messages if run_inference else None,
-                        "model_response": assistant_content if run_inference else None,
-                        "reference_messages": original_messages,
-                    }
-                    debug_log.append(debug_entry)
+                debug_log.append(debug_entry)
 
     tasks = [
         asyncio.create_task(_score_one(i, sample, tools_per_sample[i]))
@@ -699,6 +920,14 @@ async def run_scoring(
             "Debug: wrote %d entries + curl scripts to %s",
             len(debug_log), output_dir,
         )
+
+    # Logged as well as returned: most callers of run_scoring are automated
+    # (watcher checkpoint evals, DPO iterations, cloud scoring) and render
+    # only the mean, so without this a run that lost a third of its samples
+    # looks exactly like a healthy one.
+    warning = failure_warning(failed_count, total)
+    if warning:
+        logger.warning("run_scoring: %s", warning.strip())
 
     return ScoringResult(
         total=total,
@@ -928,6 +1157,12 @@ async def score_predictions_by_source(
     dist = score_distribution_stats(all_valid_scores)
     if dist is not None:
         payload["score_distribution"] = dist
+    # Optional key — readers must tolerate its absence (old files, healthy
+    # runs). Present so a sweep comparing configs can see that one of the
+    # means was taken over a badly thinned sample set.
+    warning = failure_warning(result.failed, result.total)
+    if warning:
+        payload["failure_warning"] = warning.strip()
     (output_dir / "eval_result.json").write_text(
         json.dumps(payload, indent=2) + "\n", encoding="utf-8"
     )
@@ -941,6 +1176,8 @@ async def run_data_scoring(
     *,
     model_size: str = "small",
     concurrency: int = 100,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    sample_timeout: float | None = None,
     on_progress: Callable[[int, int], Any] | None = None,
 ) -> ScoringResult:
     """Score data quality of a dataset (no inference, co-located output).
@@ -962,6 +1199,11 @@ async def run_data_scoring(
         "large" (highest quality, for final evaluations).
     concurrency:
         Max parallel scoring calls.
+    max_retries:
+        Retries per sample on scoring failure (attempts = this + 1).
+    sample_timeout:
+        Per-sample deadline in seconds covering the sample and its retries;
+        ``None`` picks :data:`JUDGE_TIMEOUT_S`, non-positive disables it.
     on_progress:
         Callback ``on_progress(completed, total)`` after each sample.
     """
@@ -981,63 +1223,66 @@ async def run_data_scoring(
             output_dir=dataset_dir,
         )
 
-    # Score each sample
-    results: list[dict[str, Any]] = []
+    # Score each sample. Slots are indexed by sample so the timeout path can
+    # tell "not recorded yet" from "already recorded".
+    slots: list[dict[str, Any] | None] = [None] * total
     scored = 0
     failed_count = 0
     completed = 0
     sem = asyncio.Semaphore(concurrency)
     lock = asyncio.Lock()
+    deadline = _resolve_sample_timeout(sample_timeout)
 
     async def _score_one(index: int, messages: list[dict], sample_tools: list[dict] | None) -> None:
+        nonlocal failed_count, completed
+
+        # Deadline starts after the semaphore: waiting for a slot is not the
+        # sample's fault.
+        async with sem:
+            try:
+                async with asyncio.timeout(deadline):
+                    await _score_one_body(index, messages, sample_tools)
+            except TimeoutError:
+                logger.warning(
+                    "Scoring timed out for sample %d after %ss", index, deadline,
+                )
+                async with lock:
+                    if slots[index] is not None:
+                        return  # the body recorded before the deadline landed
+                    slots[index] = {
+                        "sample_index": index,
+                        "score": 0.0,
+                        "reasoning": _timeout_reasoning(deadline or 0.0),
+                        "scorer": scorer_path.name,
+                    }
+                    failed_count += 1
+                    completed += 1
+                    if on_progress:
+                        on_progress(completed, total)
+
+    async def _score_one_body(index: int, messages: list[dict], sample_tools: list[dict] | None) -> None:
         nonlocal scored, failed_count, completed
 
-        async with sem:
-            scoring_prompt = _build_scoring_prompt(scorer_text, messages, tools=sample_tools)
-            score = 0.0
-            reasoning = ""
-            success = False
+        scoring_prompt = _build_scoring_prompt(scorer_text, messages, tools=sample_tools)
+        score, reasoning, success = await _judge_sample(
+            client, scoring_model, scoring_prompt,
+            max_retries=max_retries, index=index, label="run_data_scoring",
+        )
 
-            for attempt in range(3):
-                try:
-                    response = await client.chat.completions.create(
-                        model=scoring_model,
-                        messages=scoring_prompt,
-                        temperature=0.0,
-                        response_format=SCORE_RESPONSE_SCHEMA,
-                    )
-                    if not response.choices:
-                        raise ValueError("Empty choices in scoring response")
-                    raw = response.choices[0].message.content or ""
-                    score, reasoning = _parse_score_response(raw)
-                    # 0 is a valid worst-quality grade, not a failure; only
-                    # parse/API errors are retried and excluded from the stats.
-                    if not is_scoring_error(reasoning):
-                        success = True
-                        break
-                    if attempt < 2:
-                        await asyncio.sleep(2 ** attempt)
-                except Exception as exc:
-                    logger.warning("Scoring sample %d attempt %d: %s", index, attempt + 1, exc)
-                    if attempt < 2:
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        reasoning = f"[Scoring error] {exc}"
-
-            async with lock:
-                results.append({
-                    "sample_index": index,
-                    "score": score if success else 0.0,
-                    "reasoning": reasoning,
-                    "scorer": scorer_path.name,
-                })
-                if success:
-                    scored += 1
-                else:
-                    failed_count += 1
-                completed += 1
-                if on_progress:
-                    on_progress(completed, total)
+        async with lock:
+            slots[index] = {
+                "sample_index": index,
+                "score": score if success else 0.0,
+                "reasoning": reasoning,
+                "scorer": scorer_path.name,
+            }
+            if success:
+                scored += 1
+            else:
+                failed_count += 1
+            completed += 1
+            if on_progress:
+                on_progress(completed, total)
 
     tasks = [
         asyncio.create_task(_score_one(i, sample, tools_per_sample[i]))
@@ -1045,8 +1290,8 @@ async def run_data_scoring(
     ]
     await asyncio.gather(*tasks)
 
-    # Sort by sample_index
-    results.sort(key=lambda r: r["sample_index"])
+    # Already in sample order by construction.
+    results = [r for r in slots if r is not None]
 
     # Write scores.parquet co-located with data.parquet
     scores_table = pa.table(
@@ -1070,6 +1315,10 @@ async def run_data_scoring(
     mean_score = sum(scores) / len(scores) if scores else 0.0
     sorted_scores = sorted(scores)
     median_score = sorted_scores[len(sorted_scores) // 2] if sorted_scores else 0.0
+
+    warning = failure_warning(failed_count, total)
+    if warning:
+        logger.warning("run_data_scoring: %s", warning.strip())
 
     return ScoringResult(
         total=total,
@@ -1095,7 +1344,8 @@ async def run_data_filter(
     threshold: float = 6.0,
     model_size: str = "small",
     concurrency: int = 100,
-    max_retries: int = 2,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    sample_timeout: float | None = None,
     on_progress: Callable[[int, int], Any] | None = None,
 ) -> FilterResult:
     """Score a user-brought dataset and emit a filtered subset.
@@ -1103,8 +1353,14 @@ async def run_data_filter(
     The input parquet must follow the same ChatML schema lqh uses for its
     own datasets (``messages`` column, optional ``tools`` / ``audio``).
     Each sample is judged against *scorer_path*; samples scoring strictly
-    below *threshold* are dropped.  Failures to score (judge errors) are
-    dropped as well so nothing unvetted slips through.
+    below *threshold* are dropped.
+
+    **Judge failures fail open**: a sample the judge could not score (API
+    error, unparseable verdict, blown deadline) is KEPT and reported as
+    ``kept_unjudged``. This is user-brought data — deleting a row the user
+    deliberately supplied because our judge had a bad minute is a much worse
+    outcome than letting a few unvetted rows through, and the count is
+    surfaced so a re-run is an informed choice.
 
     Outputs under *output_dataset_dir*:
 
@@ -1152,6 +1408,7 @@ async def run_data_filter(
                     "total": 0,
                     "scored": 0,
                     "kept": 0,
+                    "kept_unjudged": 0,
                     "dropped": 0,
                     "failed": 0,
                     "keep_rate": 0.0,
@@ -1175,57 +1432,60 @@ async def run_data_filter(
     completed = 0
     sem = asyncio.Semaphore(concurrency)
     lock = asyncio.Lock()
+    deadline = _resolve_sample_timeout(sample_timeout)
 
     async def _score_one(index: int, messages: list[dict], sample_tools: list[dict] | None) -> None:
-        nonlocal scored, failed_count, completed
+        nonlocal failed_count, completed
+        # Deadline starts after the semaphore: waiting for a slot is not the
+        # sample's fault.
         async with sem:
-            scoring_prompt = _build_scoring_prompt(scorer_text, messages, tools=sample_tools)
-            score = 0.0
-            reasoning = ""
-            success = False
-            for attempt in range(max_retries + 1):
-                try:
-                    response = await client.chat.completions.create(
-                        model=scoring_model,
-                        messages=scoring_prompt,
-                        temperature=0.0,
-                        response_format=SCORE_RESPONSE_SCHEMA,
-                    )
-                    if not response.choices:
-                        raise ValueError("Empty choices in scoring response")
-                    raw = response.choices[0].message.content or ""
-                    score, reasoning = _parse_score_response(raw)
-                    # 0 is a valid worst-quality grade (it just won't clear the
-                    # keep threshold); only parse/API errors are retried/dropped.
-                    if not is_scoring_error(reasoning):
-                        success = True
-                        break
-                    if attempt < max_retries:
-                        await asyncio.sleep(2 ** attempt)
-                except Exception as exc:
-                    logger.warning(
-                        "run_data_filter: sample %d attempt %d failed: %s",
-                        index, attempt + 1, exc,
-                    )
-                    if attempt < max_retries:
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        reasoning = f"[Scoring error] {exc}"
-
-            async with lock:
-                results[index] = {
-                    "sample_index": index,
-                    "score": score if success else 0.0,
-                    "reasoning": reasoning,
-                    "kept": success and score >= threshold,
-                }
-                if success:
-                    scored += 1
-                else:
+            try:
+                async with asyncio.timeout(deadline):
+                    await _score_one_body(index, messages, sample_tools)
+            except TimeoutError:
+                logger.warning(
+                    "run_data_filter: sample %d timed out after %ss", index, deadline,
+                )
+                async with lock:
+                    if results[index] is not None:
+                        return  # the body recorded before the deadline landed
+                    results[index] = {
+                        "sample_index": index,
+                        "score": 0.0,
+                        "reasoning": _timeout_reasoning(deadline or 0.0),
+                        # Fail open — see the docstring.
+                        "kept": True,
+                    }
                     failed_count += 1
-                completed += 1
-                if on_progress:
-                    on_progress(completed, total)
+                    completed += 1
+                    if on_progress:
+                        on_progress(completed, total)
+
+    async def _score_one_body(index: int, messages: list[dict], sample_tools: list[dict] | None) -> None:
+        nonlocal scored, failed_count, completed
+
+        scoring_prompt = _build_scoring_prompt(scorer_text, messages, tools=sample_tools)
+        score, reasoning, success = await _judge_sample(
+            client, scoring_model, scoring_prompt,
+            max_retries=max_retries, index=index, label="run_data_filter",
+        )
+
+        async with lock:
+            results[index] = {
+                "sample_index": index,
+                "score": score if success else 0.0,
+                "reasoning": reasoning,
+                # A judged sample lives or dies by the threshold; an unjudged
+                # one is kept (fail open — see the docstring).
+                "kept": score >= threshold if success else True,
+            }
+            if success:
+                scored += 1
+            else:
+                failed_count += 1
+            completed += 1
+            if on_progress:
+                on_progress(completed, total)
 
     tasks = [
         asyncio.create_task(_score_one(i, sample, tools_per_sample[i]))
@@ -1262,7 +1522,10 @@ async def run_data_filter(
     pq.write_table(kept_table, data_path)
 
     kept_count = len(kept_indices)
-    dropped = total - kept_count - failed_count
+    # Unjudged rows are kept, so "dropped" is exactly the judged rows that
+    # missed the threshold — everything not kept.
+    dropped = total - kept_count
+    kept_unjudged = sum(1 for r in rows if r["kept"] and is_scoring_error(r["reasoning"]))
     # Mean over judged samples (0 included); exclude only parse/API errors.
     valid_scores = [r["score"] for r in rows if not is_scoring_error(r["reasoning"])]
     mean_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
@@ -1274,6 +1537,7 @@ async def run_data_filter(
         "total": total,
         "scored": scored,
         "kept": kept_count,
+        "kept_unjudged": kept_unjudged,
         "dropped": dropped,
         "failed": failed_count,
         "keep_rate": round(kept_count / total, 4) if total else 0.0,
@@ -1283,6 +1547,10 @@ async def run_data_filter(
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    warning = failure_warning(failed_count, total)
+    if warning:
+        logger.warning("run_data_filter: %s", warning.strip())
 
     return FilterResult(
         total=total,
@@ -1295,6 +1563,7 @@ async def run_data_filter(
         output_dataset_dir=output_dataset_dir,
         scores_path=scores_path,
         summary_path=summary_path,
+        kept_unjudged=kept_unjudged,
     )
 
 

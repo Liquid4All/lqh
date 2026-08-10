@@ -385,7 +385,7 @@ class RunWatcher:
             )
             from lqh.scoring import score_predictions_by_source
 
-            client = create_client(self.api_key, self.api_base_url)
+            client = create_client(self.api_key, self.api_base_url, max_retries=0)
 
             # A run-root request is the final result stage. Checkpoint-local
             # requests are internal training diagnostics and must not replace
@@ -591,7 +591,7 @@ class RunWatcher:
                 dataset_path=predictions,
                 scorer_path=self.project_dir / scorer,
                 output_dir=output,
-                client=create_client(self.api_key, self.api_base_url),
+                client=create_client(self.api_key, self.api_base_url, max_retries=0),
                 model_size=str(
                     effective_config.get("preference_judge_size", "small")
                 ),
@@ -639,7 +639,7 @@ class RunWatcher:
             )
             from lqh.scoring import run_scoring
 
-            client = create_client(self.api_key, self.api_base_url)
+            client = create_client(self.api_key, self.api_base_url, max_retries=0)
             try:
                 iteration = int(iter_dir.name.rsplit("_", 1)[-1])
             except (TypeError, ValueError):
