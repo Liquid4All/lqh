@@ -96,6 +96,33 @@ def _write_checkpoint_lineage(
     (model_dir / "lineage.json").write_text(json.dumps(lineage, indent=2) + "\n")
 
 
+def _persist_resolved_config(run_dir: Path, config: dict[str, Any]) -> None:
+    """Rewrite ``run_dir/config.json`` after filling in resolved defaults.
+
+    Only called when something was actually resolved, so a config that already
+    carried every value is left untouched byte-for-byte.
+
+    Why it has to reach disk: ``training_status``'s Training-health line reads
+    the on-disk config for the learning rate (``handlers._run_config_training_
+    block``) — the subprocess's in-memory dict is invisible to it. A run that
+    resolved its rate to 1e-4 would otherwise train correctly and still show no
+    LR on the one line whose job is to explain a flat run. The published
+    config.json and any resume of this run pick the values up for the same
+    reason.
+
+    Best-effort: a run must never die because its config could not be rewritten.
+    """
+    target = run_dir / "config.json"
+    if not target.exists():
+        # Unusual layout (the config was loaded from another name/place). Don't
+        # invent an artifact readers would then trust.
+        return
+    try:
+        target.write_text(json.dumps(config, indent=2) + "\n")
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"  WARNING: could not persist resolved config: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Callback: writes progress.jsonl and handles checkpoint eval
 # ---------------------------------------------------------------------------
@@ -365,7 +392,11 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     """
     base_model = config["base_model"]
     dataset_path = config["dataset"]
-    training_cfg = config.get("training", {})
+    # setdefault, not get: with `get` a config that carries no training block at
+    # all leaves training_cfg DETACHED, so everything written into it here —
+    # resolved defaults, the calibrated batch — is invisible to anything reading
+    # `config` (checkpoint lineage recorded nulls for exactly this reason).
+    training_cfg = config.setdefault("training", {})
     lora_cfg = config.get("lora", {})
 
     # Modality: normally set by handle_start_training; the AutoConfig
@@ -599,8 +630,8 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # tiny dataset can still land here), and the log cadence below.
     from lqh.train.defaults import (
         SFT_MIN_HEALTHY_OPTIMIZER_STEPS,
+        fill_missing_hyperparameters,
         optimizer_steps,
-        recommended,
     )
 
     # A config with no learning_rate (or num_epochs) reaches here from an older
@@ -615,14 +646,20 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # function reads, so a value left implicit shows up as `learning_rate: null`
     # in a checkpoint's lineage and as a missing LR on the training_status
     # health line — for a run that did have one.
-    _resolved = recommended(
+    _filled = fill_missing_hyperparameters(
+        training_cfg,
         run_type="sft",
         lora=lora_enabled,
         modality="vision" if is_vision else "text",
     )
-    training_cfg.setdefault("learning_rate", _resolved.learning_rate)
-    if _resolved.num_epochs is not None:
-        training_cfg.setdefault("num_epochs", _resolved.num_epochs)
+    if _filled:
+        print(
+            "  resolved missing hyperparameters from lqh.train.defaults: "
+            + ", ".join(f"{k}={v}" for k, v in _filled.items())
+        )
+        # Reaches the on-disk config so training_status, publish and a resume
+        # all report what this run actually trained at.
+        _persist_resolved_config(run_dir, config)
 
     # micro x accumulation, never the config's effective_batch_size field: the
     # calibration probe above may have lowered the micro-batch for memory, and

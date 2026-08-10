@@ -295,6 +295,41 @@ def recommended(
     )
 
 
+def fill_missing_hyperparameters(
+    training_cfg: dict[str, Any],
+    *,
+    run_type: str,
+    lora: bool = True,
+    modality: str = "text",
+) -> dict[str, Any]:
+    """Fill an absent (or null) ``learning_rate`` / ``num_epochs`` in place.
+
+    Returns only the keys it filled, so the caller can log them and persist the
+    config — an empty dict means the config was already complete and must be
+    left untouched.
+
+    A training config reaches a trainer incomplete from an older bundle, a
+    hand-written file, or a direct ``python -m lqh.train`` invocation. Every
+    fallback for those must come from this module, not from a literal at the read
+    site: the read-site fallback for the learning rate used to be 2e-5, so a
+    config missing the field trained at the value feedback item 47 was about,
+    while the config (hence lineage, ``training_status`` and the published
+    artifacts) recorded nothing at all.
+
+    ``None`` counts as missing: an explicit null in a hand-written config would
+    otherwise reach HF Trainer as one.
+    """
+    hp = recommended(run_type=run_type, lora=lora, modality=modality)
+    filled: dict[str, Any] = {}
+    if training_cfg.get("learning_rate") is None:
+        filled["learning_rate"] = hp.learning_rate
+    # None for DPO, which is bounded by num_iterations instead of epochs.
+    if hp.num_epochs is not None and training_cfg.get("num_epochs") is None:
+        filled["num_epochs"] = hp.num_epochs
+    training_cfg.update(filled)
+    return filled
+
+
 def sweeps_by_default(run_type: str) -> bool:
     """Whether ``start_training`` sweeps this run type when unspecified.
 
