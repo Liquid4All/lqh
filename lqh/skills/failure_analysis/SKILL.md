@@ -93,8 +93,10 @@ two-attempt fix into a six-attempt one — check these in order:
      is derived from `rows × epochs`, so the fix is more of either:
      `start_training(..., num_epochs=<2× the run's epochs>)` on the same data,
      or more rows. **A higher learning rate does not create updates** — do not
-     reach for it here. A dataset of a few hundred rows cannot reach ~50 even at
-     the minimum batch; there, more data is the only real answer.
+     reach for it here. Epochs are the faster of the two (200 rows at the
+     minimum batch of 16 reach ~52 updates by epoch 4), but they buy updates by
+     re-reading the same rows, so past ~6 epochs on a few-hundred-row set expect
+     memorisation rather than learning and go get more data instead.
    - **Enough updates but the train loss barely moved.** "Barely moved" means
      the loss fell by **less than ~10% of its starting value** over the whole
      run (e.g. 3.74 → 3.50); a 3.74 → 2.40 fall is a run that learned. A low

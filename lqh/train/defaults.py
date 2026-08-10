@@ -18,8 +18,12 @@ handler. There are two reasons this is worth its own module:
    (epoch count, batch sizes, LoRA shape, DPO knobs) is an unmeasured literal,
    and the per-value comments say which is which.
 
-``recommended()`` is the only entry point. It returns the full hyperparameter
-set for a run; callers must not re-derive any part of it.
+``recommended()`` is the only entry point for a *new* run's hyperparameters:
+callers must not invent their own values or copy a literal out of this file. The
+one legitimate re-derivation is by this module's own helpers — a sweep child
+whose grid point changes ``num_epochs`` calls :func:`sft_effective_batch` again
+(``lqh.train.sweep._rederive_sft_batch``) so its batch matches what a standalone
+run at those hyperparameters would get.
 """
 
 from __future__ import annotations
@@ -57,8 +61,9 @@ PROVENANCE = (
     "settled above 350M. "
     "num_epochs (3) and effective_batch_size: NOT from the study — see their "
     "own comments below. The batch is derived from the dataset (item 47) so a "
-    "run always takes enough optimizer steps to learn; the fixed 256 gave a "
-    "1,790-row 3-epoch run 21 updates in total."
+    "run aims at enough optimizer steps to learn — datasets too small to reach "
+    "the target at the minimum batch still fall short, by design; the fixed 256 "
+    "gave a 1,790-row 3-epoch run 21 updates in total."
 )
 
 # Text LFM attention + FFN projections. LFM2 names its FFN projections

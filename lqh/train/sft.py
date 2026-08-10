@@ -603,16 +603,26 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         recommended,
     )
 
-    # A config with no learning_rate reaches here from an older bundle, a
-    # hand-written config, or a direct `python -m lqh.train` invocation. Its
-    # fallback must come from the same source of truth the tool uses, not a
-    # hardcoded literal — this one was 2e-5, the value item 47 was about, so a
-    # config missing the field trained at the known-bad rate.
-    fallback_lr = recommended(
+    # A config with no learning_rate (or num_epochs) reaches here from an older
+    # bundle, a hand-written config, or a direct `python -m lqh.train`
+    # invocation. Fallbacks must come from the same source of truth the tool
+    # uses, not hardcoded literals — the learning-rate one was 2e-5, the value
+    # item 47 was about, so a config missing the field trained at the known-bad
+    # rate.
+    #
+    # Resolve them INTO training_cfg rather than at each read site: the config
+    # dict is what _write_checkpoint_lineage publishes and what the rest of this
+    # function reads, so a value left implicit shows up as `learning_rate: null`
+    # in a checkpoint's lineage and as a missing LR on the training_status
+    # health line — for a run that did have one.
+    _resolved = recommended(
         run_type="sft",
         lora=lora_enabled,
         modality="vision" if is_vision else "text",
-    ).learning_rate
+    )
+    training_cfg.setdefault("learning_rate", _resolved.learning_rate)
+    if _resolved.num_epochs is not None:
+        training_cfg.setdefault("num_epochs", _resolved.num_epochs)
 
     # micro x accumulation, never the config's effective_batch_size field: the
     # calibration probe above may have lowered the micro-batch for memory, and
@@ -663,10 +673,10 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     has_eval = eval_dataset is not None
     sft_kwargs: dict[str, Any] = dict(
         output_dir=checkpoint_output,
-        num_train_epochs=training_cfg.get("num_epochs", 3),
+        num_train_epochs=training_cfg["num_epochs"],
         per_device_train_batch_size=training_cfg.get("per_device_batch_size", 4),
         gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 4),
-        learning_rate=training_cfg.get("learning_rate", fallback_lr),
+        learning_rate=training_cfg["learning_rate"],
         warmup_ratio=training_cfg.get("warmup_ratio", 0.1),
         logging_steps=training_cfg.get("logging_steps", default_logging_steps),
         gradient_checkpointing=training_cfg.get("gradient_checkpointing", True),

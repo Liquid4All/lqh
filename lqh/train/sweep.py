@@ -47,14 +47,18 @@ SFT  →  ``eval_loss`` from HF Trainer.
         (hpd-stageA, 2026-08) judge-scored every config in 6 cells and
         measured mean Spearman ρ = −0.787 — the ordering is broadly
         right — with **top-1 agreement 0/6**: the lowest-eval_loss
-        config was never the highest-judge config. The practical cost
-        is bounded by how tightly the top configs cluster (in that
-        study the top five sat within 0.10 judge points, well inside
-        the noise floor), so the winner is near-best rather than best.
-        Do NOT quote "top-1 picked correctly" as a current property. If
-        exact selection ever matters, judge-score the top few by
-        eval_loss instead of trusting rank 1 — ``eval_all`` already
-        scores every config and is what the study used.
+        config was never the highest-judge config. How much that costs
+        is UNMEASURED. The study reported each config's regret against
+        its cell's judge-chosen oracle, not the regret of whichever
+        config eval_loss selected in that cell, and those are different
+        quantities — a globally low-regret grid does not bound the loss
+        from picking the wrong member of it in a particular cell.
+        Measuring it needs one number the study did not report:
+        per-cell judge regret of the eval_loss-selected config.
+        Meanwhile: do NOT quote "top-1 picked correctly" as a current
+        property, and if exact selection matters, judge-score the top
+        few by eval_loss rather than trusting rank 1 — ``eval_all``
+        already scores every config and is what the study used.
 
 DPO  →  held-out judge score on one fixed validation dataset, maximized across
         iterations. ``eval_ce_chosen_delta_ref`` remains a hard collapse veto.
@@ -431,13 +435,24 @@ def _rederive_sft_batch(config: dict[str, Any]) -> None:
     from lqh.train.defaults import sft_effective_batch
 
     epochs = training.get("num_epochs")
-    batch = sft_effective_batch(rows, epochs if isinstance(epochs, int) else None)
-    # Respect a micro-batch the caller pinned below the target (memory); the
-    # calibration probe may lower it further at train time either way.
-    micro = min(int(training.get("per_device_batch_size") or batch), batch)
-    training["effective_batch_size"] = batch
-    training["per_device_batch_size"] = max(1, micro)
-    training["gradient_accumulation_steps"] = max(1, batch // max(1, micro))
+    target = sft_effective_batch(rows, epochs if isinstance(epochs, int) else None)
+    # A micro-batch that matches the batch we are replacing is submission's own
+    # shape (it sets micro == effective and lets calibration lower it), not a
+    # deliberate memory pin — so it moves with the target. Only a micro-batch
+    # someone put *below* that value is preserved, otherwise a grid point with
+    # more epochs would keep the smaller micro and undershoot its target.
+    previous = int(training.get("effective_batch_size") or 0)
+    pinned = int(training.get("per_device_batch_size") or 0)
+    micro = target if pinned <= 0 or pinned >= previous else min(pinned, target)
+    micro = max(1, micro)
+    # Record what micro x accumulation actually realizes, not the target — a
+    # pinned micro-batch rarely divides it (target 53, pinned 48 -> accum 1 ->
+    # 48 realized), and a field that advertises 53 while training at 48 is the
+    # bug calibrate._apply had: the step-count accounting reads this value.
+    accum = max(1, target // micro)
+    training["per_device_batch_size"] = micro
+    training["gradient_accumulation_steps"] = accum
+    training["effective_batch_size"] = micro * accum
 
 
 def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:

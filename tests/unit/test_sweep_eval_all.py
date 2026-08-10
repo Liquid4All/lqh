@@ -467,6 +467,28 @@ class TestRederiveSftBatch:
         assert training["effective_batch_size"] == 20
         assert training["gradient_accumulation_steps"] == 5
 
+    def test_records_the_realized_batch_when_micro_does_not_divide_it(self) -> None:
+        """The derived target is rarely a multiple of a pinned micro-batch, and
+        accumulation cannot be fractional — so the field must hold what
+        micro x accum realizes. Advertising the target instead is the bug
+        calibrate._apply had: the step accounting reads this value."""
+        from lqh.train import defaults
+        from lqh.train.sweep import _rederive_sft_batch
+
+        cfg = self._base(rows=1_790)
+        assert defaults.sft_effective_batch(1_790, 3) == 53  # not a round number
+        cfg["training"]["per_device_batch_size"] = 48
+        _rederive_sft_batch(cfg)
+        training = cfg["training"]
+        assert training["per_device_batch_size"] == 48
+        assert training["gradient_accumulation_steps"] == 1
+        assert training["effective_batch_size"] == 48  # realized, not 53
+        assert (
+            training["effective_batch_size"]
+            == training["per_device_batch_size"]
+            * training["gradient_accumulation_steps"]
+        )
+
     def test_noop_without_rows_or_for_dpo_vision_and_full_finetune(self) -> None:
         from lqh.train.sweep import _rederive_sft_batch
 

@@ -62,8 +62,12 @@ it. What it did **not** settle, and what a follow-up should target:
   thirds of the optimizer updates they would get as a shipped default. `lqh.train
   .sweep` now re-derives each child's batch for its own epoch count (and this
   harness passes `dataset_rows` so it does), which makes the axis measurable —
-  but only from the next run onward. The learning-rate conclusion is unaffected:
-  all LRs shared one epoch count, hence one batch.
+  but only from the next run onward. The learning-rate conclusion survives, with
+  one qualification: stage A trained *every* config in a cell at the same batch,
+  so any two configs sharing an epoch count differ only in learning rate and
+  those comparisons are clean — which is what "1e-4 beats 5e-5 and 2e-4" rests
+  on. Comparisons *across* epoch counts (including the aggregate ranking that
+  named `lr1e-4_e3` rather than `lr1e-4_e2`) carry the update-count confound.
 
 - **Model size.** 5 of the 6 contributing cells were 350M — the 1.2B cells were
   mostly lost to orphaned cloud jobs (see "Jobs that did not complete" in its

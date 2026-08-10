@@ -275,8 +275,11 @@ records where they came from).
 **One exception: a run that did not learn at all.** Read the "Training health"
 line in `training_status` on a finished run:
 
-- train loss barely moved, with a healthy step count → retrain at **5× the
-  learning rate**;
+- train loss barely moved (fell by **less than ~10%** of its starting value)
+  with a healthy step count → **one** retrain at **5× the learning rate**,
+  **capped at 5e-4**. If token accuracy on the same line is also near zero,
+  suspect a mechanical fault (masked labels, unattached adapter, wrong
+  `target_modules`) and report rather than retrain;
 - the line warns about **too few optimizer updates** → retrain with a higher
   **`num_epochs`** (or more rows). The effective batch is derived from
   `rows × epochs`, so epochs buy updates; a higher learning rate does not.
@@ -327,7 +330,7 @@ So a sweep trains cheaply, picks a winner using an in-training proxy that costs 
 
 ### The proxy
 
-- **SFT** uses HF's `eval_loss` on a held-out 10% split. It **ranks well but picks badly**: Pearson r = −0.90 with judge_mean on the ar_to_de validation and mean Spearman −0.787 across the hp_defaults cells, but in that study the lowest-`eval_loss` config was the highest-judge config in **0 of 6 cells**. So treat the sweep's winner as *a good config*, not *the best config* — and if which one matters, judge-score the top few rather than trusting rank 1. The same metric also drives ordinary (non-sweep) runs, where it picks between this run's own checkpoints rather than between configs: training keeps the best checkpoint by `eval_loss` instead of the last one, so a generous `num_epochs` does not overtrain.
+- **SFT** uses HF's `eval_loss` on the eval set (the `eval_dataset` you pass, which the normal path always has; a 10% split of the training data only when none is given). It **ranks well but picks badly**: Pearson r = −0.90 with judge_mean on the ar_to_de validation and mean Spearman −0.787 across the hp_defaults cells, but in that study the lowest-`eval_loss` config was the highest-judge config in **0 of 6 cells**. So treat the sweep's winner as *a good config*, not *the best config* — and if which one matters, judge-score the top few rather than trusting rank 1. The same metric also drives ordinary (non-sweep) runs, where it picks between this run's own checkpoints rather than between configs: training keeps the best checkpoint by `eval_loss` instead of the last one, so a generous `num_epochs` does not overtrain.
 
 - **DPO** ranks configs by their **held-out judge score** on one fixed validation set, shared across every config and iteration. The `sweep_summary.json` `primary` column holds the *negated* mean (so lower is better everywhere); `training_status` shows it directly.
 
