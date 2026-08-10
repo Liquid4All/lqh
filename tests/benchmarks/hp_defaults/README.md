@@ -41,12 +41,23 @@ otherwise, regret does not.
 | **hyperparameters** | lr ∈ {2e-5, 1e-4, 2e-4, 5e-4, 1e-3} × epochs ∈ {1, 2, 3} |
 
 48 cells × 15 configs. The learning-rate range is deliberately **wider than the
-product's sweep grid** (`{1e-4, 3e-4, 1e-3}`) and brackets the shipped LoRA
-default of 2e-4 on both sides: 2e-5 is the full-fine-tuning-style rate the
-product shipped until a customer's flat runs argued against it, and 1e-3 tests
-whether that correction went far enough. A search confined to the product grid
-could never discover that the whole grid sits in the wrong place — which is
-exactly what happened while the default was 2e-5.
+product's sweep grid** (`{5e-5, 1e-4, 5e-4}`) and brackets the shipped LoRA
+default of 1e-4 on both sides. A search confined to the product grid could never
+discover that the whole grid sits in the wrong place — which is exactly what
+happened while the default was 2e-5.
+
+**Stage A has run** (`hpd-stageA`, 2026-08) on the earlier axis
+`{1e-5, 2e-5, 5e-5, 1e-4, 2e-4}`: `lr1e-4_e3` won at 0.015 mean regret, no
+dimension earned its own default, and the shipped defaults were updated from it.
+What it did **not** settle, and what a follow-up should target:
+
+- **Model size.** 5 of the 6 contributing cells were 350M — the 1.2B cells were
+  mostly lost to orphaned cloud jobs (see "Jobs that did not complete" in its
+  report). The `param_count` verdict is therefore near-vacuous.
+- **Training variance.** No `--replicate-seeds`, so the 0.127-point noise floor
+  is a lower bound and the top five configs are statistically tied.
+- **The range above 2e-4.** Untested, though a customer's 1.2B task gained +1.30
+  from 5e-4 — hence the widened axis.
 
 Tasks come from `base_vs_instruct/pipelines/`. `voice_satisfaction` is the
 non-saturating one — the others reach >8/10 after SFT, which compresses the
@@ -94,20 +105,20 @@ for base models.
 # Smoke first — local GPU, no cloud spend, proves the whole path.
 uv run python -m tests.benchmarks.hp_defaults.run --compute local \
     --tasks translation --models 350M-Instruct --sizes 100 \
-    --grid-points lr=2e-4:e1,lr=1e-3:e1 --eval-size 20 --yes
+    --grid-points lr=1e-4:e1,lr=5e-4:e1 --eval-size 20 --yes
 
 # Stage A — screen.
 uv run python -m tests.benchmarks.hp_defaults.run --anchors-only --yes
 
 # Stage B — confirm the finalists everywhere, with a stronger judge.
 uv run python -m tests.benchmarks.hp_defaults.run \
-    --grid-points lr=1e-4:e2,lr=2e-4:e2,lr=2e-4:e3,lr=5e-4:e2 \
+    --grid-points lr=1e-4:e2,lr=1e-4:e3,lr=5e-4:e2,lr=5e-4:e3 \
     --judge-size large --yes
 
 # Noise floor.
 uv run python -m tests.benchmarks.hp_defaults.run \
     --tasks translation,extraction --sizes 2000 \
-    --grid-points lr=2e-4:e2,lr=5e-4:e2 --replicate-seeds 1,2,3 --yes
+    --grid-points lr=1e-4:e3,lr=5e-4:e3 --replicate-seeds 1,2,3 --yes
 ```
 
 `run.py` prints the cell/run count and a cost estimate and refuses to launch

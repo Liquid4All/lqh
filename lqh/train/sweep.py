@@ -38,10 +38,23 @@ Both proxies were validated empirically on ar_to_de (results live in
 ``results/proxy_validation/`` from 2026-05-11 / 12).
 
 SFT  →  ``eval_loss`` from HF Trainer.
-        Pearson r = −0.90 with judge_mean. Top-1 picked correctly.
-        SAFE because SFT cross-entropy directly measures the absolute
-        probability the policy assigns to the gold response — there
-        is no hackable ratio.
+        Pearson r = −0.90 with judge_mean on ar_to_de; top-1 picked
+        correctly there. SAFE because SFT cross-entropy directly
+        measures the absolute probability the policy assigns to the
+        gold response — there is no hackable ratio.
+
+        **But it ranks, it does not pick.** The hp_defaults study
+        (hpd-stageA, 2026-08) judge-scored every config in 6 cells and
+        measured mean Spearman ρ = −0.787 — the ordering is broadly
+        right — with **top-1 agreement 0/6**: the lowest-eval_loss
+        config was never the highest-judge config. The practical cost
+        is bounded by how tightly the top configs cluster (in that
+        study the top five sat within 0.10 judge points, well inside
+        the noise floor), so the winner is near-best rather than best.
+        Do NOT quote "top-1 picked correctly" as a current property. If
+        exact selection ever matters, judge-score the top few by
+        eval_loss instead of trusting rank 1 — ``eval_all`` already
+        scores every config and is what the study used.
 
 DPO  →  held-out judge score on one fixed validation dataset, maximized across
         iterations. ``eval_ce_chosen_delta_ref`` remains a hard collapse veto.
@@ -132,21 +145,23 @@ _CHILD_PROGRESS_CONTEXT: ContextVar[_ChildProgressContext | None] = ContextVar(
 
 
 def sft_grid_small() -> list[SweepPoint]:
-    """SFT grid: lr ∈ {1e-4, 3e-4, 1e-3} × epochs ∈ {2, 3} = 6 configs.
+    """SFT grid: lr ∈ {5e-5, 1e-4, 5e-4} × epochs ∈ {2, 3} = 6 configs.
 
-    Centred on the shipped LoRA default (2e-4, see
-    ``lqh.train.defaults.recommended``) with one step down and one up, so a
-    sweep can bracket the optimum from both sides.
+    Brackets the shipped LoRA default (1e-4, measured by the hp_defaults study
+    — see ``lqh.train.defaults.PROVENANCE``) on both sides, and includes it as
+    an in-job control so the leaderboard shows what the alternatives were
+    beaten against.
 
-    The previous grid was {2e-5, 5e-5, 1e-4}, which sat entirely at or below
-    the default — every config in it was a step *down*, so the sweep could only
-    confirm the default, never improve on it. That grid was inherited from an
-    era when 2e-5 was the default; its own docstring already conceded the
-    optimum "was likely higher than the tested range", which a customer then
-    paid three flat runs to discover (feedback item 47).
+    A grid must never sit entirely on one side of the default. The pre-item-47
+    grid {2e-5, 5e-5, 1e-4} was all at-or-below a 2e-5 default, so a sweep
+    could only confirm it — a customer paid three flat runs to discover the
+    optimum was above the whole grid. 5e-4 is the top edge because that is the
+    value a customer's 1.2B task gained +1.30 from, and the study's cells were
+    almost all 350M: on a bigger model the optimum may genuinely be higher than
+    the measured default, and this is the lever that finds out.
     """
     points: list[SweepPoint] = []
-    for lr in (1e-4, 3e-4, 1e-3):
+    for lr in (5e-5, 1e-4, 5e-4):
         for epochs in (2, 3):
             points.append(
                 SweepPoint(

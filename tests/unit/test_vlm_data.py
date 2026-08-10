@@ -434,7 +434,7 @@ def test_text_base_config_unchanged(training_project) -> None:
     config = _launched_training_config(recorded)
     assert "modality" not in config
     assert "max_image_tokens" not in config["training"]
-    assert config["training"]["learning_rate"] == 2e-4
+    assert config["training"]["learning_rate"] == 1e-4
     assert config["training"]["per_device_batch_size"] == 16
     assert config["lora"]["r"] == 32
     assert config["lora"]["alpha"] == 64

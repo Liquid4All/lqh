@@ -143,13 +143,17 @@ clears the deployment bar above:
 2. **Step up the model size** (within budget). Same dataset, next size up.
 3. **Sweep the SFT hyperparameters** — `start_training(..., enable_sweep=true)`
    on the settled dataset and model size. **This is the first lever that is
-   purely about tuning, and it belongs here, not earlier.** SFT runs at the
-   shipped defaults (`lqh/train/defaults.py`), so a sweep is chasing what
-   those defaults left on the table: expect a fraction of a point, for
-   several times the wall-clock of one run. It only makes sense once levers
-   1 and 2 have stopped paying — a sweep cannot rescue a run that is short
-   on data or on model capacity. (A run that isn't learning at all is the
-   other branch's step 1, and a single rerun there, not a sweep.)
+   purely about tuning, and it belongs here, not earlier — and it is now the
+   weakest lever on the list.** The SFT defaults are measured
+   (`lqh/train/defaults.py` `PROVENANCE`), and the study that measured them
+   priced per-project tuning at **0.015 mean judge points** (0.05 worst case)
+   against those defaults, for several times the wall-clock of one run. Expect
+   nothing and be right most of the time. Two cases still justify it: the model
+   is larger than 350M (the study's cells were almost all 350M, and one
+   customer's 1.2B task gained +1.30 from the grid's top learning rate), or the
+   user asked. A sweep cannot rescue a run that is short on data or capacity,
+   and a run that isn't learning at all is the other branch's step 1 — one
+   targeted rerun, not a six-config search.
 4. **On-policy DPO** on the best SFT checkpoint (text models only — VLMs
    skip this lever). DPO polishes consistent failure modes; it is
    task-dependent and much slower than SFT — follow the train skill's DPO

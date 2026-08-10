@@ -298,10 +298,19 @@ whose loss never moved needs one rerun at a higher learning rate, not a
 six-config search), then fix the data or step up the model.
 
 **Default grids** (6 configs each):
-- SFT: `lr ∈ {1e-4, 3e-4, 1e-3} × epochs ∈ {2, 3}` — centred on the 2e-4 default
+- SFT: `lr ∈ {5e-5, 1e-4, 5e-4} × epochs ∈ {2, 3}` — brackets the measured 1e-4 default on both sides
 - DPO: `lr ∈ {3e-7, 1e-6, 2e-6} × β ∈ {0.05, 0.10}`
 
-**Cost**: roughly `2–3×` a single-config training, so plan for ~2-3h on a single GPU. For calibration: in the validation experiment on `ar_to_de` (2026-05-11), the swept winner beat the *then*-default hyperparameters by +0.44 mean judge score for SFT. Treat that as an upper bound on what a sweep buys today, not an expectation — it measured a sweep against untuned defaults.
+**Cost**: roughly `2–3×` a single-config training, so plan for ~2-3h on a single GPU.
+
+**What it buys, measured**: the hp_defaults study (hpd-stageA) judge-scored all
+15 configs in each of 6 cells. Tuning per cell instead of using the shipped
+default was worth **0.015 mean judge points** (worst case 0.05) — i.e. the SFT
+sweep now buys approximately nothing on the cells it covers (350M-heavy, 500–8k
+rows). The older `ar_to_de` figure of +0.44 measured a sweep against *untuned*
+defaults and no longer applies. Two situations still justify one: a model class
+the study barely covered (its 1.2B cells were largely lost, and a customer's
+1.2B task gained +1.30 from 5e-4 — the grid's top edge), or a user who asks.
 
 ### Why a proxy?
 
@@ -335,8 +344,10 @@ Defaults live in `lqh/train/defaults.py`; a sweep overrides `learning_rate` /
 
 - **`lora`** (default: true) — use LoRA for parameter-efficient fine-tuning.
 - **`num_epochs`** (default: 3) — SFT only. Training keeps the best checkpoint by
-  eval loss, so this is a ceiling rather than a target.
-- **`learning_rate`** (default: 2e-4 for SFT LoRA, 2e-5 for full-fine-tuning
+  eval loss, so a generous count cannot overtrain — but it is not *only* a
+  ceiling: the hp_defaults study found 3 epochs beat 2 and 1 at every learning
+  rate, and only 10% of runs kept a pre-final-epoch checkpoint.
+- **`learning_rate`** (default: 1e-4 for SFT LoRA, 2e-5 for full-fine-tuning
   SFT, 1e-6 for DPO, 5e-4 for vision LoRA). LoRA and full fine-tuning want
   genuinely different rates — only the adapter moves under LoRA.
 - **batch size** is not a knob you pass: for SFT LoRA the effective batch is

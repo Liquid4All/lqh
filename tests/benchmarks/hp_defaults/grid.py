@@ -4,12 +4,13 @@ Axes are learning rate × epochs — the two the product's sweep already varies,
 so the study's answer is directly installable in ``lqh/train/defaults.py``.
 
 The learning-rate range is deliberately **wider than the product grid**
-(`{1e-4, 3e-4, 1e-3}`), and brackets the shipped LoRA default of 2e-4 on both
-sides: 2e-5 confirms the full-fine-tuning-style rate the product used to ship
-(and which a customer's flat runs argued against) is genuinely worse, and 1e-3
-tests whether the correction went far enough. A study that only searched inside
-the product grid could not discover that the whole grid sits in the wrong place
-— which is exactly what happened when the default was 2e-5.
+(`{5e-5, 1e-4, 5e-4}`) and brackets the shipped LoRA default of 1e-4 on both
+sides. Stage A ran the earlier axis `{1e-5, 2e-5, 5e-5, 1e-4, 2e-4}` and found
+1e-4 best as an *interior* optimum (5e-5 below and 2e-4 above both worse), with
+the old 2e-5 default at 0.52-0.96 mean regret. The axis below keeps 2e-5 as the
+known-bad anchor and adds 5e-4 / 1e-3, which stage A never tested — the range a
+customer's 1.2B task actually gained from, and the open question for models
+larger than the 350M-heavy cells stage A covered.
 """
 
 from __future__ import annotations

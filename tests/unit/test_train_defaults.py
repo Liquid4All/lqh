@@ -2,10 +2,11 @@
 
 These pin the recommended hyperparameters to the values the product ships.
 Originally that was the exact literals ``handle_start_training`` inlined before
-they were centralised; the text LoRA learning rate and the SFT batch derivation
-have since moved (see ``defaults.PROVENANCE``). When the hp_defaults calibration
-study lands new values, THIS FILE is what changes alongside defaults.py — and a
-diff here is the signal that a shipped default moved.
+they were centralised; the text LoRA learning rate has since moved twice (2e-5 →
+2e-4 on field evidence, then → 1e-4 when the hp_defaults stage-A study measured
+it) and the SFT batch became dataset-derived. See ``defaults.PROVENANCE``. When
+the study lands new values, THIS FILE is what changes alongside defaults.py —
+and a diff here is the signal that a shipped default moved.
 """
 
 from __future__ import annotations
@@ -29,8 +30,9 @@ VISION_MODULES = [
     "run_type,lora,modality,expected_lr",
     [
         # LoRA moves only the adapter and wants an order of magnitude more than
-        # a full fine-tune; the two must not share one literal.
-        ("sft", True, "text", 2e-4),
+        # a full fine-tune; the two must not share one literal. 1e-4 is the
+        # hp_defaults stage-A winner (see defaults.PROVENANCE).
+        ("sft", True, "text", 1e-4),
         ("sft", False, "text", 2e-5),
         ("sft", True, "vision", 5e-4),
         ("on_policy_dpo", True, "text", 1e-6),
@@ -252,7 +254,7 @@ def test_sft_gets_epochs_and_dpo_does_not():
 def test_training_config_shape():
     training = defaults.recommended(run_type="sft", lora=True).training_config()
     assert training == {
-        "learning_rate": 2e-4,
+        "learning_rate": 1e-4,
         "max_seq_length": 2048,
         "per_device_batch_size": 256,
         "gradient_accumulation_steps": 1,

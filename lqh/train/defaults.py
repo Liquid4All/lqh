@@ -7,13 +7,14 @@ handler. There are two reasons this is worth its own module:
    SFT by default (see ``lqh/skills/train/SKILL.md``) — the first run is a
    single run at these values, and the sweep is the late-stage "squeeze out
    more" lever. A default that is merely plausible is no longer good enough.
-2. **They are meant to be measured, not guessed.**
+2. **The learning rate and epoch count are measured, not guessed.**
    ``tests/benchmarks/hp_defaults`` runs a factorial study over task × dataset
    size × model (base/instruct) × model size and reports the config with the
    lowest mean regret against each cell's oracle. Its output is a data-only
-   edit to this file plus a ``PROVENANCE`` update — nothing else moves. It has
-   not been run yet, so ``PROVENANCE`` currently reads "literals" — check it
-   before treating any number here as validated.
+   edit to this file plus a ``PROVENANCE`` update — nothing else moves. Its
+   stage-A screen has run; ``PROVENANCE`` records the run id, the regret, and
+   the three limits on how far that result generalises. Everything else in this
+   file (batch sizes, LoRA shape, DPO knobs) is still an unmeasured literal.
 
 ``recommended()`` is the only entry point. It returns the full hyperparameter
 set for a run; callers must not re-derive any part of it.
@@ -29,19 +30,26 @@ from typing import Any
 # changes any value below — a default whose provenance is unknown is a default
 # nobody can safely revisit.
 PROVENANCE = (
-    "unvalidated pre-study literals, carried over verbatim from "
-    "handle_start_training (2026-08), with two field-driven corrections in "
-    "2026-08 (feedback item 47): (a) the text LoRA learning rate was split "
-    "off from the full-fine-tuning rate and raised 2e-5 -> 2e-4, after a "
-    "customer's trilingual-translation task moved +1.30 judge points from a "
-    "hand-set 5e-4 while three runs at 2e-5 produced nothing; (b) the LoRA "
-    "effective batch size is now derived from the dataset so a run always "
-    "takes enough optimizer steps to learn (the fixed 256 gave a 1,790-row "
-    "3-epoch run 21 updates in total). Both are still literals, not "
-    "measurements: the hp_defaults calibration study "
-    "(tests/benchmarks/hp_defaults) has not been run yet. When it is, replace "
-    "the values below with its report's recommendation block and cite the run "
-    "id here."
+    "learning_rate + num_epochs: hp_defaults study run hpd-stageA (2026-08) — "
+    "lr1e-4_e3 won on mean regret 0.015 judge points (95% CI 0.002-0.032) over "
+    "6 cells x 15 configs, and it is an interior optimum (5e-5 below and 2e-4 "
+    "above are both worse). No dimension earned its own default. THREE LIMITS "
+    "on that number: (1) stage A only — the anchor screen, 6 cells, not the "
+    "48-cell confirm, and 6 chunks were lost to orphaned cloud jobs; (2) no "
+    "seed replicates, so the 0.127-point noise floor is a lower bound and the "
+    "top five configs (regret 0.015-0.097, i.e. 1e-4/2e-4 either way) are "
+    "statistically tied — what the study establishes firmly is the size of the "
+    "old default's error, not the winner's precise value; (3) 5 of the 6 cells "
+    "are 350M models, so this is close to a 350M result. The prior default "
+    "2e-5 measures at 0.523-0.960 mean regret, up to 2.61 worst-case: that is "
+    "what feedback item 47's customer paid over six iterations, and a customer "
+    "task on a 1.2B model gained +1.30 from a hand-set 5e-4. Run stage B and "
+    "--replicate-seeds, and re-check the 1.2B cells, before treating 1e-4 as "
+    "settled above 350M. "
+    "effective_batch_size: NOT from the study — derived from the dataset "
+    "(item 47) so a run always takes enough optimizer steps to learn; the "
+    "fixed 256 gave a 1,790-row 3-epoch run 21 updates in total. The study "
+    "measured at the derived batch, not at 256."
 )
 
 # Text LFM attention + FFN projections. LFM2 names its FFN projections
@@ -65,6 +73,10 @@ VISION_MAX_IMAGE_TOKENS = 256
 
 MAX_SEQ_LENGTH = 2048
 
+# Measured (hpd-stageA): 3 epochs beat 2 and 1 at every learning rate — the
+# 1-epoch configs carry 0.28-1.27 mean regret. The axis is NOT redundant with
+# load_best_model_at_end: only 10% of runs kept a checkpoint from before the
+# last epoch, so epochs are still buying training, not just a ceiling.
 DEFAULT_SFT_EPOCHS = 3
 
 # How many optimizer updates a text SFT run should get. A LoRA adapter at a
@@ -206,11 +218,12 @@ def recommended(
     elif is_dpo:
         learning_rate = 1e-6
     elif lora:
-        # LoRA wants 1e-4–5e-4, not a full-fine-tuning rate: only the adapter
-        # moves, so the same 2e-5 that suits every weight in the model barely
-        # moves a rank-32 adapter (see PROVENANCE — three customer runs at
-        # 2e-5 were flat, the same data at 5e-4 gained +1.30).
-        learning_rate = 2e-4
+        # Measured (hpd-stageA): lowest mean regret AND lowest worst-case of
+        # the 15 configs, with 5e-5 below and 2e-4 above both worse. LoRA needs
+        # an order of magnitude more than a full fine-tune because only the
+        # adapter moves — 2e-5 here measured at 0.52-0.96 regret. See
+        # PROVENANCE for what this number does and does not cover.
+        learning_rate = 1e-4
     else:
         learning_rate = 2e-5
 

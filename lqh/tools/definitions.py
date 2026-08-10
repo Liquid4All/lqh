@@ -1714,7 +1714,7 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "type": "number",
                         "description": (
                             "Learning rate. Omit it — the default comes from "
-                            "lqh/train/defaults.py (currently 2e-4 for SFT LoRA, 2e-5 "
+                            "lqh/train/defaults.py (currently 1e-4 for SFT LoRA, 2e-5 "
                             "for full-fine-tuning SFT, 1e-6 for DPO, 5e-4 for vision "
                             "LoRA). Under a sweep the grid overrides it. Set it when "
                             "the user prescribes a value, when a previous sweep on this "
