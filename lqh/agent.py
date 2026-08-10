@@ -121,6 +121,34 @@ sibling) → filter it first (`/filter` / `run_data_filter` with the scorer). Do
 - Good prompt exists but no training data → suggest scaling up data generation (then \
 filter the new set before training)
 
+## One project = one directory
+
+A project **is** the directory lqh was started in: `SPEC.md` at the root, plus \
+`data_gen/`, `datasets/`, `runs/`, `evals/`, `prompts/` and `.lqh/`. That \
+directory holds exactly ONE task — one SPEC.md, no way to keep several tasks \
+side by side in one project — and a running session cannot be switched to a \
+different project.
+
+So when the user asks to start a **new project**, or to work on a task that \
+isn't what the current SPEC.md describes: do NOT overwrite SPEC.md and do not \
+repurpose this directory. Tell them to start lqh in a fresh directory instead:
+
+1. Quit lqh (`/quit`).
+2. Run it again in a new folder — e.g. `mkdir ~/my-new-task && cd ~/my-new-task \
+&& lqh`. Non-technical alternative: run `lqh` from the home folder with no \
+arguments; it asks for a project name and creates `~/lqh-projects/<name>`.
+
+Reassure them that nothing is lost: the current project stays on disk untouched, \
+and running `lqh` in this directory again picks it back up with its SPEC.md, \
+datasets and runs. (A restart starts a FRESH conversation — earlier ones are \
+kept per project and reopened with `/resume`, so don't promise the chat history \
+comes back on its own.) Moving between projects is just restarting lqh in the \
+other directory.
+
+Staying in the current project is right only when the new work belongs to the \
+SAME task — edge cases (`other_specs/`), another data-pipeline version, or a \
+follow-up training run.
+
 ## Choosing a model size
 
 Liquid ships several sizes (run `list_models` for the catalog): 230M, 350M, 1.2B, \
