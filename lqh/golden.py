@@ -589,6 +589,16 @@ async def _golden_from_api(
                     response = await chat_with_retry(
                         client,
                         max_retries=_GOLDEN_MAX_RETRIES,
+                        # A 429 is the server pacing us, not a failure of this
+                        # request. On a 2-attempt ladder a brief burst would
+                        # otherwise drop the sample outright — we'd wait out
+                        # the backoff and give up anyway.
+                        rate_limits_are_free=True,
+                        # Uncounted: the deadline above is the bound. A wait
+                        # counter here would abandon a sample the server was
+                        # about to serve — five 1-second waits would give up
+                        # 5s into a 300s budget.
+                        max_rate_limit_waits=None,
                         model=model,
                         messages=prompt,
                         temperature=0.0,

@@ -1511,3 +1511,78 @@ class TestPostAssemblyShortfallIsVisible:
         # and record it as converged, which is worse than a thin iteration.
         assert "skipped_reason" not in stats
         assert pq.read_table(out / "preferences.parquet").num_rows == 2
+
+
+class TestGoldenRateLimits:
+    async def test_429_burst_does_not_drop_a_golden_sample(
+        self, monkeypatch,
+    ) -> None:
+        """Golden runs a 2-attempt ladder, so a brief 429 burst used to spend
+        both and drop the sample — we waited out the backoff and gave up
+        anyway. The 300s deadline is what bounds the waiting instead."""
+        import lqh.client as client_mod
+        import lqh.golden as golden_mod
+
+        monkeypatch.setattr(client_mod.asyncio, "sleep", AsyncMock())
+
+        calls = {"n": 0}
+
+        async def _create(**_kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] <= 3:  # more 429s than the ladder has attempts
+                raise RateLimitError(
+                    "rate limited",
+                    response=httpx.Response(
+                        429, request=httpx.Request("POST", "http://x")
+                    ),
+                    body=None,
+                )
+            response = MagicMock()
+            response.choices = [MagicMock(message=MagicMock(content="GOLDEN"))]
+            return response
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+
+        result = await golden_mod._golden_from_api(
+            [0], {0: [{"role": "user", "content": "q"}]}, client, "orchestration",
+        )
+
+        assert result == {0: "GOLDEN"}
+        assert calls["n"] == 4
+
+    async def test_endless_429_is_bounded_by_the_deadline(
+        self, monkeypatch,
+    ) -> None:
+        """Golden passes max_rate_limit_waits=None — a wait counter would give
+        up ~5s into a 300s budget on a server sending Retry-After: 1. The
+        per-sample deadline is what stops it instead."""
+        import lqh.golden as golden_mod
+
+        monkeypatch.setattr(golden_mod, "_GOLDEN_TIMEOUT_S", 0.3)
+
+        async def _create(**_kwargs: Any) -> Any:
+            raise RateLimitError(
+                "rate limited",
+                response=httpx.Response(
+                    429,
+                    headers={"retry-after": "0.05"},
+                    request=httpx.Request("POST", "http://x"),
+                ),
+                body=None,
+            )
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+
+        result = await asyncio.wait_for(
+            golden_mod._golden_from_api(
+                [0], {0: [{"role": "user", "content": "q"}]}, client, "orchestration",
+            ),
+            timeout=10,
+        )
+
+        assert result == {}
+        # It kept trying for the whole budget rather than quitting at a fixed
+        # wait count — well past MAX_RATE_LIMIT_WAITS worth of attempts.
+        assert client.chat.completions.create.await_count > 5

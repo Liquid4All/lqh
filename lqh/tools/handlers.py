@@ -2868,6 +2868,27 @@ async def handle_run_scoring(
                 # Atomic claim — a bare exists() check races a second CLI.
                 output_dir.mkdir(parents=True, exist_ok=False)
             except FileExistsError:
+                # An interrupted run leaves the directory it claimed, holding
+                # partial artifacts and no real ones. "Use a different name"
+                # would strand scores the user already paid for, so say what
+                # is actually in there.
+                from lqh.scoring import PARTIAL_SUFFIX
+
+                interrupted = (
+                    not (output_dir / "summary.json").exists()
+                    and (output_dir / f"summary{PARTIAL_SUFFIX}.json").exists()
+                )
+                if interrupted:
+                    return ToolResult.fail(
+                        "conflict",
+                        f"Error: eval run '{run_name}' was interrupted and left "
+                        f"partial results.\n"
+                        f"  evals/runs/{run_name}/summary{PARTIAL_SUFFIX}.json "
+                        "holds the samples that were scored before it stopped — "
+                        "read it before discarding them.\n"
+                        f"  To redo the run: delete evals/runs/{run_name}/ or "
+                        "pick a different run_name.",
+                    )
                 return ToolResult.fail(
                     "conflict",
                     f"Error: eval run '{run_name}' already exists. Use a different name.",

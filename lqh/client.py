@@ -161,10 +161,19 @@ def describe_api_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {str(exc)[:160]}"
 
 
+MAX_RATE_LIMIT_WAITS = 5
+# Ceiling on a single honoured Retry-After when nobody above us owns a
+# deadline. Capping the wait COUNT alone does not bound the time: a server
+# reporting Retry-After: 3600 would otherwise sleep five hours inside one call.
+RATE_LIMIT_WAIT_CAP_S = 30.0
+
+
 async def chat_with_retry(
     client: AsyncOpenAI,
     max_retries: int = 3,
     on_retry: OnRetry = None,
+    rate_limits_are_free: bool = False,
+    max_rate_limit_waits: int | None = MAX_RATE_LIMIT_WAITS,
     **kwargs: object,
 ) -> ChatCompletion:
     """Call chat completions with retry logic for transient errors.
@@ -174,6 +183,22 @@ async def chat_with_retry(
       - ``RETRYABLE_STATUS`` / connection errors: exponential backoff up to
         *max_retries*.
     All other errors are raised immediately.
+
+    *rate_limits_are_free* stops a 429 from spending an attempt. A rate limit
+    is the server pacing us, not a failure of this request, so on a short
+    ladder a brief 429 burst otherwise drops the call outright — the caller
+    waited out the backoff and then gave up anyway. Off by default because a
+    caller with no outer bound could then wait indefinitely; callers that own
+    a deadline (see ``lqh/golden.py``) pass True.
+
+    *max_rate_limit_waits* bounds how many such waits are allowed, and each is
+    clamped to ``RATE_LIMIT_WAIT_CAP_S`` — together they stop a missing or
+    misreported ``Retry-After`` from hanging a caller that has no deadline of
+    its own. Pass ``None`` when you DO own one (an ``asyncio.timeout`` around
+    the call): the deadline is then the only thing that decides when to give
+    up, the server's number is honoured as sent, and a counter would
+    otherwise abandon a request the server was about to serve with most of
+    the budget unspent.
 
     *on_retry* is awaited before each backoff sleep with ``(description,
     attempt, total_attempts, wait_seconds)``. Retrying silently is what made
@@ -186,15 +211,24 @@ async def chat_with_retry(
     """
     total_attempts = max_retries + 1
 
-    async def _notify(exc: BaseException, attempt: int, wait: float) -> None:
+    async def _notify(
+        exc: BaseException, attempt: int, wait: float,
+        *, total_override: int | None = None,
+    ) -> None:
         if on_retry is None:
             return
         try:
-            await on_retry(describe_api_error(exc), attempt + 1, total_attempts, wait)
+            await on_retry(
+                describe_api_error(exc), attempt + 1,
+                total_override if total_override is not None else total_attempts,
+                wait,
+            )
         except Exception:  # a broken notifier must not eat the retry
             logger.debug("on_retry callback failed", exc_info=True)
 
-    for attempt in range(max_retries + 1):
+    attempt = 0
+    rate_limit_waits = 0
+    while attempt <= max_retries:
         start = time.monotonic()
         entry: dict[str, Any] = {"attempt": attempt}
         try:
@@ -225,9 +259,45 @@ async def chat_with_retry(
                 "status_code": 429,
             })
             _record_attempt(entry)
+            try:
+                retry_after = _parse_retry_after(exc)
+            except Exception:
+                # Header parsing must never be what kills a request.
+                retry_after = None
+            if rate_limits_are_free:
+                # The server is pacing us, not rejecting this request, so the
+                # wait doesn't cost an attempt. Bounded by the caller's own
+                # deadline; the counter is only here in case there isn't one.
+                if (
+                    max_rate_limit_waits is not None
+                    and rate_limit_waits >= max_rate_limit_waits
+                ):
+                    raise
+                rate_limit_waits += 1
+                wait = (
+                    retry_after if retry_after is not None
+                    else 2 ** (rate_limit_waits - 1)
+                )
+                if max_rate_limit_waits is not None:
+                    # Counted mode means nobody above us owns a deadline, so
+                    # the wait itself has to be bounded too.
+                    wait = min(wait, RATE_LIMIT_WAIT_CAP_S)
+                logger.warning(
+                    "chat_with_retry: 429 (wait %d, attempt not spent), sleeping %.1fs",
+                    rate_limit_waits, wait,
+                )
+                # Reported as the wait number, not the attempt: the attempt is
+                # deliberately frozen here, and showing "attempt 1 of 2" five
+                # times in a row reads as a stuck ladder.
+                await _notify(
+                    exc, rate_limit_waits - 1,
+                    wait,
+                    total_override=max_rate_limit_waits or rate_limit_waits,
+                )
+                await asyncio.sleep(wait)
+                continue
             if attempt >= max_retries:
                 raise
-            retry_after = _parse_retry_after(exc)
             wait = retry_after if retry_after is not None else 2**attempt
             logger.warning("chat_with_retry: 429 on attempt %d, sleeping %.1fs", attempt, wait)
             await _notify(exc, attempt, wait)
@@ -264,6 +334,7 @@ async def chat_with_retry(
                 await asyncio.sleep(wait)
             else:
                 raise
+        attempt += 1
 
     # Should be unreachable, but keeps the type checker happy.
     raise RuntimeError("Exceeded max retries")

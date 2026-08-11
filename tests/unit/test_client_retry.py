@@ -8,11 +8,17 @@ genuinely malformed-request 400 must still fail fast.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from openai import APIStatusError, BadRequestError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    BadRequestError,
+    RateLimitError,
+)
 
 from lqh.client import (
     chat_with_retry,
@@ -163,3 +169,69 @@ class TestChatWithRetry:
             await chat_with_retry(client, max_retries=3, model="x", messages=[])
         # No retry: a malformed request can never succeed on replay.
         assert client.chat.completions.create.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Ladder exhaustion + backoff schedule
+#
+# Neither the default 429 branch nor the connection branch had any coverage:
+# every retry test here succeeds on call 2, and the only test reaching a
+# terminal raise takes the non-retryable fast path without entering the loop.
+# A restructure that failed to advance `attempt` in those branches would loop
+# forever, so the failure mode was a HUNG SUITE rather than a red test.
+# ---------------------------------------------------------------------------
+
+
+async def test_rate_limit_exhausts_the_ladder_and_reraises() -> None:
+    client = MagicMock()
+    exc = RateLimitError(
+        "rate limited",
+        response=httpx.Response(429, request=httpx.Request("POST", "http://x")),
+        body=None,
+    )
+    client.chat.completions.create = AsyncMock(side_effect=exc)
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(RateLimitError):
+            await asyncio.wait_for(
+                chat_with_retry(client, max_retries=2, model="x", messages=[]),
+                timeout=10,
+            )
+
+    assert client.chat.completions.create.await_count == 3  # max_retries + 1
+
+
+async def test_connection_error_exhausts_the_ladder_and_reraises() -> None:
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(
+        side_effect=APIConnectionError(request=httpx.Request("POST", "http://x"))
+    )
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(APIConnectionError):
+            await asyncio.wait_for(
+                chat_with_retry(client, max_retries=2, model="x", messages=[]),
+                timeout=10,
+            )
+
+    assert client.chat.completions.create.await_count == 3
+
+
+async def test_backoff_schedule_is_exponential_from_one_second() -> None:
+    """Pins 2**attempt. The parallel rate-limit branch uses its own exponent,
+    so nothing else would catch drift here."""
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(
+        side_effect=APIConnectionError(request=httpx.Request("POST", "http://x"))
+    )
+
+    slept: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    with patch("asyncio.sleep", new=_sleep):
+        with pytest.raises(APIConnectionError):
+            await chat_with_retry(client, max_retries=3, model="x", messages=[])
+
+    assert slept == [1, 2, 4]
