@@ -158,7 +158,35 @@ def api_client(has_api_access: bool) -> Any:
     from lqh.config import load_config
 
     config = load_config()
+    # SDK retries left ON here deliberately: most callers of this fixture make
+    # a bare API call with no ladder of their own, and api.lqh.ai does return
+    # the occasional transient 502. Scoring is the exception — see
+    # ``scoring_api_client``.
     return create_client(require_token(), config.api_base_url)
+
+
+@pytest.fixture
+def scoring_api_client(has_api_access: bool) -> Any:
+    """Authenticated client configured the way production builds one for
+    ``lqh.scoring``. Skips the test on missing auth.
+
+    ``lqh.scoring`` bounds each sample with a deadline (120s judge-only) and
+    owns its own retry ladder, so every production caller passes
+    ``max_retries=0`` — the SDK's retry layer is invisible and carries a 300s
+    timeout per attempt, which would put 2x300s *inside* that deadline. A
+    scoring test built on the plain ``api_client`` therefore exercises a
+    configuration that ships nowhere, and fails with ``scored == 0`` the first
+    time a real 5xx lands, intermittently and under load only.
+    """
+    if not has_api_access:
+        pytest.skip("No API access (set LQH_DEBUG_API_KEY or run /login)")
+
+    from lqh.auth import require_token
+    from lqh.client import create_client
+    from lqh.config import load_config
+
+    config = load_config()
+    return create_client(require_token(), config.api_base_url, max_retries=0)
 
 
 # ---------------------------------------------------------------------------

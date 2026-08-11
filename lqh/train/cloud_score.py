@@ -70,10 +70,12 @@ def _make_client():
     base = os.environ["LQH_BASE_URL"].rstrip("/")
     if not base.endswith("/v1"):
         base = base + "/v1"
-    # max_retries=0: this client only ever drives lqh.scoring, which owns its
-    # own retry ladder and bounds each sample with a deadline. The SDK's
+    # max_retries=0 because this client's main job is lqh.scoring, which owns
+    # its own retry ladder and bounds each sample with a deadline; the SDK's
     # invisible replay layer would sit underneath both and multiply every
-    # timeout by three.
+    # timeout by three. It is also handed to generate_golden, which is NOT
+    # scoring — that path owns its retries via chat_with_retry for exactly
+    # this reason (see lqh/golden.py).
     return AsyncOpenAI(
         base_url=base,
         api_key=os.environ["LQH_API_TOKEN"],

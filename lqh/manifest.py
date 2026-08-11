@@ -117,6 +117,7 @@ def write_dataset_manifest(
     source_paths: list[str] | None = None,
     scorer_path: str | None = None,
     threshold: float | None = None,
+    kept_unjudged: int | None = None,
     parent_dataset: str | None = None,
     derived_from: str | None = None,
     provenance_note: str | None = None,
@@ -200,6 +201,12 @@ def write_dataset_manifest(
                 manifest["scorer_hash"] = file_hash_prefix(scorer_file, n=12)
         if threshold is not None:
             manifest["threshold"] = threshold
+        # How many rows are in this dataset WITHOUT having cleared the
+        # threshold, because the judge failed on them and the filter fails
+        # open. A manifest carrying a scorer and a threshold otherwise reads
+        # as "every row here was vetted against that bar".
+        if kept_unjudged:
+            manifest["kept_unjudged"] = kept_unjudged
         if parent_dataset:
             manifest["parent_dataset"] = _relativize(parent_dataset, project_dir)
         if derived_from:

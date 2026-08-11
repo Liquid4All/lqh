@@ -925,6 +925,14 @@ def _judge_mean_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
         out["judge_std"] = std
     if isinstance(score_summary.get("num_scored"), int):
         out["judge_num_scored"] = score_summary["num_scored"]
+    # Carried onto the row so a config whose mean was taken over a thinned
+    # sample set is distinguishable from one that scored cleanly. A sweep row
+    # showing judge_mean alone cannot tell the two apart, and the winner is
+    # picked off these rows.
+    if isinstance(score_summary.get("num_failed"), int):
+        out["judge_num_failed"] = score_summary["num_failed"]
+    if isinstance(score_summary.get("failure_warning"), str):
+        out["judge_failure_warning"] = score_summary["failure_warning"]
     return out
 
 

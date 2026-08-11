@@ -555,7 +555,7 @@ class TestScoringIntegration:
         return _factory
 
     async def test_data_quality_scoring(
-        self, tmp_path: Path, api_client: Any, write_chatml_parquet,
+        self, tmp_path: Path, scoring_api_client: Any, write_chatml_parquet,
     ) -> None:
         """Score data quality on a tiny dataset (no inference, judge only)."""
         dataset_dir = tmp_path / "ds"
@@ -579,7 +579,7 @@ class TestScoringIntegration:
         result = await run_data_scoring(
             dataset_dir=dataset_dir,
             scorer_path=scorer_path,
-            client=api_client,
+            client=scoring_api_client,
             model_size="small",
         )
 
@@ -590,7 +590,7 @@ class TestScoringIntegration:
         assert (dataset_dir / "scores.parquet").exists()
 
     async def test_model_eval_with_lfm(
-        self, tmp_path: Path, api_client: Any, make_dataset,
+        self, tmp_path: Path, scoring_api_client: Any, make_dataset,
     ) -> None:
         """Run model eval: strip assistant turns, run LFM inference, score output."""
         dataset_path = make_dataset([
@@ -617,7 +617,7 @@ class TestScoringIntegration:
             dataset_path=dataset_path,
             scorer_path=scorer_path,
             output_dir=output_dir,
-            client=api_client,
+            client=scoring_api_client,
             model_size="small",
             run_inference=True,
             inference_model="small",
@@ -635,7 +635,7 @@ class TestScoringIntegration:
         assert "scores" in summary
 
     async def test_model_eval_with_runner(
-        self, tmp_path: Path, api_client: Any, make_dataset,
+        self, tmp_path: Path, scoring_api_client: Any, make_dataset,
     ) -> None:
         """Same as above but explicitly passing an ``APIModelRunner``."""
         dataset_path = make_dataset([[
@@ -650,10 +650,10 @@ class TestScoringIntegration:
             dataset_path=dataset_path,
             scorer_path=scorer_path,
             output_dir=tmp_path / "eval_run",
-            client=api_client,
+            client=scoring_api_client,
             run_inference=True,
             inference_model="small",
-            inference_runner=APIModelRunner(api_client),
+            inference_runner=APIModelRunner(scoring_api_client),
         )
         assert result.total == 1
         assert result.scored > 0

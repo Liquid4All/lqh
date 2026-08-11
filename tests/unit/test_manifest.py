@@ -433,3 +433,42 @@ async def test_data_filter_refuses_overwrite(
     )
 
     assert "refusing to overwrite" in result.content
+
+async def test_data_filter_fails_when_nothing_could_be_judged(
+    project_dir: Path, sample_conversations, write_chatml_parquet, monkeypatch,
+) -> None:
+    """Fail-open keeps unjudged rows — but a run where NOTHING was judged has
+    filtered nothing, and reporting success hands back a dataset identical to
+    the input with a manifest naming a scorer that was never applied.
+    """
+    import json as _json
+    from unittest.mock import AsyncMock, MagicMock
+
+    src = project_dir / "datasets" / "raw"
+    write_chatml_parquet(src / "data.parquet", sample_conversations(4))
+    scorer = project_dir / "evals" / "scorers"
+    scorer.mkdir(parents=True)
+    (scorer / "quality.md").write_text("judge it\n")
+
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(side_effect=RuntimeError("judge down"))
+    monkeypatch.setattr("lqh.client.create_client", lambda *a, **kw: client)
+    monkeypatch.setattr("lqh.auth.require_token", lambda: "tok")
+
+    result = await handle_run_data_filter(
+        project_dir,
+        input_path="datasets/raw/data.parquet",
+        scorer_path="evals/scorers/quality.md",
+        output_dataset="raw_filtered",
+        max_retries=0,
+    )
+
+    assert result.ok is False, result.content
+    assert "did not vet anything" in result.content
+    assert "do NOT treat it as filtered data" in result.content
+
+    # Provenance must not read as "these 4 rows cleared the threshold".
+    manifest = _json.loads(
+        (project_dir / "datasets" / "raw_filtered" / "manifest.json").read_text()
+    )
+    assert manifest["kept_unjudged"] == 4

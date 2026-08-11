@@ -26,11 +26,13 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pyarrow.parquet as pq
 import pytest
-from openai import RateLimitError
+from openai import APIConnectionError, RateLimitError
 
 from lqh.runner import RunnerResponse
 from lqh.scoring import (
     DEFAULT_MAX_RETRIES,
+    _RATE_LIMIT_WAIT_CAP_S,
+    _rate_limit_wait,
     FAILURE_WARN_FRACTION,
     _MAX_RATE_LIMIT_WAITS,
     failure_warning,
@@ -243,7 +245,9 @@ class TestRetryLadder:
         ladder, treating 429s as failures would fail most of a run the moment
         100-wide concurrency meets a per-minute limit.
         """
-        monkeypatch.setattr("lqh.scoring._rate_limit_wait", lambda exc, n: 0.01)
+        monkeypatch.setattr(
+            "lqh.scoring._rate_limit_wait", lambda *a, **kw: 0.01
+        )
         dataset = write_chatml_parquet(
             tmp_path / "data.parquet", [CONVERSATION], num=1,
         )
@@ -280,12 +284,58 @@ class TestRetryLadder:
         assert result.failed == 0
         assert calls["n"] == 4
 
+    async def test_rate_limits_are_not_capped_while_a_deadline_is_running(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet, monkeypatch,
+    ) -> None:
+        """Under a deadline, the deadline decides when to give up — not a
+        wait counter. Capping here would fail a sample the server was about
+        to serve, with time still on the clock."""
+        monkeypatch.setattr(
+            "lqh.scoring._rate_limit_wait", lambda *a, **kw: 0.01
+        )
+        dataset = write_chatml_parquet(tmp_path / "data.parquet", [CONVERSATION])
+
+        response = MagicMock()
+        response.choices = [
+            MagicMock(message=MagicMock(content='{"reasoning": "ok", "score": 7}'))
+        ]
+        calls = {"n": 0}
+        limit = _MAX_RATE_LIMIT_WAITS + 1  # one more 429 than the cap allows
+
+        async def _create(**_kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] <= limit:
+                raise RateLimitError(
+                    "rate limited",
+                    response=httpx.Response(
+                        429, request=httpx.Request("POST", "http://x")
+                    ),
+                    body=None,
+                )
+            return response
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+
+        result = await run_scoring(
+            dataset_path=dataset,
+            scorer_path=scorer,
+            output_dir=tmp_path / "out",
+            client=client,
+            sample_timeout=10,
+        )
+
+        assert result.scored == 1
+        assert calls["n"] == limit + 1
+
     async def test_rate_limit_waits_are_capped(
         self, tmp_path: Path, scorer: Path, write_chatml_parquet, monkeypatch,
     ) -> None:
         """An endless 429 still ends: the cap keeps a sample from spinning
         when the deadline is disabled."""
-        monkeypatch.setattr("lqh.scoring._rate_limit_wait", lambda exc, n: 0.01)
+        monkeypatch.setattr(
+            "lqh.scoring._rate_limit_wait", lambda *a, **kw: 0.01
+        )
         dataset = write_chatml_parquet(
             tmp_path / "data.parquet", [CONVERSATION], num=1,
         )
@@ -342,6 +392,99 @@ class TestRetryLadder:
         table = pq.read_table(tmp_path / "out" / "results.parquet")
         stored = json.loads(table.column("messages").to_pylist()[0])
         assert stored[-1] == {"role": "assistant", "content": "MODEL ANSWER"}
+
+    async def test_inference_timeout_never_stores_the_gold_answer(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet,
+    ) -> None:
+        """A hang in *inference* must not record the reference as output.
+
+        The sample's context is published before inference runs, precisely so
+        the timeout path has something truthful to fall back to. Falling back
+        to the input conversation would write the gold assistant turn into
+        results.parquet as though the model had produced it.
+        """
+        gold = [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "GOLD"},
+        ]
+        dataset = write_chatml_parquet(tmp_path / "data.parquet", [gold])
+
+        runner = MagicMock()
+
+        async def _hang(*_args: Any, **_kwargs: Any) -> Any:
+            await asyncio.sleep(30.0)
+
+        runner.complete = AsyncMock(side_effect=_hang)
+
+        result = await asyncio.wait_for(
+            run_scoring(
+                dataset_path=dataset,
+                scorer_path=scorer,
+                output_dir=tmp_path / "out",
+                client=_judge_client(),
+                run_inference=True,
+                inference_model="m",
+                inference_runner=runner,
+                sample_timeout=0.2,
+                debug=True,
+            ),
+            timeout=10,
+        )
+
+        assert result.failed == 1
+        stored = json.loads(
+            pq.read_table(tmp_path / "out" / "results.parquet")
+            .column("messages")
+            .to_pylist()[0]
+        )
+        assert all(m.get("content") != "GOLD" for m in stored), stored
+        assert not any(m.get("role") == "assistant" for m in stored)
+
+        # And it is still debuggable: the call that never answered is replayable.
+        entries = [
+            json.loads(line)
+            for line in (tmp_path / "out" / "debug_low_scores.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        assert len(entries) == 1
+        assert entries[0]["model_response"] is None
+        assert entries[0]["inference_messages_sent"]
+
+    async def test_transient_inference_failure_is_retried(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet,
+    ) -> None:
+        """Inference gets the same ladder the judge does.
+
+        Scoring clients run with the SDK's retry layer off, so without this
+        one dropped connection fails the sample outright with most of the
+        deadline unspent.
+        """
+        dataset = write_chatml_parquet(tmp_path / "data.parquet", [CONVERSATION])
+        calls = {"n": 0}
+
+        async def _flaky(*_args: Any, **_kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("connection reset")
+            return RunnerResponse(content="ANSWER", model="m", usage=None)
+
+        runner = MagicMock()
+        runner.complete = AsyncMock(side_effect=_flaky)
+
+        result = await run_scoring(
+            dataset_path=dataset,
+            scorer_path=scorer,
+            output_dir=tmp_path / "out",
+            client=_judge_client(),
+            run_inference=True,
+            inference_model="m",
+            inference_runner=runner,
+        )
+
+        assert result.scored == 1
+        assert result.failed == 0
+        assert calls["n"] == 2
 
     async def test_model_eval_timeout_is_debuggable(
         self, tmp_path: Path, scorer: Path, write_chatml_parquet,
@@ -627,3 +770,225 @@ class TestDataFilterFailsOpen:
         assert result.kept_unjudged == 1
         assert result.failed == 1
         assert result.mean_score == 5.5  # (9 + 2) / 2 — the error is excluded
+
+
+# ---------------------------------------------------------------------------
+# Guards the review found untested
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimitWaitClamping:
+    """The wait length itself, separately from the wait *count*."""
+
+    @staticmethod
+    def _exc(retry_after: str | None) -> RateLimitError:
+        headers = {"retry-after": retry_after} if retry_after else {}
+        return RateLimitError(
+            "rate limited",
+            response=httpx.Response(
+                429, headers=headers, request=httpx.Request("POST", "http://x")
+            ),
+            body=None,
+        )
+
+    def test_unbounded_clamps_to_the_cap(self) -> None:
+        wait = _rate_limit_wait(self._exc("600"), 1, bounded=False)
+        assert wait == _RATE_LIMIT_WAIT_CAP_S
+
+    def test_bounded_honours_retry_after(self) -> None:
+        # Not clamped down to some smaller constant: retrying earlier than the
+        # server asked just earns another 429.
+        assert _rate_limit_wait(self._exc("60"), 1, bounded=True, remaining=120.0) == 60.0
+
+    def test_bounded_never_sleeps_past_the_deadline(self) -> None:
+        # Sleeping past your own deadline converts time that could have held
+        # an attempt into a guaranteed timeout.
+        assert _rate_limit_wait(self._exc("600"), 1, bounded=True, remaining=25.0) == 25.0
+        assert _rate_limit_wait(self._exc("600"), 1, bounded=True, remaining=-5.0) == 0.0
+
+    def test_missing_header_falls_back_to_backoff(self) -> None:
+        assert _rate_limit_wait(self._exc(None), 3, bounded=True, remaining=100.0) == 4.0
+
+
+class TestConcurrencyGuard:
+    async def test_zero_concurrency_does_not_hang(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet,
+    ) -> None:
+        """A zero-capacity semaphore is never acquired, and the deadline only
+        starts after acquisition — so this used to hang with nothing to stop it."""
+        dataset = write_chatml_parquet(tmp_path / "data.parquet", [CONVERSATION])
+        result = await asyncio.wait_for(
+            run_scoring(
+                dataset_path=dataset,
+                scorer_path=scorer,
+                output_dir=tmp_path / "out",
+                client=_judge_client(),
+                concurrency=0,
+            ),
+            timeout=10,
+        )
+        assert result.scored == 1
+
+    async def test_negative_concurrency_does_not_raise(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet,
+    ) -> None:
+        dataset = write_chatml_parquet(tmp_path / "data.parquet", [CONVERSATION])
+        result = await asyncio.wait_for(
+            run_scoring(
+                dataset_path=dataset,
+                scorer_path=scorer,
+                output_dir=tmp_path / "out",
+                client=_judge_client(),
+                concurrency=-5,
+            ),
+            timeout=10,
+        )
+        assert result.scored == 1
+
+
+class TestPerSourceFailureCounts:
+    """A source scored on 3 of its 100 rows must not look like a complete one."""
+
+    async def test_per_source_carries_attempted_and_failed(
+        self, tmp_path: Path,
+    ) -> None:
+        import pyarrow as pa
+
+        from lqh.scoring import score_predictions_by_source
+
+        # 40 predictions across two sources; the judge fails on all of source b.
+        n = 40
+        rows = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+        ]
+        preds = tmp_path / "preds.parquet"
+        pa_table = pa.table({
+            "sample_index": list(range(n)),
+            "messages": [json.dumps(rows)] * n,
+            "source": ["a" if i < 20 else "b" for i in range(n)],
+        })
+        pq.write_table(pa_table, preds)
+        scorer_path = tmp_path / "s.md"
+        scorer_path.write_text("score it")
+
+        calls = {"n": 0}
+
+        async def _create(**kwargs: Any) -> Any:
+            # Deterministic by call order is not safe under concurrency, so
+            # key off the prompt: source b's rows are the last 20 indices and
+            # indistinguishable by content, so fail a fixed *count* instead.
+            calls["n"] += 1
+            if calls["n"] > 20:
+                raise RuntimeError("judge down")
+            response = MagicMock()
+            response.choices = [
+                MagicMock(message=MagicMock(content='{"reasoning":"ok","score":7}'))
+            ]
+            return response
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+
+        payload = await score_predictions_by_source(
+            predictions_path=preds,
+            scorer_path=scorer_path,
+            output_dir=tmp_path / "out",
+            client=client,
+            concurrency=1,
+            max_retries=0,
+        )
+
+        per_source = payload["per_source"]
+        assert per_source["a"]["num_attempted"] == 20
+        assert per_source["b"]["num_attempted"] == 20
+        # Every source reports what it lost, whatever the split happened to be.
+        for label in ("a", "b"):
+            entry = per_source[label]
+            assert entry["num_failed"] == entry["num_attempted"] - entry["num_scored"]
+        assert sum(per_source[s]["num_scored"] for s in ("a", "b")) == 20
+        assert "failure_warning" in payload
+
+    async def test_small_source_does_not_warn_on_a_single_error(
+        self, tmp_path: Path,
+    ) -> None:
+        """One transient error in an 8-row source is 12.5% — not a signal, and
+        this string rides out to every sweep row."""
+        import pyarrow as pa
+
+        from lqh.scoring import score_predictions_by_source
+
+        rows = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+        ]
+        n = 18
+        preds = tmp_path / "preds.parquet"
+        pq.write_table(
+            pa.table({
+                "sample_index": list(range(n)),
+                "messages": [json.dumps(rows)] * n,
+                "source": ["a" if i < 10 else "b" for i in range(n)],
+            }),
+            preds,
+        )
+        scorer_path = tmp_path / "s.md"
+        scorer_path.write_text("score it")
+
+        calls = {"n": 0}
+
+        async def _create(**_kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("one transient error")
+            response = MagicMock()
+            response.choices = [
+                MagicMock(message=MagicMock(content='{"reasoning":"ok","score":7}'))
+            ]
+            return response
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+
+        payload = await score_predictions_by_source(
+            predictions_path=preds,
+            scorer_path=scorer_path,
+            output_dir=tmp_path / "out",
+            client=client,
+            concurrency=1,
+            max_retries=0,
+        )
+
+        assert "failure_warning" not in payload
+
+
+class TestGoldenGenerationRetries:
+    """generate_golden is handed the same max_retries=0 client as scoring, but
+    it is NOT scoring: it drops a sample on any exception and has no ladder of
+    its own unless one is given to it."""
+
+    async def test_transient_error_does_not_cost_a_golden_response(self) -> None:
+        from lqh.golden import _golden_from_api
+
+        calls = {"n": 0}
+
+        async def _create(**_kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise APIConnectionError(request=httpx.Request("POST", "http://x"))
+            response = MagicMock()
+            response.choices = [MagicMock(message=MagicMock(content="GOLDEN"))]
+            return response
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+
+        result = await _golden_from_api(
+            [0],
+            {0: [{"role": "user", "content": "q"}]},
+            client,
+            "orchestration",
+        )
+
+        assert result == {0: "GOLDEN"}
+        assert calls["n"] == 2

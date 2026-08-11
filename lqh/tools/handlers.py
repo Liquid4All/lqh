@@ -7777,10 +7777,18 @@ async def handle_run_data_filter(
         if claimed:
             release_output(project_dir, output_dataset)
         if succeeded:
+            # A run where nothing could be judged has filtered nothing, and
+            # the tool returns a failure below — the progress surface must not
+            # be showing a green "ready" at 100% next to that. Same shape as
+            # handle_run_scoring's "no valid scores".
+            vetted = result.scored > 0
             reporter.update(
-                phase="completed", phase_label="filtered dataset ready",
+                phase="completed",
+                phase_label=(
+                    "filtered dataset ready" if vetted else "nothing could be judged"
+                ),
                 completed=result.total, total=result.total, unit="samples",
-                overall_fraction=1.0, result_ready=True, force=True,
+                overall_fraction=1.0, result_ready=vetted, force=True,
             )
         on_done = kwargs.get("on_pipeline_done")
         if on_done:
@@ -7801,6 +7809,10 @@ async def handle_run_data_filter(
         scorer_path=scorer_path,
         threshold=threshold,
         derived_from=input_path,
+        # Provenance has to carry how much of this output was never actually
+        # vetted — a manifest naming a scorer and a threshold otherwise reads
+        # as "every row here cleared that bar".
+        kept_unjudged=result.kept_unjudged,
     ) is not None
     manifest_warning = (
         "" if manifest_written else
@@ -7809,6 +7821,24 @@ async def handle_run_data_filter(
 
     distribution = _format_score_distribution(output_dir / "scores.parquet")
     from lqh.scoring import failure_warning
+
+    # Fail open keeps rows the judge could not score — but a run where NOTHING
+    # was scored has filtered nothing. Reporting that as a success hands back
+    # a dataset byte-identical to the input, with a manifest naming a scorer
+    # and a threshold that were never actually applied, which is exactly the
+    # artifact that gets mistaken for vetted data later.
+    if result.total > 0 and result.scored == 0:
+        return ToolResult.fail(
+            "runtime",
+            f"❌ Filter did not vet anything: all {result.total} samples failed "
+            f"to score (judge: {model_size}).\n"
+            f"  datasets/{output_dataset}/ now holds an unfiltered copy of the "
+            "input — do NOT treat it as filtered data. Its manifest names the "
+            "scorer and threshold but records kept_unjudged="
+            f"{result.kept_unjudged}, i.e. nothing was actually vetted.\n"
+            "  Check the judge model, the scorer file, and API access, then "
+            "re-run.",
+        )
 
     warning = failure_warning(result.failed, result.total)
     return ToolResult(

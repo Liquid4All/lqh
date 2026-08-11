@@ -16,6 +16,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from openai import AsyncOpenAI
 
+from lqh.client import chat_with_retry
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["generate_golden", "load_or_score_chosen_scores"]
@@ -506,7 +508,14 @@ async def _golden_from_api(
 
         async with semaphore:
             try:
-                response = await client.chat.completions.create(
+                # chat_with_retry, not a bare create: this path drops a sample
+                # on any exception, and the clients it is handed come from the
+                # scoring callers, which run with the OpenAI SDK's retry layer
+                # switched off. Without a ladder of its own a single transient
+                # 502 would silently cost a golden response.
+                response = await chat_with_retry(
+                    client,
+                    max_retries=2,
                     model=model,
                     messages=prompt,
                     temperature=0.0,

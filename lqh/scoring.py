@@ -106,6 +106,11 @@ DEFAULT_MAX_RETRIES = 1
 # cause is usually the judge, the scorer, or API access, not bad luck.
 FAILURE_WARN_FRACTION = 0.10
 
+# Smallest source for which the per-source thinning check means anything. On
+# 8 predictions one transient judge error is 12.5% and would raise a run-level
+# warning that propagates to every sweep row.
+_THINNING_MIN_SOURCE = 20
+
 
 def failure_warning(failed: int, total: int) -> str | None:
     """One-line warning when more than :data:`FAILURE_WARN_FRACTION` of a run
@@ -442,16 +447,33 @@ def _parse_score_response(text: str) -> tuple[float, str]:
 
 
 # A 429 is the server pacing us, not a failed attempt, so it does not consume
-# the retry budget — the per-sample deadline is what bounds the waiting. The
-# cap only matters when that deadline is disabled, so a sample can't spin.
+# the retry budget. When a deadline wraps the sample, that deadline IS the
+# bound and the wait count is unlimited — capping it there would fail a sample
+# the server was going to serve, with time still on the clock. These two only
+# govern the unbounded case (``sample_timeout=0``), where something has to stop
+# a sample from waiting forever.
 _MAX_RATE_LIMIT_WAITS = 5
 _RATE_LIMIT_WAIT_CAP_S = 30.0
 
 
-def _rate_limit_wait(exc: BaseException, waits_so_far: int) -> float:
+def _rate_limit_wait(
+    exc: BaseException,
+    waits_so_far: int,
+    *,
+    bounded: bool,
+    remaining: float | None = None,
+) -> float:
     """How long to wait after a 429: the server's ``Retry-After`` if it sent
-    one, else exponential backoff. Clamped so we neither busy-loop nor sleep
-    past a sample's usefulness."""
+    one, else exponential backoff.
+
+    The server's number is honoured rather than clamped to some smaller
+    constant — retrying earlier than it asked just earns another 429 and
+    spends an attempt to learn nothing. But it is never longer than the
+    sample has left (*remaining*): sleeping past your own deadline converts
+    time you could have spent on an attempt into a guaranteed timeout. With
+    no deadline at all, a fixed cap is the only thing standing between a
+    misreported ``Retry-After`` and an unbounded sleep.
+    """
     try:
         retry_after = _parse_retry_after(exc)  # type: ignore[arg-type]
     except Exception:
@@ -459,8 +481,12 @@ def _rate_limit_wait(exc: BaseException, waits_so_far: int) -> float:
         # inside an ``except`` clause, so anything raised here escapes the
         # per-sample handling entirely and aborts every other sample with it.
         retry_after = None
-    wait = retry_after if retry_after is not None else 2 ** (waits_so_far - 1)
-    return max(1.0, min(float(wait), _RATE_LIMIT_WAIT_CAP_S))
+    wait = float(retry_after if retry_after is not None else 2 ** (waits_so_far - 1))
+    if not bounded:
+        return max(1.0, min(wait, _RATE_LIMIT_WAIT_CAP_S))
+    if remaining is not None:
+        wait = min(wait, max(0.0, remaining))
+    return max(0.0, wait)
 
 
 async def _judge_sample(
@@ -471,6 +497,8 @@ async def _judge_sample(
     max_retries: int,
     index: int,
     label: str,
+    bounded: bool,
+    deadline: float | None = None,
 ) -> tuple[float, str, bool]:
     """Run the judge on one prepared prompt. Returns ``(score, reasoning, ok)``.
 
@@ -494,6 +522,7 @@ async def _judge_sample(
     reasoning = ""
     attempt = 0
     rate_limit_waits = 0
+    started = asyncio.get_running_loop().time()
     while True:
         last_attempt = attempt >= max_retries
         try:
@@ -510,14 +539,23 @@ async def _judge_sample(
             if not is_scoring_error(reasoning):
                 return score, reasoning, True
         except RateLimitError as exc:
-            if rate_limit_waits >= _MAX_RATE_LIMIT_WAITS:
+            # Only the unbounded case counts waits — under a deadline, that
+            # deadline decides when to give up.
+            if not bounded and rate_limit_waits >= _MAX_RATE_LIMIT_WAITS:
                 reasoning = f"[Scoring error] {exc}"
                 break
             rate_limit_waits += 1
-            wait = _rate_limit_wait(exc, rate_limit_waits)
+            remaining = (
+                deadline - (asyncio.get_running_loop().time() - started)
+                if deadline is not None
+                else None
+            )
+            wait = _rate_limit_wait(
+                exc, rate_limit_waits, bounded=bounded, remaining=remaining,
+            )
             logger.warning(
-                "%s: sample %d rate-limited (wait %d/%d), sleeping %.1fs",
-                label, index, rate_limit_waits, _MAX_RATE_LIMIT_WAITS, wait,
+                "%s: sample %d rate-limited (wait %d), sleeping %.1fs",
+                label, index, rate_limit_waits, wait,
             )
             await asyncio.sleep(wait)
             continue  # not a failed attempt — don't spend the retry budget
@@ -535,6 +573,50 @@ async def _judge_sample(
     return 0.0, reasoning, False
 
 
+async def _run_inference(
+    runner: ModelRunner,
+    inf_messages: list[dict],
+    *,
+    model: str,
+    response_format: dict[str, Any] | None,
+    tools: list[dict] | None,
+    max_retries: int,
+    index: int,
+) -> Any:
+    """Generate one model_eval response, with the same retry ladder the judge
+    gets.
+
+    The judge owns its retries in :func:`_judge_sample`; without a matching
+    ladder here the generation half of a model_eval sample would be the one
+    unprotected call in the pipeline — scoring clients run with the OpenAI
+    SDK's retry layer switched off (it multiplies the deadline), so a single
+    dropped connection would fail the sample outright with most of the
+    deadline unspent. Bounded by that same deadline, not multiplied by it.
+    """
+    last_exc: Exception | None = None
+    # max(0, ...) so a negative max_retries still makes one attempt, matching
+    # _judge_sample rather than falling out of the loop with nothing to raise.
+    for attempt in range(max(0, max_retries) + 1):
+        try:
+            return await runner.complete(
+                inf_messages,
+                model=model,
+                temperature=0.0,
+                response_format=response_format,
+                tools=tools,
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Inference for sample %d failed (attempt %d/%d): %s",
+                index, attempt + 1, max_retries + 1, exc,
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(2 ** attempt)
+    assert last_exc is not None
+    raise last_exc
+
+
 def _timeout_reasoning(seconds: float) -> str:
     """Reasoning string for a sample that blew its deadline.
 
@@ -542,6 +624,18 @@ def _timeout_reasoning(seconds: float) -> str:
     failure path — excluded from mean/median, counted in ``failed``.
     """
     return f"[Scoring error] sample timed out after {seconds:.0f}s"
+
+
+def _valid_concurrency(concurrency: int) -> int:
+    """At least one slot.
+
+    ``asyncio.Semaphore(0)`` can never be acquired, and the per-sample
+    deadline only starts once a sample holds a slot — so a zero here would
+    hang the whole run forever with no timeout to rescue it. Negative values
+    are clamped the same way rather than raising: a bad concurrency is never
+    worth failing a run over.
+    """
+    return max(1, int(concurrency))
 
 
 def _resolve_sample_timeout(
@@ -647,7 +741,7 @@ async def run_scoring(
     scored = 0
     failed_count = 0
     completed = 0
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(_valid_concurrency(concurrency))
     lock = asyncio.Lock()
     deadline = _resolve_sample_timeout(sample_timeout, run_inference=run_inference)
 
@@ -687,8 +781,10 @@ async def run_scoring(
 
                     # A sample that hung is precisely the one a user chasing a
                     # slow run wants to replay by hand, so it gets a debug
-                    # entry like any other. Only reachable once inference has
-                    # produced something to replay.
+                    # entry like any other — including when inference itself
+                    # is what hung, where model_response is simply null and
+                    # the replay script reproduces the call that never
+                    # answered.
                     if run_inference and ctx is not None:
                         debug_log.append({
                             "sample_index": index,
@@ -727,14 +823,29 @@ async def run_scoring(
             if inference_system_prompt:
                 inf_messages.insert(0, {"role": "system", "content": inference_system_prompt})
 
+            # Published BEFORE the call, not after: if inference is the thing
+            # that hangs, the timeout handler must not fall back to the
+            # original conversation, which still carries the gold assistant
+            # turn and would be recorded as though the model had produced it.
+            # Until inference answers, what is on the table is the unlabelled
+            # prompt and nothing else.
+            judged[index] = {
+                "scored_messages": unlabelled,
+                "inf_messages": inf_messages,
+                "assistant_content": None,
+                "original_messages": original_messages,
+            }
+
             runner = inference_runner or APIModelRunner(client)
             try:
-                inf_response = await runner.complete(
+                inf_response = await _run_inference(
+                    runner,
                     inf_messages,
                     model=inference_model or "orchestration",
-                    temperature=0.0,
                     response_format=inference_response_format,
                     tools=sample_tools,
+                    max_retries=max_retries,
+                    index=index,
                 )
                 assistant_content = inf_response.content
                 scored_messages = unlabelled + [{"role": "assistant", "content": assistant_content}]
@@ -765,6 +876,7 @@ async def run_scoring(
         score, reasoning, success = await _judge_sample(
             client, scoring_model, scoring_prompt,
             max_retries=max_retries, index=index, label="run_scoring",
+            bounded=deadline is not None, deadline=deadline,
         )
 
         async with lock:
@@ -870,6 +982,11 @@ async def run_scoring(
 
     summary["scoring_model"] = scoring_model
     summary["scoring_model_size"] = model_size
+    # Optional key — absent on healthy runs and on files written before this
+    # existed, so readers must treat it as such.
+    run_warning = failure_warning(failed_count, total)
+    if run_warning:
+        summary["failure_warning"] = run_warning.strip()
     if run_inference:
         summary["inference_model"] = inference_model or "orchestration"
         if inference_system_prompt:
@@ -1114,16 +1231,41 @@ async def score_predictions_by_source(
     if not all_labels:
         all_labels = {"all"}
 
+    # How many predictions each source actually contributed, so a source that
+    # was scored on 3 of its 100 rows is distinguishable from one scored on
+    # all 100. Without this the macro-average weights them identically and a
+    # badly thinned source silently carries the same vote as a complete one.
+    attempted_by_label: dict[str, int] = {}
+    for sample_idx in src_by_idx:
+        attempted_by_label[src_by_idx[sample_idx]] = (
+            attempted_by_label.get(src_by_idx[sample_idx], 0) + 1
+        )
+    if not src_by_idx:
+        attempted_by_label = {"all": result.total}
+
     per_source: dict[str, Any] = {}
     per_source_means: list[float] = []
     per_source_medians: list[float] = []
+    thinned: list[str] = []
     for label in sorted(all_labels):
         scores_list = grouped.get(label, [])
         stats = _score_stats(scores_list)
+        attempted = attempted_by_label.get(label, len(scores_list))
         per_source[label] = {
             "num_scored": len(scores_list),
+            "num_attempted": attempted,
+            "num_failed": max(0, attempted - len(scores_list)),
             "scores": stats,
         }
+        # A global 10% threshold can't see one small source losing most of its
+        # rows, so each source is checked on its own too — but only once it is
+        # big enough for a share to mean anything. Below the floor a single
+        # transient error clears 10% on its own, and this string rides all the
+        # way out to every sweep row.
+        if attempted >= _THINNING_MIN_SOURCE and failure_warning(
+            attempted - len(scores_list), attempted
+        ):
+            thinned.append(f"{label} ({len(scores_list)}/{attempted})")
         if scores_list:
             per_source_means.append(stats["mean"])
             per_source_medians.append(stats["median"])
@@ -1161,8 +1303,18 @@ async def score_predictions_by_source(
     # runs). Present so a sweep comparing configs can see that one of the
     # means was taken over a badly thinned sample set.
     warning = failure_warning(result.failed, result.total)
+    if thinned and not warning:
+        # The run as a whole looks fine, but at least one source doesn't.
+        warning = (
+            "  ⚠️  Some sources were scored on only part of their predictions; "
+            "their per-source means carry the same weight in the macro-average "
+            "as fully scored ones."
+        )
     if warning:
+        if thinned:
+            warning = f"{warning.strip()} Thinned sources: {', '.join(thinned)}."
         payload["failure_warning"] = warning.strip()
+        logger.warning("score_predictions_by_source: %s", warning.strip())
     (output_dir / "eval_result.json").write_text(
         json.dumps(payload, indent=2) + "\n", encoding="utf-8"
     )
@@ -1229,7 +1381,7 @@ async def run_data_scoring(
     scored = 0
     failed_count = 0
     completed = 0
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(_valid_concurrency(concurrency))
     lock = asyncio.Lock()
     deadline = _resolve_sample_timeout(sample_timeout)
 
@@ -1267,6 +1419,7 @@ async def run_data_scoring(
         score, reasoning, success = await _judge_sample(
             client, scoring_model, scoring_prompt,
             max_retries=max_retries, index=index, label="run_data_scoring",
+            bounded=deadline is not None, deadline=deadline,
         )
 
         async with lock:
@@ -1430,7 +1583,7 @@ async def run_data_filter(
     scored = 0
     failed_count = 0
     completed = 0
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(_valid_concurrency(concurrency))
     lock = asyncio.Lock()
     deadline = _resolve_sample_timeout(sample_timeout)
 
@@ -1468,6 +1621,7 @@ async def run_data_filter(
         score, reasoning, success = await _judge_sample(
             client, scoring_model, scoring_prompt,
             max_retries=max_retries, index=index, label="run_data_filter",
+            bounded=deadline is not None, deadline=deadline,
         )
 
         async with lock:
