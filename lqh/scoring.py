@@ -582,9 +582,11 @@ async def _run_inference(
     tools: list[dict] | None,
     max_retries: int,
     index: int,
+    bounded: bool,
+    deadline: float | None = None,
 ) -> Any:
     """Generate one model_eval response, with the same retry ladder the judge
-    gets.
+    gets — rate-limit handling included.
 
     The judge owns its retries in :func:`_judge_sample`; without a matching
     ladder here the generation half of a model_eval sample would be the one
@@ -592,11 +594,20 @@ async def _run_inference(
     SDK's retry layer switched off (it multiplies the deadline), so a single
     dropped connection would fail the sample outright with most of the
     deadline unspent. Bounded by that same deadline, not multiplied by it.
+
+    429s take the same branch they take on the judge side: honour
+    ``Retry-After``, don't spend an attempt. Treating them as ordinary
+    failures here would undo the judge-side fix for any model_eval run, since
+    a rate-limit burst hits generation first.
     """
     last_exc: Exception | None = None
+    started = asyncio.get_running_loop().time()
+    rate_limit_waits = 0
+    attempt = 0
     # max(0, ...) so a negative max_retries still makes one attempt, matching
     # _judge_sample rather than falling out of the loop with nothing to raise.
-    for attempt in range(max(0, max_retries) + 1):
+    max_attempts = max(0, max_retries) + 1
+    while attempt < max_attempts:
         try:
             return await runner.complete(
                 inf_messages,
@@ -605,15 +616,37 @@ async def _run_inference(
                 response_format=response_format,
                 tools=tools,
             )
+        except RateLimitError as exc:
+            last_exc = exc
+            if not bounded and rate_limit_waits >= _MAX_RATE_LIMIT_WAITS:
+                break
+            rate_limit_waits += 1
+            remaining = (
+                deadline - (asyncio.get_running_loop().time() - started)
+                if deadline is not None
+                else None
+            )
+            wait = _rate_limit_wait(
+                exc, rate_limit_waits, bounded=bounded, remaining=remaining,
+            )
+            logger.warning(
+                "Inference for sample %d rate-limited (wait %d), sleeping %.1fs",
+                index, rate_limit_waits, wait,
+            )
+            await asyncio.sleep(wait)
+            continue  # not a failed attempt — don't spend the retry budget
         except Exception as exc:
             last_exc = exc
             logger.warning(
                 "Inference for sample %d failed (attempt %d/%d): %s",
-                index, attempt + 1, max_retries + 1, exc,
+                index, attempt + 1, max_attempts, exc,
             )
-            if attempt < max_retries:
+            if attempt < max_attempts - 1:
                 await asyncio.sleep(2 ** attempt)
-    assert last_exc is not None
+        attempt += 1
+    if last_exc is None:
+        # Only reachable if max_attempts was 0, which max(0, ...) prevents.
+        raise RuntimeError("inference made no attempts")
     raise last_exc
 
 
@@ -624,6 +657,24 @@ def _timeout_reasoning(seconds: float) -> str:
     failure path — excluded from mean/median, counted in ``failed``.
     """
     return f"[Scoring error] sample timed out after {seconds:.0f}s"
+
+
+# Interrupted runs write here instead of over the real artifact names. Callers
+# gate on the existence of results.parquet / summary.json — the DPO watcher
+# skips held-out scoring for any iteration that already has a summary.json, and
+# that mean feeds best-checkpoint selection — so a partial file under the real
+# name would pin an iteration to a score computed over a handful of samples,
+# forever. Under these names an interrupted run correctly looks unscored, and
+# the work already paid for is still on disk to salvage.
+PARTIAL_SUFFIX = ".partial"
+
+
+def _results_name(partial: bool) -> str:
+    return f"results{PARTIAL_SUFFIX}.parquet" if partial else "results.parquet"
+
+
+def _summary_name(partial: bool) -> str:
+    return f"summary{PARTIAL_SUFFIX}.json" if partial else "summary.json"
 
 
 def _valid_concurrency(concurrency: int) -> int:
@@ -737,6 +788,12 @@ async def run_scoring(
     # evidence you want kept when the judge is the thing that timed out — both
     # for the results row and for the debug replay script.
     judged: list[dict[str, Any] | None] = [None] * total
+    # Set once the run stops accepting results, so a sample that outlives its
+    # cancellation cannot write into a run that has already been serialized.
+    # Same guard engine.py uses. Today the write path below contains no await,
+    # so no task can interleave with it anyway — this keeps that safe if one
+    # is ever added.
+    closed = False
     debug_log: list[dict[str, Any]] = []  # low-scoring samples for debugging
     scored = 0
     failed_count = 0
@@ -760,8 +817,8 @@ async def run_scoring(
                     "Scoring timed out for sample %d after %ss", index, deadline,
                 )
                 async with lock:
-                    if recorded[index]:
-                        return  # the body counted it before the deadline landed
+                    if closed or recorded[index]:
+                        return  # run already serialized, or body already counted
                     recorded[index] = True
                     ctx = judged[index]
                     reasoning = _timeout_reasoning(deadline or 0.0)
@@ -809,7 +866,20 @@ async def run_scoring(
             unlabelled = _strip_trailing_assistant(messages)
             if not unlabelled:
                 async with lock:
+                    if closed:
+                        return
                     recorded[index] = True
+                    # A row like every other failure mode, so results.parquet
+                    # always has one row per sample.
+                    results[index] = {
+                        "sample_index": index,
+                        "messages": json.dumps(messages, ensure_ascii=False),
+                        "score": 0.0,
+                        "reasoning": (
+                            "[Scoring error] nothing to infer from: the sample "
+                            "has no non-assistant turns"
+                        ),
+                    }
                     failed_count += 1
                     completed += 1
                     if on_progress:
@@ -846,17 +916,43 @@ async def run_scoring(
                     tools=sample_tools,
                     max_retries=max_retries,
                     index=index,
+                    bounded=deadline is not None,
+                    deadline=deadline,
                 )
                 assistant_content = inf_response.content
                 scored_messages = unlabelled + [{"role": "assistant", "content": assistant_content}]
             except Exception as exc:
                 logger.error("Inference failed for sample %d: %s", index, exc)
                 async with lock:
+                    if closed:
+                        return
                     recorded[index] = True
+                    # A row, like every other failure mode. Without one this
+                    # sample is counted in `failed` but absent from
+                    # results.parquet, so the file silently has fewer rows
+                    # than the run had samples and the failure is invisible to
+                    # anything reading the artifact.
+                    reasoning = f"[Scoring error] inference failed: {exc}"
+                    results[index] = {
+                        "sample_index": index,
+                        "messages": json.dumps(unlabelled, ensure_ascii=False),
+                        "score": 0.0,
+                        "reasoning": reasoning,
+                    }
                     failed_count += 1
                     completed += 1
                     if on_progress:
                         on_progress(completed, total)
+                    if debug:
+                        debug_log.append({
+                            "sample_index": index,
+                            "score": 0.0,
+                            "reasoning": reasoning,
+                            "inference_model": inference_model or "orchestration",
+                            "inference_messages_sent": inf_messages,
+                            "model_response": None,
+                            "reference_messages": original_messages,
+                        })
                 return
 
         # Score the sample
@@ -880,6 +976,8 @@ async def run_scoring(
         )
 
         async with lock:
+            if closed:
+                return
             recorded[index] = True
             final_score = score if success else 0.0
             results[index] = {
@@ -913,7 +1011,41 @@ async def run_scoring(
         asyncio.create_task(_score_one(i, sample, tools_per_sample[i]))
         for i, sample in enumerate(samples)
     ]
-    await asyncio.gather(*tasks)
+    cancellation: BaseException | None = None
+    try:
+        await asyncio.gather(*tasks)
+    except (asyncio.CancelledError, KeyboardInterrupt) as exc:
+        # Ctrl-C at 199/200 used to throw away all 199 finished scores and the
+        # money spent on them, because nothing is written until every task has
+        # returned. The scores are already in hand, so they go to disk on the
+        # way out — but under PARTIAL_SUFFIX names, never the real ones.
+        #
+        # That naming is load-bearing, not cosmetic. Callers gate on the
+        # existence of results.parquet / summary.json: the DPO watcher skips
+        # held-out scoring for any iteration whose summary.json exists, and
+        # the resulting mean feeds best-checkpoint selection. A partial file
+        # under the real name would permanently pin that iteration to a score
+        # computed over a handful of samples — worse than the data loss this
+        # is meant to fix. Under a partial name the run simply looks unscored,
+        # which it is, and the scores are still there for a human to salvage.
+        #
+        # Covers cancellation, not process death; durable incremental writes
+        # with a resume path are separate work.
+        #
+        # run_data_scoring and run_data_filter deliberately do NOT do this.
+        # Their output is a dataset, not a report: a partial filtered
+        # data.parquet is a poisoned training input with no marker inside the
+        # file, and handlers read their summary.json for kept/total
+        # provenance. Losing an interrupted filter run is the safe outcome
+        # there; losing an interrupted eval is not.
+        cancellation = exc
+        closed = True
+        for task in tasks:
+            task.cancel()
+        logger.warning(
+            "run_scoring interrupted: writing the %d/%d samples already scored "
+            "to %s (partial artifacts)", completed, total, output_dir,
+        )
 
     # Build output. Aggregate over every successfully judged sample — a score
     # of 0 is a valid grade, not a failure. Only parse/API errors (which carry
@@ -956,7 +1088,7 @@ async def run_scoring(
             ]),
         )
 
-    pq.write_table(table, output_dir / "results.parquet")
+    pq.write_table(table, output_dir / _results_name(cancellation is not None))
 
     # Write summary.json
     std_score = 0.0
@@ -987,12 +1119,17 @@ async def run_scoring(
     run_warning = failure_warning(failed_count, total)
     if run_warning:
         summary["failure_warning"] = run_warning.strip()
+    if cancellation is not None:
+        # Belt and braces on top of the partial filename: num_samples is the
+        # run that was asked for, and only these say how much of it ran.
+        summary["interrupted"] = True
+        summary["num_completed"] = completed
     if run_inference:
         summary["inference_model"] = inference_model or "orchestration"
         if inference_system_prompt:
             summary["inference_system_prompt"] = inference_system_prompt
 
-    (output_dir / "summary.json").write_text(
+    (output_dir / _summary_name(cancellation is not None)).write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
 
@@ -1045,6 +1182,16 @@ async def run_scoring(
     warning = failure_warning(failed_count, total)
     if warning:
         logger.warning("run_scoring: %s", warning.strip())
+
+    if cancellation is not None:
+        # The artifacts are on disk now; the cancellation still has to happen.
+        # Swallowing it would turn Ctrl-C into "returned a partial result as
+        # though it were the whole run". The ORIGINAL exception is re-raised,
+        # not a fresh CancelledError: a KeyboardInterrupt that arrives here
+        # must stay a KeyboardInterrupt, or the CLI's `except KeyboardInterrupt`
+        # handlers stop matching and Ctrl-C prints a traceback instead of
+        # exiting cleanly.
+        raise cancellation
 
     return ScoringResult(
         total=total,

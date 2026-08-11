@@ -6529,12 +6529,26 @@ def _format_dpo_iter_stats(iterations_dir: Path) -> list[str]:
                 pairs_total = stats.get("pairs_with_both_scored") or stats.get("total_predictions")
                 if kept is not None and pairs_total:
                     kept_str = f"{kept}/{pairs_total} pairs"
+                    # `kept` is the pre-generation selection. What actually
+                    # reaches training is pairs_written, which is smaller
+                    # whenever golden generation dropped a response or a pair
+                    # was identical/duplicate. Showing only `kept` overstates
+                    # the training set.
+                    written = stats.get("pairs_written")
+                    if isinstance(written, int) and written != kept:
+                        kept_str += f" → {written} written"
                 gp50 = stats.get("qualifying_gap_p50") or stats.get("gap_p50")
                 gp90 = stats.get("qualifying_gap_p90") or stats.get("gap_p90")
                 if gp50 is not None and gp90 is not None:
                     gap_str = f"gap p50={gp50:.1f}, p90={gp90:.1f}"
                 if stats.get("skipped_reason"):
                     gap_str = (gap_str + " ⚠️ skipped: " + stats["skipped_reason"]).strip()
+                missing = stats.get("golden_missing")
+                if isinstance(missing, int) and missing > 0:
+                    gap_str = (
+                        gap_str
+                        + f" ⚠️ {missing} golden response(s) missing"
+                    ).strip()
             except (json.JSONDecodeError, OSError):
                 pass
         # Held-out eval

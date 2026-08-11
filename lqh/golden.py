@@ -383,6 +383,33 @@ async def generate_golden(
             low_indices, dataset_path
         )
 
+    # How many of the selected samples actually got a golden response. A
+    # dropped one (judge error, timeout, empty content) simply vanishes from
+    # the map, so without this the shortfall is invisible: stats["kept"] keeps
+    # reporting the pre-generation selection while the pipeline quietly trains
+    # on fewer pairs.
+    stats["golden_attempted"] = len(low_indices)
+    stats["golden_generated"] = len(golden_responses)
+    stats["golden_missing"] = len(low_indices) - len(golden_responses)
+    if stats["golden_missing"]:
+        from lqh.scoring import FAILURE_WARN_FRACTION
+
+        logger.warning(
+            "Golden generation produced %d of %d responses (%d missing)",
+            len(golden_responses), len(low_indices), stats["golden_missing"],
+        )
+        # Golden-specific prose. The judge-side failure_warning() talks about
+        # scores and scorers; nothing was being scored here, and there are no
+        # scores for a reader to treat as provisional.
+        share = stats["golden_missing"] / max(1, len(low_indices))
+        if share > FAILURE_WARN_FRACTION:
+            stats["golden_warning"] = (
+                f"{stats['golden_missing']}/{len(low_indices)} selected samples "
+                f"({share:.0%}) got no golden response — the preference set is "
+                "that much smaller than the selection. Usually the golden model "
+                "or API access, not the data."
+            )
+
     # Write golden.parquet
     golden_entries = []
     for idx, response in golden_responses.items():
@@ -445,6 +472,35 @@ async def generate_golden(
     stats["identical_pairs_excluded"] = identical_pairs
     stats["duplicate_pairs_excluded"] = duplicate_pairs
     stats["pairs_written"] = len(pref_entries)
+
+    # KNOWN GAP, deliberately not closed here. The min-pairs floor is applied
+    # before generation, on the selection; pairs are lost after it too (a
+    # dropped golden response, an identical or duplicate pair), so a selection
+    # of 52 can become 4 written pairs and DPO will train on 4 — it only stops
+    # on an *empty* file.
+    #
+    # Enforcing the floor again here is not the fix it looks like. The
+    # selector pins its target AT the floor (target = max(min_pairs_per_iter,
+    # quantile * qualifying)), so in the common configuration `kept` equals
+    # the floor exactly and a single duplicate would trip a re-check — and
+    # duplicates are routine, since rollouts are greedy and repeat-weighted
+    # sources reproduce a prompt. Worse, the only "skip" signal available is
+    # an empty preferences file, which dpo.py treats as convergence and uses
+    # to END THE RUN. Trading "trained one iter on 4 pairs" for "stopped the
+    # run at iteration 1 and called it converged" is not an improvement, and
+    # picking the tolerance is a training-policy decision.
+    #
+    # What this function does instead is make the shortfall impossible to
+    # miss: golden_attempted/generated/missing above, golden_warning, a log
+    # line, and `kept → N written` in the DPO status block.
+    if 0 < len(pref_entries) < stats.get("kept", 0):
+        logger.warning(
+            "Preference assembly kept %d of %d selected pairs "
+            "(golden_missing=%s, identical=%d, duplicate=%d)",
+            len(pref_entries), stats.get("kept"), stats.get("golden_missing"),
+            identical_pairs, duplicate_pairs,
+        )
+
     (output_dir / "preference_stats.json").write_text(
         json.dumps(stats, indent=2) + "\n"
     )

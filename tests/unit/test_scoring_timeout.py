@@ -31,6 +31,7 @@ from openai import APIConnectionError, RateLimitError
 from lqh.runner import RunnerResponse
 from lqh.scoring import (
     DEFAULT_MAX_RETRIES,
+    PARTIAL_SUFFIX,
     _RATE_LIMIT_WAIT_CAP_S,
     _rate_limit_wait,
     FAILURE_WARN_FRACTION,
@@ -1149,3 +1150,364 @@ class TestWipedSourceIsAlwaysReported:
         assert "no usable scores at all" in warning
         assert "scored on only part" not in warning
         assert "Thinned sources" not in warning
+
+
+class TestInterruptDurability:
+    """Ctrl-C at 199/200 used to discard all 199 finished scores and the money
+    spent on them, because nothing is written until every task returns."""
+
+    async def test_cancellation_writes_the_scores_already_paid_for(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet,
+    ) -> None:
+        dataset = write_chatml_parquet(
+            tmp_path / "data.parquet", [CONVERSATION], num=6,
+        )
+        out = tmp_path / "out"
+
+        two_done = asyncio.Event()
+        gate = asyncio.Event()
+        response = MagicMock()
+        response.choices = [
+            MagicMock(message=MagicMock(content='{"reasoning": "ok", "score": 7}'))
+        ]
+        calls = {"n": 0}
+
+        async def _create(**_kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] > 2:
+                await gate.wait()  # never released — these stay in flight
+            return response
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+
+        # Deterministic: fire exactly when the run has RECORDED two samples,
+        # rather than on a call count plus a sleep.
+        def _on_progress(completed: int, _total: int) -> None:
+            if completed >= 2:
+                two_done.set()
+
+        task = asyncio.create_task(
+            run_scoring(
+                dataset_path=dataset,
+                scorer_path=scorer,
+                output_dir=out,
+                client=client,
+                concurrency=6,
+                on_progress=_on_progress,
+            )
+        )
+        await asyncio.wait_for(two_done.wait(), timeout=10)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The finished work survived — under PARTIAL names, so nothing that
+        # gates on results.parquet/summary.json existing mistakes this for a
+        # scored run. (The DPO watcher skips held-out scoring for any iter
+        # that already has a summary.json, and that mean picks a checkpoint.)
+        assert not (out / "results.parquet").exists()
+        assert not (out / "summary.json").exists()
+        table = pq.read_table(out / f"results{PARTIAL_SUFFIX}.parquet")
+        assert len(table) == 2
+        summary = json.loads((out / f"summary{PARTIAL_SUFFIX}.json").read_text())
+        assert summary["interrupted"] is True
+        assert summary["num_samples"] == 6
+        assert summary["num_completed"] == 2
+
+    async def test_keyboard_interrupt_stays_a_keyboard_interrupt(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet, monkeypatch,
+    ) -> None:
+        """Minting a fresh CancelledError instead of re-raising the original
+        would break every `except KeyboardInterrupt` in the CLI: Ctrl-C would
+        print a traceback instead of exiting cleanly."""
+        import lqh.scoring as scoring_mod
+
+        dataset = write_chatml_parquet(
+            tmp_path / "data.parquet", [CONVERSATION], num=2,
+        )
+        out = tmp_path / "out"
+        real_gather = asyncio.gather
+
+        async def _gather(*aws: Any, **kw: Any) -> Any:
+            await real_gather(*aws, **kw)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(scoring_mod.asyncio, "gather", _gather)
+
+        with pytest.raises(KeyboardInterrupt):
+            await run_scoring(
+                dataset_path=dataset,
+                scorer_path=scorer,
+                output_dir=out,
+                client=_judge_client(),
+            )
+
+        assert not (out / "summary.json").exists()
+        summary = json.loads((out / f"summary{PARTIAL_SUFFIX}.json").read_text())
+        assert summary["interrupted"] is True
+
+    async def test_uninterrupted_run_says_nothing_about_interruption(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet,
+    ) -> None:
+        dataset = write_chatml_parquet(tmp_path / "data.parquet", [CONVERSATION])
+        await run_scoring(
+            dataset_path=dataset,
+            scorer_path=scorer,
+            output_dir=tmp_path / "out",
+            client=_judge_client(),
+        )
+        summary = json.loads((tmp_path / "out" / "summary.json").read_text())
+        assert "interrupted" not in summary
+
+
+class TestInferenceRateLimits:
+    async def test_inference_429_does_not_spend_the_retry_budget(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet, monkeypatch,
+    ) -> None:
+        """A rate-limit burst hits generation before the judge, so treating
+        429 as an ordinary failure here would undo the judge-side fix for
+        every model_eval run."""
+        monkeypatch.setattr("lqh.scoring._rate_limit_wait", lambda *a, **kw: 0.01)
+        dataset = write_chatml_parquet(tmp_path / "data.parquet", [CONVERSATION])
+
+        calls = {"n": 0}
+
+        async def _complete(*_args: Any, **_kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] <= 3:  # more 429s than the ladder has attempts
+                raise RateLimitError(
+                    "rate limited",
+                    response=httpx.Response(
+                        429, request=httpx.Request("POST", "http://x")
+                    ),
+                    body=None,
+                )
+            return RunnerResponse(content="ANSWER", model="m", usage=None)
+
+        runner = MagicMock()
+        runner.complete = AsyncMock(side_effect=_complete)
+
+        result = await run_scoring(
+            dataset_path=dataset,
+            scorer_path=scorer,
+            output_dir=tmp_path / "out",
+            client=_judge_client(),
+            run_inference=True,
+            inference_model="m",
+            inference_runner=runner,
+        )
+
+        assert result.scored == 1
+        assert calls["n"] == 4
+
+    async def test_failed_inference_still_gets_a_row(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet,
+    ) -> None:
+        """Counted in `failed` but absent from results.parquet meant the file
+        silently had fewer rows than the run had samples."""
+        dataset = write_chatml_parquet(
+            tmp_path / "data.parquet", [CONVERSATION], num=2,
+        )
+        runner = MagicMock()
+        runner.complete = AsyncMock(side_effect=RuntimeError("generation broke"))
+
+        result = await run_scoring(
+            dataset_path=dataset,
+            scorer_path=scorer,
+            output_dir=tmp_path / "out",
+            client=_judge_client(),
+            run_inference=True,
+            inference_model="m",
+            inference_runner=runner,
+            debug=True,
+        )
+
+        assert result.failed == 2
+        table = pq.read_table(tmp_path / "out" / "results.parquet")
+        assert len(table) == 2, "one row per sample, whatever the failure mode"
+        for reasoning in table.column("reasoning").to_pylist():
+            assert is_scoring_error(reasoning)
+            assert "inference failed" in reasoning
+        # And it is replayable, like every other model_eval failure.
+        assert (tmp_path / "out" / "debug_low_scores.jsonl").exists()
+
+
+class TestGoldenShortfallIsReported:
+    """A dropped golden response vanishes from the map, so without counts the
+    shortfall is invisible and `kept` keeps reporting the pre-generation
+    selection while training gets fewer pairs."""
+
+    async def test_stats_record_attempted_generated_and_missing(
+        self, tmp_path: Path,
+    ) -> None:
+        import pyarrow as pa
+
+        from lqh.golden import generate_golden
+
+        out = tmp_path / "iter"
+        out.mkdir()
+        n = 4
+        pq.write_table(
+            pa.table({
+                "sample_index": list(range(n)),
+                "messages": [
+                    json.dumps([
+                        {"role": "user", "content": f"p{i}"},
+                        {"role": "assistant", "content": f"rejected {i}"},
+                    ])
+                    for i in range(n)
+                ],
+            }),
+            out / "predictions.parquet",
+        )
+        pq.write_table(
+            pa.table({
+                "sample_index": list(range(n)),
+                "score": [1.0] * n,
+                "reasoning": ["bad"] * n,
+            }),
+            out / "results.parquet",
+        )
+
+        # The API answers for the first two selected samples and fails after.
+        calls = {"n": 0}
+
+        async def _create(**_kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] > 2:
+                raise RuntimeError("golden model down")
+            response = MagicMock()
+            response.choices = [MagicMock(message=MagicMock(content="GOLDEN"))]
+            return response
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+
+        await generate_golden(
+            predictions_path=out / "predictions.parquet",
+            scores_path=out / "results.parquet",
+            dataset_path=str(tmp_path / "unused.parquet"),
+            config={
+                "golden_source": "api",
+                "golden_model": "orchestration",
+                "rejection_threshold": 6.0,
+            },
+            client=client,
+            output_dir=out,
+        )
+
+        stats = json.loads((out / "preference_stats.json").read_text())
+        assert stats["kept"] == n            # pre-generation selection
+        assert stats["golden_attempted"] == n
+        assert stats["golden_generated"] == 2
+        assert stats["golden_missing"] == 2
+        # What actually reaches training is smaller than `kept`, and the
+        # artifact now says so rather than leaving the gap to be inferred.
+        assert stats["pairs_written"] == 2
+        assert "golden_warning" in stats
+
+    def test_status_shows_written_pairs_not_just_kept(self, tmp_path: Path) -> None:
+        """`kept` is the selection; `pairs_written` is what training sees."""
+        from lqh.tools.handlers import _format_dpo_iter_stats
+
+        run_dir = tmp_path / "run"
+        iter_dir = run_dir / "iter_1"
+        iter_dir.mkdir(parents=True)
+        (iter_dir / "preference_stats.json").write_text(
+            json.dumps({
+                "kept": 2,
+                "pairs_with_both_scored": 10,
+                "pairs_written": 1,
+                "golden_missing": 1,
+            })
+        )
+
+        lines = _format_dpo_iter_stats(run_dir)
+        blob = "\n".join(lines)
+        assert "→ 1 written" in blob
+        assert "golden response(s) missing" in blob
+
+
+class TestPostAssemblyShortfallIsVisible:
+    """Pairs are lost after the min-pairs floor is applied (dropped golden
+    responses, identical/duplicate pairs), so what trains can be smaller than
+    what was selected. Re-enforcing the floor here would end the run — dpo.py
+    reads an empty preferences file as convergence — so the shortfall is
+    reported loudly instead."""
+
+    async def test_shortfall_is_recorded_but_does_not_end_the_run(
+        self, tmp_path: Path,
+    ) -> None:
+        import pyarrow as pa
+
+        from lqh.golden import generate_golden
+
+        out = tmp_path / "iter"
+        out.mkdir()
+        n = 6
+        pq.write_table(
+            pa.table({
+                "sample_index": list(range(n)),
+                "messages": [
+                    json.dumps([
+                        {"role": "user", "content": f"p{i}"},
+                        {"role": "assistant", "content": f"rejected {i}"},
+                    ])
+                    for i in range(n)
+                ],
+            }),
+            out / "predictions.parquet",
+        )
+        pq.write_table(
+            pa.table({
+                "sample_index": list(range(n)),
+                "score": [1.0] * n,
+                "reasoning": ["bad"] * n,
+            }),
+            out / "results.parquet",
+        )
+
+        calls = {"n": 0}
+
+        async def _create(**_kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] > 2:  # only 2 of 6 golden responses survive
+                raise RuntimeError("golden model down")
+            response = MagicMock()
+            response.choices = [
+                MagicMock(message=MagicMock(content=f"GOLDEN {calls['n']}"))
+            ]
+            return response
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+
+        await generate_golden(
+            predictions_path=out / "predictions.parquet",
+            scores_path=out / "results.parquet",
+            dataset_path=str(tmp_path / "unused.parquet"),
+            config={
+                "golden_source": "api",
+                "golden_model": "orchestration",
+                "selection": {
+                    "min_pairs_per_iter": 5,
+                    "top_quantile": 1.0,
+                    "min_gap": 0.5,
+                },
+            },
+            client=client,
+            output_dir=out,
+            chosen_scores=[9.0] * n,
+        )
+
+        stats = json.loads((out / "preference_stats.json").read_text())
+        assert stats["kept"] == n
+        assert stats["golden_missing"] == 4
+        assert stats["pairs_written"] == 2
+        assert "golden_warning" in stats
+        # NOT skipped: an empty preferences file would stop the whole DPO run
+        # and record it as converged, which is worse than a thin iteration.
+        assert "skipped_reason" not in stats
+        assert pq.read_table(out / "preferences.parquet").num_rows == 2
