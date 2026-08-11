@@ -18,6 +18,14 @@ from openai import AsyncOpenAI
 
 from lqh.client import chat_with_retry
 
+# Per-sample bound for API golden generation. The backend caps one upstream
+# call at 270s (LQH_UPSTREAM_BUDGET), so this is that plus slack, covering the
+# whole sample including its retries. Golden generation waits on every task,
+# so without this a single wedged sample stalls the pass — the straggler
+# problem feedback #44 was filed about.
+_GOLDEN_TIMEOUT_S = 300.0
+_GOLDEN_MAX_RETRIES = 1
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["generate_golden", "load_or_score_chosen_scores"]
@@ -508,21 +516,35 @@ async def _golden_from_api(
 
         async with semaphore:
             try:
-                # chat_with_retry, not a bare create: this path drops a sample
-                # on any exception, and the clients it is handed come from the
-                # scoring callers, which run with the OpenAI SDK's retry layer
-                # switched off. Without a ladder of its own a single transient
-                # 502 would silently cost a golden response.
-                response = await chat_with_retry(
-                    client,
-                    max_retries=2,
-                    model=model,
-                    messages=prompt,
-                    temperature=0.0,
-                )
+                # The deadline starts here, after the semaphore, and covers the
+                # retries rather than being multiplied by them — the same shape
+                # lqh.scoring uses, and for the same reason: the gather below
+                # waits for every task, so an unbounded ladder here would let
+                # one wedged sample hold up the whole golden pass.
+                async with asyncio.timeout(_GOLDEN_TIMEOUT_S):
+                    # chat_with_retry, not a bare create: this path drops a
+                    # sample on any exception, and the clients it is handed
+                    # come from the scoring callers, which run with the OpenAI
+                    # SDK's retry layer switched off. Without a ladder of its
+                    # own a single transient 502 silently costs a golden
+                    # response. A fast failure gets a real second attempt; a
+                    # sample that burned the deadline does not, which is the
+                    # intended trade.
+                    response = await chat_with_retry(
+                        client,
+                        max_retries=_GOLDEN_MAX_RETRIES,
+                        model=model,
+                        messages=prompt,
+                        temperature=0.0,
+                    )
                 content = response.choices[0].message.content
                 if content:
                     result[idx] = content
+            except TimeoutError:
+                logger.warning(
+                    "Golden generation for sample %d timed out after %ss",
+                    idx, _GOLDEN_TIMEOUT_S,
+                )
             except Exception:
                 logger.warning("Failed to generate golden for sample %d", idx)
 

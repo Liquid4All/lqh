@@ -1247,6 +1247,7 @@ async def score_predictions_by_source(
     per_source_means: list[float] = []
     per_source_medians: list[float] = []
     thinned: list[str] = []
+    wiped: list[str] = []
     for label in sorted(all_labels):
         scores_list = grouped.get(label, [])
         stats = _score_stats(scores_list)
@@ -1262,7 +1263,14 @@ async def score_predictions_by_source(
         # big enough for a share to mean anything. Below the floor a single
         # transient error clears 10% on its own, and this string rides all the
         # way out to every sweep row.
-        if attempted >= _THINNING_MIN_SOURCE and failure_warning(
+        #
+        # A source that lost EVERYTHING bypasses the floor: it contributes no
+        # mean at all, so it silently drops out of the macro-average and the
+        # headline is computed over the survivors. Size has nothing to do with
+        # whether that is worth saying.
+        if attempted > 0 and not scores_list:
+            wiped.append(f"{label} (0/{attempted})")
+        elif attempted >= _THINNING_MIN_SOURCE and failure_warning(
             attempted - len(scores_list), attempted
         ):
             thinned.append(f"{label} ({len(scores_list)}/{attempted})")
@@ -1303,18 +1311,35 @@ async def score_predictions_by_source(
     # runs). Present so a sweep comparing configs can see that one of the
     # means was taken over a badly thinned sample set.
     warning = failure_warning(result.failed, result.total)
-    if thinned and not warning:
-        # The run as a whole looks fine, but at least one source doesn't.
+    if (thinned or wiped) and not warning:
+        # The run as a whole looks fine, but at least one source doesn't. A
+        # wiped-only run must not get the thinning sentence: that source was
+        # scored on NONE of its predictions and carries NO weight in the
+        # macro-average, which is the opposite of what thinning prose says.
         warning = (
-            "  ⚠️  Some sources were scored on only part of their predictions; "
-            "their per-source means carry the same weight in the macro-average "
-            "as fully scored ones."
+            "  ⚠️  Some sources produced no usable scores at all."
+            if wiped and not thinned
+            else (
+                "  ⚠️  Some sources were scored on only part of their "
+                "predictions; their per-source means carry the same weight in "
+                "the macro-average as fully scored ones."
+            )
         )
     if warning:
+        parts = [warning.strip()]
+        if wiped:
+            # Stronger than thinning: these contribute no mean, so they drop
+            # out of the macro-average entirely and the headline is computed
+            # over the survivors alone.
+            parts.append(
+                "Sources with NO usable scores, excluded from the headline: "
+                f"{', '.join(wiped)}."
+            )
         if thinned:
-            warning = f"{warning.strip()} Thinned sources: {', '.join(thinned)}."
-        payload["failure_warning"] = warning.strip()
-        logger.warning("score_predictions_by_source: %s", warning.strip())
+            parts.append(f"Thinned sources: {', '.join(thinned)}.")
+        warning = " ".join(parts)
+        payload["failure_warning"] = warning
+        logger.warning("score_predictions_by_source: %s", warning)
     (output_dir / "eval_result.json").write_text(
         json.dumps(payload, indent=2) + "\n", encoding="utf-8"
     )

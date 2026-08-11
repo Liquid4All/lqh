@@ -992,3 +992,160 @@ class TestGoldenGenerationRetries:
 
         assert result == {0: "GOLDEN"}
         assert calls["n"] == 2
+
+
+    async def test_a_wedged_golden_sample_does_not_stall_the_pass(
+        self, monkeypatch,
+    ) -> None:
+        """Adding a retry ladder without a bound would have recreated exactly
+        the straggler problem this ticket is about: golden generation waits on
+        every task, so 3 attempts x an upstream budget is one sample holding
+        up the whole pass."""
+        import lqh.golden as golden_mod
+
+        monkeypatch.setattr(golden_mod, "_GOLDEN_TIMEOUT_S", 0.2)
+
+        async def _hang(**_kwargs: Any) -> Any:
+            await asyncio.sleep(30.0)
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_hang)
+
+        result = await asyncio.wait_for(
+            golden_mod._golden_from_api(
+                [0, 1],
+                {
+                    0: [{"role": "user", "content": "q"}],
+                    1: [{"role": "user", "content": "q"}],
+                },
+                client,
+                "orchestration",
+            ),
+            timeout=10,
+        )
+
+        # Dropped, not waited out — a missing golden response is the existing
+        # semantics for a sample that could not be generated.
+        assert result == {}
+
+
+class TestWipedSourceIsAlwaysReported:
+    async def test_fully_failed_small_source_still_warns(
+        self, tmp_path: Path,
+    ) -> None:
+        """A source that lost everything drops out of the macro-average, so
+        the headline is computed over the survivors. That is worth saying
+        regardless of how small the source was."""
+        import pyarrow as pa
+
+        from lqh.scoring import _THINNING_MIN_SOURCE, score_predictions_by_source
+
+        # 200 good rows + a 19-row source that loses everything: 19/219 is
+        # 8.7%, under the global threshold, and 19 is under the per-source
+        # thinning floor. Neither existing check can see this one.
+        big, small = 200, _THINNING_MIN_SOURCE - 1
+        rows = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+        ]
+        n = big + small
+        preds = tmp_path / "preds.parquet"
+        pq.write_table(
+            pa.table({
+                "sample_index": list(range(n)),
+                "messages": [json.dumps(rows)] * n,
+                "source": ["big" if i < big else "small" for i in range(n)],
+            }),
+            preds,
+        )
+        scorer_path = tmp_path / "s.md"
+        scorer_path.write_text("score it")
+
+        calls = {"n": 0}
+
+        async def _create(**_kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] > big:  # concurrency=1 -> the small source is last
+                raise RuntimeError("judge down for this source")
+            response = MagicMock()
+            response.choices = [
+                MagicMock(message=MagicMock(content='{"reasoning":"ok","score":8}'))
+            ]
+            return response
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+
+        payload = await score_predictions_by_source(
+            predictions_path=preds,
+            scorer_path=scorer_path,
+            output_dir=tmp_path / "out",
+            client=client,
+            concurrency=1,
+            max_retries=0,
+        )
+
+        assert payload["per_source"]["small"]["num_scored"] == 0
+        assert payload["per_source"]["small"]["num_attempted"] == small
+        assert small / n <= FAILURE_WARN_FRACTION  # global check stays silent
+        assert small < _THINNING_MIN_SOURCE       # thinning floor stays silent
+        assert "failure_warning" in payload, payload
+        assert "NO usable scores" in payload["failure_warning"]
+        assert "small" in payload["failure_warning"]
+
+    async def test_wiped_only_run_does_not_get_thinning_prose(
+        self, tmp_path: Path,
+    ) -> None:
+        """The lead sentence must not claim a wiped source was 'scored on only
+        part of' its predictions and carries weight in the macro-average —
+        both are the opposite of what happened to it."""
+        import pyarrow as pa
+
+        from lqh.scoring import _THINNING_MIN_SOURCE, score_predictions_by_source
+
+        big, small = 200, _THINNING_MIN_SOURCE - 1
+        rows = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+        ]
+        n = big + small
+        preds = tmp_path / "preds.parquet"
+        pq.write_table(
+            pa.table({
+                "sample_index": list(range(n)),
+                "messages": [json.dumps(rows)] * n,
+                "source": ["big" if i < big else "small" for i in range(n)],
+            }),
+            preds,
+        )
+        scorer_path = tmp_path / "s.md"
+        scorer_path.write_text("score it")
+
+        calls = {"n": 0}
+
+        async def _create(**_kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] > big:
+                raise RuntimeError("judge down for this source")
+            response = MagicMock()
+            response.choices = [
+                MagicMock(message=MagicMock(content='{"reasoning":"ok","score":8}'))
+            ]
+            return response
+
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+
+        payload = await score_predictions_by_source(
+            predictions_path=preds,
+            scorer_path=scorer_path,
+            output_dir=tmp_path / "out",
+            client=client,
+            concurrency=1,
+            max_retries=0,
+        )
+
+        warning = payload["failure_warning"]
+        assert "no usable scores at all" in warning
+        assert "scored on only part" not in warning
+        assert "Thinned sources" not in warning

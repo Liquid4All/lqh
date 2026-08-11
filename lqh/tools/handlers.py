@@ -5969,11 +5969,36 @@ def _format_final_eval_block(run_dir: Path) -> list[str]:
         parts.append(scored_part)
 
     lines = [f"  Final eval: {', '.join(parts)}"]
+    # The headline is the number people act on, so the caveat travels with it
+    # rather than living only in eval_result.json.
+    eval_warning = result.get("failure_warning")
+    if isinstance(eval_warning, str) and eval_warning:
+        lines.append(f"    {eval_warning.strip()}")
     if len(per_source) > 1:
         for label in sorted(per_source):
-            src_mean = per_source[label].get("scores", {}).get("mean")
-            if src_mean is not None:
-                lines.append(f"    {label}: mean={src_mean:.2f}")
+            entry = per_source[label]
+            src_mean = entry.get("scores", {}).get("mean")
+            if src_mean is None:
+                continue
+            attempted = entry.get("num_attempted")
+            scored_n = entry.get("num_scored")
+            # _score_stats([]) reports mean 0.0, so a source nothing could be
+            # scored on must not print as "mean=0.00" — that is an invented
+            # score, and the worst one available.
+            if scored_n == 0:
+                lines.append(
+                    f"    {label}: no usable scores"
+                    + (f" (0/{attempted})" if isinstance(attempted, int) else "")
+                )
+                continue
+            line = f"    {label}: mean={src_mean:.2f}"
+            # A source averaged over 3 of its 100 rows carries the same weight
+            # in the macro mean as one averaged over all 100.
+            if isinstance(attempted, int) and isinstance(scored_n, int) and (
+                scored_n < attempted
+            ):
+                line += f" (scored {scored_n}/{attempted})"
+            lines.append(line)
 
     dist = result.get("score_distribution")
     if isinstance(dist, dict):
@@ -6187,19 +6212,47 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
                                 f"  p10/p50/p90="
                                 f"{pct['p10']:.1f}/{pct['p50']:.1f}/{pct['p90']:.1f}"
                             )
+                        # A checkpoint mean taken over a thinned sample set is
+                        # not comparable to its neighbours, and these lines are
+                        # read side by side to pick a checkpoint.
+                        if result.get("num_failed"):
+                            line += f"  ({result['num_failed']} failed)"
                         eval_results.append(line)
                         # When multiple eval sources were scored, the headline
                         # mean is a macro-average — show the per-source breakdown.
                         per_source = result.get("per_source") or {}
                         if len(per_source) > 1:
                             for label in sorted(per_source):
-                                src_mean = (
-                                    per_source[label].get("scores", {}).get("mean")
-                                )
-                                if src_mean is not None:
+                                entry = per_source[label]
+                                src_mean = entry.get("scores", {}).get("mean")
+                                if src_mean is None:
+                                    continue
+                                scored_n = entry.get("num_scored")
+                                attempted_n = entry.get("num_attempted")
+                                # _score_stats([]) reports mean 0.0, so a
+                                # source nothing could be scored on would
+                                # otherwise print as "mean=0.00" — the
+                                # strongest negative signal there is, invented.
+                                # These lines get read side by side to pick a
+                                # checkpoint.
+                                if scored_n == 0:
                                     eval_results.append(
-                                        f"      {label}: mean={src_mean:.2f}"
+                                        f"      {label}: no usable scores"
+                                        + (
+                                            f" (0/{attempted_n})"
+                                            if isinstance(attempted_n, int)
+                                            else ""
+                                        )
                                     )
+                                    continue
+                                src_line = f"      {label}: mean={src_mean:.2f}"
+                                if (
+                                    isinstance(scored_n, int)
+                                    and isinstance(attempted_n, int)
+                                    and scored_n < attempted_n
+                                ):
+                                    src_line += f" (scored {scored_n}/{attempted_n})"
+                                eval_results.append(src_line)
                 except (json.JSONDecodeError, OSError):
                     pass
         if eval_results:
@@ -7837,7 +7890,8 @@ async def handle_run_data_filter(
             "scorer and threshold but records kept_unjudged="
             f"{result.kept_unjudged}, i.e. nothing was actually vetted.\n"
             "  Check the judge model, the scorer file, and API access, then "
-            "re-run.",
+            f"re-run with overwrite=true — datasets/{output_dataset}/ exists "
+            "now, so a plain re-run will hit overwrite protection.",
         )
 
     warning = failure_warning(result.failed, result.total)
