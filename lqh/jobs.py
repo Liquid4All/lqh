@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
+from lqh import diskspace
 from lqh.project_identity import cloud_project_key as _ckey
 from lqh.background_tasks import BackgroundTask, BackgroundTaskRegistry
 
@@ -169,6 +170,9 @@ class JobSupervisor:
         # Runs we've already warned about stalling, so the notice fires
         # once per run per process rather than every poll.
         self.stall_notified: set[str] = set()
+        # One disk serves every run: latched per process, cleared on
+        # recovery so a later incident is still heard.
+        self.disk_full_notified = False
         # The advisory text per stalled run, folded into that run's
         # completion notice so a parked agent hears about it too.
         self.stall_advisories: dict[str, str] = {}
@@ -323,7 +327,15 @@ class JobSupervisor:
             return ("unknown", None)
         remote_run_dir = meta.get("remote_run_dir")
         if remote_run_dir:
-            await backend.sync_progress(str(remote_run_dir), str(run_dir))
+            try:
+                await backend.sync_progress(str(remote_run_dir), str(run_dir))
+            except Exception as exc:
+                if not diskspace.note_enospc(exc):
+                    raise
+                # A full disk breaks the mirror, not the job. Without this
+                # the poll aborts before poll_status, every tick reports
+                # "unknown", and the run just looks hung forever.
+                logger.warning("Out of disk space mirroring %s", run_dir.name)
         status = await backend.poll_status(str(meta["job_id"]))
         # Reconcile LOCAL state with what the backend just told us.
         #
@@ -477,6 +489,8 @@ class JobSupervisor:
                 self.tasks.unregister(name)
 
             for run_name, state, error, remote in snapshots:
+                # Above the branches: "unknown" runs are skipped below.
+                self.maybe_notify_disk_full(run_name)
                 if state == "unknown":
                     # Transient SSH/FS hiccup — don't update last_state,
                     # retry next tick.
@@ -688,6 +702,31 @@ class JobSupervisor:
                 continue
         return None
 
+    def maybe_notify_disk_full(self, run_name: str) -> None:
+        """Say once that the disk is out of room.
+
+        An advisory, never a completion notice — nothing was cancelled.
+        Makes no per-run claim: one sentence true of every run beats four
+        situational ones that each have a case where they are wrong.
+        """
+        if not diskspace.failing(self.project_dir):
+            self.disk_full_notified = False
+            return
+        if self.disk_full_notified:
+            return
+        self.disk_full_notified = True
+        free = diskspace.free_mb(self.project_dir)
+        free_note = f" ({free} MB free)" if free is not None else ""
+        if self.hooks.on_notice is not None:
+            self.hooks.on_notice(run_name, (
+                f"[System: the machine running lqh is out of disk space{free_note}. "
+                "Local writes are failing, so any run's progress, results and "
+                "status on disk may be stale or incomplete: a remote run keeps "
+                "going but cannot be mirrored, a local one may fail at its next "
+                "write. Tell the user in one sentence to free up space; do not "
+                "restart runs or poll training_status in a loop.]"
+            ), "disk_full")
+
     def maybe_notify_stall(self, run_name: str) -> None:
         """Push a one-shot advisory when a running job stops moving.
 
@@ -698,6 +737,11 @@ class JobSupervisor:
         cancelled — this is information, not a state change.
         """
         if run_name in self.stall_notified:
+            return
+        if diskspace.is_low(self.project_dir):
+            # progress.jsonl froze because it cannot be written, not
+            # because the sandbox wedged; "stalled" would invite the
+            # agent to stop a healthy run.
             return
         # Durable across restarts: both collections are in-memory, so a
         # CLI restart used to re-notify about the same stalled run and

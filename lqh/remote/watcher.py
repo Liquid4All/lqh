@@ -11,6 +11,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from lqh import diskspace
 from lqh.config import default_api_base_url
 from lqh.remote.backend import RemoteBackend
 from lqh.train.progress import read_latest_progress, read_latest_status
@@ -67,6 +68,7 @@ class RemoteRunWatcher(RunWatcher):
         self._backend = backend
         self._remote_run_dir = remote_run_dir
         self._job_id = job_id
+        self._disk_full_logged = False
 
         # Track which result files we've already pushed to the remote
         self._pushed_eval_results: set[str] = set()
@@ -137,7 +139,18 @@ class RemoteRunWatcher(RunWatcher):
             await self._backend.sync_progress(
                 self._remote_run_dir, str(self.run_dir),
             )
-        except Exception:
+        except Exception as exc:
+            if diskspace.note_enospc(exc):
+                # Every cycle fails the same way: log once, without the
+                # traceback that spammed stderr, and keep polling — the
+                # mirror recovers by itself once there is room.
+                if not self._disk_full_logged:
+                    self._disk_full_logged = True
+                    logger.warning(
+                        "Out of disk space mirroring %s; progress sync paused",
+                        self.run_name,
+                    )
+                return
             logger.warning(
                 "Failed to sync progress from remote for %s",
                 self.run_name,

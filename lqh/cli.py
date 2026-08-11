@@ -140,23 +140,30 @@ def _configure_logging(project_dir: Path) -> None:
     the dataset viewer / status bar. Replace the root handlers with a
     file handler and disable the stderr lastResort to keep the screen
     clean — errors are still inspectable via ``tail -f .lqh/lqh.log``.
+
+    Both stderr escape hatches are closed, first, so a failure below
+    cannot leak either — ``raiseExceptions`` is the one that fires when
+    the handler's own write fails, once per record (feedback #50).
     """
+    logging.lastResort = None
+    logging.raiseExceptions = False
+
     log_dir = project_dir / ".lqh"
+    handler: logging.Handler
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
+        # Can fail on a full disk too — unguarded, that aborted `lqh`
+        # at startup before the TUI ever drew.
+        handler = logging.FileHandler(log_dir / "lqh.log")
     except OSError:
-        return  # read-only filesystem? leave default logging alone
-
-    handler = logging.FileHandler(log_dir / "lqh.log")
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+        handler = logging.NullHandler()  # swallow, never reach the terminal
+    else:
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(logging.INFO)
-    # Without this Python falls back to a stderr StreamHandler when no
-    # handler matches a message — defeats the file routing.
-    logging.lastResort = None
 
 
 def _positive_int(value: str) -> int:
