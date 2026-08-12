@@ -35,8 +35,13 @@ COMMANDS: list[SlashCommand] = [
     SlashCommand("/feedback", "Send feedback to the lqh team"),
     SlashCommand("/telemetry", "Show or change telemetry: on|off|status"),
     SlashCommand("/help", "Show available commands"),
-    SlashCommand("/quit", "Exit lqh"),
+    SlashCommand("/quit", "Exit lqh (or press Ctrl+C twice)"),
+    SlashCommand("/exit", "Exit lqh (or press Ctrl+C twice)"),
 ]
+
+# Commands that shut the app down. ``/exit`` is an alias for ``/quit`` —
+# both must be honoured everywhere a quit is accepted.
+EXIT_COMMANDS: frozenset[str] = frozenset({"/quit", "/exit"})
 
 
 class SlashCommandCompleter(Completer):

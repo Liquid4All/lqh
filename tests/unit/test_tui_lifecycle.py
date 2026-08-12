@@ -88,6 +88,13 @@ async def test_reconnect_command_no_pending_operation(app: LqhApp) -> None:
     assert any("No reconnect is pending" in text for text in emitted)
 
 
+@pytest.mark.parametrize("command", ["/quit", "/exit"])
+async def test_exit_commands_request_shutdown(app: LqhApp, command: str) -> None:
+    """/exit is an alias for /quit — both end the session."""
+    assert await app._handle_command(command) is False
+    assert app._shutdown_requested is True
+
+
 @pytest.mark.parametrize(
     "command",
     ["/spec", "/datagen"],

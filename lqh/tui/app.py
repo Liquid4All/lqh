@@ -31,7 +31,13 @@ from lqh.agent import (
 from lqh.auth import LoginExpired, get_token, login_device_code
 from lqh.project_identity import cloud_project_key as _ckey
 from lqh.session import Session
-from lqh.tui.commands import COMMANDS, SlashCommandCompleter, is_command, parse_command
+from lqh.tui.commands import (
+    COMMANDS,
+    EXIT_COMMANDS,
+    SlashCommandCompleter,
+    is_command,
+    parse_command,
+)
 from lqh.tui.dataset_viewer import DatasetViewer
 from lqh.tui.renderer import (
     render_agent_message,
@@ -958,7 +964,7 @@ class LqhApp:
             await self._emit(render_system_message(f"Telemetry is {state}{suffix}."))
             return True
 
-        if command == "/quit":
+        if command in EXIT_COMMANDS:
             self._save_session()
             self._request_shutdown()
             return False
@@ -2563,7 +2569,7 @@ class LqhApp:
         self._invalidate()
         await self._emit(render_system_message(
             "⏸ Auto mode paused. Type an instruction and press Enter to "
-            "continue the run; /quit (or Ctrl+C twice) exits."
+            "continue the run; /exit (or Ctrl+C twice) quits."
         ))
         try:
             while True:
@@ -2577,13 +2583,13 @@ class LqhApp:
                     continue
                 if is_command(text):
                     command, _ = parse_command(text)
-                    if command == "/quit":
+                    if command in EXIT_COMMANDS:
                         self._save_session()
                         self._request_shutdown()
                         return None
                     await self._emit(render_system_message(
                         "Slash commands aren't available during an auto run. "
-                        "Type an instruction to continue, or /quit to exit."
+                        "Type an instruction to continue, or /exit to quit."
                     ))
                     continue
                 return text

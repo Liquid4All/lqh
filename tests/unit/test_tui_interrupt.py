@@ -485,12 +485,15 @@ class TestAutoModePause:
         assert await pause is None
         assert not app._auto_paused
 
-    async def test_pause_quit_command_shuts_down(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("command", ["/quit", "/exit"])
+    async def test_pause_quit_command_shuts_down(
+        self, tmp_path: Path, command: str,
+    ) -> None:
         app = LqhApp(tmp_path, auto_mode=True)
 
         pause = asyncio.create_task(app._pause_auto_mode())
         await asyncio.sleep(0.05)
-        app._input_queue.put_nowait("/quit")
+        app._input_queue.put_nowait(command)
         assert await pause is None
         assert app._shutdown_requested
 

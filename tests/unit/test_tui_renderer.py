@@ -42,6 +42,12 @@ class TestRenderer:
     def test_welcome_includes_version(self) -> None:
         assert f"v{__version__}" in render_welcome()
 
+    def test_welcome_tells_the_user_how_to_exit(self) -> None:
+        rendered = render_welcome()
+
+        assert "/exit" in rendered
+        assert "Ctrl+C twice" in rendered
+
     def test_welcome_uses_compact_lqh_logo(self) -> None:
         assert len(WELCOME_LOGO) == 6
         assert max(map(len, WELCOME_LOGO)) < 40

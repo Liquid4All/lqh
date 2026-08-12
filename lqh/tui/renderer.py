@@ -449,6 +449,9 @@ def render_welcome(width: int = 100) -> str:
     console.print(
         Text("  Copy:     use normal click-drag selection in the terminal", style="dim")
     )
+    console.print(
+        Text("  Exit:     /exit, or press Ctrl+C twice", style="dim")
+    )
     console.print()
     return buf.getvalue()
 
