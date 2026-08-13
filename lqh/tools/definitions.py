@@ -1494,7 +1494,9 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "optimization). Training runs in a separate process with GPU/torch, "
                 "while the agent stays responsive. Progress is tracked via the "
                 "filesystem. Requires the 'train' optional dependencies "
-                "(pip install lqh[train]). User permission is requested before starting. "
+                '(uv tool install "lqh[train]", or the pipx/pip equivalent — the '
+                "error message names the right command). User permission is "
+                "requested before starting. "
                 "The compute target (LQH Cloud vs a bring-your-own-compute remote) is "
                 "fixed per project and chosen once via a system picker — do NOT ask the "
                 "user where to train and do NOT pass any compute/remote argument; just "

@@ -16,6 +16,7 @@ from typing import Any, Callable, Awaitable
 
 from lqh.skills import list_available_skills, load_skill_content
 from lqh.tools.permissions import PERMISSIONS_FILE, PermissionContext
+from lqh.update_check import install_extras_command
 
 logger = logging.getLogger(__name__)
 
@@ -4749,7 +4750,7 @@ def _check_torch_available() -> str | None:
     except ImportError:
         return (
             "Training requires the 'train' optional dependencies.\n"
-            "Install them with: pip install lqh[train]"
+            f"Install them with: {install_extras_command('train')}"
         )
 
 

@@ -37,7 +37,7 @@ sentence** that it deviates from the ideal process and may give suboptimal resul
 Install the optional training dependencies:
 
 ```bash
-pip install lqh[train]
+uv tool install "lqh[train]"   # or: pipx install --force "lqh[train]" / pip install lqh[train]
 ```
 
 This installs `torch`, `transformers`, `trl`, and `peft`. If unavailable, training tools will show a clear error. All other lqh features work without them.

@@ -54,7 +54,7 @@ from lqh.tui.renderer import (
 )
 from lqh.tui.background_tasks import BackgroundTask, BackgroundTaskRegistry
 from lqh.tui.status_bar import StatusBar
-from lqh.update_check import check_for_update
+from lqh.update_check import check_for_update, upgrade_command
 from lqh.telemetry import TelemetryClient, notice_needed, set_active_telemetry
 
 if TYPE_CHECKING:
@@ -3061,7 +3061,7 @@ class LqhApp:
         await self._emit(
             render_system_message(
                 f"⬆️ lqh {update.latest} is available "
-                f"(installed: {update.current}). Upgrade with: pip install -U lqh"
+                f"(installed: {update.current}). Upgrade with: {upgrade_command()}"
             )
         )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,60 @@ class UpdateInfo:
 
 def _updates_disabled() -> bool:
     return os.environ.get("LQH_NO_UPDATE_CHECK", "").strip().lower() in _DISABLE_VALUES
+
+
+def _installer(prefix: str | None = None) -> str:
+    """Identify how this lqh was installed.
+
+    Returns ``uv-tool`` | ``pipx`` | ``uv-venv`` | ``pip``. ``uv tool`` and
+    ``pipx`` each drop a marker file in the venv root they manage, and that
+    root is our ``sys.prefix``; a venv built by ``uv venv`` records a ``uv``
+    key in ``pyvenv.cfg`` and, unlike a stdlib venv, ships no ``pip``.
+    Anything else (a stdlib venv, a system install) is treated as pip.
+    """
+    root = Path(prefix if prefix is not None else sys.prefix)
+    if (root / "uv-receipt.toml").exists():
+        return "uv-tool"
+    if (root / "pipx_metadata.json").exists():
+        return "pipx"
+    try:
+        cfg = (root / "pyvenv.cfg").read_text()
+    except OSError:
+        return "pip"
+    for line in cfg.splitlines():
+        key, sep, _ = line.partition("=")
+        if sep and key.strip() == "uv":
+            return "uv-venv"
+    return "pip"
+
+
+def upgrade_command(prefix: str | None = None) -> str:
+    """Return the upgrade command matching how this lqh was installed."""
+    installer = _installer(prefix)
+    if installer == "uv-tool":
+        return "uv tool upgrade lqh"
+    if installer == "pipx":
+        return "pipx upgrade lqh"
+    if installer == "uv-venv":
+        return "uv pip install -U lqh"
+    return "pip install -U lqh"
+
+
+def install_extras_command(extras: str, prefix: str | None = None) -> str:
+    """Return the command that adds an optional-dependency group to this lqh.
+
+    ``uv``- and ``pipx``-managed environments have no usable ``pip``, so
+    telling those users to ``pip install lqh[train]`` sends them nowhere;
+    each manager installs the extras its own way.
+    """
+    installer = _installer(prefix)
+    if installer == "uv-tool":
+        return f'uv tool install "lqh[{extras}]"'
+    if installer == "pipx":
+        return f'pipx install --force "lqh[{extras}]"'
+    if installer == "uv-venv":
+        return f'uv pip install "lqh[{extras}]"'
+    return f"pip install lqh[{extras}]"
 
 
 def _read_cache(path: Path, now: float) -> str | None:
