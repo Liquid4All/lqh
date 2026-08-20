@@ -1490,8 +1490,13 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
             cli=True, mutating=True, permission_domain="training", needs_loop=True,
             description=(
                 "Start a fine-tuning run as a background subprocess. Supports SFT "
-                "(supervised fine-tuning) and on-policy DPO (direct preference "
-                "optimization). Training runs in a separate process with GPU/torch, "
+                "(supervised fine-tuning), on-policy DPO (direct preference "
+                "optimization), and GRPO (RL on judge-ranked rollouts — load the "
+                "`rl` skill BEFORE starting one; it is cloud-only, needs no gold "
+                "answers in `dataset`, always requires `scorer` as the reward, "
+                "never sweeps, and its measured defaults must not be overridden "
+                "with learning_rate or hand-picked sampling unless the user "
+                "prescribes values). Training runs in a separate process with GPU/torch, "
                 "while the agent stays responsive. Progress is tracked via the "
                 "filesystem. Requires the 'train' optional dependencies "
                 '(uv tool install "lqh[train]", or the pipx/pip equivalent — the '
@@ -1540,10 +1545,14 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": ["sft", "on_policy_dpo"],
+                        "enum": ["sft", "on_policy_dpo", "grpo"],
                         "description": (
                             "'sft' for supervised fine-tuning, 'on_policy_dpo' for "
-                            "on-policy direct preference optimization."
+                            "on-policy direct preference optimization, 'grpo' for "
+                            "RL on judge-ranked rollouts (see the `rl` skill; "
+                            "base_model should normally be the best SFT "
+                            "checkpoint, and `dataset` is a prompt pool — "
+                            "assistant turns are stripped)."
                         ),
                     },
                     "base_model": {

@@ -1064,6 +1064,8 @@ def _infer_kind(config: dict[str, Any], module: str) -> str:
         return "train_sft_sweep"
     if cfg_type in ("dpo", "on_policy_dpo"):
         return "train_dpo"
+    if cfg_type in ("grpo", "on_policy_grpo"):
+        return "train_grpo"
     return "train_sft"
 
 

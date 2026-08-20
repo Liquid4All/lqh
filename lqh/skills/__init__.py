@@ -41,6 +41,13 @@ def list_available_skills() -> list[dict[str, str]]:
         {
             "name": "train",
             "description": "Fine-tune a model on generated data (requires torch)",
+        },
+        {
+            "name": "rl",
+            "description": (
+                "Improve a trained model with RL (GRPO) — judge-ranked rollouts, "
+                "no labels needed; for plateaued SFT or objectives without gold data"
+            ),
             "command": "/train",
         },
         {
@@ -97,6 +104,11 @@ _SKILL_ALIASES: dict[str, str] = {
     "/prompt": "prompt_optimization",
     "prompt_opt": "prompt_optimization",
     "/train": "train",
+    "/rl": "rl",
+    "grpo": "rl",
+    "/grpo": "rl",
+    "reinforcement": "rl",
+    "rlhf": "rl",
     "improve": "failure_analysis",
     "/improve": "failure_analysis",
     "failures": "failure_analysis",

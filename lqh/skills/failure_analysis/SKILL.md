@@ -178,7 +178,13 @@ clears the deployment bar above:
    skip this lever). DPO polishes consistent failure modes; it is
    task-dependent and much slower than SFT — follow the train skill's DPO
    guidance (small pair sets, held-out trajectory; DPO sweeps by default).
-5. **All of the above exhausted?** Run the qualitative failure-analysis
+5. **RL (GRPO)** on the best SFT checkpoint (text models, cloud only) when
+   SFT is plateaued and fresh GOLD data is exhausted — GRPO needs only a
+   prompt pool and the scorer (measured +0.5–0.7 judge points over a
+   converged SFT baseline). Unlike DPO it raises the mean rather than
+   fixing specific failures. Judge-call expensive — load the `rl` skill
+   first; its default-hyperparameter rules are load-bearing.
+6. **All of the above exhausted?** Run the qualitative failure-analysis
    loop below — quantitative scaling can only get you so far.
 
 ## Inference budget compliance

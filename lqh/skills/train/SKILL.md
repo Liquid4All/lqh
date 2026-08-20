@@ -57,6 +57,9 @@ DPO is best suited for **fixing specific failure modes** — when the model scor
 
 **Important:** If the user explicitly requests DPO from the start, or wants to skip SFT, follow their instructions. The above is the default recommendation, not a hard rule.
 
+### Phase 4: RL (GRPO)
+When SFT is plateaued and fresh gold data is exhausted — or the objective has no gold answers at all, only a scorer — GRPO can extract further gains by judge-ranking on-policy rollouts (measured: +0.5–0.7 judge points over a converged SFT checkpoint, 3/3 seeds). It is judge-call expensive (~22k calls/run) and cloud-only. **Load the `rl` skill for the procedure and the (important) default hyperparameter rules before starting a `type="grpo"` run.** Prefer continued SFT whenever fresh gold data is still cheap; prefer DPO when the goal is fixing a few specific failure modes rather than raising the mean.
+
 ## Soft thresholds for "did training work?" (defaults — adjust to the task)
 
 These are starting points to judge a checkpoint. They are not hard rules

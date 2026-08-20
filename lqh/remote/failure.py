@@ -310,6 +310,13 @@ def _shrink_menu(f: JobFailure) -> str:
             "fewer eval samples, a shorter max_seq_length, or splitting the "
             "eval set into batches"
         )
+    if "grpo" in kind:
+        return (
+            "fewer optimizer steps (grpo.max_steps), fewer generations per "
+            "prompt (grpo.num_generations), shorter completions "
+            "(grpo.max_completion_length), or a lower "
+            "grpo.vllm_gpu_memory_utilization"
+        )
     if "dpo" in kind:
         return (
             "fewer iterations, fewer rollout samples per iteration, or a "

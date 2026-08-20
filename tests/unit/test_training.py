@@ -1597,3 +1597,138 @@ class TestDPOEndToEnd:
         model_dir = run / "model"
         assert model_dir.exists()
         assert (model_dir / "config.json").exists()
+
+
+class TestGrpoStartTraining:
+    """Phase-5 GRPO surface on start_training (see the rl skill /
+    GRPO_IMPLEMENTATION.md): cloud-only, scorer-as-reward, no sweeps,
+    grpo_ run prefix."""
+
+    async def test_grpo_rejected_off_cloud(
+        self, training_workspace: Path, stub_torch_available, monkeypatch,
+    ) -> None:
+        """A local/SSH compute target → GRPO is rejected: the grpo image's
+        vLLM+TRL runtime exists only on LQH Cloud."""
+        import lqh.tools.handlers as handlers
+        from lqh.tools.handlers import handle_start_training
+
+        monkeypatch.setattr(
+            handlers, "_resolve_compute_target", lambda project_dir: None,
+        )
+        result = await handle_start_training(
+            training_workspace,
+            type="grpo",
+            base_model="test-model",
+            dataset="datasets/test_ds",
+            eval_dataset="datasets/test_eval",
+            scorer="evals/scorers/test.md",
+        )
+        assert "only on LQH Cloud" in result.content
+
+    async def test_grpo_cannot_disable_scoring(
+        self, training_workspace: Path, stub_torch_available, monkeypatch,
+    ) -> None:
+        """The scorer IS the GRPO reward — disable_scoring is rejected."""
+        import lqh.tools.handlers as handlers
+
+        monkeypatch.setattr(
+            handlers, "_resolve_compute_target", lambda project_dir: "cloud",
+        )
+        result = await handlers.handle_start_training(
+            training_workspace,
+            type="grpo",
+            base_model="test-model",
+            dataset="datasets/test_ds",
+            eval_dataset="datasets/test_eval",
+            disable_scoring=True,
+        )
+        assert "cannot be disabled for GRPO" in result.content
+
+    async def test_grpo_rejects_sweep(
+        self, training_workspace: Path, stub_torch_available, monkeypatch,
+    ) -> None:
+        import lqh.tools.handlers as handlers
+
+        monkeypatch.setattr(
+            handlers, "_resolve_compute_target", lambda project_dir: "cloud",
+        )
+        result = await handlers.handle_start_training(
+            training_workspace,
+            type="grpo",
+            base_model="test-model",
+            dataset="datasets/test_ds",
+            eval_dataset="datasets/test_eval",
+            scorer="evals/scorers/test.md",
+            enable_sweep=True,
+        )
+        assert "does not support sweeps" in result.content
+
+    async def test_grpo_run_prefix_and_cloud_dispatch(
+        self, training_workspace: Path, stub_torch_available, monkeypatch,
+    ) -> None:
+        """A permitted GRPO launch routes to the cloud executor with a
+        grpo_-prefixed run name and type='grpo' in the config."""
+        import lqh.tools.handlers as handlers
+
+        monkeypatch.setattr(
+            handlers, "_resolve_compute_target", lambda project_dir: "cloud",
+        )
+        recorded: dict = {}
+
+        async def fake_remote(
+            project_dir, run_dir, config, run_name, remote_name, api_key, **kw,
+        ):
+            recorded["run_name"] = run_name
+            recorded["config"] = config
+            return handlers.ToolResult(content=f"stub: {run_name} on {remote_name}")
+
+        monkeypatch.setattr(
+            handlers, "_execute_start_training_remote", fake_remote,
+        )
+        result = await handlers.handle_start_training(
+            training_workspace,
+            type="grpo",
+            base_model="test-model",
+            dataset="datasets/test_ds",
+            eval_dataset="datasets/test_eval",
+            scorer="evals/scorers/test.md",
+        )
+        assert "stub" in result.content
+        assert recorded["run_name"].startswith("grpo_")
+        assert recorded["config"]["type"] == "grpo"
+        # Judge-cost preview only appears on the permission prompt path;
+        # here perms are project-wide, but the config must not sweep.
+        assert recorded["config"].get("type") != "sweep"
+
+
+class TestRlSkill:
+    """The rl skill is registered, aliased, and cross-referenced."""
+
+    def test_rl_skill_loads(self) -> None:
+        from lqh.skills import list_available_skills, load_skill_content
+
+        names = [s["name"] for s in list_available_skills()]
+        assert "rl" in names
+        content = load_skill_content("rl")
+        assert "GRPO" in content
+        # The load-bearing rules must be stated, not implied.
+        assert "one tier" in content            # judge-tier rule
+        assert "do not override" in content.lower()
+
+    def test_grpo_alias_resolves(self) -> None:
+        from lqh.skills import load_skill_content
+
+        assert load_skill_content("grpo").startswith("# Skill: RL (GRPO)")
+
+    def test_train_skill_cross_references_rl(self) -> None:
+        from lqh.skills import load_skill_content
+
+        train = load_skill_content("train")
+        assert "`rl` skill" in train
+
+    def test_start_training_enum_has_grpo(self) -> None:
+        from lqh.tools.definitions import get_all_tools
+
+        tools = {t["function"]["name"]: t["function"] for t in get_all_tools()}
+        types = tools["start_training"]["parameters"]["properties"]["type"]["enum"]
+        assert types == ["sft", "on_policy_dpo", "grpo"]

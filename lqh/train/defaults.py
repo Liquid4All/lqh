@@ -129,6 +129,60 @@ SFT_MAX_EFFECTIVE_BATCH = 256
 SFT_MIN_HEALTHY_OPTIMIZER_STEPS = 50
 
 _DPO_TYPES = frozenset({"dpo", "on_policy_dpo"})
+_GRPO_TYPES = frozenset({"grpo", "on_policy_grpo"})
+
+# --- GRPO knob defaults ----------------------------------------------------
+# Every value below is an UNMEASURED LITERAL (2026-08): starting points from
+# the GRPO plan (lqh_py/GRPO_CLAUDE.md §Phase 4 / GRPO_CODEX.md), to be
+# replaced by tests/benchmarks/grpo_value results. The temperature is the one
+# with a hard external constraint: LFMs degrade fast above ~0.3 (MODELS.md),
+# and the Phase-0.2 spike measures where group diversity survives under that
+# ceiling.
+GRPO_NUM_GENERATIONS = 8       # below 4 the group statistic is junk
+GRPO_MAX_STEPS = 300           # DPO's lesson: count optimizer updates first
+GRPO_MAX_COMPLETION_LENGTH = 512
+# Rollout sampling: two MEASURED profiles (grpo_value exploration study,
+# RESULTS.md 2026-08-18), selected in grpo.py by whether the run continues
+# an existing adapter:
+#  - FROM-BASE (fresh policy): full exploration — T=1.0, top_p=1.0, no
+#    min_p, no repetition penalty. 3/3 seeds: +0.83/+0.73/+1.10 vs raw
+#    (CIs exclude zero, replicates under judge:medium), ~2.4x the gain of
+#    the conservative profile at identical lr/KL/steps.
+#  - CONTINUATION (post-SFT adapter): the LFM low-temperature discipline
+#    (MODELS.md). T=1.0 from a converged SFT policy measured NEGATIVE
+#    (-0.19, robust -0.77); T=0.3 is the do-no-harm setting (3-seed null,
+#    never negative).
+GRPO_TEMPERATURE = 0.3
+GRPO_TOP_P = 1.0
+GRPO_MIN_P = 0.05
+GRPO_REPETITION_PENALTY = 1.05
+GRPO_TEMPERATURE_FROM_BASE = 1.0
+GRPO_MIN_P_FROM_BASE = 0.0
+GRPO_REPETITION_PENALTY_FROM_BASE = 1.0
+# MEASURED (grpo_value from-base trial, 2026-08-16 — see
+# tests/benchmarks/grpo_value/RESULTS.md): with lr 2e-6 / beta 0.005 the
+# policy barely moves (final KL ~0.005) and gains nothing anywhere; at
+# lr 1e-5 / beta 0.001 GRPO extracts +0.34 [+0.15, +0.52] judge points
+# from a raw 1.2B (robust across judges). The leash-and-crawl combination
+# was safe but useless — a default that provably does nothing burns GPU
+# to return the input model. The two knobs were measured as a bundle.
+GRPO_BETA = 0.001
+# Continuation runs get NO KL term. Mechanism (verified in trl 1.10
+# grpo_trainer.py: with a PEFT model the reference logprobs come from
+# `disable_adapter()`): the KL reference is the BASE MODEL UNDER the
+# adapter, not the policy at training start. From-base those coincide
+# and the leash helps (+0.83 vs +0.17 at beta 0, exploration study);
+# continuing an SFT adapter they do NOT — beta>0 pulls the policy away
+# from the SFT solution toward the raw base (measured at T=1.0:
+# -0.19 with beta 0.001 vs +0.55 with beta 0, seed 17).
+GRPO_BETA_CONTINUATION = 0.0
+GRPO_LOSS_TYPE = "dapo"        # TRL default; token-normalized, no length bias
+GRPO_SCALE_REWARDS = "group"
+
+# Below this many optimizer steps a GRPO run is warned about at train time —
+# same reasoning as SFT_MIN_HEALTHY_OPTIMIZER_STEPS, and the same caveat: a
+# judgement call flagging update starvation, not a measured optimum.
+GRPO_MIN_HEALTHY_OPTIMIZER_STEPS = 100
 
 
 @dataclass(frozen=True)
@@ -241,10 +295,18 @@ def recommended(
     conditional default later is a change to this function's body alone.
     """
     is_dpo = run_type in _DPO_TYPES
+    is_grpo = run_type in _GRPO_TYPES
     is_vision = modality == "vision"
 
     if is_vision:
         learning_rate = 5e-4  # Liquid VLM LoRA recipe
+    elif is_grpo:
+        # MEASURED (grpo_value from-base trial, 2026-08-16): 2e-6 moved
+        # nothing (null everywhere, KL ~0.005); 1e-5 found the reward's
+        # signal (+0.34 from a raw 1.2B, CI excluding zero, judge-robust).
+        # On an already-strong SFT checkpoint neither gained — see
+        # RESULTS.md for both regimes before trusting this on a new task.
+        learning_rate = 1e-5 if lora else 2e-6
     elif is_dpo:
         learning_rate = 1e-6
     elif lora:
@@ -261,6 +323,11 @@ def recommended(
         # No calibration probe for vision — start conservative and let the OOM
         # self-heal (report_oom_downgrade) shrink further if needed.
         micro_batch, effective_batch = 2, 16
+    elif is_grpo:
+        # GRPO batch units are COMPLETIONS, not rows: 64 per step at G=8 is
+        # 8 prompt groups per optimizer update. The SFT calibration profiles
+        # do not apply (vLLM shares the card); batches stay explicit.
+        micro_batch, effective_batch = 8, 64
     elif lora and is_dpo:
         # DPO preference batches are normally only a few hundred rows. The
         # LoRA-wide default of 256 would reduce those to one or two optimizer
@@ -287,7 +354,9 @@ def recommended(
 
     return HParams(
         learning_rate=learning_rate,
-        num_epochs=None if is_dpo else (num_epochs or DEFAULT_SFT_EPOCHS),
+        # DPO is bounded by num_iterations, GRPO by grpo.max_steps — neither
+        # trains in epochs.
+        num_epochs=None if (is_dpo or is_grpo) else (num_epochs or DEFAULT_SFT_EPOCHS),
         per_device_batch_size=micro_batch,
         effective_batch_size=effective_batch,
         max_seq_length=MAX_SEQ_LENGTH,

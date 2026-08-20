@@ -266,8 +266,13 @@ def _run_checkpoint_eval(
         inference_end = (
             FINAL_INFERENCE_END if has_final_scoring(config) else 1.0
         )
+        # grpo_loop reuses this final-eval path; keep its progress events
+        # labelled with the run's own kind rather than "sft".
+        task_kind = (
+            "grpo" if config.get("type") in ("grpo", "on_policy_grpo") else "sft"
+        )
         final_reporter = ProgressReporter(
-            task_kind="sft", label=checkpoint_dir.parent.parent.name,
+            task_kind=task_kind, label=checkpoint_dir.parent.parent.name,
             run_dir=checkpoint_dir.parent.parent,
         )
         final_reporter.update(

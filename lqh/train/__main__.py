@@ -41,6 +41,10 @@ def main() -> None:
             from lqh.train.dpo import dpo_loop
 
             dpo_loop(run_dir, config)
+        elif run_type in ("grpo", "on_policy_grpo"):
+            from lqh.train.grpo import grpo_loop
+
+            grpo_loop(run_dir, config)
         else:
             print(f"Unknown training type: {run_type!r}", file=sys.stderr)
             sys.exit(1)

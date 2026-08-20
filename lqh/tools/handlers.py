@@ -5038,6 +5038,21 @@ async def handle_start_training(
 
     remote = _resolve_compute_target(project_dir)
 
+    is_grpo = type in ("grpo", "on_policy_grpo")
+    # GRPO runs only on LQH Cloud: the distinct `grpo` image carries the
+    # vLLM + newer-TRL runtime that the local/SSH training environments do
+    # not (and cannot — trl<1.1 is pinned there; see GRPO_IMPLEMENTATION.md).
+    if is_grpo and not (remote and _is_cloud_target(remote)):
+        return ToolResult.fail(
+            "config",
+            (
+                "Error: GRPO training runs only on LQH Cloud — it needs the "
+                "dedicated grpo image (vLLM rollout engine + TRL 1.10), which "
+                "local and SSH environments do not have. This project's compute "
+                f"target is {'local' if remote is None else remote!r}."
+            ),
+        )
+
     # Check torch + GPU only when running locally; remote execution has its
     # own venv (provisioned by remote_setup) and its own GPUs.
     if remote is None:
@@ -5171,6 +5186,30 @@ async def handle_start_training(
             ),
         )
 
+    # GRPO's scorer IS the reward: the judge ranks every rollout group
+    # against it. Without a scorer there is no training signal at all.
+    if is_grpo and disable_scoring:
+        return ToolResult.fail(
+            "validation",
+            (
+                "Error: scoring cannot be disabled for GRPO — the scorer is the "
+                "reward function (every rollout group is judge-ranked against "
+                "it). Pass `scorer=<path>` (the project's default/best scorer)."
+            ),
+        )
+
+    # No GRPO sweeps in v1 (single run at the measured defaults; parallel
+    # GRPO is judge-RPM hostile and the colocated vLLM engine cannot share
+    # a GPU across configs).
+    if is_grpo and enable_sweep:
+        return ToolResult.fail(
+            "validation",
+            (
+                "Error: GRPO does not support sweeps — it runs ONCE at the "
+                "measured defaults (see the rl skill). Omit enable_sweep."
+            ),
+        )
+
     # Scoring must be an explicit decision: pass a scorer, or opt out via
     # disable_scoring. Silently omitting the scorer would degrade eval-of-best
     # to proxy-only with no judge score — a common, quiet failure mode.
@@ -5214,7 +5253,7 @@ async def handle_start_training(
     # pre-consent mkdir would make that second invocation collide with its own
     # empty directory. The approved auto-generated name is pinned by the agent
     # on re-invocation, then atomically claimed immediately before submission.
-    run_prefix = "sft" if type == "sft" else "dpo"
+    run_prefix = "sft" if type == "sft" else ("grpo" if is_grpo else "dpo")
     requested_run_name = run_name or None
     run_name = requested_run_name or _next_run_name(project_dir, run_prefix)
     run_dir = project_dir / "runs" / run_name
@@ -5372,6 +5411,20 @@ async def handle_start_training(
             from lqh.hf_token import hf_disclosure_line
 
             hf_line = hf_disclosure_line(project_dir, indent="  ")
+        # GRPO's dominant cost after GPU time is judge traffic: the reward
+        # channel makes ~(groups + completions) judge calls per optimizer
+        # step. Surface the estimate so approving the run is an informed
+        # spend decision, not a surprise on the invoice.
+        grpo_line = ""
+        if is_grpo:
+            from lqh.train import defaults as _hp
+
+            _steps = _hp.GRPO_MAX_STEPS
+            _per_step = 64 + 64 // _hp.GRPO_NUM_GENERATIONS
+            grpo_line = (
+                f"  Reward:    ~{_steps * _per_step / 1000:.0f}k judge calls "
+                f"over {_steps} steps (billed; judge tier per the rl skill)\n"
+            )
         return ToolResult(
             content="PERMISSION_REQUIRED",
             requires_user_input=True,
@@ -5382,7 +5435,8 @@ async def handle_start_training(
                 f"  Model:     {base_model}\n"
                 f"  Dataset:   {dataset_summary}\n"
                 f"  Eval:      {eval_summary}\n"
-                f"  GPU:       {gpu_info}{size_warning}\n"
+                + grpo_line
+                + f"  GPU:       {gpu_info}{size_warning}\n"
                 + hf_line
                 + "\nAllow execution?"
             ),

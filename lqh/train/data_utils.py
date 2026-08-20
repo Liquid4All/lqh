@@ -298,6 +298,57 @@ def chatml_to_sft_dataset(
     return result
 
 
+def chatml_to_grpo_rows(
+    conversations: list[list[dict[str, Any]]],
+    tools_per_sample: list[list[dict[str, Any]] | None] | None = None,
+) -> list[dict[str, Any]]:
+    """Convert ChatML conversations to GRPO prompt-only rows.
+
+    Each row is ``{"prompt", "sample_id", "reference", "has_tools"}``:
+
+    - ``prompt`` — the conversation with trailing assistant turns stripped
+      (the policy generates them during training);
+    - ``sample_id`` — a stable content hash of the prompt. The reward
+      functions regroup the flat B×G completion batch by it (and assert
+      the grouping — see ``lqh.train.reward.iter_groups``), and it keys
+      the reward ledger;
+    - ``reference`` — the stripped assistant content, kept for the
+      *pointwise anchor* judge only. The rank judge is deliberately
+      reference-free so GRPO doesn't collapse back into imitation of
+      what SFT already saw;
+    - ``has_tools`` — whether the sample carries tool definitions (drives
+      the malformed-tool-call guard penalty).
+
+    Rows whose prompt is empty after stripping are dropped.
+    """
+    import hashlib
+
+    tools_seq = tools_per_sample or [None] * len(conversations)
+    rows: list[dict[str, Any]] = []
+    for conv, tools in zip(conversations, tools_seq):
+        prompt = list(conv)
+        reference_parts: list[str] = []
+        while prompt and prompt[-1].get("role") == "assistant":
+            content = prompt.pop().get("content")
+            if isinstance(content, str) and content:
+                reference_parts.append(content)
+        if not prompt:
+            continue
+        reference_parts.reverse()
+        sample_id = hashlib.sha256(
+            json.dumps(prompt, sort_keys=True).encode()
+        ).hexdigest()[:24]
+        rows.append(
+            {
+                "prompt": prompt,
+                "sample_id": sample_id,
+                "reference": "\n".join(reference_parts) or None,
+                "has_tools": bool(tools),
+            }
+        )
+    return rows
+
+
 def chatml_to_dpo_dataset(
     preferences: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:

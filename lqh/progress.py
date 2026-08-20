@@ -69,6 +69,7 @@ def final_scoring_context(
     configured_type = str(config.get("type", "training"))
     default_kind = (
         "dpo" if configured_type in {"dpo", "on_policy_dpo"}
+        else "grpo" if configured_type in {"grpo", "on_policy_grpo"}
         else configured_type if is_training else "evaluation"
     )
     task_kind = str(config.get(
@@ -125,7 +126,9 @@ def final_result_dir(run_dir: Path, config: dict[str, Any]) -> Path | None:
     effective = config.get("base_config", {}) if run_type == "sweep" else config
     if not effective.get("scorer"):
         return None
-    if run_type == "sft":
+    if run_type in {"sft", "grpo", "on_policy_grpo"}:
+        # GRPO shares SFT's final-eval shape: the judged headline result
+        # lands in checkpoints/final (see lqh.train.sft._run_checkpoint_eval).
         if not has_final_inference(effective):
             return None
         return run_dir / "checkpoints" / "final"
