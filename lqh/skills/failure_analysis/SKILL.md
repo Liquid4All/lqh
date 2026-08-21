@@ -19,7 +19,7 @@ Never route on the score alone. Collect all of these first:
 | Latest score + distribution | `training_status(run_name=...)` — the "Final eval" block (mean, percentiles, histogram); raw JSON in `runs/<name>/eval_result.json` |
 | How the run trained | `training_status` — the "Training health" line: optimizer steps, train-loss start → end, eval loss, token accuracy, learning rate. A flat score with a flat loss is a *training* problem; a flat score with a falling loss is a data or capacity problem. |
 | Zero-shot baseline | The pre-training eval run of the same base model on the same eval set (`evals/runs/*/summary.json` or `runs/<baseline>/eval_result.json`). Did SFT actually improve the model? |
-| Model size | `runs/<name>/config.json` → `base_model`. Text ladder: 230M / 350M / 1.2B / 2.6B / 8B-A1B; VLM ladder: 450M / 1.6B (see `list_models`). |
+| Model size | `runs/<name>/config.json` → `base_model`. Text ladder: 230M / 350M / 1.2B / 2.6B / 8B-A1B; VLM ladder: 450M / 1.6B / 3B (see `list_models`). |
 | Training-set size | `training_status` "Data:" line, or `runs/<name>/config.json` → `dataset_rows` (`train`, `train_effective`, `eval`). Older runs: use `summary` to read dataset row counts. |
 | Inference budget | `SPEC.md` → `## Inference Budget` (`**Budget**:` line). If the section is missing, treat as `auto` and confirm with the user before stepping far up the ladder. |
 
@@ -35,7 +35,7 @@ these differ, the comparison is invalid — re-run the baseline under the
 post-training run's exact conditions before routing on Δ.
 
 **VLM tasks (LFM2.5-VL) differ from the text playbook.** The ladder is
-450M → 1.6B (450M is the "small model" in the routing below, not 350M);
+450M → 1.6B → 3B (450M is the "small model" in the routing below, not 350M);
 **DPO is not supported for VLMs** — skip that lever and go from data/model
 scaling straight to the qualitative loop; **GGUF export is not supported for
 VLMs** — at ≥8 offer deploy-as-API only.

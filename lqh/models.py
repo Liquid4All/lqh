@@ -44,7 +44,9 @@ SIZE_RECOMMENDATION = (
     "before the first eval or fine-tune run; use the zero-shot baseline as a rough "
     "read on task complexity, and step up a size if fine-tuning keeps struggling "
     "despite good data and a sane scorer. For the SFT base, instruct/no-suffix is "
-    "the safe default; '-Base' has a slight edge at large dataset sizes."
+    "the safe default; '-Base' has a slight edge at large dataset sizes. Exception: "
+    "the no-suffix 2.6B and 8B-A1B are thinking models — fine-tune from their "
+    "'-Base' variants."
 )
 
 
@@ -88,12 +90,14 @@ LIQUID_MODELS: list[LiquidModel] = [
     LiquidModel("lfm2.5-1.2b-base", "LiquidAI/LFM2.5-1.2B-Base", "base"),
     LiquidModel("lfm2.5-8b-a1b", "LiquidAI/LFM2.5-8B-A1B", "thinking"),
     LiquidModel("lfm2.5-8b-a1b-base", "LiquidAI/LFM2.5-8B-A1B-Base", "base"),
-    LiquidModel("lfm2-2.6b-exp", "LiquidAI/LFM2-2.6B-Exp", "instruct"),
+    LiquidModel("lfm2.5-2.6b-base", "LiquidAI/LFM2.5-2.6B-Base", "base"),
+    LiquidModel("lfm2.5-2.6b", "LiquidAI/LFM2.5-2.6B", "thinking"),
     LiquidModel("lfm2-24b-a2b", "LiquidAI/LFM2-24B-A2B", "instruct"),
     # Vision-language models (image + text → text). SFT-only for now
     # (no DPO); datasets carry image_url data-URLs in the messages.
     LiquidModel("lfm2.5-vl-450m", "LiquidAI/LFM2.5-VL-450M", "instruct", vision=True),
     LiquidModel("lfm2.5-vl-1.6b", "LiquidAI/LFM2.5-VL-1.6B", "instruct", vision=True),
+    LiquidModel("lfm2.5-vl-3b", "LiquidAI/LFM2.5-VL-3B", "instruct", vision=True),
 ]
 
 

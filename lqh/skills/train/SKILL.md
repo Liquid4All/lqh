@@ -239,8 +239,8 @@ After setup, the next `start_training` offers the new remote in the picker. The 
 
 ## Vision-language (LFM2.5-VL) training
 
-Fine-tuning the vision models (`lfm2.5-vl-450m`, `lfm2.5-vl-1.6b` — see
-`list_models`) works through the same `start_training` tool with **no extra
+Fine-tuning the vision models (`lfm2.5-vl-450m`, `lfm2.5-vl-1.6b`,
+`lfm2.5-vl-3b` — see `list_models`) works through the same `start_training` tool with **no extra
 arguments** — the harness detects the VL base and switches automatically:
 
 - **SFT only.** DPO is rejected for VL bases in this version.

@@ -165,7 +165,7 @@ follow-up training run.
 ## Choosing a model size
 
 Liquid ships several sizes (run `list_models` for the catalog): 230M, 350M, 1.2B, \
-2.6B (LFM2-2.6B-Exp), and the MoE models 8B-A1B and 24B-A2B. Picking the size is one \
+2.6B, and the MoE models 8B-A1B and 24B-A2B. Picking the size is one \
 of the first decisions before evaluation or fine-tuning.
 
 - **Respect the inference budget in SPEC.md** (`## Inference Budget`): `auto` means \

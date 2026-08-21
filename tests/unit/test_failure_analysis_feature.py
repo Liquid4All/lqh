@@ -768,7 +768,7 @@ class TestInferenceBudget:
         cap = "## Inference Budget\n- **Budget**: max:1.2B\n"
         assert check_budget_for_model(cap, "lfm2.5-350m") is None
         assert check_budget_for_model(cap, "LiquidAI/LFM2.5-1.2B-Instruct") is None
-        assert check_budget_for_model(cap, "lfm2-2.6b-exp") is not None
+        assert check_budget_for_model(cap, "lfm2.5-2.6b") is not None
 
         pin = "## Inference Budget\n- **Budget**: pinned:lfm2.5-1.2b-instruct\n"
         # Short id and HF id both count as the pinned model.
@@ -835,9 +835,9 @@ class TestInferenceBudget:
         from lqh.models import check_budget_for_model
         from lqh.tools.handlers import _budget_base_model
 
-        ckpt_path = self._write_checkpoint(tmp_path, "lfm2-2.6b-exp")
+        ckpt_path = self._write_checkpoint(tmp_path, "lfm2.5-2.6b")
         resolved = _budget_base_model(tmp_path, ckpt_path)
-        assert resolved == "lfm2-2.6b-exp"
+        assert resolved == "lfm2.5-2.6b"
         cap = "## Inference Budget\n- **Budget**: max:1.2B\n"
         assert check_budget_for_model(cap, resolved) is not None
 
@@ -875,7 +875,7 @@ class TestInferenceBudget:
         result = await handle_start_training(
             tmp_path,
             type="sft",
-            base_model="lfm2-2.6b-exp",
+            base_model="lfm2.5-2.6b",
             dataset="datasets/train",
             eval_dataset="datasets/eval",
             scorer="evals/scorers/s.md",
