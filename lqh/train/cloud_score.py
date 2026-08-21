@@ -60,12 +60,14 @@ def is_cloud_mode() -> bool:
 
 
 def _make_client():
-    """Build an AsyncOpenAI client pointed at the backend API.
+    """Build a client pointed at the backend API.
 
     Defers the import so non-cloud trainers don't pay the openai
-    import cost at module load.
+    import cost at module load. Goes through ``lqh.client.create_client``
+    so the in-band-error check (backend keepalive heartbeat: errors can
+    arrive inside a 200 body) and the default max_tokens apply here too.
     """
-    from openai import AsyncOpenAI
+    from lqh.client import create_client
 
     base = os.environ["LQH_BASE_URL"].rstrip("/")
     if not base.endswith("/v1"):
@@ -76,9 +78,9 @@ def _make_client():
     # timeout by three. It is also handed to generate_golden, which is NOT
     # scoring — that path owns its retries via chat_with_retry for exactly
     # this reason (see lqh/golden.py).
-    return AsyncOpenAI(
-        base_url=base,
-        api_key=os.environ["LQH_API_TOKEN"],
+    return create_client(
+        os.environ["LQH_API_TOKEN"],
+        base,
         max_retries=0,
     )
 

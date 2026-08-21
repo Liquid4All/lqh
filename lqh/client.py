@@ -8,6 +8,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import httpx
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -91,6 +92,7 @@ def create_client(
         **({} if max_retries is None else {"max_retries": max_retries}),
     )
     _install_default_max_tokens(client)
+    _install_inband_error_check(client)
     return client
 
 
@@ -105,6 +107,56 @@ def _install_default_max_tokens(client: AsyncOpenAI) -> None:
         return await original(*args, **kwargs)
 
     completions.create = create_with_default  # type: ignore[method-assign]
+
+
+def _install_inband_error_check(client: AsyncOpenAI) -> None:
+    """Patch ``create`` to surface backend errors delivered inside a 200.
+
+    Once the backend's keepalive heartbeat has committed a 200 (a slow call
+    outlasting the edge proxy's read-timeout window), it can no longer change
+    the HTTP status — an upstream failure then arrives as a 200 whose body is
+    the OpenAI error envelope with the true status in ``error.code``. The SDK
+    parses that leniently into a ChatCompletion with no choices and the
+    envelope kept as an ``error`` extra field. Re-raise it as the matching
+    APIStatusError subclass so every retry ladder above behaves exactly as if
+    the real status had been on the wire.
+    """
+    completions = client.chat.completions
+    original = completions.create
+
+    async def create_checked(*args: Any, **kwargs: Any) -> Any:
+        resp = await original(*args, **kwargs)
+        err = getattr(resp, "error", None)
+        # Only an error WITHOUT choices is the in-band shape; some providers
+        # attach a partial ``error`` next to a real completion.
+        if isinstance(err, dict) and not getattr(resp, "choices", None):
+            raise _inband_status_error(client, err)
+        return resp
+
+    completions.create = create_checked  # type: ignore[method-assign]
+
+
+def _inband_status_error(client: AsyncOpenAI, err: dict[str, Any]) -> APIStatusError:
+    """Build the APIStatusError an in-band error body would have been.
+
+    Uses the SDK's own status→subclass factory so a 429 becomes a
+    RateLimitError (which ``chat_with_retry`` handles on its own branch), a
+    500 an InternalServerError, and so on.
+    """
+    code = err.get("code")
+    status = code if isinstance(code, int) and 400 <= code <= 599 else 502
+    message = str(err.get("message") or "upstream error")
+    response = httpx.Response(
+        status,
+        request=httpx.Request("POST", str(client.base_url)),
+    )
+    make = getattr(client, "_make_status_error", None)
+    if callable(make):
+        try:
+            return make(message, body=err, response=response)
+        except Exception:  # private SDK API — never let it eat the error
+            logger.debug("_make_status_error failed", exc_info=True)
+    return APIStatusError(message, response=response, body=err)
 
 
 def is_transient_upstream_error(exc: object) -> bool:
@@ -134,13 +186,16 @@ OnRetry = Callable[[str, int, int, float], Awaitable[None]] | None
 
 # HTTP statuses worth re-sending the same payload for. 502 covers both an
 # upstream model that ran out of time and a proxy that could not reach the
-# API; 504/408 are the same story told by an intermediary. 429 is absent
+# API; 504/408 are the same story told by an intermediary. 524 is the edge
+# proxy giving up on a silent origin — retryable, though a request that
+# inherently needs longer than the edge window will 524 every time (the
+# backend's keepalive heartbeat exists to prevent that). 429 is absent
 # because ``RateLimitError`` is handled on its own branch (it honours
 # Retry-After). This must stay a SUBSET of the statuses
 # ``lqh.tui.app._is_reconnectable_error`` accepts — that function decides the
 # same question one layer up, and a status retried here but not there would
 # strand a turn the outer ladder refuses to resume.
-RETRYABLE_STATUS = frozenset({408, 500, 502, 503, 504})
+RETRYABLE_STATUS = frozenset({408, 500, 502, 503, 504, 524})
 
 
 def describe_api_error(exc: BaseException) -> str:

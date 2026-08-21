@@ -295,13 +295,10 @@ class GrpoRewardEngine:
                 "(scoped LQH_API_TOKEN is injected automatically) or set "
                 "LQH_API_TOKEN / log in with `lqh login` for local runs"
             )
-        from openai import AsyncOpenAI
+        from lqh.client import create_client
 
-        from lqh.config import default_api_base_url
-
-        return AsyncOpenAI(
-            base_url=default_api_base_url(),
-            api_key=token,
+        return create_client(
+            token,
             max_retries=0,  # this module owns its retry ladder
         )
 
