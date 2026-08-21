@@ -13,7 +13,14 @@ from openai import (
     APIConnectionError,
     APIStatusError,
     AsyncOpenAI,
+    AuthenticationError,
+    BadRequestError,
+    ConflictError,
+    InternalServerError,
+    NotFoundError,
+    PermissionDeniedError,
     RateLimitError,
+    UnprocessableEntityError,
 )
 from openai.types.chat import ChatCompletion
 
@@ -89,6 +96,11 @@ def create_client(
         api_key=api_key,
         base_url=base_url if base_url is not None else default_api_base_url(),
         timeout=300.0,
+        # Opt in to the backend's keepalive heartbeat for slow completions.
+        # The backend only ever commits an early 200 (whitespace keepalives,
+        # errors in-band) for requests carrying this header, because only a
+        # client with the in-band error check below can read that shape.
+        default_headers={"X-LQH-Heartbeat": "1"},
         **({} if max_retries is None else {"max_retries": max_retries}),
     )
     _install_default_max_tokens(client)
@@ -126,23 +138,54 @@ def _install_inband_error_check(client: AsyncOpenAI) -> None:
 
     async def create_checked(*args: Any, **kwargs: Any) -> Any:
         resp = await original(*args, **kwargs)
-        err = getattr(resp, "error", None)
-        # Only an error WITHOUT choices is the in-band shape; some providers
-        # attach a partial ``error`` next to a real completion.
-        if isinstance(err, dict) and not getattr(resp, "choices", None):
+        err = _extract_inband_error(resp)
+        if err is not None:
             raise _inband_status_error(client, err)
         return resp
 
     completions.create = create_checked  # type: ignore[method-assign]
 
 
-def _inband_status_error(client: AsyncOpenAI, err: dict[str, Any]) -> APIStatusError:
-    """Build the APIStatusError an in-band error body would have been.
+def _extract_inband_error(resp: Any) -> dict[str, Any] | None:
+    """Return the error envelope if *resp* is an in-band error, else None.
 
-    Uses the SDK's own status→subclass factory so a 429 becomes a
-    RateLimitError (which ``chat_with_retry`` handles on its own branch), a
-    500 an InternalServerError, and so on.
+    Only an ``error`` WITHOUT choices is the in-band shape; some providers
+    attach a partial ``error`` next to a real completion. Tolerates the SDK
+    representing the unknown member as either a plain dict or a model.
     """
+    try:
+        err = getattr(resp, "error", None)
+        if err is None or getattr(resp, "choices", None):
+            return None
+        if isinstance(err, dict):
+            return err
+        dump = getattr(err, "model_dump", None)
+        if callable(dump):
+            dumped = dump()
+            if isinstance(dumped, dict):
+                return dumped
+    except Exception:  # detection must never break a healthy response
+        logger.debug("in-band error detection failed", exc_info=True)
+    return None
+
+
+# Public status→exception mapping, mirroring the SDK's own dispatch. Kept
+# explicit (rather than calling the SDK's private ``_make_status_error``) so
+# an in-band 429 reliably becomes RateLimitError — which ``chat_with_retry``
+# handles on its own Retry-After branch — across SDK versions.
+_STATUS_ERROR_CLASSES: dict[int, type[APIStatusError]] = {
+    400: BadRequestError,
+    401: AuthenticationError,
+    403: PermissionDeniedError,
+    404: NotFoundError,
+    409: ConflictError,
+    422: UnprocessableEntityError,
+    429: RateLimitError,
+}
+
+
+def _inband_status_error(client: AsyncOpenAI, err: dict[str, Any]) -> APIStatusError:
+    """Build the APIStatusError an in-band error body would have been."""
     code = err.get("code")
     status = code if isinstance(code, int) and 400 <= code <= 599 else 502
     message = str(err.get("message") or "upstream error")
@@ -150,13 +193,15 @@ def _inband_status_error(client: AsyncOpenAI, err: dict[str, Any]) -> APIStatusE
         status,
         request=httpx.Request("POST", str(client.base_url)),
     )
-    make = getattr(client, "_make_status_error", None)
-    if callable(make):
-        try:
-            return make(message, body=err, response=response)
-        except Exception:  # private SDK API — never let it eat the error
-            logger.debug("_make_status_error failed", exc_info=True)
-    return APIStatusError(message, response=response, body=err)
+    cls = _STATUS_ERROR_CLASSES.get(
+        status, InternalServerError if status >= 500 else APIStatusError
+    )
+    exc = cls(message, response=response, body=err)
+    # Subclasses pin status_code as a class-level literal; make sure the
+    # instance carries the actual embedded status (e.g. 524 on
+    # InternalServerError) so retry ladders see the truth.
+    exc.status_code = status  # type: ignore[misc]
+    return exc
 
 
 def is_transient_upstream_error(exc: object) -> bool:

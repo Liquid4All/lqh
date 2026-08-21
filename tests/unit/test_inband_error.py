@@ -18,10 +18,12 @@ from openai.types.chat import ChatCompletion
 
 from lqh.client import (
     RETRYABLE_STATUS,
+    _extract_inband_error,
     _inband_status_error,
     _install_default_max_tokens,
     _install_inband_error_check,
     chat_with_retry,
+    create_client,
 )
 
 
@@ -53,10 +55,41 @@ class TestInbandStatusError:
             assert isinstance(exc, APIStatusError)
             assert exc.status_code == 502
 
-    def test_524_yields_plain_status_error(self):
+    def test_524_keeps_true_status(self):
         exc = _inband_status_error(_client(), {"code": 524, "message": "edge timeout"})
         assert isinstance(exc, APIStatusError)
         assert exc.status_code == 524
+
+class TestExtractInbandError:
+    def test_dict_envelope_detected(self):
+        resp = ChatCompletion.construct(error={"code": 502, "message": "x"})
+        assert _extract_inband_error(resp) == {"code": 502, "message": "x"}
+
+    def test_model_typed_envelope_detected(self):
+        # A stricter SDK could deserialize the unknown member into a model
+        # rather than a plain dict — model_dump must recover it.
+        import pydantic
+
+        class Envelope(pydantic.BaseModel):
+            code: int
+            message: str
+
+        resp = SimpleNamespace(error=Envelope(code=502, message="x"), choices=None)
+        assert _extract_inband_error(resp) == {"code": 502, "message": "x"}
+
+    def test_error_with_choices_ignored(self):
+        resp = SimpleNamespace(error={"code": 500}, choices=[object()])
+        assert _extract_inband_error(resp) is None
+
+    def test_clean_response_ignored(self):
+        resp = SimpleNamespace(choices=[object()])
+        assert _extract_inband_error(resp) is None
+
+
+class TestHeartbeatOptIn:
+    def test_create_client_sends_opt_in_header(self):
+        client = create_client("test-key", "https://api.lqh.ai/v1")
+        assert client.default_headers.get("X-LQH-Heartbeat") == "1"
 
 
 class TestCreateCheckedWrapper:
