@@ -2186,29 +2186,63 @@ class Agent:
         elif "don't ask again for this repo" in response:
             grant_hf_permission(self.project_dir, repo_id=repo_id)
 
-        # Execute the push
-        from lqh.tools.handlers import _execute_hf_push, _get_hf_api, _validate_path
+        # Execute the push.
+        #
+        # This mirrors the dispatch at the end of handlers.handle_hf_push. The
+        # two paths have to agree on repo type, and previously they did not:
+        # this one assumed dataset, globbed for parquet, and indexed
+        # parquet_files[0], which raises IndexError on a model folder.
+        from lqh.tools.handlers import (
+            _detect_hf_repo_type,
+            _execute_hf_push_dataset,
+            _execute_hf_push_model,
+            _get_hf_api,
+            _validate_path,
+        )
 
         api = _get_hf_api(self.project_dir)
         local_path = push_args.get("local_path", "")
         target = _validate_path(self.project_dir, local_path)
 
-        # Find parquet file
-        if target.is_dir():
-            data_parquet = target / "data.parquet"
-            parquet_files = list(target.glob("*.parquet"))
-            parquet_path = data_parquet if data_parquet.exists() else parquet_files[0]
-        else:
-            parquet_path = target
+        repo_type = push_args.get("repo_type")
+        detected, parquet_files, _model_files = _detect_hf_repo_type(target)
+        if repo_type is None:
+            repo_type = detected
+        if repo_type is None:
+            # handle_hf_push rejects this before ever prompting, so reaching it
+            # here means the folder changed between the prompt and the answer.
+            return ToolResult.fail(
+                "validation",
+                (
+                    f"Error: '{local_path}' is no longer recognizable as a dataset "
+                    f"or model folder. Re-run hf_push."
+                ),
+            )
 
-        return await _execute_hf_push(
+        if repo_type == "dataset":
+            data_parquet = target / "data.parquet"
+            parquet_path = (
+                data_parquet if data_parquet.exists() else target / parquet_files[0]
+            )
+            return await _execute_hf_push_dataset(
+                self.project_dir,
+                target,
+                parquet_path,
+                local_path,
+                repo_id,
+                push_args.get("private", True),
+                push_args.get("split", "train"),
+                push_args.get("subset"),
+                push_args.get("commit_message"),
+                api,
+            )
+
+        return await _execute_hf_push_model(
             self.project_dir,
-            parquet_path,
+            target,
             local_path,
             repo_id,
             push_args.get("private", True),
-            push_args.get("split", "train"),
-            push_args.get("subset"),
             push_args.get("commit_message"),
             api,
         )
