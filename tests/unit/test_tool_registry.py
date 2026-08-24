@@ -77,3 +77,10 @@ def test_auto_only_tools_not_exposed() -> None:
     }
     for name in ("set_auto_stage", "exit_auto_mode", "ask_user", "load_skill"):
         assert by_name[name][METADATA_KEY]["cli"] is False
+
+
+def test_deployment_tool_only_advertises_scale_to_zero_development() -> None:
+    tools = {t["function"]["name"]: t for t in get_all_tools(auto_mode=True)}
+    properties = tools["push_to_production"]["function"]["parameters"]["properties"]
+    assert properties["tier"]["enum"] == ["debug"]
+    assert properties["min_containers"]["enum"] == [0]

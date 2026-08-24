@@ -1245,8 +1245,9 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "https://inference.lqh.ai/v1 with the deployment name as the model id. "
                 "LoRA checkpoint artifacts are auto-merged into their base model "
                 "first (status: pending → merging → deploying → running); full "
-                "fine-tunes skip the merge (pending → deploying → running). Billing "
-                "is per GPU-hour while the deployment runs. Use this after training "
+                "fine-tunes skip the merge (pending → deploying → running). Only "
+                "development deployments are currently supported; they scale to zero "
+                "when idle. Billing is per GPU-hour while capacity is warm. Use this after training "
                 "when the user wants to serve the model — find the checkpoint's "
                 "artifact ID via 'artifacts' (action=list), then create an access "
                 "key with create_inference_key so the user can call the endpoint."
@@ -1272,11 +1273,10 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     },
                     "tier": {
                         "type": "string",
-                        "enum": ["debug", "prod"],
+                        "enum": ["debug"],
                         "description": (
-                            "'debug' (default) for cheap testing; 'prod' for "
-                            "customer-facing traffic. Only use 'prod' when the user "
-                            "explicitly asks for a production deployment."
+                            "Development deployment that scales to zero when idle. "
+                            "Production deployments are temporarily unavailable."
                         ),
                         "default": "debug",
                     },
@@ -1289,9 +1289,10 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                     },
                     "min_containers": {
                         "type": "integer",
+                        "enum": [0],
                         "description": (
-                            "Minimum number of serving containers. 0 allows "
-                            "scale-to-zero (cold starts); omit for the default."
+                            "Must be 0 so the deployment scales to zero when idle; "
+                            "omit for the default."
                         ),
                     },
                     "max_containers": {

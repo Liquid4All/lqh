@@ -3791,6 +3791,18 @@ async def handle_push_to_production(
     **kwargs: Any,
 ) -> ToolResult:
     """Deploy a checkpoint artifact as a serving endpoint on LQH Cloud."""
+    if tier != "debug":
+        return ToolResult.fail(
+            "validation",
+            "Production deployments are temporarily unavailable. Use tier='debug' "
+            "for a development deployment that scales to zero.",
+        )
+    if min_containers not in (None, 0):
+        return ToolResult.fail(
+            "validation",
+            "min_containers must be 0; only development deployments that scale "
+            "to zero are currently supported.",
+        )
     # Deployment attribution ALWAYS uses the resolved stable key — a
     # model-supplied project_id (e.g. a stale basename) would create the
     # deployment outside this project's namespace. The parameter is no
@@ -3803,7 +3815,7 @@ async def handle_push_to_production(
     body: dict[str, Any] = {
         "name": name,
         "artifact_id": artifact_id,
-        "tier": tier,
+        "tier": "debug",
         "project_id": _ckey(project_dir),
     }
     if gpu_type:
