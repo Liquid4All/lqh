@@ -706,12 +706,33 @@ class LqhApp:
         self._ctrl_c_pressed = False
         text = buff.text.strip()
 
+        if self._processing and self._ask_user_future is None and self._agent_busy():
+            # Out-of-band feedback: the user saw the model go wrong and wants
+            # to report it now, not after the turn ends. The main loop is
+            # serial, so this bypasses _input_queue and runs as its own task.
+            # Inline text is required — the ask_user prompt belongs to the
+            # running agent, so we never open it from here.
+            command, args = parse_command(text) if is_command(text) else ("", "")
+            if command == "/feedback":
+                if not args.strip():
+                    asyncio.get_event_loop().create_task(
+                        self._emit(render_system_message(
+                            "While a turn is running, include the text inline: "
+                            "/feedback <your message>"
+                        ))
+                    )
+                    return True  # keep_text
+                buff.reset()
+                asyncio.get_event_loop().create_task(self._do_feedback(args))
+                return False
+
         if self._processing and self._ask_user_future is None:
             # The interrupt keys only apply to an in-flight agent turn; input
             # is also held during startup (e.g. while a resumed conversation
             # loads), where offering them would be a lie.
             hint = (
-                " (or press Esc / Ctrl+C to interrupt it)"
+                " (or press Esc / Ctrl+C to interrupt it, "
+                "or /feedback <text> to report a problem)"
                 if self._agent_busy() else ""
             )
             asyncio.get_event_loop().create_task(
@@ -926,7 +947,7 @@ class LqhApp:
         command, _args = parse_command(text)
 
         tracked_command = command.removeprefix("/")
-        if tracked_command in {"spec", "datagen", "validate", "train", "eval", "prompt", "clear", "resume", "feedback"}:
+        if tracked_command in {"spec", "datagen", "validate", "train", "eval", "prompt", "clear", "resume"}:
             # File locks may contend with another CLI in the same project;
             # keep that synchronous disk work off the UI event loop.
             await self._telemetry.run_deferred(self._telemetry.record_workflow_command, tracked_command)
@@ -1348,6 +1369,10 @@ class LqhApp:
 
         from lqh.auth import send_feedback
 
+        # Counted here (not in _handle_command) so the mid-turn path in
+        # _on_accept is tracked the same way.
+        await self._telemetry.run_deferred(self._telemetry.record_workflow_command, "feedback")
+
         if not get_token():
             await self._emit(render_error("Not logged in. Please run /login first."))
             return
@@ -1378,8 +1403,11 @@ class LqhApp:
 
         # Lock input and show an in-flight indicator so the user knows the
         # request is outstanding and stray keystrokes aren't taken as a new
-        # message while it's in flight.
-        self._lock_input()
+        # message while it's in flight. When called mid-turn from _on_accept
+        # the agent already holds the lock — leave it alone.
+        owns_lock = not self._processing
+        if owns_lock:
+            self._lock_input()
         await self._emit(render_system_message("⏳ Sending your feedback…"))
         try:
             await send_feedback(message, context, session_id)
@@ -1394,7 +1422,8 @@ class LqhApp:
             await self._emit(render_error(f"Failed to send feedback: {detail}"))
             return
         finally:
-            self._unlock_input()
+            if owns_lock:
+                self._unlock_input()
 
         await self._emit(render_system_message(
             "✅ Thanks — your feedback was sent to the lqh team."

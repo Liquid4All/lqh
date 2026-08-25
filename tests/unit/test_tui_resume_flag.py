@@ -411,3 +411,85 @@ async def test_resume_hint_silent_for_empty_conversation(
     await app._emit_resume_hint()
 
     assert app._emitted == []
+
+
+async def _busy_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """An app mid-turn: input locked and a fake agent task in flight."""
+    import asyncio
+
+    app = _app(tmp_path, monkeypatch, None)
+    app._lock_input()
+    turn = asyncio.create_task(asyncio.sleep(60))
+    app._agent_task = turn
+    return app, turn
+
+
+async def test_feedback_with_text_submits_during_agent_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """/feedback <text> must go out mid-turn, bypassing the serial input
+    queue, and must not release the input lock the agent turn holds."""
+    import asyncio
+
+    from prompt_toolkit.buffer import Buffer
+
+    sent: list[str] = []
+
+    async def _send_feedback(message, context, session_id):
+        sent.append(message)
+
+    monkeypatch.setattr("lqh.auth.send_feedback", _send_feedback)
+    monkeypatch.setattr("lqh.sysinfo.collect_environment", lambda: {})
+
+    app, turn = await _busy_app(tmp_path, monkeypatch)
+    try:
+        buffer = Buffer(accept_handler=app._on_accept)
+        buffer.text = "/feedback the model looped"
+        buffer.validate_and_handle()
+        # The telemetry hop inside _do_feedback awaits real time; give the
+        # out-of-band task a bounded window to finish.
+        for _ in range(200):
+            if "your feedback was sent" in _plain(app._emitted):
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        turn.cancel()
+
+    assert sent == ["the model looped"]
+    assert buffer.text == ""
+    assert app._input_queue.empty()
+    # The agent turn still owns the lock.
+    assert app._processing is True
+    printed = _plain(app._emitted)
+    assert "Please wait" not in printed
+    assert "your feedback was sent" in printed
+
+
+async def test_feedback_without_text_during_turn_is_kept_with_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from prompt_toolkit.buffer import Buffer
+
+    called = False
+
+    async def _send_feedback(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("lqh.auth.send_feedback", _send_feedback)
+
+    app, turn = await _busy_app(tmp_path, monkeypatch)
+    try:
+        buffer = Buffer(accept_handler=app._on_accept)
+        buffer.text = "/feedback"
+        buffer.validate_and_handle()
+        await asyncio.sleep(0)
+    finally:
+        turn.cancel()
+
+    assert not called
+    assert buffer.text == "/feedback"
+    assert app._input_queue.empty()
+    assert "/feedback <your message>" in _plain(app._emitted)
