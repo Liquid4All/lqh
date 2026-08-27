@@ -368,6 +368,7 @@ Defaults live in `lqh/train/defaults.py`; a sweep overrides `learning_rate` /
   for ~20 updates and look like bad data. Two caveats: the 16 floor means a
   few-hundred-row dataset still lands below the target, and the ~100 target is a
   judgement call rather than a measured optimum (see `defaults.py`).
+- **`assistant_only_loss`** (default: false) — text SFT only; labels assistant turns alone (needs `{% generation %}` in the chat template, as in LFM2.5).
 - **`num_iterations`** (default: 5) — DPO only.
 - **`dpo_beta`** (default: 0.1) — DPO KL anchor strength.
 
