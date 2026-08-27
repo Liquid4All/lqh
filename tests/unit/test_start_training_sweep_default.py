@@ -190,3 +190,29 @@ def test_dpo_config_carries_no_num_epochs(launch):
     rec = launch(type="on_policy_dpo")
     assert "num_epochs" not in rec["config"]["base_config"]["training"]
     assert rec["config"]["base_config"]["num_iterations"] == 5
+
+
+def test_assistant_only_loss_is_off_unless_asked(launch):
+    training = launch(type="sft")["config"]["training"]
+    assert training["assistant_only_loss"] is False
+
+
+def test_assistant_only_loss_reaches_the_training_config(launch):
+    training = launch(type="sft", assistant_only_loss=True)["config"]["training"]
+    assert training["assistant_only_loss"] is True
+
+
+def test_assistant_only_loss_is_rejected_for_vision_models(launch):
+    rec = launch(
+        type="sft", base_model="LiquidAI/LFM2.5-VL-450M", assistant_only_loss=True
+    )
+    assert rec["result"].ok is False
+    assert rec["result"].error_kind == "config"
+    assert "config" not in rec
+
+
+def test_assistant_only_loss_is_rejected_outside_sft(launch):
+    rec = launch(type="on_policy_dpo", assistant_only_loss=True)
+    assert rec["result"].ok is False
+    assert rec["result"].error_kind == "config"
+    assert "config" not in rec

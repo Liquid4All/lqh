@@ -73,6 +73,7 @@ def _write_checkpoint_lineage(
         "per_device_batch_size": training_cfg.get("per_device_batch_size"),
         "gradient_accumulation_steps": training_cfg.get("gradient_accumulation_steps"),
         "effective_batch_size": training_cfg.get("effective_batch_size"),
+        "assistant_only_loss": bool(training_cfg.get("assistant_only_loss", False)),
     }
     if lora_cfg.get("enabled", True):
         hyperparams.update(
@@ -958,6 +959,7 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         gradient_checkpointing=training_cfg.get("gradient_checkpointing", True),
         bf16=training_cfg.get("bf16", True),
         max_length=training_cfg.get("max_seq_length", 2048),
+        assistant_only_loss=bool(training_cfg.get("assistant_only_loss", False)),
         dataloader_num_workers=training_cfg.get("dataloader_num_workers", 4),
         dataloader_pin_memory=True,
         ddp_find_unused_parameters=False,

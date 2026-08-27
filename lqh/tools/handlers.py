@@ -5101,6 +5101,7 @@ async def handle_start_training(
     lora: bool = True,
     num_epochs: int | None = None,
     learning_rate: float | None = None,
+    assistant_only_loss: bool = False,
     num_iterations: int = 5,
     dpo_beta: float = 0.1,
     golden_source: str = "dataset",
@@ -5386,6 +5387,11 @@ async def handle_start_training(
     from lqh.models import is_vlm_model_name
 
     is_vision = is_vlm_model_name(base_model)
+    if assistant_only_loss and (is_vision or type != "sft"):
+        return ToolResult.fail(
+            "config",
+            "Error: assistant_only_loss applies to text SFT only.",
+        )
     if is_vision and type != "sft":
         return ToolResult.fail(
             "validation",
@@ -5474,6 +5480,7 @@ async def handle_start_training(
         "training": {
             **recommended.training_config(),
             "learning_rate": lr,
+            "assistant_only_loss": assistant_only_loss,
         },
         "lora": recommended.lora,
         "manifest": ["base_model", "dataset"],

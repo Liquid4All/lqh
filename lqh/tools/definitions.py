@@ -1746,6 +1746,14 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                             "\'training isn\'t working\' branch."
                         ),
                     },
+                    "assistant_only_loss": {
+                        "type": "boolean",
+                        "description": (
+                            "Text SFT only: compute the loss on assistant turns "
+                            "alone. Set when user turns dominate the row."
+                        ),
+                        "default": False,
+                    },
                     "num_iterations": {
                         "type": "integer",
                         "description": (
