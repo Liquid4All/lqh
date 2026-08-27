@@ -39,6 +39,7 @@ from lqh.train.data_utils import (
     load_eval_sources,
     split_train_eval,
 )
+from lqh.train.deadline import DeadlineStopCallback
 from lqh.train.progress import write_eval_request, write_progress, write_status
 from lqh.train.resume import train_with_checkpoint_fallback
 
@@ -53,6 +54,7 @@ def _write_checkpoint_lineage(
     *,
     config: dict[str, Any],
     training_method: str,
+    stopped_at_step: int | None = None,
 ) -> None:
     """Write metadata consumed by lqh.remote.publish for checkpoint artifacts."""
     training_cfg = config.get("training", {})
@@ -93,6 +95,14 @@ def _write_checkpoint_lineage(
     # no cloud job to inherit from.
     if config.get("spec_sha256"):
         lineage["spec_sha256"] = config["spec_sha256"]
+    # A checkpoint from a deadline-truncated run is usable but did not
+    # train the schedule its hyperparams describe. Without this flag no
+    # artifact distinguishes it from a completed run, and the LR schedule
+    # never reached its end — which is exactly what a weak eval score
+    # would otherwise be blamed on the data for.
+    if stopped_at_step is not None:
+        lineage["stopped_early"] = True
+        lineage["stopped_at_step"] = stopped_at_step
     (model_dir / "lineage.json").write_text(json.dumps(lineage, indent=2) + "\n")
 
 
@@ -779,12 +789,30 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
             greater_is_better=False,
         )
     else:
-        sft_kwargs["save_steps"] = training_cfg.get("save_steps", 500)
+        # A run killed part-way (wall-clock cap, preemption, OOM) can only
+        # be salvaged from a checkpoint on disk, and the old default of 500
+        # writes none at all for the short runs this trainer usually does —
+        # a small dataset at an auto-tuned batch is ~14 optimizer steps.
+        # Same shape as logging_steps above: about four saves per run,
+        # never coarser than the old 500.
+        default_save_steps = 500
+        if total_steps:
+            default_save_steps = max(1, min(500, math.ceil(total_steps / 4)))
+        sft_kwargs["save_steps"] = training_cfg.get("save_steps", default_save_steps)
+        # Checkpoints are full copies of the model and the project volume is
+        # shared with every sibling job, so keep the tail bounded (the eval
+        # branch above already does).
+        sft_kwargs["save_total_limit"] = training_cfg.get("save_total_limit", 2)
     sft_config = SFTConfig(**sft_kwargs)
 
     # Progress callback. For vision it gets the processor (checkpoint eval
     # needs apply_chat_template with images), not the bare tokenizer.
     progress_cb = ProgressCallback(run_dir, config, processor if is_vision else tokenizer)
+
+    # Stops training before the sandbox's wall-clock cap so the final save
+    # and the launcher's publish step still happen. No-op when the backend
+    # passed no deadline (SSH-direct runs, local runs).
+    deadline_cb = DeadlineStopCallback(run_dir, label="sft")
 
     # Trainer
     trainer_kwargs: dict[str, Any] = {
@@ -792,7 +820,7 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         "args": sft_config,
         "train_dataset": train_dataset,
         "processing_class": processor if is_vision else tokenizer,
-        "callbacks": [progress_cb],
+        "callbacks": [progress_cb, deadline_cb],
     }
     if is_vision:
         from lqh.train.vlm_data import VLMCollator
@@ -884,6 +912,7 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         final_model_dir,
         config=config,
         training_method="lora" if saving_adapter else "full",
+        stopped_at_step=deadline_cb.stopped_at_step if deadline_cb.triggered else None,
     )
 
     print(f"Model saved to {display_model_ref(final_model_dir, run_dir)}")

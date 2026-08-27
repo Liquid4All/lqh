@@ -41,6 +41,7 @@ from lqh.train.dpo_metrics import (
     has_no_train_signal,
     held_out_stop_reason,
 )
+from lqh.train.deadline import DeadlineStopCallback
 from lqh.train.progress import (
     wait_for_file,
     write_eval_request,
@@ -996,7 +997,6 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                 save_total_limit=2,
                 # load_best_model_at_end=False (default) — see comment above.
             )
-        dpo_config = DPOConfig(**dpo_kwargs)
 
         effective_batch = max(
             1,
@@ -1020,6 +1020,29 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                 "effective batch or increase pairs/epochs."
             )
 
+        if not has_eval:
+            # Same reason as sft.py: an iteration killed part-way (wall-clock
+            # cap, preemption, OOM) can only be salvaged from a checkpoint on
+            # disk, and HF's default cadence of 500 steps writes none at all
+            # for a typical DPO iteration of a few dozen steps. About four
+            # saves per iteration, tail bounded because each checkpoint is a
+            # full copy on a volume shared with sibling jobs.
+            dpo_kwargs.update(
+                save_strategy="steps",
+                save_steps=training_cfg.get(
+                    "save_steps",
+                    max(1, min(500, math.ceil(planned_optimizer_steps / 4))),
+                ),
+                save_total_limit=training_cfg.get("save_total_limit", 2),
+            )
+        dpo_config = DPOConfig(**dpo_kwargs)
+
+        # Stops this iteration before the sandbox's wall-clock cap so the
+        # run still saves and publishes. No-op without a backend deadline.
+        deadline_cb = DeadlineStopCallback(
+            run_dir, label=f"dpo iteration {iteration}",
+        )
+
         callbacks: list[TrainerCallback] = [
             _DPOProgressCallback(
                 run_dir,
@@ -1027,7 +1050,8 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
                 num_iterations,
                 has_held_out_eval=bool(held_out_convos),
                 training_end=training_end,
-            )
+            ),
+            deadline_cb,
         ]
 
         # If we have an eval split, precompute reference-model CE on
@@ -1444,6 +1468,21 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             except Exception:
                 payload = {"reason": "unparseable"}
             print(f"Early abort signaled by harness at iter {iteration}: {payload}")
+            early_stopped = True
+            break
+
+        # ponytail: checked at the end of the body, like the early-abort
+        # above, so this iteration's bookkeeping still completes. That
+        # bookkeeping (CE re-measure, per-iter predictions) runs inside the
+        # publish reserve; if a real run runs out of reserve here, move the
+        # check to just after train_with_checkpoint_fallback instead.
+        if deadline_cb.triggered:
+            print(
+                f"Wall-clock deadline reached during iter {iteration}; "
+                f"skipping the remaining iterations so this run can save "
+                f"and publish. Resubmit with a larger timeout_minutes to "
+                f"train all {num_iterations}."
+            )
             early_stopped = True
             break
 
