@@ -2334,7 +2334,11 @@ class LqhApp:
             if full_path.suffix.lower() in (".parquet", ".jsonl", ".json"):
                 return await self._open_dataset_viewer(full_path, message)
 
-            content = full_path.read_text(encoding="utf-8")
+            from lqh.tools.handlers import _read_text_capped
+
+            content, capped = _read_text_capped(full_path)
+            if capped:
+                content += "\n\n[truncated: file is larger than the display cap]"
             await self._emit(render_file_view(path, content))
             return None
         except Exception as e:
