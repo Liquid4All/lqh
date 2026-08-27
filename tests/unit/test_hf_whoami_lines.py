@@ -5,7 +5,8 @@ It used to read `auth.accessToken.type`, a field that does not exist in HF's
 is worse than useless when the question being asked is "which credential is
 this machine actually using".
 
-Every test here also asserts the token value never appears in the output.
+Every fixture here carries a sentinel token value that the renderer must never
+copy into its output.
 """
 
 from __future__ import annotations
@@ -18,6 +19,9 @@ TOKEN = "hf_SENTINEL_DO_NOT_PRINT_0123456789"
 def test_personal_access_token_reports_its_class_and_role():
     info = {
         "name": "someone",
+        # whoami responses can carry the credential itself; it must not be
+        # rendered, so it goes in the fixture for the leak assertion to bite.
+        "token": TOKEN,
         "auth": {
             "type": "access_token",
             "accessToken": {"displayName": "laptop", "role": "read"},
@@ -42,6 +46,7 @@ def test_oauth_credential_is_named_and_flagged_as_expiring():
     # have produced "unknown".
     info = {
         "name": "someone",
+        "token": TOKEN,
         "auth": {"type": "app_token_as_user", "expiresAt": "2026-09-20T00:00:00Z"},
     }
     out = "\n".join(_whoami_lines(info))
@@ -54,10 +59,33 @@ def test_oauth_credential_is_named_and_flagged_as_expiring():
     assert TOKEN not in out
 
 
+def test_unrecognised_class_is_named_but_gets_no_oauth_advice():
+    # A class this build has never heard of. Name it, and stop there — the
+    # expiry advice only holds for the two documented OAuth classes.
+    info = {
+        "name": "someone",
+        "token": TOKEN,
+        "auth": {"type": "some_future_class", "accessToken": {"role": "write"}},
+    }
+    out = "\n".join(_whoami_lines(info))
+
+    assert "Token type: some_future_class" in out
+    assert "role: write" in out
+    assert "settings/tokens" not in out
+    assert TOKEN not in out
+
+
 def test_unknown_shape_degrades_instead_of_raising():
     # A whoami response we do not recognise (or an older/newer Hub) must still
     # render. "unknown" is honest here; it was not honest as a blanket answer.
-    for info in ({}, {"name": "someone"}, {"name": "someone", "auth": None}):
+    for auth in (..., None, {}):
+        info = {"name": "someone", "token": TOKEN}
+        if auth is not ...:
+            info["auth"] = auth
         out = "\n".join(_whoami_lines(info))
         assert "Token type: unknown" in out
         assert "settings/tokens" not in out  # no expiry advice we cannot support
+        assert TOKEN not in out
+
+    # The fully empty response too — no name, no auth.
+    assert "Token type: unknown" in "\n".join(_whoami_lines({}))

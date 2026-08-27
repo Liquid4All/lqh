@@ -3361,9 +3361,11 @@ def _whoami_lines(info: dict[str, Any]) -> list[str]:
     )
     lines.append(f"  Token type: {kind}" + (f" ({detail})" if detail else ""))
 
-    # "access_token" is a token from huggingface.co/settings/tokens: static,
-    # no expiry, fine for a cloud job. Anything else came from an OAuth flow.
-    if kind not in ("access_token", "unknown"):
+    # The two OAuth classes, matched positively: an unrecognised kind (older or
+    # newer Hub) must not be handed advice we cannot stand behind. The third
+    # documented kind, "access_token", is a static settings-page token — no
+    # expiry, fine for a cloud job.
+    if kind in ("app_token", "app_token_as_user"):
         lines.append(
             "  Note: this is an OAuth credential and it expires. Cloud jobs get a "
             "static copy and cannot refresh it — create a fine-grained token at "
