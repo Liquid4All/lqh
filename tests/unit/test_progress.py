@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -380,47 +381,167 @@ def test_checkpoint_eval_band_spans_one_training_step() -> None:
     assert checkpoint_eval_band(TRAINING_END, 0, 81) is None
 
 
-def test_mid_run_checkpoint_eval_reports_without_rewinding(
+# ---------------------------------------------------------------------------
+# The wiring itself: ProgressCallback.on_save -> _run_checkpoint_eval.
+#
+# lqh/train/sft.py imports the torch stack at module scope, so the fixture
+# below stubs whichever of those packages is missing (the unit suite runs
+# without `pip install lqh[train]`) and imports the module fresh.
+# ---------------------------------------------------------------------------
+
+
+class _FakeIds:
+    """Minimum tensor surface `_run_checkpoint_eval` touches."""
+
+    def __init__(self, rows: list[list[int]]) -> None:
+        self.rows = rows
+
+    def to(self, device: object) -> "_FakeIds":
+        return self
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (len(self.rows), len(self.rows[0]))
+
+    def __getitem__(self, i: int) -> list[int]:
+        return self.rows[i]
+
+
+class _FakeTokenizer:
+    def apply_chat_template(self, msgs, **kwargs):  # noqa: ANN001, ANN201
+        return {"input_ids": _FakeIds([[1, 2, 3]])}
+
+    def decode(self, ids, **kwargs) -> str:  # noqa: ANN001
+        return "generated"
+
+
+class _FakeModel:
+    device = "cpu"
+
+    def eval(self) -> None:
+        return None
+
+    def generate(self, input_ids, **kwargs):  # noqa: ANN001, ANN201
+        return _FakeIds([[1, 2, 3, 4]])
+
+
+@pytest.fixture
+def sft_module(monkeypatch: pytest.MonkeyPatch):  # noqa: ANN201
+    import importlib
+    import importlib.machinery
+    import importlib.util
+    import sys
+    import types
+
+    def stub(name: str, **attrs: object) -> None:
+        if importlib.util.find_spec(name) is not None:
+            return  # real package installed — nothing to fake
+        mod = types.ModuleType(name)
+        # `datasets` probes find_spec("torch"), which raises on a spec-less
+        # stub module.
+        mod.__spec__ = importlib.machinery.ModuleSpec(name, None)
+        for key, value in attrs.items():
+            setattr(mod, key, value)
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    import contextlib
+
+    stub("torch", no_grad=contextlib.nullcontext, bfloat16="bf16")
+    stub("datasets", Dataset=type("Dataset", (), {}))
+    stub("peft", LoraConfig=type("LoraConfig", (), {}))
+    stub(
+        "transformers",
+        TrainerCallback=type("TrainerCallback", (), {}),
+        TrainerControl=type("TrainerControl", (), {}),
+        TrainerState=type("TrainerState", (), {}),
+        TrainingArguments=type("TrainingArguments", (), {}),
+    )
+    stub(
+        "trl",
+        SFTConfig=type("SFTConfig", (), {}),
+        SFTTrainer=type("SFTTrainer", (), {}),
+    )
+
+    monkeypatch.delitem(sys.modules, "lqh.train.sft", raising=False)
+    module = importlib.import_module("lqh.train.sft")
+    yield module
+    # Never leave a stub-built module cached for the rest of the session.
+    sys.modules.pop("lqh.train.sft", None)
+
+
+def test_on_save_reports_the_mid_run_eval_without_rewinding(
     tmp_path: Path,
+    sft_module,  # noqa: ANN001
+    sample_conversations,  # noqa: ANN001
+    write_chatml_parquet,  # noqa: ANN001
 ) -> None:
     """The interleave a stalled-looking run actually produces.
 
-    Training reaches step 50 of 81, the checkpoint eval generates over 149
-    samples, then training resumes. Every eval sample must append a row (the
-    stall watchdog stats this file) and the fraction must never go backwards.
+    Training reaches step 50 of 81, `on_save` runs the checkpoint eval over
+    the whole eval set, then training resumes at step 55. Every generated
+    sample must append a row — the stall watchdog stats this file — and the
+    resumed step must still be able to move the fraction forward.
+
+    Driven through `ProgressCallback`, so dropping the reporter/band wiring
+    in `sft.py` fails here.
     """
-    reporter = ProgressReporter(
-        task_kind="sft", label="run", run_dir=tmp_path, min_interval=0.0,
+    run_dir = tmp_path / "sft_001"
+    run_dir.mkdir()
+    eval_path = write_chatml_parquet(
+        tmp_path / "eval" / "eval.parquet", sample_conversations(3),
+    )
+    config = {
+        "type": "sft",
+        "eval_on_checkpoints": True,
+        "eval_dataset": str(eval_path),
+        "scorer": "judge:small",
+    }
+
+    callback = sft_module.ProgressCallback(
+        run_dir=run_dir, config=config, tokenizer=_FakeTokenizer(),
+    )
+    # Real generation takes ~30s a sample; without this the reporter's time
+    # throttle would collapse the whole loop into one row.
+    callback.reporter.min_interval = 0.0
+
+    callback.on_save(
+        None,
+        SimpleNamespace(global_step=50, max_steps=81, epoch=1.0),
+        None,
+        model=_FakeModel(),
+    )
+    callback.on_log(
+        None,
+        SimpleNamespace(global_step=55, max_steps=81, epoch=1.1),
+        None,
+        logs={"loss": 0.5},
     )
 
-    def train_step(step: int) -> None:
-        reporter.update(
-            phase="training", phase_label="training SFT",
-            completed=step, total=81, unit="steps",
-            overall_fraction=TRAINING_END * step / 81,
-        )
-
-    train_step(50)
-    band = checkpoint_eval_band(TRAINING_END, 50, 81)
-    assert band is not None
-    start, end = band
-    for sample in (1, 74, 149):
-        reporter.update(
-            phase="checkpoint_eval",
-            phase_label="evaluating checkpoint step 50",
-            completed=sample, total=149, unit="samples",
-            overall_fraction=start + (end - start) * sample / 149,
-        )
-    train_step(55)
+    assert (run_dir / "checkpoints" / "step_50" / "predictions.parquet").exists()
 
     rows = [
         json.loads(line)
-        for line in (tmp_path / "progress.jsonl").read_text().splitlines()
+        for line in (run_dir / "progress.jsonl").read_text().splitlines()
         if line.strip()
     ]
-    fractions = [row["overall_fraction"] for row in rows]
+    fractions = [
+        row["overall_fraction"] for row in rows if "overall_fraction" in row
+    ]
     assert fractions == sorted(fractions), fractions
 
     eval_rows = [row for row in rows if row.get("phase") == "checkpoint_eval"]
-    assert len(eval_rows) == 3, "each generated sample must refresh the file"
-    assert eval_rows[-1]["overall_fraction"] < TRAINING_END * 55 / 81
+    # One opening row plus one per generated sample.
+    assert len(eval_rows) == 4, "each generated sample must refresh the file"
+    assert eval_rows[-1]["phase_label"] == "evaluating checkpoint step 50"
+    assert eval_rows[-1]["completed"] == 3
+
+    # The band is the sliver of the training band this checkpoint sits on —
+    # borrowing the 0.90 final-inference band would pin the rest of training.
+    assert eval_rows[0]["overall_fraction"] == pytest.approx(
+        TRAINING_END * 50 / 81
+    )
+    assert eval_rows[-1]["overall_fraction"] == pytest.approx(
+        TRAINING_END * 51 / 81
+    )
+    resumed = [row for row in rows if row.get("phase") == "training"][-1]
+    assert resumed["overall_fraction"] == pytest.approx(TRAINING_END * 55 / 81)
