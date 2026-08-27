@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +11,8 @@ from lqh.progress import (
     EtaEstimate,
     ProgressEvent,
     ProgressReporter,
+    TRAINING_END,
+    checkpoint_eval_band,
     dpo_overall_fraction,
     estimate_eta,
     estimate_eta_seconds,
@@ -356,3 +360,67 @@ def test_stalled_phase_promises_nothing() -> None:
     assert estimate_eta(rows) == EtaEstimate()
     line, _ = format_event_oneline(rows[-1], history=rows, observed_at=None)
     assert "ETA" not in line
+
+
+def test_checkpoint_eval_band_spans_one_training_step() -> None:
+    """A mid-run band must stay inside the training band, not borrow 0.90."""
+    band = checkpoint_eval_band(TRAINING_END, 50, 81)
+    assert band is not None
+    start, end = band
+    assert start == pytest.approx(TRAINING_END * 50 / 81)
+    assert end == pytest.approx(TRAINING_END * 51 / 81)
+    # The next logged training step must still be able to move forward.
+    assert end < TRAINING_END * 55 / 81
+    # Last step: the band collapses instead of running past the band end.
+    assert checkpoint_eval_band(TRAINING_END, 81, 81) == (
+        pytest.approx(TRAINING_END), pytest.approx(TRAINING_END),
+    )
+    # Unusable step counts give nothing to anchor to.
+    assert checkpoint_eval_band(TRAINING_END, 50, 0) is None
+    assert checkpoint_eval_band(TRAINING_END, 0, 81) is None
+
+
+def test_mid_run_checkpoint_eval_reports_without_rewinding(
+    tmp_path: Path,
+) -> None:
+    """The interleave a stalled-looking run actually produces.
+
+    Training reaches step 50 of 81, the checkpoint eval generates over 149
+    samples, then training resumes. Every eval sample must append a row (the
+    stall watchdog stats this file) and the fraction must never go backwards.
+    """
+    reporter = ProgressReporter(
+        task_kind="sft", label="run", run_dir=tmp_path, min_interval=0.0,
+    )
+
+    def train_step(step: int) -> None:
+        reporter.update(
+            phase="training", phase_label="training SFT",
+            completed=step, total=81, unit="steps",
+            overall_fraction=TRAINING_END * step / 81,
+        )
+
+    train_step(50)
+    band = checkpoint_eval_band(TRAINING_END, 50, 81)
+    assert band is not None
+    start, end = band
+    for sample in (1, 74, 149):
+        reporter.update(
+            phase="checkpoint_eval",
+            phase_label="evaluating checkpoint step 50",
+            completed=sample, total=149, unit="samples",
+            overall_fraction=start + (end - start) * sample / 149,
+        )
+    train_step(55)
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "progress.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    fractions = [row["overall_fraction"] for row in rows]
+    assert fractions == sorted(fractions), fractions
+
+    eval_rows = [row for row in rows if row.get("phase") == "checkpoint_eval"]
+    assert len(eval_rows) == 3, "each generated sample must refresh the file"
+    assert eval_rows[-1]["overall_fraction"] < TRAINING_END * 55 / 81
