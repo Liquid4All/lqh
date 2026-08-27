@@ -3322,6 +3322,60 @@ def _save_hf_mapping(
 # ---------------------------------------------------------------------------
 
 
+def _whoami_lines(info: dict[str, Any]) -> list[str]:
+    """Render `HfApi.whoami()` for a tool result. Never includes the token.
+
+    The shape is HF's ``AuthInfo``
+    (https://huggingface.co/docs/huggingface.js/hub/interfaces/AuthInfo)::
+
+        auth: {
+          type: "access_token" | "app_token" | "app_token_as_user",
+          accessToken?: { displayName, role, createdAt },   # optional!
+          expiresAt?: Date,
+        }
+
+    ``auth.type`` is the credential class; ``auth.accessToken.role`` is the
+    permission. This used to read ``auth.accessToken.type``, which does not
+    exist in that shape, so it printed "unknown" for every token ever issued
+    — and printed it most usefully wrong for an OAuth credential, where
+    ``accessToken`` may be absent entirely.
+
+    Worth distinguishing, because ``hf auth login`` with no ``--token`` runs a
+    browser flow and saves an *expiring* OAuth credential. That works locally,
+    where the hub library refreshes it, and is the wrong thing to hand a cloud
+    job, which holds a static copy with no way to refresh.
+    """
+    lines = [f"🤗 Authenticated as: **{info.get('name', 'unknown')}**"]
+
+    auth = info.get("auth") or {}
+    token = auth.get("accessToken") or {}
+    kind = auth.get("type") or "unknown"
+    detail = ", ".join(
+        f"{label}: {value}"
+        for label, value in (
+            ("role", token.get("role")),
+            ("name", token.get("displayName")),
+            ("expires", auth.get("expiresAt")),
+        )
+        if value
+    )
+    lines.append(f"  Token type: {kind}" + (f" ({detail})" if detail else ""))
+
+    # "access_token" is a token from huggingface.co/settings/tokens: static,
+    # no expiry, fine for a cloud job. Anything else came from an OAuth flow.
+    if kind not in ("access_token", "unknown"):
+        lines.append(
+            "  Note: this is an OAuth credential and it expires. Cloud jobs get a "
+            "static copy and cannot refresh it — create a fine-grained token at "
+            "https://huggingface.co/settings/tokens for cloud work."
+        )
+
+    orgs = [o.get("name", "?") for o in info.get("orgs", [])]
+    if orgs:
+        lines.append(f"  Organizations: {', '.join(orgs)}")
+    return lines
+
+
 async def handle_hf_repo_info(
     *, repo_id: str | None = None, repo_type: str = "dataset", **kwargs: Any,
 ) -> ToolResult:
@@ -3334,18 +3388,7 @@ async def handle_hf_repo_info(
     try:
         if repo_id is None:
             # whoami
-            info = api.whoami()
-            username = info.get("name", "unknown")
-            orgs = [o.get("name", "?") for o in info.get("orgs", [])]
-            auth = info.get("auth", {})
-            access_type = auth.get("accessToken", {}).get("type", "unknown")
-            lines = [
-                f"🤗 Authenticated as: **{username}**",
-                f"  Token type: {access_type}",
-            ]
-            if orgs:
-                lines.append(f"  Organizations: {', '.join(orgs)}")
-            return ToolResult(content="\n".join(lines))
+            return ToolResult(content="\n".join(_whoami_lines(api.whoami())))
         else:
             info = api.repo_info(repo_id=repo_id, repo_type=repo_type)
             lines = [
