@@ -57,6 +57,17 @@ def deadline_epoch() -> float | None:
     return value if value > 0 else None
 
 
+def past_deadline(reserve_seconds: float = PUBLISH_RESERVE_SECONDS) -> bool:
+    """True when only the publish reserve is left of the sandbox's cap.
+
+    For the phases that run outside a training loop and so never reach
+    :meth:`DeadlineStopCallback.on_step_end` — DPO's rollout and
+    preference-scoring phases, which can each outlast the whole reserve.
+    """
+    deadline = deadline_epoch()
+    return deadline is not None and time.time() >= deadline - max(0.0, reserve_seconds)
+
+
 class DeadlineStopCallback(TrainerCallback):
     """Ends training in time for the run to save and publish."""
 
@@ -89,14 +100,20 @@ class DeadlineStopCallback(TrainerCallback):
             return
         if time.time() < self.stop_at:
             return
+        # HF increments global_step before this hook, so the final
+        # scheduled step arrives here already complete. Stopping is
+        # moot and the marker would be a lie: the schedule did run.
+        step = int(getattr(state, "global_step", 0) or 0)
+        max_steps = getattr(state, "max_steps", 0)
+        if isinstance(max_steps, int) and max_steps > 0 and step >= max_steps:
+            return
         self.triggered = True
-        self.stopped_at_step = int(getattr(state, "global_step", 0) or 0)
+        self.stopped_at_step = step
         # should_save as well as should_training_stop: the loop may exit
         # between HF's own save points, and the whole purpose here is to
         # leave a checkpoint behind.
         control.should_training_stop = True
         control.should_save = True
-        max_steps = getattr(state, "max_steps", 0)
         print(
             f"{self.label}: wall-clock deadline reached at step "
             f"{self.stopped_at_step}"

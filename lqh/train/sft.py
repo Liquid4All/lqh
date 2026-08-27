@@ -855,12 +855,21 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     #      its metrics into state.log_history, so the dump below picks
     #      it up as the LAST eval_loss entry — exactly the one
     #      _read_sft_proxy in sweep.py uses.
-    if eval_dataset is not None:
+    #
+    # Skipped on a deadline stop: everything after this point shares the
+    # publish reserve with the save, the tar and a multi-GB upload, and an
+    # eval pass is not bounded by it. A run long enough to hit the cap has
+    # fired its step evals many times over, so eval_history still carries an
+    # eval_loss for the sweep proxy — the case above is a short run, which
+    # never reaches the deadline.
+    if eval_dataset is not None and not deadline_cb.triggered:
         try:
             final_metrics = trainer.evaluate()
             print(f"Final eval: eval_loss={final_metrics.get('eval_loss')}")
         except Exception as exc:  # noqa: BLE001 — eval must not kill a finished train
             print(f"  WARNING: final evaluation failed: {exc}")
+    elif eval_dataset is not None:
+        print("  deadline stop: skipping the final evaluation so the run can publish.")
 
     # Dump the full log history (one entry per logging step, including
     # eval rows) for downstream correlation analysis. Filter to
@@ -917,8 +926,15 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
 
     print(f"Model saved to {display_model_ref(final_model_dir, run_dir)}")
 
-    # Final eval if requested
-    if config.get("eval_on_checkpoints") and config.get("eval_dataset"):
+    # Final eval if requested. Generation + scoring over the eval set, so
+    # the least bounded thing in the run — never inside the publish reserve.
+    if deadline_cb.triggered and config.get("eval_on_checkpoints"):
+        print("  deadline stop: skipping checkpoint eval so the run can publish.")
+    if (
+        config.get("eval_on_checkpoints")
+        and config.get("eval_dataset")
+        and not deadline_cb.triggered
+    ):
         final_checkpoint = run_dir / "checkpoints" / "final"
         final_checkpoint.mkdir(parents=True, exist_ok=True)
 

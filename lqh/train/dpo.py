@@ -41,7 +41,7 @@ from lqh.train.dpo_metrics import (
     has_no_train_signal,
     held_out_stop_reason,
 )
-from lqh.train.deadline import DeadlineStopCallback
+from lqh.train.deadline import DeadlineStopCallback, past_deadline
 from lqh.train.progress import (
     wait_for_file,
     write_eval_request,
@@ -712,6 +712,21 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             continue
     for iteration in range(start_iteration, num_iterations):
+        # An iteration is rollout + scoring + training, and only the last of
+        # those three reaches the callback below. Starting one with nothing
+        # but the publish reserve left spends the reserve in a phase that
+        # cannot stop itself. Requires a completed iteration to fall back on
+        # — with none, breaking here would publish the untrained base model
+        # as if it were a result.
+        if completed_iterations > start_iteration and past_deadline():
+            print(
+                f"Wall-clock deadline reached before iter {iteration}; "
+                f"stopping so this run can save and publish. Resubmit with a "
+                f"larger timeout_minutes to train all {num_iterations}."
+            )
+            early_stopped = True
+            break
+
         iter_name = f"iter_{iteration:03d}"
         iter_dir = iterations_dir / iter_name
         iter_dir.mkdir(parents=True, exist_ok=True)
@@ -1160,7 +1175,7 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         # callback's last row was measured against weights that have
         # since been replaced. Re-measure on the current trainer model
         # so the summary matches the saved final checkpoint.
-        if ce_cb is not None and has_eval:
+        if ce_cb is not None and has_eval and not deadline_cb.triggered:
             try:
                 ce_chosen_post = _per_example_ce(
                     trainer.model, tokenizer,
@@ -1337,7 +1352,13 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         # using the just-trained model so the harness can score it and
         # decide whether to early-abort. Uses the same in-memory model
         # to avoid loading the LoRA adapter from disk again.
-        if held_out_convos:
+        if held_out_convos and deadline_cb.triggered:
+            print(
+                "  deadline stop: skipping the held-out eval so this run can "
+                "save and publish (its generation, inline scoring and host "
+                "round-trip each outlast the reserve)."
+            )
+        elif held_out_convos:
             print(f"Running held-out eval ({len(held_out_convos)} samples)...")
             try:
                 from lqh.train.cloud_score import is_cloud_mode
@@ -1471,11 +1492,11 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
             early_stopped = True
             break
 
-        # ponytail: checked at the end of the body, like the early-abort
-        # above, so this iteration's bookkeeping still completes. That
-        # bookkeeping (CE re-measure, per-iter predictions) runs inside the
-        # publish reserve; if a real run runs out of reserve here, move the
-        # check to just after train_with_checkpoint_fallback instead.
+        # Checked at the end of the body, like the early-abort above, so the
+        # iteration checkpoint and iter_complete.json are on disk — they are
+        # what best-iter selection and the final save read. Everything
+        # between the trainer returning and here that is not cheap
+        # bookkeeping was bypassed above, so the reserve is intact.
         if deadline_cb.triggered:
             print(
                 f"Wall-clock deadline reached during iter {iteration}; "
@@ -1552,8 +1573,22 @@ def dpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
 
     tokenizer.save_pretrained(str(final_model_dir))
 
-    final_eval_expected = has_final_inference(config) and not interrupted
-    final_scoring_expected = has_final_scoring(config) and not interrupted
+    # Final inference (generation over the whole eval set) plus judge scoring
+    # sits between the save above and the launcher's publish. Out of reserve
+    # it is the thing that gets the sandbox killed with a saved checkpoint
+    # nobody ever uploads — the exact failure this deadline exists to end.
+    out_of_time = past_deadline()
+    if out_of_time and has_final_inference(config):
+        print(
+            "  deadline stop: skipping final inference and scoring so the "
+            "saved model gets published."
+        )
+    final_eval_expected = (
+        has_final_inference(config) and not interrupted and not out_of_time
+    )
+    final_scoring_expected = (
+        has_final_scoring(config) and not interrupted and not out_of_time
+    )
     final_eval_failed = False
     if final_eval_expected:
         try:

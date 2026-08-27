@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import time
 
-from lqh.train.deadline import DeadlineStopCallback, deadline_epoch
+from lqh.train.deadline import DeadlineStopCallback, deadline_epoch, past_deadline
 
 
 class _Control:
@@ -70,3 +70,56 @@ def test_deadline_comes_from_the_environment(monkeypatch):
     for bad in ("", "   ", "later", "0", "-5"):
         monkeypatch.setenv("LQH_DEADLINE_EPOCH", bad)
         assert deadline_epoch() is None
+
+
+def test_a_completed_schedule_is_not_marked_truncated(tmp_path):
+    """HF increments global_step before on_step_end.
+
+    So the final scheduled step reaches this hook already done. Stopping
+    is moot there and the marker would be a lie — a reader (and the
+    lineage flag) would call a fully trained checkpoint truncated.
+    """
+    cb = DeadlineStopCallback(
+        tmp_path, label="sft", reserve_seconds=600, deadline=time.time() + 30,
+    )
+
+    class _Done:
+        global_step = 100
+        max_steps = 100
+        epoch = 2.0
+
+    control = _Control()
+    cb.on_step_end(None, _Done(), control)
+    assert not control.should_training_stop
+    assert not cb.triggered
+    assert cb.stopped_at_step is None
+    assert not (tmp_path / "stopped_early.json").exists()
+
+
+def test_an_unbounded_schedule_still_stops(tmp_path):
+    """max_steps <= 0 must not read as "already complete"."""
+    cb = DeadlineStopCallback(
+        tmp_path, label="dpo", reserve_seconds=600, deadline=time.time() + 30,
+    )
+
+    class _NoMax:
+        global_step = 7
+        max_steps = 0
+        epoch = 0.5
+
+    control = _Control()
+    cb.on_step_end(None, _NoMax(), control)
+    assert control.should_training_stop and cb.triggered
+    assert cb.stopped_at_step == 7
+
+
+def test_past_deadline_covers_phases_with_no_training_loop(monkeypatch):
+    """DPO rollout and scoring never reach on_step_end."""
+    monkeypatch.delenv("LQH_DEADLINE_EPOCH", raising=False)
+    assert past_deadline() is False
+
+    monkeypatch.setenv("LQH_DEADLINE_EPOCH", str(time.time() + 3600))
+    assert past_deadline(reserve_seconds=60) is False
+
+    monkeypatch.setenv("LQH_DEADLINE_EPOCH", str(time.time() + 30))
+    assert past_deadline(reserve_seconds=600) is True
