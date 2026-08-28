@@ -16,6 +16,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from lqh.tools.handlers import (
+    ToolResult,
     _validate_path,
     execute_tool,
     handle_create_file,
@@ -637,3 +638,75 @@ class TestHfPushPermissionSentinel:
         assert result.content == "PERMISSION_REQUIRED"
         # repo_id was auto-generated inside the handler; the key exposes it.
         assert result.permission_key == f"hf_push:tester/{tmp_path.name}-demo"
+
+
+class TestHfPushPermissionExecutes:
+    """The push that runs *after* the user approves must reach the Hub.
+
+    `handle_hf_push` returns PERMISSION_REQUIRED on the first push to a repo,
+    so this path is the one every new user takes. It dispatches separately from
+    the already-approved path, and the two have to agree about repo type.
+    """
+
+    @staticmethod
+    def _agent(project_dir):
+        from lqh.agent import Agent
+
+        agent = Agent.__new__(Agent)
+        agent.project_dir = project_dir
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_approved_dataset_push_reaches_the_dataset_executor(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        seen = {}
+
+        async def fake_dataset(project_dir, target, parquet_path, *a, **k):
+            seen["parquet"] = parquet_path
+            return ToolResult(content="pushed dataset")
+
+        monkeypatch.setattr("lqh.tools.handlers._get_hf_api", lambda *a, **k: object())
+        monkeypatch.setattr(
+            "lqh.tools.handlers._execute_hf_push_dataset", fake_dataset
+        )
+        dataset = tmp_path / "datasets" / "demo"
+        dataset.mkdir(parents=True)
+        (dataset / "data.parquet").write_bytes(b"x")
+
+        result = await self._agent(tmp_path)._handle_hf_push_permission(
+            "Push once, ask again next time",
+            {"local_path": "datasets/demo"},
+            permission_key="hf_push:tester/demo",
+        )
+        assert result.content == "pushed dataset"
+        assert seen["parquet"].name == "data.parquet"
+
+    @pytest.mark.asyncio
+    async def test_approved_model_push_reaches_the_model_executor(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A model folder has no parquet at all.
+
+        The previous implementation globbed for parquet unconditionally and
+        indexed [0], so this folder could not be pushed after approval.
+        """
+        called = {}
+
+        async def fake_model(project_dir, target, local_path, *a, **k):
+            called["local_path"] = local_path
+            return ToolResult(content="pushed model")
+
+        monkeypatch.setattr("lqh.tools.handlers._get_hf_api", lambda *a, **k: object())
+        monkeypatch.setattr("lqh.tools.handlers._execute_hf_push_model", fake_model)
+        model = tmp_path / "checkpoints" / "lfm"
+        model.mkdir(parents=True)
+        (model / "config.json").write_text("{}")
+
+        result = await self._agent(tmp_path)._handle_hf_push_permission(
+            "Push once, ask again next time",
+            {"local_path": "checkpoints/lfm"},
+            permission_key="hf_push:tester/lfm",
+        )
+        assert result.content == "pushed model"
+        assert called["local_path"] == "checkpoints/lfm"
