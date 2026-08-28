@@ -55,6 +55,20 @@ MAX_CONTENT_WIDTH = 120
 # stall the paint loop; the viewer notes the truncation explicitly.
 _MAX_BODY_LINES = 5000
 
+# Rows loaded into memory. A full load OOM-killed the CLI on HF datasets with
+# blob columns (a 285 MB parquet peaks at ~1.6 GB decoded). The file's real row
+# count still comes from the parquet footer, so score alignment and the agent
+# summary stay honest about what the dataset holds.
+# ponytail: first-N window, not fetch-on-demand — page in row groups only if
+# people really scroll into million-row datasets.
+VIEWER_MAX_ROWS = 2000
+
+# Rows are not the only axis: 300 rows of embedded PDFs is 285 MB. Stop on
+# decoded size too, whichever cap comes first. The batch size bounds what one
+# decode step can pull in before the size check runs.
+VIEWER_MAX_BYTES = 64 * 1024 * 1024
+_BATCH_ROWS = 16
+
 # Agent banner is capped to this many rendered lines so a long message can
 # never squeeze the body viewport out of existence on small terminals.
 _MAX_BANNER_LINES = 2
@@ -126,26 +140,56 @@ def _maybe_json(value: object) -> object:
     return value
 
 
-def _load_records(path: Path) -> list[dict]:
-    """Load rows from a parquet/jsonl/json file as a list of dicts."""
+def _load_records(
+    path: Path, max_rows: int | None = None
+) -> tuple[list[dict], int]:
+    """Load up to ``max_rows`` rows as dicts. Returns ``(rows, rows_in_file)``.
+
+    ``rows_in_file`` is the real count even when the load stops at the cap.
+    """
+    max_rows = VIEWER_MAX_ROWS if max_rows is None else max_rows
     suffix = path.suffix.lower()
     if suffix == ".parquet":
+        import pyarrow as pa
         import pyarrow.parquet as pq
 
-        return pq.read_table(path).to_pylist()
+        pf = pq.ParquetFile(path)
+        total = pf.metadata.num_rows
+        batches, need, nbytes = [], max_rows, 0
+        for batch in pf.iter_batches(batch_size=max(1, min(need, _BATCH_ROWS))):
+            chunk = batch.slice(0, need)
+            batches.append(chunk)
+            need -= chunk.num_rows
+            nbytes += chunk.nbytes
+            if need <= 0 or nbytes >= VIEWER_MAX_BYTES:
+                break
+        if not batches:
+            return [], total
+        rows = pa.Table.from_batches(batches, schema=pf.schema_arrow).to_pylist()
+        return rows, total
     if suffix == ".jsonl":
         records = []
+        total = 0
+        nbytes = 0
         with path.open(encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if line:
+                if not line.strip():
+                    continue
+                total += 1
+                if len(records) < max_rows and nbytes < VIEWER_MAX_BYTES:
                     records.append(json.loads(line))
-        return [r if isinstance(r, dict) else {"value": r} for r in records]
+                    nbytes += len(line)
+        return [r if isinstance(r, dict) else {"value": r} for r in records], total
     if suffix == ".json":
+        # ponytail: a whole-file parse — JSON has no streaming shape and these
+        # are config-sized in practice. Cap the rows kept, not the parse.
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, list):
-            return [r if isinstance(r, dict) else {"value": r} for r in data]
-        return [data if isinstance(data, dict) else {"value": data}]
+            rows = [
+                r if isinstance(r, dict) else {"value": r} for r in data[:max_rows]
+            ]
+            return rows, len(data)
+        return [data if isinstance(data, dict) else {"value": data}], 1
     raise ValueError(f"Unsupported file type: {path.suffix}")
 
 
@@ -234,9 +278,13 @@ class DatasetViewer:
             if candidate.exists() and candidate != path:
                 sibling_scores_path = candidate
 
-        records = _load_records(data_path)
+        records, file_rows = _load_records(data_path)
         self._data_path = data_path
+        # total_rows bounds navigation, so it counts *loaded* rows. file_rows
+        # is what the file holds — used for score alignment and the labels.
         self.total_rows = len(records)
+        self.file_rows = file_rows
+        self.rows_capped = file_rows > self.total_rows
 
         is_chat = bool(records) and all(
             isinstance(r, dict) and "messages" in r for r in records
@@ -284,7 +332,7 @@ class DatasetViewer:
                     )
                 else:
                     score_rows = [_normalize_score_row(r) for r in score_rows]
-                    scores = _align_scores(score_rows, self.total_rows)
+                    scores = _align_scores(score_rows, self.file_rows)
                     if scores is None:
                         self.scores_warning = (
                             f"{sibling_scores_path.name} does not align with this "
@@ -295,6 +343,8 @@ class DatasetViewer:
                         self._score_total = len(score_rows)
                         self.scores_source = sibling_scores_path.name
                         for i, row in scores.items():
+                            if i >= len(self.source_indices):
+                                continue  # score for a row past the load cap
                             if isinstance(row.get("sample_index"), int):
                                 self.source_indices[i] = row["sample_index"]
         else:
@@ -328,7 +378,7 @@ class DatasetViewer:
         if score_rows is None:
             return False
         try:
-            records = _load_records(data_path)
+            records, file_rows = _load_records(data_path)
         except Exception:
             return False
         if not records or not all(
@@ -336,7 +386,7 @@ class DatasetViewer:
         ):
             return False
         aligned = _align_scores(
-            [_normalize_score_row(dict(r)) for r in score_rows], len(records)
+            [_normalize_score_row(dict(r)) for r in score_rows], file_rows
         )
         return aligned is not None and len(aligned) == len(score_rows)
 
@@ -661,6 +711,8 @@ class DatasetViewer:
         title = Text()
         title.append(f"Sample {min(self.current_index + 1, self.total_rows)}", style="bold bright_cyan")
         title.append(f" of {self.total_rows}", style="dim")
+        if self.rows_capped:
+            title.append(f" (first {self.total_rows} of {self.file_rows} rows)", style="dim yellow")
         source = self.source_index(self.current_index)
         if source is not None and source != self.current_index:
             title.append(f" (source #{source})", style="dim")
@@ -772,6 +824,11 @@ class DatasetViewer:
             f"of {self.total_rows} total rows in {self._data_path.name}"
             f" [{self.mode.value} mode]."
         )
+        if self.rows_capped:
+            summary += (
+                f" Only the first {self.total_rows} of {self.file_rows} rows in the"
+                " file were loaded (viewer memory cap)."
+            )
         # Stable identities for filtered/subset data: display position N may
         # really be source sample_index 47.
         sources = [self.source_index(i) for i in viewed]

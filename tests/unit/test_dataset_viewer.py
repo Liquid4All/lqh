@@ -1137,3 +1137,82 @@ def test_summary_uses_one_based_positions_and_source_ids(tmp_path):
     s = v.get_summary()
     assert "positions 1, 2, 1-based" in s or "(positions 1, 2, 1-based)" in s
     assert "Source sample_index of viewed: 1, 3" in s
+
+
+# ---------------------------------------------------------------------------
+# Load cap (a full load OOM-killed the CLI on blob-column datasets)
+# ---------------------------------------------------------------------------
+
+def test_load_stops_at_the_cap_but_reports_the_real_count(tmp_path, monkeypatch):
+    import lqh.tui.dataset_viewer as dv
+
+    monkeypatch.setattr(dv, "VIEWER_MAX_ROWS", 4)
+    # Fail loudly if anything loads the whole file.
+    monkeypatch.setattr(
+        pq, "read_table", lambda *a, **k: pytest.fail("whole file was loaded")
+    )
+    rows = make_chat_rows() * 5  # 15 rows
+    p = write_chat_parquet(tmp_path / "data.parquet", rows=rows)
+
+    v = DatasetViewer(p)
+    assert v.total_rows == 4  # navigation stays inside the loaded rows
+    assert v.file_rows == 15
+    assert v.rows_capped
+    assert "first 4 of 15 rows" in strip_ansi(v.header_text(120))
+    assert "first 4 of 15 rows in the file were loaded" in v.get_summary()
+
+    for _ in range(10):
+        v.go_next()
+    assert v.current_index == 3  # never past the loaded rows
+
+
+def test_capped_load_keeps_scores_aligned(tmp_path, monkeypatch):
+    """Alignment uses the file's row count, so a cap is not a 'mismatch'."""
+    import lqh.tui.dataset_viewer as dv
+
+    monkeypatch.setattr(dv, "VIEWER_MAX_ROWS", 2)
+    rows = make_chat_rows() * 4  # 12 rows
+    p = write_chat_parquet(tmp_path / "data.parquet", rows=rows)
+    write_scores_parquet(tmp_path / "scores.parquet", n=12)
+
+    v = DatasetViewer(p)
+    assert v.mode is ViewMode.SCORED_CHAT
+    assert v.scores_warning is None
+    assert 0 in v.scores and 1 in v.scores
+    assert len(v.source_indices) == v.total_rows  # no write past the cap
+
+
+def test_jsonl_and_json_are_capped(tmp_path, monkeypatch):
+    import lqh.tui.dataset_viewer as dv
+
+    monkeypatch.setattr(dv, "VIEWER_MAX_ROWS", 3)
+    jl = tmp_path / "d.jsonl"
+    jl.write_text("\n".join(json.dumps({"a": i}) for i in range(10)))
+    v = DatasetViewer(jl)
+    assert (v.total_rows, v.file_rows) == (3, 10)
+
+    js = tmp_path / "d.json"
+    js.write_text(json.dumps([{"a": i} for i in range(10)]))
+    v = DatasetViewer(js)
+    assert (v.total_rows, v.file_rows) == (3, 10)
+
+
+def test_small_dataset_is_not_flagged(tmp_path):
+    p = write_chat_parquet(tmp_path / "data.parquet")
+    v = DatasetViewer(p)
+    assert (v.total_rows, v.file_rows, v.rows_capped) == (3, 3, False)
+    assert "rows)" not in strip_ansi(v.header_text(120))
+
+
+def test_byte_budget_stops_before_the_row_cap(tmp_path, monkeypatch):
+    """300 fat rows are under any sane row cap but are still 285 MB."""
+    import lqh.tui.dataset_viewer as dv
+
+    monkeypatch.setattr(dv, "VIEWER_MAX_BYTES", 50_000)
+    rows = [{"messages": [{"role": "user", "content": "x" * 20_000}]} for _ in range(40)]
+    p = write_chat_parquet(tmp_path / "data.parquet", rows=rows)
+
+    v = DatasetViewer(p)
+    assert v.file_rows == 40
+    assert v.total_rows < 40  # stopped on size, not row count
+    assert v.rows_capped

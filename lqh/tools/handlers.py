@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 # Truncation threshold: ~40,000 chars (~10k tokens)
 TRUNCATION_THRESHOLD = 40_000
 
+# Hard cap on how much of a file we pull into memory. Truncation used to run
+# *after* the whole file was in RAM, so a multi-GB file got the CLI OOM-killed
+# (SIGKILL) before it printed anything.
+MAX_READ_CHARS = 8 * 1024 * 1024
+
 
 # Sentinel content value: the tool produced a one-time secret that must be
 # delivered to the user out-of-band (never into the conversation). The agent
@@ -221,6 +226,18 @@ def _sources_to_config(entries: "list[dict[str, Any]]") -> "str | list[dict[str,
     if len(entries) == 1 and entries[0].get("repeat", 1) == 1:
         return entries[0]["path"]
     return entries
+
+
+def _read_text_capped(path: Path) -> tuple[str, bool]:
+    """Read at most MAX_READ_CHARS of a text file.
+
+    ponytail: a byte cap, not a streaming line window — paging past the cap
+    isn't supported; add a seek-based window if anyone needs line 10M.
+    """
+    with path.open(encoding="utf-8") as fh:
+        text = fh.read(MAX_READ_CHARS)
+        capped = fh.read(1) != ""
+    return text, capped
 
 
 def _truncate_content(content: str, offset: int = 0) -> tuple[str, bool]:
@@ -984,11 +1001,11 @@ async def handle_read_file(
 
     # Handle parquet files
     if target.suffix == ".parquet":
-        return await _read_parquet(target)
+        return await _read_parquet(target, offset=offset, limit=limit)
 
     # Read text file
     try:
-        text = target.read_text(encoding="utf-8")
+        text, capped = _read_text_capped(target)
     except UnicodeDecodeError:
         return ToolResult(content=f"Error: '{path}' is not a text file")
 
@@ -1010,34 +1027,80 @@ async def handle_read_file(
         end = offset + len(content.split("\n"))
         header = f"File: {path} (showing lines {start}-{end} of {total_lines})\n\n"
 
+    if capped:
+        mb = MAX_READ_CHARS // (1024 * 1024)
+        header = (
+            header.rstrip()
+            + f"\n[only the first {mb} MB of the file was read; line counts are"
+            " for that part]\n\n"
+        )
+
     return ToolResult(content=header + content)
 
 
-async def _read_parquet(path: Path) -> ToolResult:
-    """Read a parquet file and render as text."""
+PARQUET_PREVIEW_ROWS = 20
+PARQUET_MAX_PREVIEW_ROWS = 100
+PARQUET_MAX_CELL_CHARS = 200
+# Rows are not the only axis: one row with an embedded PDF can be megabytes.
+# The batch size bounds what one decode step pulls in before the size check.
+PARQUET_MAX_PREVIEW_BYTES = 32 * 1024 * 1024
+_PARQUET_BATCH_ROWS = 16
+
+
+async def _read_parquet(path: Path, offset: int = 0, limit: int | None = None) -> ToolResult:
+    """Preview a parquet file without loading it into memory.
+
+    Row count and schema come from the footer metadata; only the preview rows
+    are decoded. pq.read_table() used to pull the whole file in, which
+    OOM-killed the CLI on datasets with blob columns (PDFs, images).
+    """
     try:
+        import pyarrow as pa
         import pyarrow.parquet as pq
     except ImportError:
         return ToolResult(content="Error: pyarrow not installed")
 
-    table = pq.read_table(path)
-    total_rows = len(table)
-    schema_str = str(table.schema)
+    pf = pq.ParquetFile(path)
+    total_rows = pf.metadata.num_rows
+    schema_str = str(pf.schema_arrow)
 
-    # Show first 20 rows
-    preview_rows = min(20, total_rows)
-    preview = table.slice(0, preview_rows).to_pandas().to_string()
+    want = PARQUET_PREVIEW_ROWS if limit is None else limit
+    want = max(1, min(want, PARQUET_MAX_PREVIEW_ROWS))
+    skip = max(0, offset)
 
-    content = (
+    batches = []
+    need = want
+    nbytes = 0
+    for batch in pf.iter_batches(batch_size=max(1, min(need, _PARQUET_BATCH_ROWS))):
+        if skip >= batch.num_rows:
+            skip -= batch.num_rows
+            continue
+        chunk = batch.slice(skip, min(need, batch.num_rows - skip))
+        skip = 0
+        batches.append(chunk)
+        need -= chunk.num_rows
+        nbytes += chunk.nbytes
+        if need <= 0 or nbytes >= PARQUET_MAX_PREVIEW_BYTES:
+            break
+
+    header = (
         f"Parquet file: {path.name}\n"
         f"Total rows: {total_rows}\n\n"
         f"Schema:\n{schema_str}\n\n"
-        f"First {preview_rows} rows:\n{preview}"
     )
+    if not batches:
+        return ToolResult(content=header + f"[No rows at offset {offset}.]")
 
-    if total_rows > preview_rows:
-        content += f"\n\n[Showing {preview_rows} of {total_rows} rows. Use offset={preview_rows} to see more.]"
+    table = pa.Table.from_batches(batches, schema=pf.schema_arrow)
+    shown = len(table)
+    preview = table.to_pandas().to_string(max_colwidth=PARQUET_MAX_CELL_CHARS)
 
+    end = offset + shown
+    content = header + f"Rows {offset}-{end - 1} of {total_rows}:\n{preview}"
+    if end < total_rows:
+        content += f"\n\n[Showing {shown} of {total_rows} rows. Use offset={end} to see more.]"
+
+    content, _ = _truncate_content(content)
     return ToolResult(content=content)
 
 
@@ -2206,7 +2269,7 @@ async def handle_show_file(
         )
 
     try:
-        text = target.read_text(encoding="utf-8")
+        text, _ = _read_text_capped(target)
     except UnicodeDecodeError:
         return ToolResult(content=f"Error: '{path}' is not a text file")
 
