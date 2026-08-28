@@ -27,6 +27,7 @@ from lqh.progress import (
     ProgressEvent,
     ProgressReporter,
     TRAINING_END,
+    checkpoint_eval_band,
     has_final_inference,
     has_final_scoring,
     training_end_for,
@@ -224,12 +225,22 @@ class ProgressCallback(TrainerCallback):
         if model is None:
             return
 
-        # Run inference on eval dataset and write predictions
+        # Run inference on eval dataset and write predictions.
+        # reporter+band are what keep this pass visible: it can run longer
+        # than the training it interrupts, and without progress rows the
+        # stall watchdog reports a healthy run as a wedged sandbox.
+        max_steps = getattr(state, "max_steps", 0)
         _run_checkpoint_eval(
             model=model,
             tokenizer=self.tokenizer,
             config=self.config,
             checkpoint_dir=checkpoint_dir,
+            reporter=self.reporter,
+            band=checkpoint_eval_band(
+                self.training_end,
+                state.global_step,
+                max_steps if isinstance(max_steps, int) else 0,
+            ),
         )
 
 
@@ -243,8 +254,21 @@ def _run_checkpoint_eval(
     tokenizer: Any,
     config: dict[str, Any],
     checkpoint_dir: Path,
+    *,
+    reporter: ProgressReporter | None = None,
+    band: tuple[float, float] | None = None,
 ) -> None:
-    """Generate predictions on the eval dataset and signal for scoring."""
+    """Generate predictions on the eval dataset and signal for scoring.
+
+    The final eval (``checkpoint_dir.name == "final"``) builds its own
+    reporter over the reserved final-inference band. A MID-RUN checkpoint
+    instead passes the trainer callback's own *reporter* plus a *band* from
+    ``checkpoint_eval_band`` — reusing that one reporter is what keeps the
+    overall fraction monotonic across the training/eval interleave.
+
+    With neither, the pass runs silently, which is what made a healthy run
+    look like a stalled sandbox for the whole generation loop.
+    """
     eval_dataset_path = config.get("eval_dataset")
     if not eval_dataset_path:
         return
@@ -259,26 +283,40 @@ def _run_checkpoint_eval(
     predictions: list[dict[str, Any]] = []
     model.eval()
 
-    final_reporter = None
+    eval_reporter = None
+    phase = "inference"
+    phase_label = "evaluating final model"
+    frac_start = 0.0
+    frac_end = 0.0
     total_eval = sum(len(convos) for _, convos in eval_srcs)
     if checkpoint_dir.name == "final" and has_final_inference(config):
-        inference_start = training_end_for(config)
-        inference_end = (
-            FINAL_INFERENCE_END if has_final_scoring(config) else 1.0
-        )
+        frac_start = training_end_for(config)
+        frac_end = FINAL_INFERENCE_END if has_final_scoring(config) else 1.0
         # grpo_loop reuses this final-eval path; keep its progress events
         # labelled with the run's own kind rather than "sft".
         task_kind = (
             "grpo" if config.get("type") in ("grpo", "on_policy_grpo") else "sft"
         )
-        final_reporter = ProgressReporter(
+        eval_reporter = ProgressReporter(
             task_kind=task_kind, label=checkpoint_dir.parent.parent.name,
             run_dir=checkpoint_dir.parent.parent,
         )
-        final_reporter.update(
-            phase="inference", phase_label="evaluating final model",
+    elif reporter is not None and band is not None:
+        # Mid-run checkpoint: reuse the caller's reporter (a second instance
+        # would carry its own _last_fraction and let the reported fraction
+        # jump around) and stay inside the training band it was given.
+        eval_reporter = reporter
+        frac_start, frac_end = band
+        phase = "checkpoint_eval"
+        phase_label = (
+            "evaluating checkpoint "
+            + checkpoint_dir.name.replace("step_", "step ")
+        )
+    if eval_reporter is not None:
+        eval_reporter.update(
+            phase=phase, phase_label=phase_label,
             completed=0, total=total_eval, unit="samples",
-            overall_fraction=inference_start, force=True,
+            overall_fraction=frac_start, force=True,
         )
 
     idx = 0
@@ -335,14 +373,13 @@ def _run_checkpoint_eval(
                 }
             )
             idx += 1
-            if final_reporter is not None:
-                final_reporter.update(
-                    phase="inference", phase_label="evaluating final model",
+            if eval_reporter is not None:
+                eval_reporter.update(
+                    phase=phase, phase_label=phase_label,
                     completed=idx, total=total_eval, unit="samples",
                     overall_fraction=(
-                        inference_start
-                        + (inference_end - inference_start)
-                        * idx / max(total_eval, 1)
+                        frac_start
+                        + (frac_end - frac_start) * idx / max(total_eval, 1)
                     ),
                     force=idx == total_eval,
                 )

@@ -120,6 +120,32 @@ def training_end_for(config: dict[str, Any]) -> float:
     return FINAL_INFERENCE_END if has_final_inference(config) else 1.0
 
 
+def checkpoint_eval_band(
+    training_end: float, step: int, max_steps: int
+) -> tuple[float, float] | None:
+    """Overall-fraction band for a MID-RUN checkpoint eval, or None.
+
+    A mid-run checkpoint eval generates over the whole eval set, which can
+    take longer than the training it interrupts. It has to report *something*
+    while it runs, or the stall watchdog (``lqh/jobs.py``) sees a frozen
+    progress file and tells the agent a healthy run is a wedged sandbox.
+
+    The band deliberately does NOT reuse the final-inference band starting at
+    ``TRAINING_END``: ``ProgressReporter.update`` clamps the fraction so it
+    never decreases, so reporting 0.90 at step 50 of 81 would pin the rest of
+    training at 90%. Instead the band spans the single training step this
+    checkpoint sits on. The bar barely moves, which is honest — this pass
+    buys no training progress — while every sample still refreshes the file.
+
+    Returns None when the step count gives nothing to anchor to.
+    """
+    if max_steps <= 0 or step <= 0:
+        return None
+    start = training_end * min(step, max_steps) / max_steps
+    end = training_end * min(step + 1, max_steps) / max_steps
+    return start, max(start, end)
+
+
 def final_result_dir(run_dir: Path, config: dict[str, Any]) -> Path | None:
     """Return the one artifact directory that gates whole-run completion."""
     run_type = config.get("type")
