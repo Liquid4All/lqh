@@ -745,21 +745,32 @@ class LqhApp:
             # instead of being wiped by the buffer's post-accept reset.
             return True
 
+        if (
+            self._ask_user_future is not None
+            and is_command(text)
+            and parse_command(text)[0] in {cmd.name for cmd in COMMANDS}
+        ):
+            # Slash commands are dispatched only on the main input path
+            # (_handle_input). While an ask_user prompt is active, a real
+            # command would otherwise be swallowed as the literal answer, so
+            # intercept it here and tell the user to answer the question first.
+            # Only *known* commands: an answer that merely starts with "/"
+            # (an absolute path, say) is a legitimate answer, and refusing it
+            # would leave it unanswerable — the kept text would re-trigger
+            # this refusal on every Enter.
+            # Checked before the reset below so the refusal keeps the text
+            # (keep_text) instead of eating what the user typed.
+            asyncio.get_event_loop().create_task(
+                self._emit(render_system_message(
+                    "Commands aren't available while a question is pending. "
+                    "Please answer the question above first."
+                ))
+            )
+            return True
+
         buff.reset()
 
         if self._ask_user_future is not None:
-            # Slash commands are dispatched only on the main input path
-            # (_handle_input). While an ask_user prompt is active, a leading
-            # "/" would otherwise be swallowed as the literal answer, so
-            # intercept it here and tell the user to answer the question first.
-            if is_command(text):
-                asyncio.get_event_loop().create_task(
-                    self._emit(render_system_message(
-                        "Commands aren't available while a question is pending. "
-                        "Please answer the question above first."
-                    ))
-                )
-                return False
             self._resolve_ask_user(text)
             return False
 

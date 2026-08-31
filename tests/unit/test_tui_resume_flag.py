@@ -390,6 +390,97 @@ async def test_wait_message_offers_interrupt_during_an_agent_turn(
     assert "Esc / Ctrl+C to interrupt" in _plain(app._emitted)
 
 
+async def test_command_during_a_question_is_refused_but_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slash command typed at a pending question must not be eaten either."""
+    import asyncio
+
+    from prompt_toolkit.buffer import Buffer
+
+    app = _app(tmp_path, monkeypatch, None)
+    future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+    app._ask_user_future = future
+    try:
+        buffer = Buffer(accept_handler=app._on_accept)
+        buffer.text = "/help me out"
+        buffer.validate_and_handle()
+        await asyncio.sleep(0)
+        # Refused, so the question is still waiting for a real answer.
+        answered = future.done()
+    finally:
+        future.cancel()
+
+    assert "Commands aren't available" in _plain(app._emitted)
+    assert buffer.text == "/help me out"
+    assert answered is False
+
+
+async def test_answer_to_a_question_still_clears_the_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The non-command path keeps its reset — an answered question empties it."""
+    import asyncio
+
+    from prompt_toolkit.buffer import Buffer
+
+    app = _app(tmp_path, monkeypatch, None)
+    future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+    app._ask_user_future = future
+    buffer = Buffer(accept_handler=app._on_accept)
+    buffer.text = "yes"
+    buffer.validate_and_handle()
+    await asyncio.sleep(0)
+
+    assert buffer.text == ""
+    assert future.result() == "yes"
+
+
+async def test_path_answer_is_not_mistaken_for_a_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only real commands are refused — "/..." can be a legitimate answer.
+
+    Refusing it would make it unanswerable: the kept text re-triggers the
+    refusal on every Enter.
+    """
+    import asyncio
+
+    from prompt_toolkit.buffer import Buffer
+
+    app = _app(tmp_path, monkeypatch, None)
+    future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+    app._ask_user_future = future
+    buffer = Buffer(accept_handler=app._on_accept)
+    buffer.text = "/tmp/data.jsonl"
+    buffer.validate_and_handle()
+    await asyncio.sleep(0)
+
+    assert "Commands aren't available" not in _plain(app._emitted)
+    assert buffer.text == ""
+    assert future.result() == "/tmp/data.jsonl"
+
+
+async def test_empty_enter_at_an_options_prompt_still_selects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty input drives option selection — it must reach _resolve_ask_user."""
+    import asyncio
+
+    from prompt_toolkit.buffer import Buffer
+
+    app = _app(tmp_path, monkeypatch, None)
+    future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+    app._ask_user_future = future
+    app._ask_user_options = ["keep going", "stop"]
+    app._ask_user_selected = 1
+    buffer = Buffer(accept_handler=app._on_accept)
+    buffer.validate_and_handle()
+    await asyncio.sleep(0)
+
+    assert future.result() == "stop"
+
+
 async def test_resume_hint_prints_full_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
