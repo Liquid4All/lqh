@@ -3771,6 +3771,12 @@ async def handle_artifacts(
                     flags.append("📌 pinned")
                 if h.checkpoint_role:
                     flags.append(h.checkpoint_role)
+                if h.job_id:
+                    # The only way to tell which run an artifact came from:
+                    # runs/<name>/cloud_state.json carries the same job id.
+                    # Without it a checkpoint published by a run that later
+                    # failed cannot be found, and the run gets redone.
+                    flags.append(f"job {h.job_id}")
                 if h.expires_at:
                     flags.append(f"expires {h.expires_at}")
                 elif not h.pinned:

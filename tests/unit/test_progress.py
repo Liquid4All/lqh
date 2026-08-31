@@ -547,6 +547,72 @@ def test_on_save_reports_the_mid_run_eval_without_rewinding(
     assert resumed["overall_fraction"] == pytest.approx(TRAINING_END * 55 / 81)
 
 
+def test_checkpoint_eval_stops_inside_the_publish_reserve(
+    tmp_path: Path,
+    sft_module,  # noqa: ANN001
+    sample_conversations,  # noqa: ANN001
+    write_chatml_parquet,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The eval pass must hand the rest of the cap back to the publish.
+
+    The reported failure: training finished, the unbounded generation pass
+    ran past the sandbox's wall-clock cap, and the run was killed before it
+    published anything — six GPU-hours of training thrown away and retrained
+    from scratch only to get an eval score.
+    """
+    run_dir = tmp_path / "sft_001"
+    run_dir.mkdir()
+    eval_path = write_chatml_parquet(
+        tmp_path / "eval" / "eval.parquet", sample_conversations(3),
+    )
+    config = {
+        "type": "sft",
+        "eval_on_checkpoints": True,
+        "eval_dataset": str(eval_path),
+        "scorer": "judge:small",
+    }
+
+    # Time runs out after the first sample, which is where a per-sample
+    # check earns its keep: checking only before the pass would let this
+    # one run to the end.
+    calls = {"n": 0}
+
+    def fake_past_deadline(*args: object, **kwargs: object) -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    monkeypatch.setattr(sft_module, "past_deadline", fake_past_deadline)
+
+    callback = sft_module.ProgressCallback(
+        run_dir=run_dir, config=config, tokenizer=_FakeTokenizer(),
+    )
+    callback.reporter.min_interval = 0.0
+    callback.on_save(
+        None,
+        SimpleNamespace(global_step=50, max_steps=81, epoch=1.0),
+        None,
+        model=_FakeModel(),
+    )
+
+    # No predictions and no scoring request: a partial pass would be scored
+    # as if it covered the eval set, and the judge stage is unbounded too.
+    checkpoint = run_dir / "checkpoints" / "step_50"
+    assert not (checkpoint / "predictions.parquet").exists()
+    assert not (checkpoint / "eval_request.json").exists()
+
+    rows = [
+        json.loads(line)
+        for line in (run_dir / "progress.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    generated = [
+        row for row in rows
+        if row.get("phase") == "checkpoint_eval" and row.get("completed")
+    ]
+    assert [row["completed"] for row in generated] == [1]
+
+
 def test_checkpoint_eval_promises_no_whole_job_eta() -> None:
     """An interlude's rate must not be projected over the rest of the job.
 

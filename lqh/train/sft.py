@@ -40,7 +40,7 @@ from lqh.train.data_utils import (
     load_eval_sources,
     split_train_eval,
 )
-from lqh.train.deadline import DeadlineStopCallback
+from lqh.train.deadline import DeadlineStopCallback, past_deadline
 from lqh.train.progress import write_eval_request, write_progress, write_status
 from lqh.train.resume import train_with_checkpoint_fallback
 
@@ -451,8 +451,32 @@ def _run_checkpoint_eval(
         )
 
     idx = 0
+    out_of_time = False
     for source_label, eval_convos in eval_srcs:
+        if out_of_time:
+            break
         for conv in eval_convos:
+            # Generation over the eval set is the least bounded thing in a
+            # run (a 159-row set took 72 minutes on an L4) and it sits
+            # between the saved model and the launcher's publish. Spending
+            # the publish reserve here is what gets the sandbox killed with
+            # a checkpoint nobody ever uploads — the run then has to be
+            # trained again from scratch just to be evaluated. The caller
+            # checks the deadline before starting; this checks it again per
+            # sample because training can finish with time for only part of
+            # the pass.
+            if past_deadline():
+                out_of_time = True
+                print(
+                    f"  deadline stop: ending this eval after {idx}/"
+                    f"{total_eval} samples so the run can publish its "
+                    f"checkpoint. Score that checkpoint without retraining: "
+                    f"push lqh:<artifact_id> to HF, then eval_hf_model. Or "
+                    f"resubmit with a larger timeout_minutes.",
+                    flush=True,
+                )
+                break
+
             # Strip trailing assistant turn if present (we want the model to generate)
             prompt_msgs = conv
             if conv and conv[-1].get("role") == "assistant":
@@ -514,6 +538,12 @@ def _run_checkpoint_eval(
                     ),
                     force=idx == total_eval,
                 )
+
+    if out_of_time:
+        # Predictions over part of the set would be scored as if they
+        # covered it, and the judge pass is itself unbounded. What is left
+        # of the cap belongs to the publish.
+        return
 
     # Write predictions as parquet (single combined file, source-tagged)
     import pyarrow as pa
@@ -1086,12 +1116,21 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
 
     # Final eval if requested. Generation + scoring over the eval set, so
     # the least bounded thing in the run — never inside the publish reserve.
-    if deadline_cb.triggered and config.get("eval_on_checkpoints"):
-        print("  deadline stop: skipping checkpoint eval so the run can publish.")
+    # `triggered` alone is not enough: training that ends on its own with
+    # only the reserve left never reaches the callback, and loading a fresh
+    # model for inference at that point spends the reserve before the pass
+    # even starts.
+    out_of_time = deadline_cb.triggered or past_deadline()
+    if out_of_time and config.get("eval_on_checkpoints"):
+        print(
+            "  deadline stop: skipping checkpoint eval so the run can publish. "
+            "Score the published checkpoint without retraining: push "
+            "lqh:<artifact_id> to HF, then eval_hf_model."
+        )
     if (
         config.get("eval_on_checkpoints")
         and config.get("eval_dataset")
-        and not deadline_cb.triggered
+        and not out_of_time
     ):
         final_checkpoint = run_dir / "checkpoints" / "final"
         final_checkpoint.mkdir(parents=True, exist_ok=True)
