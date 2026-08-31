@@ -429,6 +429,9 @@ class SSHDirectBackend(RemoteBackend):
                 "checkpoints/*/",
                 "checkpoints/*/eval_request.json",
                 "checkpoints/*/predictions.parquet",
+                # Says the step's score covers a sample of the eval set, not
+                # all of it — pulled with the predictions it qualifies.
+                "checkpoints/*/eval_sampling.json",
                 "iterations/",
                 "iterations/*/",
                 "iterations/*/iter_request.json",

@@ -341,6 +341,11 @@ def _resolve_candidates(run_dir: Path) -> list[_Candidate]:
                     ("results.parquet", "predictions"),
                     ("eval_request.json", "eval_result"),
                     ("eval_result.json", "eval_result"),
+                    # A mid-run checkpoint scores a SAMPLE of the eval set
+                    # (lqh/train/sft.py MID_RUN_CHECKPOINT_EVAL_SAMPLES), so
+                    # its mean is not comparable to the full-set final one.
+                    # The caveat travels with the result it qualifies.
+                    ("eval_sampling.json", "other"),
                 ):
                     p = sub / fname
                     if p.exists() and p.is_file():

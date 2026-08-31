@@ -545,3 +545,179 @@ def test_on_save_reports_the_mid_run_eval_without_rewinding(
     )
     resumed = [row for row in rows if row.get("phase") == "training"][-1]
     assert resumed["overall_fraction"] == pytest.approx(TRAINING_END * 55 / 81)
+
+
+def test_checkpoint_eval_promises_no_whole_job_eta() -> None:
+    """An interlude's rate must not be projected over the rest of the job.
+
+    The mid-run pass crawls through the thin band `checkpoint_eval_band`
+    gives it (0.5556 -> 0.5667 over 72 minutes for the reported run). Read as
+    a whole-job rate that is ~46 hours remaining, quoted while training has
+    half an hour left — the same class of wrong number that talked an agent
+    into cancelling three healthy runs.
+    """
+    base = datetime(2026, 8, 22, 0, 42, tzinfo=timezone.utc)
+    start, end = checkpoint_eval_band(TRAINING_END, 50, 81)
+    rows = [
+        {
+            "phase": "checkpoint_eval",
+            "phase_label": "evaluating checkpoint step 50",
+            "overall_fraction": start + (end - start) * i / 149,
+            "completed": i,
+            "total": 149,
+            "unit": "samples",
+            "timestamp": (base + timedelta(seconds=29 * i)).isoformat(),
+        }
+        for i in range(1, 40)
+    ]
+    last = (base + timedelta(seconds=29 * 39)).timestamp()
+    assert estimate_eta(rows, now=last + 1) == EtaEstimate()
+    line, _ = format_event_oneline(rows[-1], history=rows, observed_at=None)
+    assert "ETA" not in line
+    # The phase still says what it is doing — this suppresses the number,
+    # not the row.
+    assert "39/149 samples" in line
+
+
+def test_cap_eval_sources_samples_every_source(sft_module) -> None:  # noqa: ANN001
+    """Capping keeps each source represented, evenly spaced and stable."""
+    cap = sft_module.cap_eval_sources
+    big = [[{"role": "user", "content": str(i)}] for i in range(100)]
+    small = [[{"role": "user", "content": f"s{i}"}] for i in range(3)]
+
+    capped = cap([("big", big), ("small", small)], 24)
+    kept = {label: convos for label, convos in capped}
+    assert sum(len(c) for c in kept.values()) == pytest.approx(24, abs=2)
+    # A source 3% the size of the other still contributes to the per-source
+    # macro-average instead of vanishing from it.
+    assert len(kept["small"]) >= 1
+    assert all(conv in big for conv in kept["big"])
+    # Evenly spaced, not the first N: a head slice would score only the
+    # beginning of the eval set.
+    assert kept["big"][0] == big[0]
+    assert kept["big"][-1] != big[len(kept["big"]) - 1]
+    # Same rows at every checkpoint, so the curve compares like with like.
+    assert cap([("big", big), ("small", small)], 24) == capped
+
+    # At or under the limit, and "no cap", are both pass-throughs.
+    srcs = [("small", small)]
+    assert cap(srcs, 24) is srcs
+    assert cap([("big", big)], 0) == [("big", big)]
+
+
+def test_mid_run_checkpoint_eval_is_capped_and_the_final_one_is_not(
+    tmp_path: Path,
+    sft_module,  # noqa: ANN001
+    sample_conversations,  # noqa: ANN001
+    write_chatml_parquet,  # noqa: ANN001
+) -> None:
+    """The pass that nothing reads must not outrun the training it interrupts.
+
+    149 rows at ~29s each was 72 minutes an L4 spent on a mid-run curve, for
+    output only `checkpoints/final/` ever surfaces (feedback #80). The final
+    eval — the one whose score is reported — still generates over every row.
+    """
+    import pyarrow.parquet as pq
+
+    run_dir = tmp_path / "sft_001"
+    run_dir.mkdir()
+    eval_path = write_chatml_parquet(
+        tmp_path / "eval" / "eval.parquet", sample_conversations(60),
+    )
+    config = {
+        "type": "sft",
+        "eval_on_checkpoints": True,
+        "eval_dataset": str(eval_path),
+    }
+
+    callback = sft_module.ProgressCallback(
+        run_dir=run_dir, config=config, tokenizer=_FakeTokenizer(),
+    )
+    callback.reporter.min_interval = 0.0
+    callback.on_save(
+        None,
+        SimpleNamespace(global_step=50, max_steps=81, epoch=1.0),
+        None,
+        model=_FakeModel(),
+    )
+    step_dir = run_dir / "checkpoints" / "step_50"
+    mid = pq.read_table(step_dir / "predictions.parquet")
+    assert mid.num_rows == sft_module.MID_RUN_CHECKPOINT_EVAL_SAMPLES
+
+    # The thinned score gets labelled where it is read side by side with the
+    # final one, so the sidecar has to round-trip through that renderer.
+    from lqh.tools.handlers import _checkpoint_eval_sampling
+
+    assert _checkpoint_eval_sampling(step_dir) == (mid.num_rows, 60)
+
+    final_dir = run_dir / "checkpoints" / "final"
+    final_dir.mkdir(parents=True)
+    sft_module._run_checkpoint_eval(
+        model=_FakeModel(),
+        tokenizer=_FakeTokenizer(),
+        config=config,
+        checkpoint_dir=final_dir,
+    )
+    assert pq.read_table(final_dir / "predictions.parquet").num_rows == 60
+    # Nothing was thinned, so nothing claims it was.
+    assert _checkpoint_eval_sampling(final_dir) is None
+
+    # Opt-out restores the old whole-eval-set behaviour.
+    uncapped_dir = run_dir / "checkpoints" / "step_60"
+    uncapped_dir.mkdir(parents=True)
+    sft_module._run_checkpoint_eval(
+        model=_FakeModel(),
+        tokenizer=_FakeTokenizer(),
+        config={**config, "checkpoint_eval_samples": 0},
+        checkpoint_dir=uncapped_dir,
+    )
+    assert pq.read_table(uncapped_dir / "predictions.parquet").num_rows == 60
+    assert _checkpoint_eval_sampling(uncapped_dir) is None
+
+
+def test_a_relaunch_that_stops_sampling_clears_the_stale_label(
+    tmp_path: Path,
+    sft_module,  # noqa: ANN001
+    sample_conversations,  # noqa: ANN001
+    write_chatml_parquet,  # noqa: ANN001
+) -> None:
+    """A resume re-runs the same step_N into the same directory.
+
+    So the sidecar has to be cleared, not just written: inheriting the
+    previous attempt's file would label a full-set score as sampled — the
+    exact confusion the label exists to prevent.
+    """
+    from lqh.tools.handlers import _checkpoint_eval_sampling
+
+    run_dir = tmp_path / "sft_001"
+    step_dir = run_dir / "checkpoints" / "step_50"
+    step_dir.mkdir(parents=True)
+    eval_path = write_chatml_parquet(
+        tmp_path / "eval" / "eval.parquet", sample_conversations(60),
+    )
+    config = {"eval_on_checkpoints": True, "eval_dataset": str(eval_path)}
+
+    sft_module._run_checkpoint_eval(
+        model=_FakeModel(), tokenizer=_FakeTokenizer(),
+        config=config, checkpoint_dir=step_dir,
+    )
+    assert _checkpoint_eval_sampling(step_dir) is not None
+
+    # Relaunched with the cap turned off: same directory, full eval set.
+    sft_module._run_checkpoint_eval(
+        model=_FakeModel(), tokenizer=_FakeTokenizer(),
+        config={**config, "checkpoint_eval_samples": 0},
+        checkpoint_dir=step_dir,
+    )
+    assert _checkpoint_eval_sampling(step_dir) is None
+
+
+def test_a_junk_sample_limit_falls_back_to_the_default(sft_module) -> None:  # noqa: ANN001
+    """A hand-written config must not turn the cap off by being unparseable."""
+    read = sft_module.mid_run_checkpoint_eval_samples
+    default = sft_module.MID_RUN_CHECKPOINT_EVAL_SAMPLES
+    assert read({}) == default
+    assert read({"checkpoint_eval_samples": None}) == default
+    assert read({"checkpoint_eval_samples": "lots"}) == default
+    assert read({"checkpoint_eval_samples": "8"}) == 8
+    assert read({"checkpoint_eval_samples": 0}) == 0

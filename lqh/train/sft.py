@@ -258,6 +258,114 @@ class ProgressCallback(TrainerCallback):
 # Checkpoint evaluation (inline inference, no subprocess)
 # ---------------------------------------------------------------------------
 
+# A mid-run checkpoint eval generates one sample at a time over the eval set.
+# On an L4 a 149-row eval set took 72 minutes — longer than the ~17-minute
+# training run it interrupted (feedback #80), and nothing SELECTS on it:
+# checkpoint selection is `load_best_model_at_end` on the teacher-forced
+# `eval_loss` (34 seconds, a separate pass), the sweep proxy reads
+# `eval_history.json`, and the published `selected_checkpoint` is always
+# "final". So the mid-run pass is a mid-training sanity curve, and a sample of
+# the eval set draws the same curve for a fraction of the GPU time.
+#
+# It is not invisible, though: a LOCAL run's `training_status` prints every
+# `checkpoints/*/eval_result.json` under "Eval scores:", step rows directly
+# above the final one (`handlers._format_status`). A 24-row mean is not
+# comparable to a full-set one, so `_write_eval_sampling` records the counts
+# and that renderer labels the sampled rows. The final eval stays uncapped —
+# that one is the reported number, and on a cloud run it is the only one
+# `handlers._hydrate_run_eval_artifacts` pulls back at all.
+MID_RUN_CHECKPOINT_EVAL_SAMPLES = 24
+
+# Sidecar the status renderer reads to label a thinned checkpoint score. Kept
+# out of eval_result.json because that file is written much later by whichever
+# scorer ran (the laptop watcher, or `cloud_score` inline in the sandbox) and
+# neither one can see how many rows generation started from.
+EVAL_SAMPLING_FILE = "eval_sampling.json"
+
+
+def mid_run_checkpoint_eval_samples(config: dict[str, Any]) -> int:
+    """How many eval rows a MID-RUN checkpoint eval may generate.
+
+    ``checkpoint_eval_samples: 0`` (or any non-positive value) restores the
+    old behaviour of generating over the whole eval set. It is an escape
+    hatch for a hand-written ``config.json`` run through ``python -m
+    lqh.train`` — ``train_start`` builds its config from typed arguments and
+    does not pass this through.
+    """
+    raw = config.get("checkpoint_eval_samples", MID_RUN_CHECKPOINT_EVAL_SAMPLES)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return MID_RUN_CHECKPOINT_EVAL_SAMPLES
+
+
+def cap_eval_sources(
+    eval_srcs: list[tuple[str, list[list[dict[str, str]]]]],
+    limit: int,
+) -> list[tuple[str, list[list[dict[str, str]]]]]:
+    """Keep about *limit* conversations across the sources, proportionally.
+
+    Sources stay DISTINCT and every non-empty one keeps at least one
+    conversation, so the per-source macro-average the judge computes still has
+    a row from each source it had before. That floor wins over *limit*: with
+    more sources than *limit* the result is one row each, above it. Otherwise
+    rounding lands the total a sample or two either side, which costs seconds.
+
+    The rows are an evenly spaced stride, not a random sample: every
+    checkpoint of a run then evaluates the SAME rows, so the score curve
+    compares like with like. A non-positive *limit*, or a set already at or
+    under it, is returned untouched.
+    """
+    total = sum(len(convos) for _, convos in eval_srcs)
+    if limit <= 0 or total <= limit:
+        return eval_srcs
+    capped: list[tuple[str, list[list[dict[str, str]]]]] = []
+    for label, convos in eval_srcs:
+        if not convos:
+            capped.append((label, convos))
+            continue
+        keep = min(len(convos), max(1, round(limit * len(convos) / total)))
+        stride = len(convos) / keep
+        capped.append(
+            (
+                label,
+                [
+                    convos[min(len(convos) - 1, int(i * stride))]
+                    for i in range(keep)
+                ],
+            )
+        )
+    return capped
+
+
+def _write_eval_sampling(
+    checkpoint_dir: Path, generated: int, eval_rows: int
+) -> None:
+    """Record whether this checkpoint's score came from a sample of the set.
+
+    Writes the sidecar when the set was thinned and REMOVES it when it was
+    not. Both directions matter: a relaunch re-runs the same ``step_N`` into
+    the same directory, so a resume that opts out of the cap (or whose eval
+    set shrank below it) would otherwise inherit the previous attempt's file
+    and label a full-set score as sampled.
+
+    Best-effort: a run must never die because the sidecar could not be
+    written. Its only consumer is the status renderer, which falls back to an
+    unlabelled line.
+    """
+    sidecar = checkpoint_dir / EVAL_SAMPLING_FILE
+    try:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if generated < eval_rows:
+            sidecar.write_text(
+                json.dumps({"generated": generated, "eval_rows": eval_rows})
+                + "\n"
+            )
+        else:
+            sidecar.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"  WARNING: could not record checkpoint eval sampling: {exc}")
+
 
 def _run_checkpoint_eval(
     model: Any,
@@ -287,6 +395,19 @@ def _run_checkpoint_eval(
     # its source, so the judge can score every source separately and combine
     # them into a macro-average (see score_predictions_by_source).
     eval_srcs = load_eval_sources(eval_dataset_path)
+    if checkpoint_dir.name != "final":
+        full_rows = sum(len(convos) for _, convos in eval_srcs)
+        eval_srcs = cap_eval_sources(
+            eval_srcs, mid_run_checkpoint_eval_samples(config),
+        )
+        kept_rows = sum(len(convos) for _, convos in eval_srcs)
+        if kept_rows < full_rows:
+            print(
+                f"  checkpoint eval ({checkpoint_dir.name}): generating over "
+                f"{kept_rows} of {full_rows} eval rows (the final eval uses "
+                f"all of them)"
+            )
+        _write_eval_sampling(checkpoint_dir, kept_rows, full_rows)
     max_seq = config.get("training", {}).get("max_seq_length", 2048)
     is_vision = config.get("modality") == "vision"
 

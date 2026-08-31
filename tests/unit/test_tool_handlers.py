@@ -8,6 +8,7 @@ tests exercise ``handle_list_models`` and ``handle_run_scoring`` against
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Callable
 
@@ -637,3 +638,69 @@ class TestHfPushPermissionSentinel:
         assert result.content == "PERMISSION_REQUIRED"
         # repo_id was auto-generated inside the handler; the key exposes it.
         assert result.permission_key == f"hf_push:tester/{tmp_path.name}-demo"
+
+
+class TestSampledCheckpointScoreIsLabelled:
+    """A thinned mid-run score must not read like a full-set one.
+
+    A local run's `training_status` prints every `checkpoints/*/eval_result
+    .json` under "Eval scores:", step rows directly above the final one, and
+    those lines get read side by side to pick a checkpoint. Since the mid-run
+    eval generates over a sample of the eval set and `final` uses all of it,
+    the sampled rows say so.
+    """
+
+    def _status(self, tmp_path: Path, cp_scores: dict[str, float]) -> str:
+        from lqh.tools.handlers import _format_status
+
+        run_dir = tmp_path / "runs" / "sft_001"
+        for name, mean in cp_scores.items():
+            cp_dir = run_dir / "checkpoints" / name
+            cp_dir.mkdir(parents=True, exist_ok=True)
+            (cp_dir / "eval_result.json").write_text(
+                json.dumps({"scores": {"mean": mean}})
+            )
+        status = SimpleNamespace(
+            state="completed", step=None, loss=None, lr=None, epoch=None,
+            error=None,
+        )
+        return _format_status("sft_001", status, run_dir)
+
+    def test_sampled_step_row_is_marked_and_final_is_not(
+        self, tmp_path: Path
+    ) -> None:
+        text = self._status(tmp_path, {"step_50": 6.31, "final": 7.02})
+        # No sidecar yet: nothing was thinned, so nothing is labelled.
+        assert "sampled" not in text
+
+        # The producer side (lqh.train.sft._write_eval_sampling) needs torch,
+        # so it is covered in test_progress.py, which stubs the torch stack;
+        # that test asserts this exact payload round-trips.
+        (
+            tmp_path / "runs" / "sft_001" / "checkpoints" / "step_50"
+            / "eval_sampling.json"
+        ).write_text(json.dumps({"generated": 24, "eval_rows": 149}))
+        text = self._status(tmp_path, {"step_50": 6.31, "final": 7.02})
+        step_line = next(l for l in text.splitlines() if "step_50" in l)
+        final_line = next(l for l in text.splitlines() if "final" in l)
+        assert "(sampled 24/149)" in step_line
+        assert "sampled" not in final_line
+
+    def test_an_unusable_sidecar_leaves_the_line_alone(
+        self, tmp_path: Path
+    ) -> None:
+        """Never invent a label from a truncated or nonsense sidecar."""
+        from lqh.tools.handlers import _checkpoint_eval_sampling
+
+        cp_dir = tmp_path / "checkpoints" / "step_50"
+        cp_dir.mkdir(parents=True)
+        assert _checkpoint_eval_sampling(cp_dir) is None  # no file
+        for payload in (
+            "{not json",
+            json.dumps({"generated": 24}),
+            json.dumps({"generated": "24", "eval_rows": 149}),
+            # Generated everything — a "sampled 149/149" label would be a lie.
+            json.dumps({"generated": 149, "eval_rows": 149}),
+        ):
+            (cp_dir / "eval_sampling.json").write_text(payload)
+            assert _checkpoint_eval_sampling(cp_dir) is None, payload

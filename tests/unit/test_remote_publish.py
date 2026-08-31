@@ -92,3 +92,26 @@ def test_publish_uploads_the_sweep_leaderboard(tmp_path: Path):
 
     assert kinds["sweep_summary.json"] == "metrics"
     assert kinds["runs.jsonl"] == "metrics"
+
+
+def test_publish_uploads_the_checkpoint_eval_sampling_caveat(tmp_path: Path):
+    """The "scored a sample" caveat must travel with the result it qualifies.
+
+    A mid-run checkpoint scores a SAMPLE of the eval set
+    (lqh/train/sft.py MID_RUN_CHECKPOINT_EVAL_SAMPLES) while `final` scores
+    all of it, so a step mean left unqualified reads as comparable to the
+    final one. This allowlist fails silently — a missing entry just omits the
+    file — which is why it is asserted rather than assumed.
+    """
+    step = tmp_path / "checkpoints" / "step_50"
+    step.mkdir(parents=True)
+    (step / "predictions.parquet").write_bytes(b"x")
+    (step / "eval_result.json").write_text(json.dumps({"scores": {"mean": 6.3}}))
+    (step / "eval_sampling.json").write_text(
+        json.dumps({"generated": 24, "eval_rows": 149})
+    )
+
+    kinds = {c.relpath: c.kind for c in _resolve_candidates(tmp_path)}
+
+    assert kinds["checkpoints/step_50/eval_sampling.json"] == "other"
+    assert kinds["checkpoints/step_50/eval_result.json"] == "eval_result"

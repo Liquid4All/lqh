@@ -6350,6 +6350,23 @@ def _format_training_health_block(run_dir: Path) -> list[str]:
     return lines
 
 
+def _checkpoint_eval_sampling(cp_dir: Path) -> tuple[int, int] | None:
+    """``(generated, eval_rows)`` when this checkpoint scored a sample.
+
+    Written by ``lqh.train.sft._write_eval_sampling`` only when the mid-run
+    eval actually thinned the set; absent for the final eval and for any run
+    small enough to have generated over all of it.
+    """
+    try:
+        data = json.loads((cp_dir / "eval_sampling.json").read_text())
+        generated, eval_rows = data["generated"], data["eval_rows"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+    if not isinstance(generated, int) or not isinstance(eval_rows, int):
+        return None
+    return (generated, eval_rows) if 0 < generated < eval_rows else None
+
+
 def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
     """Format a RunStatus as a readable string."""
     state_emoji = {
@@ -6410,7 +6427,14 @@ def _format_status(run_name: str, status: Any, run_dir: Path) -> str:
                             )
                         # A checkpoint mean taken over a thinned sample set is
                         # not comparable to its neighbours, and these lines are
-                        # read side by side to pick a checkpoint.
+                        # read side by side to pick a checkpoint. A mid-run
+                        # checkpoint eval generates over a sample of the eval
+                        # set (lqh/train/sft.py MID_RUN_CHECKPOINT_EVAL_SAMPLES)
+                        # while `final` uses all of it, so say which is which
+                        # rather than print two means that look comparable.
+                        sampled = _checkpoint_eval_sampling(cp_dir)
+                        if sampled is not None:
+                            line += f"  (sampled {sampled[0]}/{sampled[1]})"
                         if result.get("num_failed"):
                             line += f"  ({result['num_failed']} failed)"
                         eval_results.append(line)

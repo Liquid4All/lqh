@@ -43,6 +43,10 @@ DPO_JUDGING_SHARE = DPO_PREFERENCE_SHARE * 2 / 3
 ETA_MIN_ADVANCES = 4
 ETA_MIN_WINDOW_S = 20.0
 ETA_PENDING_LABEL = "ETA soon"
+# Phases that interrupt another phase and hand back to it, rather than
+# carrying the job through to the end. Their throughput says nothing about
+# what remains, so they get no whole-job ETA at all (``estimate_eta``).
+INTERLUDE_PHASES = frozenset({"checkpoint_eval"})
 
 
 @dataclass(frozen=True)
@@ -125,8 +129,9 @@ def checkpoint_eval_band(
 ) -> tuple[float, float] | None:
     """Overall-fraction band for a MID-RUN checkpoint eval, or None.
 
-    A mid-run checkpoint eval generates over the whole eval set, which can
-    take longer than the training it interrupts. It has to report *something*
+    A mid-run checkpoint eval generates over a sample of the eval set
+    (``lqh/train/sft.py`` MID_RUN_CHECKPOINT_EVAL_SAMPLES — it generated over
+    all of it, for 72 minutes, until that cap). It has to report *something*
     while it runs, or the stall watchdog (``lqh/jobs.py``) sees a frozen
     progress file and tells the agent a healthy run is a wedged sandbox.
 
@@ -549,6 +554,14 @@ def estimate_eta(
 
     # Keep the contiguous current phase, then distinct advances.
     current_phase = parsed[-1][2]
+    if current_phase in INTERLUDE_PHASES:
+        # An interlude occupies a sliver of the overall band (see
+        # ``checkpoint_eval_band``) and then hands back to the phase that was
+        # running, which moves through the fraction orders of magnitude
+        # faster. Projecting this phase's rate over the rest of the job quotes
+        # days for a run with half an hour left. No ETA is the honest answer;
+        # the phase's own "34/149 samples" still says what is happening.
+        return EtaEstimate()
     phase_rows: list[tuple[float, float, str]] = []
     for row in reversed(parsed[-1024:]):
         if row[2] != current_phase:
