@@ -129,6 +129,17 @@ def _no_ambient_hf_token(monkeypatch, request, tmp_path_factory):
     monkeypatch.setattr("lqh.hf_token._candidate_env_files", _tmp_only)
 
 
+@pytest.fixture(autouse=True)
+def _fixed_render_width(monkeypatch):
+    """Pin the TUI render width so assertions don't depend on the terminal.
+
+    Scrollback blocks wrap to the terminal (``renderer._display_width``), so
+    without this a suite run inside an 80-column terminal wraps rendered text
+    at a different point than CI does and substring assertions fail.
+    """
+    monkeypatch.setenv("COLUMNS", "100")
+
+
 @pytest.fixture(scope="session")
 def has_api_access() -> bool:
     """True when ``LQH_DEBUG_API_KEY`` or ``~/.lqh/config.json`` is set."""

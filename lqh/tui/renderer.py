@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from io import StringIO
 from rich.console import Console
 from rich.markdown import Markdown
@@ -47,13 +48,27 @@ WELCOME_LOGO_GLYPHS = (
 )
 
 
+def _display_width(width: int) -> int:
+    """Clamp a requested render width to the terminal's.
+
+    Rendered blocks are written to stdout verbatim, so a line wider than the
+    terminal gets re-wrapped by the terminal itself — at its own width and
+    without the block indent — which is what makes long messages look ragged
+    on a narrow terminal.
+    """
+    # get_terminal_size falls back on its own when there is no tty (piped
+    # output, CI), so a fallback of *width* leaves the width untouched there.
+    columns = shutil.get_terminal_size(fallback=(width, 24)).columns
+    return max(MIN_RENDER_WIDTH, min(width, columns))
+
+
 def _make_console(width: int = 100) -> Console:
     """Create a Rich console that renders to a string."""
     buf = StringIO()
     return Console(
         file=buf,
         force_terminal=True,
-        width=max(MIN_RENDER_WIDTH, width - BLOCK_INDENT),
+        width=max(MIN_RENDER_WIDTH, _display_width(width) - BLOCK_INDENT),
         color_system="truecolor",
     )
 
@@ -70,7 +85,7 @@ def _render_block(
     console = Console(
         file=buf,
         force_terminal=True,
-        width=max(MIN_RENDER_WIDTH, width - BLOCK_INDENT),
+        width=max(MIN_RENDER_WIDTH, _display_width(width) - BLOCK_INDENT),
         color_system="truecolor",
     )
     render_fn(console)
@@ -99,7 +114,7 @@ def render_markdown(text: str, width: int = 100) -> str:
     """Render markdown text to ANSI string."""
     buf = StringIO()
     console = Console(
-        file=buf, force_terminal=True, width=width, color_system="truecolor"
+        file=buf, force_terminal=True, width=_display_width(width), color_system="truecolor"
     )
     console.print(Markdown(text))
     return buf.getvalue()
@@ -266,7 +281,7 @@ def render_auto_progress(
     """Render the auto-mode progress panel."""
     buf = StringIO()
     console = Console(
-        file=buf, force_terminal=True, width=width, color_system="truecolor"
+        file=buf, force_terminal=True, width=_display_width(width), color_system="truecolor"
     )
     headline_style = "bold green" if done else "bold cyan"
     headline = "🤖 AUTO MODE"
@@ -308,7 +323,7 @@ def render_options(
     """
     buf = StringIO()
     console = Console(
-        file=buf, force_terminal=True, width=width, color_system="truecolor"
+        file=buf, force_terminal=True, width=_display_width(width), color_system="truecolor"
     )
 
     if checked is not None:
@@ -357,7 +372,7 @@ def render_option_list(options: list[str], width: int = 100) -> str:
     """Render options as a numbered list for append-only terminal output."""
     buf = StringIO()
     console = Console(
-        file=buf, force_terminal=True, width=width, color_system="truecolor"
+        file=buf, force_terminal=True, width=_display_width(width), color_system="truecolor"
     )
     for i, opt in enumerate(options, start=1):
         console.print(Text(f"  {i}. {opt}", style="dim"))
@@ -401,10 +416,15 @@ def render_welcome(width: int = 100) -> str:
     lqh_logo_width = max(len(line) for line in WELCOME_LOGO)
     logo_gap = 4
     logo_width = 2 + liquid_logo_width + logo_gap + 2 + lqh_logo_width
+    text_width = _display_width(width)
+    # The ASCII art can't shrink — Rich crops to the console width even with
+    # overflow="ignore" — so the logo keeps a console wide enough for it. The
+    # lines under it get their own, and wrap to the terminal like every other
+    # block.
     console = Console(
         file=buf,
         force_terminal=True,
-        width=max(width, logo_width),
+        width=max(text_width, logo_width),
         color_system="truecolor",
     )
 
@@ -426,6 +446,12 @@ def render_welcome(width: int = 100) -> str:
             )
         console.print(brand_line, no_wrap=True, overflow="ignore")
 
+    console = Console(
+        file=buf,
+        force_terminal=True,
+        width=text_width,
+        color_system="truecolor",
+    )
     console.print()
     console.print(
         Text(
@@ -464,7 +490,7 @@ def render_resume_hint(session_id: str, width: int = 100) -> str:
     """
     buf = StringIO()
     console = Console(
-        file=buf, force_terminal=True, width=width, color_system="truecolor"
+        file=buf, force_terminal=True, width=_display_width(width), color_system="truecolor"
     )
     console.print()
     console.print(Text("  Resume this conversation with:", style="dim"))
