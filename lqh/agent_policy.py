@@ -81,8 +81,14 @@ def subagent_policy(
 ) -> AgentPolicy:
     """Policy for `lqh run` (CLI_PLAN §3.3, §4.2).
 
-    Task-implied work (scripts, cloud data-gen, training) is auto-granted
-    for the invocation; publishing is gated behind ``allow_publish``.
+    Task-implied work (scripts, cloud data-gen, training, cloud HF eval)
+    is auto-granted for the invocation; publishing is gated behind
+    ``allow_publish``. ``cloud_eval_hf`` belongs with the other spend
+    domains, not with publishing: evaluating a HuggingFace repo is
+    read-only with respect to the user's accounts, and withholding
+    ``--allow-publish`` must not cost a harness its ability to measure a
+    baseline.
+
     Secrets always ride the result payload; the run driver additionally
     persists them to .env when the caller passed --save-secret.
 
@@ -92,7 +98,7 @@ def subagent_policy(
     run simply proceeds without the token — never blocks (see the
     hf_donate handling in the agent loop).
     """
-    domains = {"script", "cloud_data_gen", "training"}
+    domains = {"script", "cloud_data_gen", "training", "cloud_eval_hf"}
     if allow_publish:
         domains.add("hf_push")
     if allow_hf_donate:

@@ -40,7 +40,11 @@ def test_subagent_policy_shape() -> None:
     assert policy.no_user is True
     assert policy.sticky_skill == "subagent"
     assert policy.auto_grant_permissions is False
-    assert policy.granted_domains == {"script", "cloud_data_gen", "training"}
+    # cloud_eval_hf sits with the other spend domains: a read-only eval of
+    # a stock HF repo must not require the publishing grant (feedback #91).
+    assert policy.granted_domains == {
+        "script", "cloud_data_gen", "training", "cloud_eval_hf",
+    }
     assert policy.allow_publish is False
     assert policy.compute_default is None
     # Secrets always ride the result payload; .env persistence is the run
@@ -51,6 +55,16 @@ def test_subagent_policy_shape() -> None:
 
     publishing = subagent_policy(allow_publish=True)
     assert "hf_push" in publishing.granted_domains
+
+
+def test_subagent_can_eval_hf_without_publish_grant(tmp_path: Path) -> None:
+    """A read-only cloud eval of a stock HF repo must not need
+    --allow-publish (feedback #91): an unattended harness that withholds
+    the publishing grant still has to be able to measure a baseline."""
+    from lqh.tools.permissions import PermissionContext
+
+    ctx = PermissionContext.granting(*subagent_policy().granted_domains)
+    assert ctx.allows_cloud_eval_hf(tmp_path) is True
 
 
 def test_subagent_gets_subagent_skill(tmp_path: Path) -> None:

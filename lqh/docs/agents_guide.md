@@ -106,7 +106,7 @@ fails with `error.kind: "conflict"` (allocate a versioned name like
 `my_dataset_v2` instead, unless the user explicitly asked to replace).
 
 `lqh run` auto-grants task-implied work (scripts, cloud data-gen,
-training) for the run, but **publishing** (`hf_push`,
+training, cloud HF evals) for the run, but **publishing** (`hf_push`,
 `push_to_production`, `create_inference_key`) is gated: without
 `--allow-publish` the run terminates with `status: "needs_permission"`
 and the exact re-invocation.
