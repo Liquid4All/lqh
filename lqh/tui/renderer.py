@@ -49,17 +49,18 @@ WELCOME_LOGO_GLYPHS = (
 
 
 def _display_width(width: int) -> int:
-    """Clamp a requested render width to the terminal's.
+    """Resolve the render width from the terminal, *width* being the fallback.
 
     Rendered blocks are written to stdout verbatim, so a line wider than the
     terminal gets re-wrapped by the terminal itself — at its own width and
     without the block indent — which is what makes long messages look ragged
-    on a narrow terminal.
+    on a narrow terminal. A wider terminal simply gets used.
     """
     # get_terminal_size falls back on its own when there is no tty (piped
-    # output, CI), so a fallback of *width* leaves the width untouched there.
+    # output, CI), so a fallback of *width* keeps that case at the caller's
+    # width.
     columns = shutil.get_terminal_size(fallback=(width, 24)).columns
-    return max(MIN_RENDER_WIDTH, min(width, columns))
+    return max(MIN_RENDER_WIDTH, columns)
 
 
 def _make_console(width: int = 100) -> Console:

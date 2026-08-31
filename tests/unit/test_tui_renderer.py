@@ -83,6 +83,18 @@ class TestRenderer:
         assert max(widths) <= 60
         assert max(widths) > 40  # still uses the width it has
 
+    def test_blocks_use_a_wide_terminal(self, monkeypatch) -> None:
+        """A terminal wider than the old fixed 100 columns gets used."""
+        monkeypatch.setattr(
+            renderer.shutil,
+            "get_terminal_size",
+            lambda fallback=(80, 24): os.terminal_size((140, 24)),
+        )
+        rendered = render_system_message("word " * 80)
+
+        widths = [len(_plain(line)) for line in rendered.splitlines()]
+        assert 100 < max(widths) <= 140
+
     def test_blocks_keep_their_width_without_a_terminal(self, monkeypatch) -> None:
         """No tty (piped output): keep the readable 100-column default."""
         def _no_terminal(fallback=(80, 24)):
