@@ -442,6 +442,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Project directory (defaults to the current directory).",
     )
     run.add_argument(
+        "--compute", metavar="TARGET", default=None,
+        help=(
+            "Compute target for this run's training/eval launches: 'cloud', "
+            "'local', or 'ssh:<remote_name>'. Persisted as the project "
+            "default (.lqh/compute.json), so an unattended harness can "
+            "configure compute up front instead of taking a "
+            "needs_configuration round-trip."
+        ),
+    )
+    run.add_argument(
         "--max-turns", type=_positive_int, default=None, metavar="N",
         help="Abort with limit_exceeded after N LLM calls.",
     )

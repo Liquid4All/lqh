@@ -27,6 +27,7 @@ def _ns(task: str | None = None, **kw) -> argparse.Namespace:
         spec=kw.get("spec"),
         project=kw.get("project"),
         timeout=kw.get("timeout"),
+        compute=kw.get("compute"),
     )
 
 
@@ -150,6 +151,37 @@ def test_unresolved_copy_blocks_run(tmp_path, monkeypatch, capfd) -> None:
     result, _ = _read_result(capfd)
     assert result["status"] == "needs_configuration"
     assert "lqh project continue" in result["reason"]
+
+
+def test_compute_flag_persists_project_default(run_project, capfd) -> None:
+    from lqh.remote.compute import load_project_default
+
+    assert load_project_default(run_project) is None
+    assert cmd_run(_ns("x", compute="cloud")) == 0
+    assert load_project_default(run_project) == "cloud"
+
+
+def test_compute_flag_rejects_bad_value(tmp_path, monkeypatch, capfd) -> None:
+    ensure_identity(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert cmd_run(_ns("x", compute="gpu-box")) == 2
+    result, _ = _read_result(capfd)
+    assert "--compute must be" in result["reason"]
+
+
+def test_compute_flag_not_written_into_unresolved_copy(
+    tmp_path, monkeypatch, capfd
+) -> None:
+    from lqh.remote.compute import compute_file_path
+
+    original = tmp_path / "proj"
+    original.mkdir()
+    ensure_identity(original)
+    copy = tmp_path / "proj_copy"
+    shutil.copytree(original, copy)
+    monkeypatch.chdir(copy)
+    assert cmd_run(_ns("do something", compute="cloud")) == 5
+    assert not compute_file_path(copy).exists()
 
 
 def test_auth_required(tmp_path, monkeypatch, capfd) -> None:

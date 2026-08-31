@@ -175,6 +175,11 @@ On failure `result` is `null` and `error` is
 | 5 | configuration required (e.g. compute target unset, unresolved project copy) |
 | 6 | interrupted |
 
+A fresh project has no compute target, so the first `lqh run` that trains or
+evals stops with exit 5. Pass `--compute cloud` (or `local` / `ssh:<remote>`)
+to set it up front — it is persisted as the project default, so later runs
+don't need the flag.
+
 ### Secrets
 
 A tool that mints a one-time secret (e.g. `create_inference_key`)
@@ -198,6 +203,7 @@ lqh docs data                   # the lqh.pipeline API reference for authoring
                                 # data-gen pipelines as an external agent
 lqh login [--no-browser]        # device-flow auth
 lqh run "<task>" [--project DIR] [--allow-publish] [--resume ID]
+        [--compute cloud|local|ssh:<remote>]
         [--max-turns N] [--max-tool-calls N] [--timeout SECONDS]
         [--prompt-file f|-] [--quiet] [--save-secret]
 lqh tool list [--json]          # the tools below

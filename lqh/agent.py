@@ -1480,10 +1480,13 @@ class Agent:
                 and load_global_default() is None
             ):
                 hint = (
-                    "No compute target is configured for this project. Set "
-                    "one first, e.g.: `lqh tool call compute_set --args "
-                    "'{\"value\": \"cloud\", \"scope\": \"project\"}'`, "
-                    "then re-run."
+                    "No compute target is configured for this project. "
+                    "Re-invoke with:\n"
+                    f"  lqh run --resume {self.session.id} --compute cloud\n"
+                    "(or 'local' / 'ssh:<remote_name>'; the same flag on a "
+                    "fresh `lqh run` works too, as does `lqh tool call "
+                    "compute_set --args '{\"value\": \"cloud\", "
+                    "\"scope\": \"project\"}'`)."
                 )
                 self._policy_halt = ("needs_configuration", hint)
                 return ToolResult(
@@ -1627,10 +1630,13 @@ class Agent:
                     save_project_default(self.project_dir, self.policy.compute_default)
                     return await self._reinvoke_tool(tool_name, arguments)
                 hint = (
-                    "No compute target is configured for this project. Set "
-                    "one first: `lqh tool call compute_set --args "
-                    "'{\"value\": \"cloud\", \"scope\": \"project\"}'` (or "
-                    "pick one in the TUI), then re-run."
+                    "No compute target is configured for this project. "
+                    "Re-invoke with:\n"
+                    f"  lqh run --resume {self.session.id} --compute cloud\n"
+                    "(or 'local' / 'ssh:<remote_name>'; the same flag on a "
+                    "fresh `lqh run` works too, as does `lqh tool call "
+                    "compute_set --args '{\"value\": \"cloud\", "
+                    "\"scope\": \"project\"}'` or the TUI picker)."
                 )
                 self._policy_halt = ("needs_configuration", hint)
                 return ToolResult(

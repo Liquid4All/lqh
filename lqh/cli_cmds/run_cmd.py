@@ -282,6 +282,13 @@ def _cmd_run_guarded(ns: argparse.Namespace, real_stdout: int) -> int:
     else:
         project_dir = Path.cwd()
 
+    compute = (getattr(ns, "compute", None) or "").strip() or None
+    if compute and compute not in ("cloud", "local") and not compute.startswith("ssh:"):
+        return _usage_error(
+            "--compute must be 'cloud', 'local', or 'ssh:<remote_name>', "
+            f"got {compute!r}"
+        )
+
     # Identity contract (CLI_PLAN §4.8) — fail closed before any cloud work.
     from lqh.headless import headless_boot
 
@@ -301,6 +308,17 @@ def _cmd_run_guarded(ns: argparse.Namespace, real_stdout: int) -> int:
             "project. Resolve it first: `lqh project continue` or "
             "`lqh project fork`, then retry.",
         )
+
+    # --compute is the caller's configuration decision, so make it the
+    # project default before the agent starts: the sub-agent compute gate
+    # (agent.py, require_compute_config) then finds a target instead of
+    # halting with needs_configuration. Written after the identity checks
+    # above so an unresolved copy is never mutated.
+    if compute:
+        from lqh.remote.compute import load_project_default, save_project_default
+
+        if load_project_default(project_dir) != compute:
+            save_project_default(project_dir, compute)
 
     from lqh.auth import get_token
 
