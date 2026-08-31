@@ -592,7 +592,7 @@ class Agent:
         self.session = session
         self.callbacks = callbacks or AgentCallbacks()
         self.context_stats = ContextStats()
-        self.orchestration_model: str = "orchestration:12"
+        self.orchestration_model: str = "orchestration:15"
         # Safety cap on tool calls per turn. None disables the cap entirely
         # (default). The E2E harness sets a strict integer cap explicitly.
         self.max_tool_calls_per_turn: int | None = None

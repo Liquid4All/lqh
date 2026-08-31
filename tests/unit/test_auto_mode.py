@@ -202,7 +202,7 @@ class TestStickySystemMessages:
     ) -> None:
         agent = make_agent()
 
-        assert agent.orchestration_model == "orchestration:12"
+        assert agent.orchestration_model == "orchestration:15"
 
     def test_auto_mode_injects_skill_as_sticky(self, make_agent: Callable[..., Agent]) -> None:
         agent = make_agent(auto_mode=True)
