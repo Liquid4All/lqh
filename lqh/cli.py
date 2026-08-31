@@ -471,6 +471,40 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Extra sticky context appended to every agent turn.",
     )
 
+    feedback = sub.add_parser(
+        "feedback",
+        help="Send feedback to the lqh team (headless /feedback).",
+        description=(
+            "Submit feedback about lqh without the TUI. The project's most "
+            "recent conversation is attached (as the TUI's /feedback does); "
+            "pick another with --session or send none with --no-context. "
+            "Notes on stderr, one machine-readable JSON result on stdout."
+        ),
+    )
+    feedback.add_argument(
+        "message", nargs="?", default=None,
+        help="The feedback text ('-' reads it from stdin).",
+    )
+    feedback.add_argument(
+        "--message-file", metavar="FILE", default=None,
+        help="Read the feedback text from FILE ('-' for stdin).",
+    )
+    feedback.add_argument(
+        "--project", metavar="DIR", default=None,
+        help="Project directory (defaults to the current directory).",
+    )
+    feedback.add_argument(
+        "--session", metavar="SESSION_ID", default=None,
+        help=(
+            "Attach this conversation instead of the most recent one "
+            "(full id or unique prefix; `lqh run` prints it as session_id)."
+        ),
+    )
+    feedback.add_argument(
+        "--no-context", action="store_true",
+        help="Send the message alone, without any conversation transcript.",
+    )
+
     status = sub.add_parser(
         "status",
         help="Show run states and attention signals for this project.",
@@ -547,6 +581,10 @@ def _dispatch(args: argparse.Namespace) -> int:
         from lqh.cli_cmds.run_cmd import cmd_run
 
         return cmd_run(args)
+    if args.command == "feedback":
+        from lqh.cli_cmds.feedback_cmd import cmd_feedback
+
+        return cmd_feedback(args)
     if args.command == "status":
         from lqh.cli_cmds.status_cmd import cmd_status
 

@@ -206,6 +206,9 @@ lqh tool call <name> --args '<json>' [--args-file f|-] [--pretty] [--save-secret
 lqh tool call training_status --args '{"run_name": "…"}' --wait
                                 # park until the run is terminal (results incl.)
 lqh status [--json]             # run states + attention signals at a glance
+lqh feedback "<text>" [--project DIR] [--session ID] [--no-context]
+        [--message-file f|-]    # report an lqh defect (attaches the project's
+                                # most recent conversation by default)
 lqh project continue|fork       # resolve a copied project directory (see below)
 lqh --resume <ID>               # interactive TUI, resuming a prior conversation
                                 # (full id or unique prefix; the id is printed
