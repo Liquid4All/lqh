@@ -309,10 +309,14 @@ Exit codes: `0` success · `1` failure · `2` usage · `3` needs_permission ·
 
 ### 4.7 Telemetry **[rev2]**
 
-Headless commands must not silently start telemetry: `lqh run` starts a
-telemetry session **only if consent was previously recorded** (the TUI
-notice); otherwise disabled, with a one-line stderr note. `lqh tool` is
-always telemetry-free.
+Headless commands must not silently start telemetry. `lqh run` therefore
+shows the consent notice itself on stderr when it is still pending, then
+starts a telemetry session — gating it on the TUI notice instead left
+headless-first users permanently invisible. The notice is only *recorded*
+as shown when stderr is a terminal, so an unattended run cannot consume a
+human's one-time disclosure; opting out (`/telemetry off`, or
+`LQH_TELEMETRY=0`) disables the session with a one-line stderr note.
+`lqh tool` is always telemetry-free.
 
 ### 4.8 Persistency-layer contract for headless boot **[rev4]**
 

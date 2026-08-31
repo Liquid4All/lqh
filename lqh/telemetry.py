@@ -1067,6 +1067,20 @@ class TelemetryClient:
         except OSError: pass
 
 
+TELEMETRY_NOTICE = (
+    "LQH collects limited usage and workflow timing telemetry to improve the product. "
+    "No prompts, responses, file names, paths, or file contents are collected."
+)
+
+
+def notice_shown() -> bool:
+    """Whether the one-time telemetry notice has been recorded as displayed."""
+    try:
+        return (config_dir() / "telemetry_notice_v1").exists()
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def notice_needed() -> bool:
     try:
         marker = config_dir() / "telemetry_notice_v1"

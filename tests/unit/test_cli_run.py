@@ -335,3 +335,80 @@ def test_artifact_ledger_rules(tmp_path: Path) -> None:
     assert {"kind": "run", "path": "runs/sft_v1", "source": "ledger"} in ledger.entries
     assert {"kind": "hf_repo", "id": "org/model-x", "source": "ledger"} in ledger.entries
     assert not any("bad" in str(e) for e in ledger.entries)
+
+
+def test_headless_shows_notice_and_starts_telemetry(tmp_path: Path, monkeypatch, capfd) -> None:
+    """Headless-first users must not stay invisible: `lqh run` shows the
+    consent notice itself instead of waiting for a TUI session."""
+    from lqh.cli_cmds.run_cmd import _maybe_start_telemetry
+    from lqh.telemetry import notice_shown, set_active_telemetry
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("LQH_TELEMETRY", raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+    ensure_identity(project)
+
+    telemetry = _maybe_start_telemetry(project)
+    _, err = capfd.readouterr()
+    assert telemetry is not None
+    assert "usage and workflow timing telemetry" in err
+    assert "LQH_TELEMETRY=0" in err
+
+    # Unattended: the disclosure is repeated, never marked as seen — nobody
+    # watched the log it was written to.
+    assert notice_shown() is False
+    telemetry = _maybe_start_telemetry(project)
+    _, err = capfd.readouterr()
+    assert telemetry is not None
+    assert "usage and workflow timing telemetry" in err
+
+    # At a terminal it is shown once per machine and recorded.
+    monkeypatch.setattr("sys.stderr.isatty", lambda: True, raising=False)
+    assert _maybe_start_telemetry(project) is not None
+    _, err = capfd.readouterr()
+    assert "usage and workflow timing telemetry" in err
+    assert notice_shown() is True
+    assert _maybe_start_telemetry(project) is not None
+    _, err = capfd.readouterr()
+    assert err == ""
+    set_active_telemetry(None)
+
+
+@pytest.mark.parametrize("opt_out", ["env", "config"])
+def test_headless_honors_opt_out(tmp_path: Path, monkeypatch, capfd, opt_out: str) -> None:
+    """A user who said no is never tracked, by either route."""
+    from lqh.cli_cmds.run_cmd import _maybe_start_telemetry
+    from lqh.config import LqhConfig, save_config
+    from lqh.telemetry import notice_shown
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("LQH_TELEMETRY", raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+    ensure_identity(project)
+    if opt_out == "env":
+        monkeypatch.setenv("LQH_TELEMETRY", "0")
+    else:
+        save_config(LqhConfig(telemetry_enabled=False))
+
+    assert _maybe_start_telemetry(project) is None
+    _, err = capfd.readouterr()
+    assert "telemetry: disabled for this run" in err
+    assert "usage and workflow timing telemetry" not in err
+    assert notice_shown() is False
+
+
+async def test_end_telemetry_flushes_the_queue() -> None:
+    """end_session only appends to the local queue; a headless-only machine
+    has nothing else that would ever upload it."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from lqh.cli_cmds.run_cmd import _end_telemetry
+
+    telemetry = MagicMock()
+    telemetry.run_deferred = AsyncMock()
+    telemetry.flush = AsyncMock()
+    await _end_telemetry(telemetry, "success")
+    telemetry.run_deferred.assert_awaited_once_with(telemetry.end_session, "succeeded")
+    telemetry.flush.assert_awaited_once()

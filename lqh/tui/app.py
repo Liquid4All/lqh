@@ -55,7 +55,7 @@ from lqh.tui.renderer import (
 from lqh.tui.background_tasks import BackgroundTask, BackgroundTaskRegistry
 from lqh.tui.status_bar import StatusBar
 from lqh.update_check import check_for_update, upgrade_command
-from lqh.telemetry import TelemetryClient, notice_needed, set_active_telemetry
+from lqh.telemetry import TELEMETRY_NOTICE, TelemetryClient, notice_needed, set_active_telemetry
 
 if TYPE_CHECKING:
     from lqh.subprocess_manager import SubprocessManager
@@ -2816,9 +2816,7 @@ class LqhApp:
         await self._emit(render_welcome())
         if notice_needed():
             await self._emit(render_system_message(
-                "LQH collects limited usage and workflow timing telemetry to improve the product. "
-                "No prompts, responses, file names, paths, or file contents are collected. "
-                "Use /telemetry off to opt out."
+                f"{TELEMETRY_NOTICE} Use /telemetry off to opt out."
             ))
         self._start_telemetry_flush()
         self._update_check_task = asyncio.create_task(self._show_update_notice())

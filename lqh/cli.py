@@ -561,9 +561,9 @@ def _launch_tui(
 
 
 def _dispatch(args: argparse.Namespace) -> int:
-    """Route a headless subcommand. Imports are per-branch and lazy —
-    never the TUI, never telemetry (lqh.telemetry.notice_needed has a
-    marker-writing side effect and must not run on these paths)."""
+    """Route a headless subcommand. Imports are per-branch and lazy — never
+    the TUI, and never telemetry except on `run`, which starts a session of
+    its own (CLI_PLAN §4.7). `lqh tool` and the rest stay telemetry-free."""
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
     if args.command in ("hello", "docs"):
         from lqh.cli_cmds.docs_cmd import cmd_docs

@@ -556,8 +556,8 @@ async def _run_async(
 
             await agent.prepare_context()
 
-            # Telemetry (CLI_PLAN §4.7): start a session only when consent
-            # was previously recorded (the TUI notice); else a one-line note.
+            # Telemetry (CLI_PLAN §4.7): show the notice if it is still
+            # pending, then start a session unless the user opted out.
             telemetry = _maybe_start_telemetry(project_dir)
         except Exception as e:  # noqa: BLE001 — result JSON is the contract
             import traceback
@@ -690,21 +690,36 @@ async def _run_async(
 
 
 def _maybe_start_telemetry(project_dir: Path):
-    """Start telemetry ONLY when consent was previously recorded (§4.7).
+    """Start a telemetry session for the run, after the notice (§4.7).
 
-    The consent check must not call notice_needed() — it has a
-    marker-writing side effect. A missing marker means the TUI notice was
-    never shown, so telemetry stays off with a one-line stderr note.
+    Consent is notice-based, and the notice is shown once per machine on
+    whichever surface the user reaches first. Headless-first users never
+    open the TUI, so `lqh run` prints it on stderr itself; gating on the
+    TUI having run made every unattended run invisible forever.
     """
     try:
-        from lqh.config import config_dir, load_config
+        from lqh.config import telemetry_enabled
 
-        consent_shown = (config_dir() / "telemetry_notice_v1").exists()
-        if not consent_shown or not load_config().telemetry_enabled:
+        if not telemetry_enabled():
             print("telemetry: disabled for this run", file=sys.stderr)
             return None
-        from lqh.telemetry import TelemetryClient, set_active_telemetry
+        from lqh.telemetry import (
+            TELEMETRY_NOTICE,
+            TelemetryClient,
+            notice_needed,
+            notice_shown,
+            set_active_telemetry,
+        )
 
+        # Only a human at a terminal can be said to have *seen* the notice.
+        # Recording it from an unattended run would burn the one-time
+        # disclosure into a log nobody reads, so those runs repeat it until
+        # an interactive surface shows it for real.
+        if notice_needed() if sys.stderr.isatty() else not notice_shown():
+            print(
+                f"telemetry: {TELEMETRY_NOTICE} Set LQH_TELEMETRY=0 to opt out.",
+                file=sys.stderr,
+            )
         telemetry = TelemetryClient(project_dir, auto_mode=True)
         set_active_telemetry(telemetry)
         telemetry.defer(telemetry.start_session)
@@ -722,8 +737,10 @@ async def _end_telemetry(telemetry, status: str) -> None:
         "timed_out": "cancelled",
     }.get(status, "failed")
     try:
-        # Await so the daemon worker flushes before process exit.
+        # Await so the daemon worker finishes before process exit, then
+        # upload: nothing else drains the queue on a headless-only machine.
         await telemetry.run_deferred(telemetry.end_session, outcome)
+        await telemetry.flush()
     except Exception:
         pass
 
