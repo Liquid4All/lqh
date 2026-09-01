@@ -23,6 +23,7 @@ COMMANDS: list[SlashCommand] = [
     SlashCommand("/hf_login", "Store a Hugging Face token for cloud jobs"),
     SlashCommand("/clear", "Start a fresh conversation"),
     SlashCommand("/resume", "Resume a previous conversation"),
+    SlashCommand("/compact", "Summarize the conversation to free up context"),
     SlashCommand("/spec", "Start specification capture mode"),
     SlashCommand("/datagen", "Start data generation mode"),
     SlashCommand("/validate", "Start data validation mode"),

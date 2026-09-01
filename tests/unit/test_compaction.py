@@ -45,6 +45,34 @@ async def test_compaction_below_threshold_is_noop(
     agent._client.chat.completions.create.assert_not_awaited()
 
 
+async def test_forced_compaction_runs_below_the_auto_threshold(
+    project_dir: Path, mock_openai_client
+) -> None:
+    """``/compact`` asks explicitly, so the auto-compaction size guard
+    does not apply — but the tail-keep still does."""
+    client = mock_openai_client(content="Summary of the short chat.")
+    agent, session = _agent_with_history(project_dir, client, n_messages=6)
+    raw_before = session.read_log()
+
+    assert await agent._compact_context(force=True) is True
+
+    assert session.read_log() == raw_before  # transcript intact
+    assert session.messages[0]["role"] == "system"
+    assert "Summary of the short chat." in session.messages[0]["content"]
+    assert session.messages[-4:] == raw_before[-4:]
+
+
+async def test_forced_compaction_still_respects_the_tail(
+    project_dir: Path, mock_openai_client
+) -> None:
+    """Nothing to cover once the tail is reserved — no LLM call, False."""
+    client = mock_openai_client()
+    agent, session = _agent_with_history(project_dir, client, n_messages=4)
+
+    assert await agent._compact_context(force=True) is False
+    client.chat.completions.create.assert_not_awaited()
+
+
 async def test_compaction_replaces_view_with_summary_and_tail(
     project_dir: Path, mock_openai_client
 ) -> None:

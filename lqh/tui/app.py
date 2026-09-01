@@ -1052,6 +1052,10 @@ class LqhApp:
             await self._do_resume()
             return True
 
+        if command == "/compact":
+            await self._do_compact()
+            return True
+
         skill_map = {
             "/spec": "spec_capture",
             "/datagen": "data_generation",
@@ -1203,6 +1207,45 @@ class LqhApp:
             return describe_api_error(exc)
         except Exception:
             return type(exc).__name__
+
+    async def _do_compact(self) -> None:
+        """Compact the conversation history on user request (/compact).
+
+        Runs the same non-destructive pass the agent does automatically:
+        the raw transcript is untouched, only the working view sent to the
+        model shrinks. ``force`` because the user asked explicitly — the
+        agent's own short-conversation guard doesn't apply here.
+        """
+        if self._agent is None or self._session is None:
+            await self._emit(render_error("No active conversation to compact."))
+            return
+
+        self._lock_input()
+        try:
+            await self._emit(render_system_message("⏳ Compacting conversation…"))
+            compacted = await self._run_interruptible(
+                lambda: self._agent._compact_context(force=True)
+            )
+        except AgentInterrupted:
+            return
+        except Exception as e:
+            await self._emit(render_error(f"{type(e).__name__}: {e}"))
+            return
+        finally:
+            self._unlock_input()
+            self._save_session()
+
+        if compacted:
+            # The agent already emitted its own "context compacted" line;
+            # only the token counters need catching up here.
+            self._status_bar.prompt_tokens = 0
+            self._status_bar.completion_tokens = 0
+            self._invalidate()
+        else:
+            await self._emit(render_system_message(
+                "Nothing to compact — the conversation is already fully "
+                "summarized, or too short to summarize."
+            ))
 
     async def _do_reconnect(self) -> None:
         """Retry the last interrupted agent operation, if any."""

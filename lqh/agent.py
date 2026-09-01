@@ -795,7 +795,7 @@ class Agent:
             return end_idx
         return None
 
-    async def _compact_context(self) -> None:
+    async def _compact_context(self, *, force: bool = False) -> bool:
         """Summarize the conversation into a derived checkpoint.
 
         Non-destructive: the raw message log is never modified. On success
@@ -805,15 +805,20 @@ class Agent:
         the input is the previous checkpoint's summary plus every log
         message it did not cover. Any failure leaves log, checkpoints, and
         view untouched.
+
+        ``force`` skips the short-conversation guard, for a compaction the
+        user asked for explicitly (``/compact``). Returns True when a
+        checkpoint was written, False when there was nothing to compact or
+        the pass failed.
         """
-        if len(self.session.messages) < 10:
-            return  # too few messages to compact
+        if not force and len(self.session.messages) < 10:
+            return False  # too few messages to compact
 
         try:
             keep_tail = self._COMPACTION_KEEP_TAIL
             entries = self.session.log_entries()
             if len(entries) <= keep_tail:
-                return
+                return False
             previous = self.session.latest_checkpoint()
             prev_covered = int(previous.get("covers_to_seq", 0)) if previous else 0
 
@@ -824,7 +829,7 @@ class Agent:
                 None,
             )
             if start_idx is None or start_idx > max_cover_idx:
-                return
+                return False
 
             # Byte-cap the pass from the FRONT (oldest first). Coverage only
             # ever extends over messages that actually enter this summary —
@@ -853,7 +858,7 @@ class Agent:
             # and the covered side must not end with unanswered tool calls.
             end_idx = self._tool_safe_boundary(entries, start_idx, end_idx)
             if end_idx is None:
-                return
+                return False
             covers_to_seq = entries[end_idx][0]
             window = entries[start_idx:end_idx + 1]
 
@@ -898,7 +903,7 @@ class Agent:
                 self._run_completion_tokens += response.usage.completion_tokens or 0
             summary_text = (response.choices[0].message.content or "").strip()
             if not summary_text:
-                return
+                return False
 
             self.session.set_compacted_view(
                 summary_text,
@@ -918,6 +923,7 @@ class Agent:
                 await self.callbacks.on_agent_message(
                     "🗜️ Context compacted to free up space."
                 )
+            return True
         except Exception:
             # Best-effort: never break the agent loop, but make the failure
             # observable. The raw transcript is intact either way.
@@ -925,6 +931,7 @@ class Agent:
                 "context compaction failed; raw transcript intact",
                 exc_info=True,
             )
+            return False
 
     async def process_user_input(self, user_input: str) -> None:
         """Process a user message and run the agent loop."""
