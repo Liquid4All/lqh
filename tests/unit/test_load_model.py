@@ -452,3 +452,99 @@ def test_display_model_ref_passes_through_hub_ids_and_foreign_paths():
     assert display_model_ref("/abs/path", None) == "/abs/path"
     # Degenerate: ref *is* the run dir — "." would say nothing.
     assert display_model_ref(str(run_dir), run_dir) == str(run_dir)
+
+
+# ---------------------------------------------------------------------------
+# assert_adapter_applied
+# ---------------------------------------------------------------------------
+
+
+class _FakeTensor:
+    """Minimal stand-in for the LoRA-B parameter tensors the check reads."""
+
+    def __init__(self, nonzero: int):
+        self._nonzero = nonzero
+
+    def detach(self):
+        return self
+
+    def count_nonzero(self):
+        return types.SimpleNamespace(item=lambda: self._nonzero)
+
+
+class _FakeModel:
+    def __init__(self, params):
+        self._params = params
+
+    def named_parameters(self):
+        return iter(self._params)
+
+
+def test_assert_adapter_applied_raises_when_every_lora_b_is_zero():
+    """PEFT does not raise on a key mismatch — every lora_B stays at its
+    zero init and the model silently IS the base (feedback #95)."""
+    from lqh.train.load_model import assert_adapter_applied
+
+    model = _FakeModel([
+        ("base_model.model.layers.0.q_proj.lora_A.default.weight", _FakeTensor(12)),
+        ("base_model.model.layers.0.q_proj.lora_B.default.weight", _FakeTensor(0)),
+        ("base_model.model.layers.1.q_proj.lora_B.default.weight", _FakeTensor(0)),
+    ])
+    with pytest.raises(RuntimeError, match="had NO effect"):
+        assert_adapter_applied(model, "/ckpt/model-lora", "fake/base")
+
+
+def test_assert_adapter_applied_passes_for_a_real_adapter(capsys):
+    from lqh.train.load_model import assert_adapter_applied
+
+    model = _FakeModel([
+        ("base_model.model.layers.0.q_proj.lora_B.default.weight", _FakeTensor(7)),
+        ("base_model.model.layers.1.q_proj.lora_B.default.weight", _FakeTensor(0)),
+    ])
+    assert_adapter_applied(model, "/ckpt/model-lora", "fake/base")
+    # The effective load is logged where the reader looks (stdout.log).
+    assert "1/2 lora_B modules" in capsys.readouterr().out
+
+
+def test_assert_adapter_applied_gives_no_verdict_without_lora_b():
+    """Non-LoRA adapter types carry no lora_B factors — nothing to judge."""
+    from lqh.train.load_model import assert_adapter_applied
+
+    model = _FakeModel([("prompt_encoder.embedding.weight", _FakeTensor(0))])
+    assert_adapter_applied(model, "/ckpt", "fake/base")
+
+
+def test_assert_adapter_applied_gives_no_verdict_on_uninspectable_model(capsys):
+    """Meta / offloaded params (and test stubs) must not fail the run —
+    but the skip has to be visible, or stdout.log reads like a pass."""
+    from lqh.train.load_model import assert_adapter_applied
+
+    class _Meta:
+        def detach(self):
+            return self
+
+        def count_nonzero(self):
+            raise NotImplementedError("meta tensor")
+
+    model = _FakeModel([("layers.0.q_proj.lora_B.default.weight", _Meta())])
+    assert_adapter_applied(model, "/ckpt", "fake/base")
+    assert "check skipped" in capsys.readouterr().out
+
+    class _Opaque:
+        def named_parameters(self):
+            raise RuntimeError("not a torch module")
+
+    assert_adapter_applied(_Opaque(), "/ckpt", "fake/base")
+    assert "check skipped" in capsys.readouterr().out
+
+
+def test_assert_adapter_applied_non_strict_warns_instead_of_raising(capsys):
+    """In-training eval loaders (sft/grpo) must not lose a checkpoint to
+    an adapter that trained to nothing — they warn and carry on."""
+    from lqh.train.load_model import assert_adapter_applied
+
+    model = _FakeModel([
+        ("layers.0.q_proj.lora_B.default.weight", _FakeTensor(0)),
+    ])
+    assert_adapter_applied(model, "/ckpt", "fake/base", strict=False)
+    assert "WARNING" in capsys.readouterr().out

@@ -1148,6 +1148,9 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
             device_map="auto",
             modality=modality,
             max_image_tokens=int(training_cfg.get("max_image_tokens", 256)) if is_vision else None,
+            # See grpo.py: a degenerate adapter must not fail the run
+            # before its checkpoint is published.
+            verify_adapter=False,
         )
         _run_checkpoint_eval(
             model=eval_model,

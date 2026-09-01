@@ -86,7 +86,11 @@ def _merge(
     import torch
     from peft import PeftModel
 
-    from lqh.train.load_model import _model_cls, detect_modality
+    from lqh.train.load_model import (
+        _model_cls,
+        assert_adapter_applied,
+        detect_modality,
+    )
 
     # Vision (LFM-VL) bases need the image-text-to-text class; text bases
     # keep AutoModelForCausalLM. merge_and_unload() itself is architecture-
@@ -110,6 +114,10 @@ def _merge(
     model = model_cls.from_pretrained(base_model, **load_kwargs)
     print("merge: applying adapter ...", flush=True)
     model = PeftModel.from_pretrained(model, str(adapter_dir))
+    # A key mismatch here is silent in PEFT and produces a "merged"
+    # checkpoint that is byte-for-byte the base — see
+    # assert_adapter_applied.
+    assert_adapter_applied(model, str(adapter_dir), base_model)
     merged = model.merge_and_unload()
     print(f"merge: saving merged weights -> {out_dir} ...", flush=True)
     merged.save_pretrained(str(out_dir), safe_serialization=True)

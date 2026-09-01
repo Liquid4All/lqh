@@ -44,6 +44,7 @@ Modality = Literal["text", "vision"]
 __all__ = [
     "ModelKind",
     "Modality",
+    "assert_adapter_applied",
     "detect_kind",
     "detect_modality",
     "display_model_ref",
@@ -147,6 +148,61 @@ def detect_modality(path_or_id: str, *, base_override: str | None = None) -> Mod
     return "text"
 
 
+def assert_adapter_applied(
+    wrapped: Any, adapter_dir: str, base: str, *, strict: bool = True,
+) -> None:
+    """Fail loudly when a just-loaded LoRA adapter has no effect.
+
+    ``PeftModel.from_pretrained`` does not raise when the checkpoint's
+    keys don't line up with the modules PEFT injected (a peft /
+    transformers version skew between the machine that trained the
+    adapter and the one loading it, a differently-wrapped save): the
+    mismatched entries are reported as unexpected and every ``lora_B``
+    factor stays at its zero init — which makes the wrapped model
+    numerically identical to the base. An eval then scores the BASE
+    model and reports the numbers as the checkpoint's, with nothing in
+    the log to say so.
+
+    Returns without a verdict — saying so on stdout, the surface the
+    reader actually gets — when the model can't be introspected (test
+    stubs, meta/offloaded params) or carries no ``lora_B`` factors at
+    all (a non-LoRA adapter type), so this only ever fires on a proven
+    no-op.
+    """
+    try:
+        tensors = [p for name, p in wrapped.named_parameters() if "lora_B" in name]
+    except Exception as exc:  # noqa: BLE001 — a stub / exotic wrapper
+        print(f"  adapter check skipped ({exc})", flush=True)
+        return
+    if not tensors:
+        print("  adapter check skipped (no lora_B factors)", flush=True)
+        return
+    try:
+        applied = sum(1 for t in tensors if t.detach().count_nonzero().item())
+    except Exception as exc:  # noqa: BLE001 — meta / offloaded params
+        print(f"  adapter check skipped ({exc})", flush=True)
+        return
+    if applied == 0:
+        message = (
+            f"LoRA adapter {adapter_dir} loaded onto base {base} but had NO "
+            f"effect: all {len(tensors)} lora_B factors are still zero, so "
+            f"the model is numerically identical to the base model. This "
+            f"usually means the adapter checkpoint's keys don't match the "
+            f"modules PEFT injected — check that the peft / transformers "
+            f"versions here match the ones that trained the adapter. "
+            f"Any eval of this model reports BASE-model scores."
+        )
+        if strict:
+            raise RuntimeError(f"{message} Refusing to continue.")
+        print(f"  WARNING: {message}", flush=True)
+        return
+    print(
+        f"  adapter applied: {applied}/{len(tensors)} lora_B modules carry "
+        f"trained weights (base: {base})",
+        flush=True,
+    )
+
+
 def _model_cls(modality: Modality):
     """The AutoModel class for a modality."""
     if modality == "vision":
@@ -207,6 +263,7 @@ def load_for_inference(
     base_override: str | None = None,
     modality: Modality | None = None,
     max_image_tokens: int | None = None,
+    verify_adapter: bool = True,
 ) -> "tuple[PreTrainedModel, PreTrainedTokenizerBase]":
     """Return a ready-to-infer model + tokenizer.
 
@@ -217,6 +274,11 @@ def load_for_inference(
     ``modality=None`` auto-detects. Vision models load via
     ``AutoModelForImageTextToText`` and return the ``AutoProcessor`` in the
     tokenizer slot (raw tokenizer at ``.tokenizer``).
+
+    ``verify_adapter=False`` downgrades :func:`assert_adapter_applied` to a
+    warning — for callers that load a checkpoint they just trained, where
+    an all-zero adapter means the training was degenerate, not that the
+    load failed, and failing the load would throw the checkpoint away.
     """
     import torch  # local: keep import-time light
 
@@ -249,6 +311,7 @@ def load_for_inference(
         base, dtype=dtype, device_map=device_map,
     )
     wrapped = PeftModel.from_pretrained(base_model, path_or_id)
+    assert_adapter_applied(wrapped, path_or_id, base, strict=verify_adapter)
     merged = wrapped.merge_and_unload()
     tokenizer = _tok(path_or_id, base)
     return merged, tokenizer

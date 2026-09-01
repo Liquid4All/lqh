@@ -547,6 +547,10 @@ def grpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         eval_model, _ = load_for_inference(
             str(final_model_dir), dtype=dtype, device_map="auto",
             modality="text",
+            # A run whose adapter came out all-zero still has to publish
+            # its checkpoint: here that means degenerate training, not a
+            # failed load, and it is the eval's job to report it.
+            verify_adapter=False,
         )
         _run_checkpoint_eval(
             model=eval_model,

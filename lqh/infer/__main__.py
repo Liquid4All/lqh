@@ -250,7 +250,12 @@ def _run_inference_hf(run_dir: Path, config: dict) -> None:
 
     from lqh.progress import ProgressReporter
     from lqh.train.data_utils import load_eval_sources_with_tools
-    from lqh.train.load_model import display_model_ref, load_for_inference
+    from lqh.train.load_model import (
+        detect_kind,
+        display_model_ref,
+        load_for_inference,
+        resolve_base_model,
+    )
     from lqh.train.progress import write_eval_request, write_progress, write_status
     from lqh.train.tool_format import get_tool_formatter
 
@@ -279,6 +284,15 @@ def _run_inference_hf(run_dir: Path, config: dict) -> None:
     )
 
     print(f"Loading model: {display_model_ref(base_model, run_dir)}")
+    # Say which weights are actually in play. A checkpoint dir that is a
+    # bare LoRA adapter scores the base model unless the adapter really
+    # loads, so the resolution belongs in the log the reader quotes back
+    # (load_for_inference itself hard-fails on a no-op adapter).
+    if detect_kind(str(base_model)) == "adapter":
+        print(
+            "  LoRA adapter dir — merging onto base "
+            f"{display_model_ref(resolve_base_model(str(base_model), base_override), run_dir)}"
+        )
     # load_for_inference transparently handles hub ids, merged dirs,
     # and adapter dirs (the latter via base+PeftModel+merge_and_unload).
     # For vision (LFM-VL) models it returns the AutoProcessor in the
