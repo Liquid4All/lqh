@@ -313,6 +313,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Do not try to open the verification URL in a browser.",
     )
 
+    account = sub.add_parser(
+        "account",
+        help="Show the logged-in account's spend and remaining budget.",
+        description=(
+            "Print the logged-in account: email, organization, this period's "
+            "spend against the monthly limit, and the org's remaining "
+            "credits. Use --json to pace an unattended run against the cap."
+        ),
+    )
+    account.add_argument(
+        "--json", action="store_true", dest="json_out",
+        help="Machine-readable JSON output.",
+    )
+
     docs = sub.add_parser(
         "docs",
         help="Print docs: skills, and the agent-harness guide.",
@@ -583,6 +597,10 @@ def _dispatch(args: argparse.Namespace) -> int:
         from lqh.cli_cmds.login_cmd import cmd_login
 
         return cmd_login(args)
+    if args.command == "account":
+        from lqh.cli_cmds.account_cmd import cmd_account
+
+        return cmd_account(args)
     if args.command == "tool":
         from lqh.cli_cmds.tool_cmd import cmd_tool
 

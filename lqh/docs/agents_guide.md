@@ -193,6 +193,13 @@ one JSON result on stdout (`status`: `already_logged_in` | `logged_in` |
 `expired` | `error`). Tools tagged `auth` below need it; everything else
 works offline/locally.
 
+`lqh account --json` reports the logged-in account at any time — one JSON
+document with `user` (`current_period_spend_cents`,
+`monthly_cost_limit_cents`) and `organization`, whose `credits` block carries
+`available_cents`, `spent_cents` and `remaining_cents`. That is the number to
+pace an unattended battery against; without `--json` it prints a short human
+summary. Exit 4 when there is no usable token.
+
 ## Commands
 
 ```
@@ -202,6 +209,7 @@ lqh docs skill <name> [--raw]   # print a skill playbook (harness-rendered)
 lqh docs data                   # the lqh.pipeline API reference for authoring
                                 # data-gen pipelines as an external agent
 lqh login [--no-browser]        # device-flow auth
+lqh account [--json]            # account, spend, and remaining credits
 lqh run "<task>" [--project DIR] [--allow-publish] [--resume ID]
         [--compute cloud|local|ssh:<remote>]
         [--max-turns N] [--max-tool-calls N] [--timeout SECONDS]

@@ -110,6 +110,27 @@ async def send_feedback(
             raise LoginError(f"failed to send feedback ({r.status_code}): {r.text[:200]}")
 
 
+async def account_info() -> dict[str, Any]:
+    """Return the authenticated account snapshot from ``/api/auth/me``:
+    the ``user`` (spend + monthly limit), the ``organization`` and its
+    resolved ``credits`` entitlement (available / spent / remaining), so a
+    headless caller can pace itself against the cap without re-running the
+    device flow. Raises LoginError on a non-200 response (``status_code``
+    is attached to the exception)."""
+    async with httpx.AsyncClient(base_url=api_root(), timeout=30.0) as http:
+        r = await http.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {require_token()}"},
+        )
+        if r.status_code != 200:
+            err = LoginError(
+                f"account lookup failed ({r.status_code}): {r.text[:200]}"
+            )
+            err.status_code = r.status_code
+            raise err
+        return r.json()
+
+
 async def hf_token_status() -> dict[str, Any]:
     """Return {"configured": bool, "last_used_at": str|None} for the
     stored HF token (the one cloud jobs use). Empty dict on error."""
