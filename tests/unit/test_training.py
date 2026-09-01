@@ -1732,3 +1732,63 @@ class TestRlSkill:
         tools = {t["function"]["name"]: t["function"] for t in get_all_tools()}
         types = tools["start_training"]["parameters"]["properties"]["type"]["enum"]
         assert types == ["sft", "on_policy_dpo", "grpo"]
+
+
+class TestCloudSubmitComputeLine:
+    """A cloud training submit names the GPU class and wall-clock cap it
+    is billed against — the same line the eval submit shows, so an A100
+    GRPO run is distinguishable from an L4 SFT run at submit time."""
+
+    async def test_cloud_training_submit_reports_gpu_and_minutes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from lqh.remote.cloud import CloudBackend
+        from lqh.tools import handlers
+
+        async def fake_submit(self, run_dir, config, *, module="lqh.train", **_kw):
+            return "job-grpo-1"
+
+        async def fake_snapshot(self, job_id):
+            return {"resource": {
+                "gpu_type": "A100-80GB", "timeout_minutes": 300,
+                "worst_case_cost_billed_micros": 45_000_000,
+            }}
+
+        monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
+        monkeypatch.setattr(CloudBackend, "job_snapshot", fake_snapshot)
+        run_dir = tmp_path / "runs" / "grpo_001"
+        run_dir.mkdir(parents=True)
+
+        result = await handlers._execute_start_training_remote(
+            tmp_path, run_dir, {"type": "grpo"}, "grpo_001", "cloud", "key",
+        )
+
+        assert "Cloud training submitted" in result.content
+        assert "Compute: A100-80GB GPU, 300 min timeout, hard cap ≈ $45.00" in result.content
+
+    async def test_cloud_training_submit_survives_snapshot_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The compute line is a display nicety — losing it must not lose
+        the submit confirmation (and with it the job id)."""
+        from lqh.remote.cloud import CloudBackend
+        from lqh.tools import handlers
+
+        async def fake_submit(self, run_dir, config, *, module="lqh.train", **_kw):
+            return "job-grpo-2"
+
+        async def boom(self, job_id):
+            raise RuntimeError("snapshot unavailable")
+
+        monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
+        monkeypatch.setattr(CloudBackend, "job_snapshot", boom)
+        run_dir = tmp_path / "runs" / "grpo_002"
+        run_dir.mkdir(parents=True)
+
+        result = await handlers._execute_start_training_remote(
+            tmp_path, run_dir, {"type": "grpo"}, "grpo_002", "cloud", "key",
+        )
+
+        assert "Cloud training submitted" in result.content
+        assert "job-grpo-2" in result.content
+        assert "Compute:" not in result.content

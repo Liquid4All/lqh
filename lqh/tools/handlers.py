@@ -5635,6 +5635,46 @@ async def handle_start_training(
     )
 
 
+async def _submit_compute_line(
+    backend: Any,
+    job_id: str,
+    *,
+    default_timeout_minutes: int | None = None,
+) -> str | None:
+    """The "Compute:" confirmation line for a freshly submitted cloud job.
+
+    Reads back the planner's ACTUAL resource selection so the submit
+    confirmation names the card that is being billed and the wall-clock
+    cap it is billed against — a GRPO run lands on an A100 while an SFT
+    or eval run lands on an L4, and that difference is the whole story
+    for anyone pacing a spend cap. Best-effort: returns None when the
+    snapshot can't be read, so a display nicety never fails a submit.
+    """
+    try:
+        resource = (await backend.job_snapshot(job_id)).get("resource") or {}
+        gpu = resource.get("gpu_type") or ""
+        timeout = resource.get("timeout_minutes")
+        cap_micros = resource.get("worst_case_cost_billed_micros")
+    except Exception:  # noqa: BLE001 — display nicety, never fail the submit
+        return None
+    if not isinstance(timeout, (int, float)):
+        timeout = default_timeout_minutes
+    timeout_part = (
+        f", {int(timeout)} min timeout"
+        if isinstance(timeout, (int, float)) and timeout > 0
+        else ""
+    )
+    cap_part = (
+        f", hard cap ≈ ${float(cap_micros) / 1e6:.2f}"
+        if isinstance(cap_micros, (int, float)) and cap_micros > 0 else ""
+    )
+    if not (gpu or timeout_part or cap_part):
+        # Nothing was actually reported — a bare "Compute: ? GPU" line
+        # carries no information, so say nothing at all.
+        return None
+    return f"  Compute: {gpu or '?'} GPU{timeout_part}{cap_part}\n"
+
+
 async def _execute_start_training_remote(
     project_dir: Path,
     run_dir: Path,
@@ -5690,12 +5730,18 @@ async def _execute_start_training_remote(
             remote="cloud",
         )
         data_line = _training_data_line(config)
+        # Which GPU class the planner actually picked and the wall-clock
+        # it bills against — the same line the eval submit already shows,
+        # so an A100 GRPO run is distinguishable from an L4 SFT run
+        # without first polling training_status.
+        compute_line = await _submit_compute_line(backend, job_id)
         return ToolResult(
             content=(
                 f"🚀 Cloud training submitted\n"
                 f"  Run:     {run_name}\n"
                 f"  Type:    {config.get('type', 'unknown')}\n"
                 + (f"  Data:    {data_line}\n" if data_line else "")
+                + (compute_line or "")
                 + f"  Job ID:  {job_id}\n\n"
                 f"Backend: LQH Cloud (api.lqh.ai). Use training_status to monitor progress."
                 + _submit_advisories(backend)
@@ -7373,21 +7419,9 @@ async def handle_eval_hf_model(
     # ACTUAL selected resource so the confirmation shows the real hard
     # cap, not the estimate. Best-effort: on any error fall back to the
     # requested timeout alone.
-    compute_line = f"  Timeout: {timeout_minutes} min (hard compute-cost cap)\n"
-    try:
-        resource = (await backend.job_snapshot(job_id)).get("resource") or {}
-        gpu = resource.get("gpu_type") or "?"
-        actual_timeout = int(resource.get("timeout_minutes") or timeout_minutes)
-        cap_micros = resource.get("worst_case_cost_billed_micros")
-        cap_part = (
-            f", hard cap ≈ ${float(cap_micros) / 1e6:.2f}"
-            if isinstance(cap_micros, (int, float)) and cap_micros > 0 else ""
-        )
-        compute_line = (
-            f"  Compute: {gpu} GPU, {actual_timeout} min timeout{cap_part}\n"
-        )
-    except Exception:  # noqa: BLE001 — display nicety, never fail the submit
-        pass
+    compute_line = await _submit_compute_line(
+        backend, job_id, default_timeout_minutes=timeout_minutes,
+    ) or f"  Timeout: {timeout_minutes} min (hard compute-cost cap)\n"
 
     return ToolResult(
         content=(
