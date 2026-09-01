@@ -167,6 +167,23 @@ def _prompt_messages(conv: list[dict], system_prompt: str | None) -> list[dict]:
     return prompt_msgs
 
 
+def _reference_messages(conv: list[dict]) -> list[dict]:
+    """The gold answer of an eval sample: the one trailing assistant turn
+    ``_prompt_messages`` strips off. Empty when the sample is unlabelled.
+
+    Exactly one turn, to stay in step with ``_prompt_messages`` — anything
+    it leaves in the prompt is context the model already saw, not the
+    answer being graded.
+
+    Carried into predictions.parquet so the judge can grade against the
+    ground truth instead of scoring the model's output on plausibility
+    alone (lqh.scoring._load_references).
+    """
+    if conv and conv[-1].get("role") == "assistant":
+        return conv[-1:]
+    return []
+
+
 def _finalize_predictions(
     run_dir: Path,
     results: list[dict | None],
@@ -187,6 +204,9 @@ def _finalize_predictions(
     import pyarrow.parquet as pq
 
     has_tools_col = any("tools" in p for p in predictions)
+    # Optional — absent for unlabelled eval sets, and for rows resumed from a
+    # partial written before this column existed (hence .get, not []).
+    has_reference_col = any(p.get("reference") for p in predictions)
     columns: dict[str, list] = {
         "sample_index": [p["sample_index"] for p in predictions],
         "messages": [p["messages"] for p in predictions],
@@ -200,6 +220,9 @@ def _finalize_predictions(
     if has_tools_col:
         columns["tools"] = [p.get("tools") for p in predictions]
         fields.append(pa.field("tools", pa.string()))
+    if has_reference_col:
+        columns["reference"] = [p.get("reference") for p in predictions]
+        fields.append(pa.field("reference", pa.string()))
 
     table = pa.table(columns, schema=pa.schema(fields))
     pq.write_table(table, run_dir / "predictions.parquet")
@@ -481,6 +504,8 @@ def _run_inference_hf(run_dir: Path, config: dict) -> None:
         }
         if sample_tools is not None:
             pred_entry["tools"] = json.dumps(sample_tools)
+        if reference := _reference_messages(conv):
+            pred_entry["reference"] = json.dumps(reference)
         results[i] = pred_entry
         _append_prediction_partial(partial_path, i, pred_entry)
         completed_count += 1

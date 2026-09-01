@@ -18,6 +18,7 @@ import pytest
 from lqh.runner import APIModelRunner, RunnerResponse, RunnerUsage
 from lqh.scoring import (
     _build_scoring_prompt,
+    _load_references,
     _parse_score_response,
     _strip_trailing_assistant,
     extract_failures,
@@ -188,6 +189,23 @@ class TestBuildScoringPrompt:
         )
         assert "Reference (ground truth)" in prompt[1]["content"]
         assert "reference" in prompt[1]["content"]
+
+    def test_reference_triggers_comparison_instruction(self) -> None:
+        """A reference in the prompt is useless unless the judge is told to
+        grade against it — that gap is how a rubric anchored on the reference
+        ended up handing 10s to answers that disagreed with it."""
+        prompt = _build_scoring_prompt(
+            "criteria",
+            [{"role": "assistant", "content": "generated"}],
+            reference_messages=[{"role": "assistant", "content": "reference"}],
+        )
+        assert "disagrees with the reference" in prompt[1]["content"]
+
+    def test_no_reference_no_comparison_instruction(self) -> None:
+        prompt = _build_scoring_prompt(
+            "criteria", [{"role": "assistant", "content": "generated"}],
+        )
+        assert "disagrees with the reference" not in prompt[1]["content"]
 
     def test_vision_sample_attaches_images(self) -> None:
         url = "data:image/jpeg;base64,QUJD"
@@ -657,3 +675,118 @@ class TestScoringIntegration:
         )
         assert result.total == 1
         assert result.scored > 0
+
+
+# ---------------------------------------------------------------------------
+# Reference (ground truth) plumbing for prediction scoring
+# ---------------------------------------------------------------------------
+
+
+def _write_predictions(
+    path: Path, rows: list[dict[str, Any]], *, with_reference: bool
+) -> Path:
+    columns: dict[str, list] = {
+        "sample_index": [r["sample_index"] for r in rows],
+        "messages": [r["messages"] for r in rows],
+        "source": [r.get("source", "all") for r in rows],
+    }
+    if with_reference:
+        columns["reference"] = [r.get("reference") for r in rows]
+    pq.write_table(pa.table(columns), path)
+    return path
+
+
+class TestLoadReferences:
+    def test_missing_column_yields_none_per_sample(self, tmp_path: Path) -> None:
+        path = _write_predictions(
+            tmp_path / "p.parquet",
+            [
+                {"sample_index": 0, "messages": "[]"},
+                {"sample_index": 1, "messages": "[]"},
+            ],
+            with_reference=False,
+        )
+        assert _load_references(path, 2) == [None, None]
+
+    def test_parses_reference_column(self, tmp_path: Path) -> None:
+        gold = [{"role": "assistant", "content": "B"}]
+        path = _write_predictions(
+            tmp_path / "p.parquet",
+            [
+                {"sample_index": 0, "messages": "[]", "reference": json.dumps(gold)},
+                {"sample_index": 1, "messages": "[]", "reference": None},
+            ],
+            with_reference=True,
+        )
+        assert _load_references(path, 2) == [gold, None]
+
+
+class TestPredictionScoringUsesReference:
+    """The predictions path (run_inference=False) must hand the judge the gold
+    answer. Without it a reference-anchored rubric grades on plausibility
+    alone, which is how a mode-collapsed checkpoint scored 8.0/10.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reference_column_reaches_the_judge(
+        self, tmp_path: Path, judge_client: MagicMock
+    ) -> None:
+        predictions = _write_predictions(
+            tmp_path / "predictions.parquet",
+            [{
+                "sample_index": 0,
+                "messages": json.dumps([
+                    {"role": "user", "content": "Classify: hello"},
+                    {"role": "assistant", "content": '{"label": "WRONG"}'},
+                ]),
+                "reference": json.dumps(
+                    [{"role": "assistant", "content": '{"label": "RIGHT"}'}]
+                ),
+            }],
+            with_reference=True,
+        )
+        scorer = tmp_path / "scorer.md"
+        scorer.write_text("10 = exact match to the reference.")
+
+        await run_scoring(
+            dataset_path=predictions,
+            scorer_path=scorer,
+            output_dir=tmp_path / "out",
+            client=judge_client,
+            run_inference=False,
+        )
+
+        sent = judge_client.chat.completions.create.await_args.kwargs["messages"]
+        user_content = sent[1]["content"]
+        assert "Reference (ground truth)" in user_content
+        assert "RIGHT" in user_content
+
+    @pytest.mark.asyncio
+    async def test_predictions_without_reference_column_still_score(
+        self, tmp_path: Path, judge_client: MagicMock
+    ) -> None:
+        """Files written before the column existed must keep working."""
+        predictions = _write_predictions(
+            tmp_path / "predictions.parquet",
+            [{
+                "sample_index": 0,
+                "messages": json.dumps([
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "a"},
+                ]),
+            }],
+            with_reference=False,
+        )
+        scorer = tmp_path / "scorer.md"
+        scorer.write_text("criteria")
+
+        result = await run_scoring(
+            dataset_path=predictions,
+            scorer_path=scorer,
+            output_dir=tmp_path / "out",
+            client=judge_client,
+            run_inference=False,
+        )
+        assert result.scored == 1
+        sent = judge_client.chat.completions.create.await_args.kwargs["messages"]
+        assert "Reference (ground truth)" not in sent[1]["content"]

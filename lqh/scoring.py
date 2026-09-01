@@ -195,6 +195,30 @@ def _load_samples(
     return samples, tools_list
 
 
+def _load_references(parquet_path: Path, total: int) -> list[list[dict] | None]:
+    """Per-sample reference (ground-truth) messages from a predictions parquet.
+
+    Prediction files carry the model's own output in ``messages``; the gold
+    answer the sample was drawn from lives in the optional ``reference``
+    column. Files written before that column existed (and non-prediction
+    datasets, which are scored with the gold turn still attached) return
+    ``None`` for every sample.
+    """
+    table = pq.read_table(parquet_path)
+    if "reference" not in table.column_names:
+        return [None] * total
+    col = table.column("reference")
+    out: list[list[dict] | None] = []
+    for i in range(len(table)):
+        raw = col[i].as_py()
+        out.append(json.loads(raw) if isinstance(raw, str) and raw else None)
+    # Defensive: a truncated column must not shift references onto the wrong
+    # samples — pad rather than mis-align.
+    while len(out) < total:
+        out.append(None)
+    return out[:total]
+
+
 def _strip_trailing_assistant(messages: list[dict]) -> list[dict]:
     """Remove trailing assistant messages to create an unlabelled sample.
 
@@ -386,6 +410,20 @@ def _build_scoring_prompt(
             "Focus on the content of what the assistant said, not the conversation format. "
             "Think step by step about what the response does well and where it "
             "falls short, then assign a score from 1 to 10."
+        )
+
+    # Without this the reference is just another block of text in the prompt:
+    # judges routinely score a confident, well-formatted answer highly while
+    # the reference sitting above it says something else. Say plainly that a
+    # response contradicting the reference cannot score as if it matched.
+    if reference_messages:
+        user_content += (
+            " A reference (ground-truth) answer is included above. Where the "
+            "criteria are defined relative to it — e.g. a top score for "
+            "matching the reference — compare the assistant's answer to that "
+            "reference and grade on the comparison. An answer that is fluent, "
+            "well-formatted, or plausible but disagrees with the reference "
+            "does not earn a top score."
         )
 
     system_content = _TOOL_CALL_JUDGE_SYSTEM if is_tool_calling else _DEFAULT_JUDGE_SYSTEM
@@ -766,6 +804,16 @@ async def run_scoring(
     scorer_text = scorer_path.read_text(encoding="utf-8")
     samples, tools_per_sample = _load_samples(dataset_path)
     total = len(samples)
+    # Ground truth for the no-inference path. When run_inference is set the
+    # sample still carries its gold turn and `original_messages` is the
+    # reference; when it isn't, `messages` is a prediction the gold was
+    # already stripped from, and without this column the judge is asked to
+    # grade against a reference it cannot see — which is exactly how a
+    # reference-anchored rubric ("10 = matches the reference") ends up
+    # rewarding fluent-but-wrong answers.
+    references_per_sample = (
+        [None] * total if run_inference else _load_references(dataset_path, total)
+    )
 
     if total == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -959,7 +1007,9 @@ async def run_scoring(
         scoring_prompt = _build_scoring_prompt(
             scorer_text,
             scored_messages,
-            reference_messages=original_messages if run_inference else None,
+            reference_messages=(
+                original_messages if run_inference else references_per_sample[index]
+            ),
             tools=sample_tools,
         )
         judged[index] = {

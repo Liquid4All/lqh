@@ -520,13 +520,16 @@ def _run_checkpoint_eval(
 
             # Store the full conversation including model response
             full_conv = prompt_msgs + [{"role": "assistant", "content": response}]
-            predictions.append(
-                {
-                    "sample_index": idx,
-                    "messages": json.dumps(full_conv),
-                    "source": source_label,
-                }
-            )
+            pred_entry = {
+                "sample_index": idx,
+                "messages": json.dumps(full_conv),
+                "source": source_label,
+            }
+            # Gold answer for the judge (see lqh.scoring._load_references) —
+            # prompt_msgs dropped it above so the model would generate.
+            if conv and conv[-1].get("role") == "assistant":
+                pred_entry["reference"] = json.dumps([conv[-1]])
+            predictions.append(pred_entry)
             idx += 1
             if eval_reporter is not None:
                 eval_reporter.update(
@@ -549,13 +552,14 @@ def _run_checkpoint_eval(
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    table = pa.table(
-        {
-            "sample_index": [p["sample_index"] for p in predictions],
-            "messages": [p["messages"] for p in predictions],
-            "source": [p["source"] for p in predictions],
-        }
-    )
+    columns: dict[str, list] = {
+        "sample_index": [p["sample_index"] for p in predictions],
+        "messages": [p["messages"] for p in predictions],
+        "source": [p["source"] for p in predictions],
+    }
+    if any(p.get("reference") for p in predictions):
+        columns["reference"] = [p.get("reference") for p in predictions]
+    table = pa.table(columns)
     pq.write_table(table, checkpoint_dir / "predictions.parquet")
 
     # Signal the main process to score

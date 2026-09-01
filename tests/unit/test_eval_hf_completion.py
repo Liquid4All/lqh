@@ -987,3 +987,85 @@ def test_stale_progress_marker_deduplicated(tmp_path) -> None:
     asyncio.run(backend._apply_event(run_dir, state, _reattach_event(2)))
     rows = (run_dir / "progress.jsonl").read_text().splitlines()
     assert len(rows) == 2  # seed + exactly one marker
+
+
+# ---------------------------------------------------------------------------
+# Reference (gold) capture in predictions.parquet
+# ---------------------------------------------------------------------------
+
+
+def test_reference_messages_extracts_trailing_gold() -> None:
+    from lqh.infer.__main__ import _reference_messages
+
+    conv = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "gold"},
+    ]
+    assert _reference_messages(conv) == [{"role": "assistant", "content": "gold"}]
+
+
+def test_reference_messages_empty_for_unlabelled_sample() -> None:
+    from lqh.infer.__main__ import _reference_messages
+
+    assert _reference_messages([{"role": "user", "content": "q"}]) == []
+
+
+def test_reference_messages_takes_one_turn_like_prompt_messages() -> None:
+    """_prompt_messages strips exactly one trailing assistant turn, so the
+    reference must be exactly that turn — an earlier assistant turn is prompt
+    context the model already saw, not the answer under grading."""
+    from lqh.infer.__main__ import _prompt_messages, _reference_messages
+
+    conv = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "earlier"},
+        {"role": "assistant", "content": "gold"},
+    ]
+    assert _reference_messages(conv) == [{"role": "assistant", "content": "gold"}]
+    assert _prompt_messages(conv, None) == conv[:-1]
+
+
+def test_finalize_predictions_writes_reference_column(tmp_path: Path) -> None:
+    import pyarrow.parquet as pq
+
+    from lqh.infer.__main__ import _finalize_predictions
+
+    results = [
+        {
+            "sample_index": 0,
+            "messages": "[]",
+            "source": "s",
+            "reference": '[{"role": "assistant", "content": "gold"}]',
+        },
+        # A row resumed from a partial written before the column existed.
+        {"sample_index": 1, "messages": "[]", "source": "s"},
+    ]
+    _finalize_predictions(
+        tmp_path, results, {"defer_terminal_status": True}, _NullReporter(), 1.0,
+    )
+    table = pq.read_table(tmp_path / "predictions.parquet")
+    assert "reference" in table.column_names
+    assert table.column("reference").to_pylist()[1] is None
+
+
+def test_finalize_predictions_omits_reference_column_when_unlabelled(
+    tmp_path: Path,
+) -> None:
+    import pyarrow.parquet as pq
+
+    from lqh.infer.__main__ import _finalize_predictions
+
+    _finalize_predictions(
+        tmp_path,
+        [{"sample_index": 0, "messages": "[]", "source": "s"}],
+        {"defer_terminal_status": True},
+        _NullReporter(),
+        1.0,
+    )
+    table = pq.read_table(tmp_path / "predictions.parquet")
+    assert "reference" not in table.column_names
+
+
+class _NullReporter:
+    def update(self, **kwargs: object) -> None:
+        pass

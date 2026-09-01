@@ -1749,12 +1749,17 @@ def _generate_predictions(
             response = f"[generation error: {exc}]"
 
         full_conv = prompt_msgs + [{"role": "assistant", "content": response}]
-        predictions.append(
-            {
-                "sample_index": i,
-                "messages": json.dumps(full_conv),
-            }
-        )
+        pred_entry: dict[str, Any] = {
+            "sample_index": i,
+            "messages": json.dumps(full_conv),
+        }
+        # Gold answer for the judge (see lqh.scoring._load_references) —
+        # stripped above so the model would generate. Held-out DPO scores
+        # gate early-abort and best-iteration selection, so a judge grading
+        # them without the reference inflates exactly where it matters most.
+        if conv and conv[-1].get("role") == "assistant":
+            pred_entry["reference"] = json.dumps([conv[-1]])
+        predictions.append(pred_entry)
 
         if (i + 1) % 10 == 0 or i == len(conversations) - 1:
             print(f"  Generated {i + 1}/{len(conversations)}")
@@ -1793,10 +1798,10 @@ def _write_predictions(
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    table = pa.table(
-        {
-            "sample_index": [p["sample_index"] for p in predictions],
-            "messages": [p["messages"] for p in predictions],
-        }
-    )
-    pq.write_table(table, iter_dir / filename)
+    columns: dict[str, list] = {
+        "sample_index": [p["sample_index"] for p in predictions],
+        "messages": [p["messages"] for p in predictions],
+    }
+    if any(p.get("reference") for p in predictions):
+        columns["reference"] = [p.get("reference") for p in predictions]
+    pq.write_table(pa.table(columns), iter_dir / filename)

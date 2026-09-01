@@ -468,7 +468,7 @@ async def _generate_all(
 ) -> None:
     import openai
 
-    from lqh.infer.__main__ import _append_prediction_partial
+    from lqh.infer.__main__ import _append_prediction_partial, _reference_messages
     from lqh.train.progress import write_progress
 
     total = len(conversations)
@@ -499,6 +499,8 @@ async def _generate_all(
         }
         if sample_tools is not None:
             pred_entry["tools"] = json.dumps(sample_tools)
+        if reference := _reference_messages(conversations[i]):
+            pred_entry["reference"] = json.dumps(reference)
         results[i] = pred_entry
         _append_prediction_partial(partial_path, i, pred_entry)
         completed_count += 1
