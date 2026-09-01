@@ -480,7 +480,7 @@ async def test_eval_hf_submit_clamps_timeout_into_config(tmp_path, monkeypatch) 
         timeout_minutes=5000,
         _permissions=PermissionContext.granting("cloud_eval_hf"),
     )
-    assert "HF eval submitted" in result.content
+    assert "Cloud eval submitted" in result.content
     # Post-submit line reflects the planner's ACTUAL selection (upsized
     # GPU + billed cap), not the consent-time default estimate.
     assert "A100-80GB GPU, 1440 min timeout" in result.content
@@ -515,10 +515,204 @@ async def test_eval_hf_default_timeout_in_config(tmp_path, monkeypatch) -> None:
         project, repo="org/model", eval_dataset="evals/x",
         scorer="scorers/x.md", training_method="full",
     )
-    assert "HF eval submitted" in result.content
+    assert "Cloud eval submitted" in result.content
     # Snapshot fetch failure degrades to the requested-timeout line.
     assert "Timeout: 120 min" in result.content
     assert submitted["config"]["timeout_minutes"] == 120
+
+
+# ---------------------------------------------------------------------------
+# eval_hf sandbox entrypoint: LQH checkpoint artifact source
+# ---------------------------------------------------------------------------
+
+
+def test_eval_hf_validate_rejects_both_sources() -> None:
+    from lqh.infer import eval_hf
+
+    with pytest.raises(ValueError, match="exactly one"):
+        eval_hf._validate({
+            "hf_repo": "org/model", "checkpoint_artifact_id": "abc",
+            "training_method": "full", "eval_dataset": "evals/x.parquet",
+        })
+
+
+def test_eval_hf_validate_requires_signed_url(monkeypatch) -> None:
+    """A restart-recovered continuation rebuilds the sandbox env without
+    the signed URL — fail loudly rather than evaluate nothing."""
+    from lqh.infer import eval_hf
+
+    monkeypatch.delenv(eval_hf.CHECKPOINT_URL_ENV, raising=False)
+    with pytest.raises(ValueError, match="Re-submit the eval"):
+        eval_hf._validate({
+            "checkpoint_artifact_id": "abc", "training_method": "full",
+            "eval_dataset": "evals/x.parquet",
+        })
+
+
+def test_eval_hf_validate_accepts_artifact_source(monkeypatch) -> None:
+    from lqh.infer import eval_hf
+
+    monkeypatch.setenv(eval_hf.CHECKPOINT_URL_ENV, "https://r2.example/signed")
+    eval_hf._validate({
+        "checkpoint_artifact_id": "abc", "training_method": "full",
+        "eval_dataset": "evals/x.parquet",
+    })
+
+
+def test_eval_hf_artifact_lineage_records_the_parent(tmp_path) -> None:
+    from lqh.infer import eval_hf
+
+    (tmp_path / "predictions.parquet").write_bytes(b"")
+    eval_hf._write_lineage_sidecar(
+        tmp_path,
+        {
+            "checkpoint_artifact_id": "art-1",
+            "training_method": "lora",
+            "base_model": "LiquidAI/LFM2.5-1.2B-Instruct",
+        },
+        judge="judge:small",
+    )
+    lineage = json.loads(
+        (tmp_path / "predictions.parquet.lineage.json").read_text()
+    )
+    # The parent is an LQH artifact here, unlike the external-HF case.
+    assert lineage["parent_ids"] == ["art-1"]
+    assert lineage["base_model"] == "LiquidAI/LFM2.5-1.2B-Instruct"
+
+
+def test_eval_hf_downloads_the_artifact_instead_of_hf(tmp_path, monkeypatch) -> None:
+    from lqh.infer import eval_hf
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    config_path = run_dir / "config.json"
+    config_path.write_text(json.dumps({
+        "type": "eval_hf",
+        "checkpoint_artifact_id": "art-1",
+        "training_method": "full",
+        "eval_dataset": "evals/x.parquet",
+        "scorer": "scorers/x.md",
+    }))
+    monkeypatch.setenv(eval_hf.CHECKPOINT_URL_ENV, "https://r2.example/signed")
+
+    calls: dict[str, Any] = {}
+
+    def fake_artifact_download(artifact_id: str, dest_root: Path) -> Path:
+        calls["artifact_id"] = artifact_id
+        calls["dest_root"] = dest_root
+        return run_dir / "ckpt"
+
+    def boom(*a, **k):  # pragma: no cover - must not be reached
+        raise AssertionError("snapshot_download must not run for an artifact source")
+
+    monkeypatch.setattr(eval_hf, "_download_artifact_checkpoint", fake_artifact_download)
+    monkeypatch.setattr(eval_hf, "_download_checkpoint", boom)
+    monkeypatch.setattr(
+        "lqh.infer.__main__._run_inference", lambda run_dir, cfg: None,
+    )
+    monkeypatch.setattr(
+        eval_hf, "_run_inline_scoring", lambda run_dir, cfg: None,
+    )
+    monkeypatch.setattr("sys.argv", ["eval_hf", str(config_path)])
+    eval_hf.main()
+
+    assert calls["artifact_id"] == "art-1"
+    # Never under a name lqh.remote.publish scans (model/, model-lora/,
+    # checkpoints/) — the downloaded weights must not be republished.
+    assert calls["dest_root"].name == "lqh_checkpoints"
+
+
+# ---------------------------------------------------------------------------
+# eval_hf_model handler: LQH checkpoint artifact source
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_eval_hf_rejects_both_model_sources(tmp_path) -> None:
+    from lqh.tools.handlers import handle_eval_hf_model
+
+    project = _eval_project(tmp_path)
+    result = await handle_eval_hf_model(
+        project, repo="org/model", checkpoint_artifact_id="abc",
+        eval_dataset="evals/x", scorer="scorers/x.md", training_method="full",
+    )
+    assert "exactly one of repo" in result.content
+
+
+@pytest.mark.asyncio
+async def test_eval_hf_requires_a_model_source(tmp_path) -> None:
+    from lqh.tools.handlers import handle_eval_hf_model
+
+    project = _eval_project(tmp_path)
+    result = await handle_eval_hf_model(
+        project, eval_dataset="evals/x", scorer="scorers/x.md",
+        training_method="full",
+    )
+    assert "exactly one of repo" in result.content
+
+
+@pytest.mark.asyncio
+async def test_eval_hf_artifact_source_submits_without_hf_repo(tmp_path, monkeypatch) -> None:
+    """The whole point of the artifact path: score a cloud-trained
+    checkpoint without pushing it to HuggingFace first."""
+    from lqh.remote.cloud import CloudBackend
+    from lqh.tools.handlers import handle_eval_hf_model
+    from lqh.tools.permissions import PermissionContext
+
+    submitted: dict = {}
+    planned: dict = {}
+
+    async def fake_submit(self, run_dir, config, *, module="lqh.train",
+                          telemetry_workflow_id=None, **_kw):
+        submitted["config"] = config
+        return "job-9"
+
+    async def fake_plan(self, kind, *, base_model=None, config=None):
+        planned["base_model"] = base_model
+        planned["config"] = config
+        return None
+
+    async def failing_snapshot(self, job_id):
+        raise RuntimeError("backend unreachable")
+
+    monkeypatch.setattr(CloudBackend, "submit_run", fake_submit)
+    monkeypatch.setattr(CloudBackend, "job_snapshot", failing_snapshot)
+    monkeypatch.setattr(CloudBackend, "plan_job", fake_plan)
+    project = _eval_project(tmp_path)
+    result = await handle_eval_hf_model(
+        project, checkpoint_artifact_id="11111111-2222-3333-4444-555555555555",
+        base_model="LiquidAI/LFM2.5-1.2B-Instruct",
+        eval_dataset="evals/x", scorer="scorers/x.md", training_method="full",
+        _permissions=PermissionContext.granting("cloud_eval_hf"),
+    )
+    assert "Cloud eval submitted" in result.content
+    cfg = submitted["config"]
+    assert cfg["checkpoint_artifact_id"] == "11111111-2222-3333-4444-555555555555"
+    assert "hf_repo" not in cfg
+    assert "revision" not in cfg
+    # Sizing still reaches the planner for a 'full' artifact, where the
+    # tool would otherwise hand it no model id at all.
+    assert planned["base_model"] == "LiquidAI/LFM2.5-1.2B-Instruct"
+    assert "hf_repo" not in planned["config"]
+
+
+@pytest.mark.asyncio
+async def test_eval_hf_artifact_consent_key_is_the_artifact(tmp_path, monkeypatch) -> None:
+    from lqh.remote.cloud import CloudBackend
+    from lqh.tools.handlers import handle_eval_hf_model
+
+    monkeypatch.setattr(CloudBackend, "plan_job", _plan_unavailable)
+    monkeypatch.setattr("lqh.tools.handlers._fetch_eval_hf_rate_usd", _none)
+    project = _eval_project(tmp_path)
+    result = await handle_eval_hf_model(
+        project, checkpoint_artifact_id="11111111-2222-3333-4444-555555555555",
+        eval_dataset="evals/x", scorer="scorers/x.md", training_method="full",
+    )
+    assert result.content == "PERMISSION_REQUIRED"
+    assert result.permission_key == (
+        "cloud_eval_hf:lqh:11111111-2222-3333-4444-555555555555"
+    )
+    assert "lqh:11111111-2222-3333-4444-555555555555" in (result.question or "")
 
 
 # ---------------------------------------------------------------------------

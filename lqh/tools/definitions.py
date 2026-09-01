@@ -1925,15 +1925,17 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
             cli=True, mutating=True, needs_auth=True,
             permission_domain="cloud_eval_hf",
             description=(
-                "Evaluate any HuggingFace checkpoint on a project's eval set "
-                "via LQH Cloud. Use this to score a public/private HF model "
-                "(LoRA adapter or full checkpoint) without training it "
-                "locally — e.g. evaluating someone else's fine-tune, "
-                "benchmarking an off-the-shelf base, or running an "
-                "alternative checkpoint version against the same scorer. "
-                "Generates rollouts on a GPU sandbox and scores them via "
-                "the LLM judge in one job; result lands as eval_result.json "
-                "under runs/<run_name>/."
+                "Evaluate a checkpoint on a project's eval set via LQH Cloud. "
+                "The model is either a HuggingFace repo (pass repo) or one of "
+                "your own LQH checkpoints from the artifact store (pass "
+                "checkpoint_artifact_id) — use the latter to score a "
+                "checkpoint a cloud training run just produced against a "
+                "different eval set, with no HuggingFace push in between. "
+                "Also covers scoring someone else's fine-tune, benchmarking "
+                "an off-the-shelf base, or running an alternative checkpoint "
+                "version against the same scorer. Generates rollouts on a GPU "
+                "sandbox and scores them via the LLM judge in one job; result "
+                "lands as eval_result.json under runs/<run_name>/."
             ),
             parameters={
                 "type": "object",
@@ -1943,7 +1945,21 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "description": (
                             "HuggingFace repository id "
                             "(e.g. 'Qwen/Qwen3.5-3B-Instruct' or "
-                            "'someuser/my-translation-lora')."
+                            "'someuser/my-translation-lora'). Mutually "
+                            "exclusive with checkpoint_artifact_id; pass "
+                            "exactly one of the two."
+                        ),
+                    },
+                    "checkpoint_artifact_id": {
+                        "type": "string",
+                        "description": (
+                            "LQH checkpoint artifact id to evaluate instead "
+                            "of an HF repo — the cloud job pulls the weights "
+                            "straight from the artifact store, so a "
+                            "cloud-trained checkpoint can be scored on a "
+                            "second eval set without hf_push. Get the id from "
+                            "the artifacts tool or from training_status "
+                            "(the run's checkpoint artifact)."
                         ),
                     },
                     "revision": {
@@ -2041,7 +2057,7 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                         "default": 120,
                     },
                 },
-                "required": ["repo", "eval_dataset", "scorer"],
+                "required": ["eval_dataset", "scorer"],
             },
         ),
         # ------------------------------------------------------------------

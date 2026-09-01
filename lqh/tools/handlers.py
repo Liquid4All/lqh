@@ -2700,7 +2700,8 @@ async def handle_list_models(**kwargs: Any) -> ToolResult:
     lines = [format_catalog()]
     lines.append("")
     lines.append("To evaluate a Liquid checkpoint, use the HuggingFace inference path:")
-    lines.append("  eval_hf_model     — cloud eval of a HuggingFace repo id / revision")
+    lines.append("  eval_hf_model     — cloud eval of a HuggingFace repo id / revision,")
+    lines.append("                      or of an LQH checkpoint (checkpoint_artifact_id)")
     lines.append("                      (for a catalog model above, pass training_method='full';")
     lines.append("                      'lora' is only for adapter repos and needs base_model)")
     lines.append("  start_local_eval  — local or SSH-remote GPU eval of a checkpoint dir")
@@ -2918,7 +2919,8 @@ async def handle_run_scoring(
                         "run_scoring mode='model_eval' — the router.liquid.ai API has been "
                         "retired (see MODELS.md). To evaluate a Liquid checkpoint, use the "
                         "HuggingFace inference path instead:\n"
-                        "  - eval_hf_model  — cloud eval of a HuggingFace repo id / revision\n"
+                        "  - eval_hf_model  — cloud eval of a HuggingFace repo id, or of an\n"
+                        "                     LQH checkpoint (checkpoint_artifact_id)\n"
                         "  - start_local_eval — local or SSH-remote GPU eval of a checkpoint dir\n"
                         "run_scoring mode='model_eval' remains available for the pool "
                         "baselines (small / medium / large / orchestration)."
@@ -6978,12 +6980,11 @@ async def handle_start_local_eval(
         )
 
     # Eval runs on the project's pinned SSH remote when there is one;
-    # otherwise it runs locally in-process. Cloud eval of LQH-trained
-    # checkpoints isn't wired yet (the artifact-aware cloud eval path is
-    # a gap — eval_hf_model only accepts HF repos), so a cloud-pinned
-    # project falls back to the local path rather than erroring; to
-    # evaluate a cloud-trained checkpoint, push it via hf_push and use
-    # eval_hf_model instead.
+    # otherwise it runs locally in-process. This tool never routes to
+    # LQH Cloud: a cloud-pinned project falls back to the local path
+    # rather than erroring. Cloud eval of a cloud-trained checkpoint is
+    # eval_hf_model(checkpoint_artifact_id=...), which reads the weights
+    # from the artifact store — see the torch hint below.
     target = _resolve_compute_target(project_dir)
     ssh_name = ssh_remote_name(target) if target else None
     if ssh_name:
@@ -6995,10 +6996,17 @@ async def handle_start_local_eval(
             on_bg_started=on_bg_started,
         )
 
-    # Check torch
+    # Check torch. Local inference needs the train extra; on a machine
+    # without it the cloud path is usually what the caller wanted, so
+    # say so instead of only naming the install command.
     err = _check_torch_available()
     if err:
-        return ToolResult.fail("config", f"❌ {err}")
+        return ToolResult.fail(
+            "config",
+            f"❌ {err}\n\nTo score a cloud-trained checkpoint without "
+            f"installing it, use eval_hf_model(checkpoint_artifact_id=...) "
+            f"— it runs on cloud GPUs and needs no local torch.",
+        )
 
     # Validate paths
     model_dir = _validate_path(project_dir, model_path)
@@ -7073,9 +7081,10 @@ async def handle_start_local_eval(
 async def handle_eval_hf_model(
     project_dir: Path,
     *,
-    repo: str,
     eval_dataset: str,
     scorer: str,
+    repo: str | None = None,
+    checkpoint_artifact_id: str | None = None,
     revision: str = "main",
     training_method: str = "lora",
     base_model: str | None = None,
@@ -7088,19 +7097,30 @@ async def handle_eval_hf_model(
     **kwargs: Any,
 ) -> ToolResult:
     """Submit an eval_hf cloud job — runs ``lqh.infer.eval_hf`` in a
-    GPU sandbox (backend-implemented) to evaluate any HF checkpoint
-    against this project's eval set + scorer.
+    GPU sandbox (backend-implemented) to evaluate a checkpoint against
+    this project's eval set + scorer. The model is either an HF repo
+    (``repo``) or one of the user's own LQH checkpoint artifacts
+    (``checkpoint_artifact_id``), which the backend presigns for the
+    sandbox at launch.
 
-    Cloud-only: HF download + GPU inference + judge scoring all happen
-    sandbox-side using the scoped LQH_API_TOKEN. SSH backends are not
-    a supported route in v1 — they'd need their own HF-download +
+    Cloud-only: checkpoint download + GPU inference + judge scoring all
+    happen sandbox-side using the scoped LQH_API_TOKEN. SSH backends are
+    not a supported route in v1 — they'd need their own download +
     scoped-token plumbing that doesn't exist yet, and the use case
-    (evaluate someone else's HF model without locally training)
-    naturally lives on managed compute.
+    (evaluate a model without locally training) naturally lives on
+    managed compute.
     """
     on_bg_started = kwargs.get("on_background_task_started")
 
     # --- Validate inputs ---
+    repo = (repo or "").strip() or None
+    checkpoint_artifact_id = (checkpoint_artifact_id or "").strip() or None
+    if bool(repo) == bool(checkpoint_artifact_id):
+        return ToolResult.fail(
+            "validation",
+            "Error: pass exactly one of repo (a HuggingFace repo id) or "
+            "checkpoint_artifact_id (an LQH checkpoint artifact).",
+        )
     if training_method not in ("lora", "full"):
         return ToolResult.fail(
             "validation",
@@ -7119,6 +7139,14 @@ async def handle_eval_hf_model(
     # Same clamp the backend picker applies ([10, the 24h sandbox max])
     # so the consent prompt and the submitted job agree.
     timeout_minutes = max(10, min(int(timeout_minutes or 120), 1440))
+
+    # How this model is named everywhere the user (and the consent
+    # record) sees it. Artifact ids get the lqh: prefix the pull / push
+    # tools already use for artifact references.
+    model_label = f"{repo}@{revision}" if repo else f"lqh:{checkpoint_artifact_id}"
+    # The model identity WITHOUT the revision — the form existing
+    # consent grants and project-log entries were recorded under.
+    model_id = repo or f"lqh:{checkpoint_artifact_id}"
 
     # Eval dataset(s) — one path or a list of held-out sources, scored
     # separately and macro-averaged sandbox-side.
@@ -7161,13 +7189,18 @@ async def handle_eval_hf_model(
     # the real submit would reject them anyway.
     plan: dict[str, Any] | None = None
     try:
-        plan_config: dict[str, Any] = {
-            "hf_repo": repo,
-            "timeout_minutes": timeout_minutes,
-        }
+        plan_config: dict[str, Any] = {"timeout_minutes": timeout_minutes}
+        if repo:
+            plan_config["hf_repo"] = repo
+        # The planner sizes the GPU from the model id: config.hf_repo for
+        # a zero-shot HF eval, base_model otherwise. An artifact source
+        # has no repo id to fall back on, so base_model is what keeps a
+        # large checkpoint off the default L4 — pass it there even for
+        # 'full', where it acts purely as a sizing hint.
+        plan_base = base_model if (training_method == "lora" or checkpoint_artifact_id) else None
         plan = await backend.plan_job(
             "eval_hf",
-            base_model=base_model if training_method == "lora" else None,
+            base_model=plan_base or None,
             config=plan_config,
         )
     except Exception:  # noqa: BLE001 — older backend / network: estimate instead
@@ -7222,10 +7255,10 @@ async def handle_eval_hf_model(
         return ToolResult(
             content="PERMISSION_REQUIRED",
             requires_user_input=True,
-            permission_key=f"cloud_eval_hf:{repo}",
+            permission_key=f"cloud_eval_hf:{model_id}",
             question=(
-                f"The agent wants to evaluate an HF checkpoint on LQH Cloud:\n"
-                f"  Model:   {repo}@{revision} ({training_method}"
+                f"The agent wants to evaluate a checkpoint on LQH Cloud:\n"
+                f"  Model:   {model_label} ({training_method}"
                 + (f", base {base_model}" if training_method == "lora" else "")
                 + ")\n"
                 f"  Eval:    {num_samples} samples, judge:{judge_size}, "
@@ -7267,8 +7300,6 @@ async def handle_eval_hf_model(
     config: dict[str, Any] = {
         "type": "eval_hf",
         "spec_sha256": _eval_spec_hash(project_dir),
-        "hf_repo": repo,
-        "revision": revision,
         "training_method": training_method,
         "eval_dataset": _sources_to_config(eval_sources),
         "scorer": scorer,
@@ -7279,11 +7310,20 @@ async def handle_eval_hf_model(
         "timeout_minutes": timeout_minutes,
         "num_samples": num_samples,
         # manifest tells lqh.remote.bundle.resolve_manifest which keys
-        # in this config name files to include in the bundle. The hf
-        # repo itself is downloaded sandbox-side via snapshot_download
-        # — it's NOT in the manifest.
+        # in this config name files to include in the bundle. The model
+        # itself is fetched sandbox-side (snapshot_download for an HF
+        # repo, the presigned artifact tar otherwise) — it's NOT in the
+        # manifest.
         "manifest": ["eval_dataset", "scorer"],
     }
+    if repo:
+        config["hf_repo"] = repo
+        config["revision"] = revision
+    else:
+        # The backend resolves this to a presigned URL for the sandbox
+        # (it will 404 the submit if the artifact isn't a checkpoint of
+        # this user).
+        config["checkpoint_artifact_id"] = checkpoint_artifact_id
     if training_method == "lora":
         config["base_model"] = base_model
     if system_prompt is not None:
@@ -7321,10 +7361,10 @@ async def handle_eval_hf_model(
     append_event(
         project_dir,
         "eval_hf_started",
-        f"Submitted eval_hf for {repo}@{revision} (run {run_name}, job {job_id})",
+        f"Submitted eval_hf for {model_label} (run {run_name}, job {job_id})",
         run_name=run_name,
         run_type="eval_hf",
-        base_model=repo,
+        base_model=model_id,
         remote="cloud",
     )
 
@@ -7351,9 +7391,9 @@ async def handle_eval_hf_model(
 
     return ToolResult(
         content=(
-            f"🧪 HF eval submitted\n"
+            f"🧪 Cloud eval submitted\n"
             f"  Run:     {run_name}\n"
-            f"  Repo:    {repo}@{revision}\n"
+            f"  Model:   {model_label}\n"
             f"  Method:  {training_method}"
             + (f" (base {base_model})" if training_method == 'lora' else "")
             + f"\n"

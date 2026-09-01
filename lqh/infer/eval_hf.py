@@ -4,18 +4,26 @@ Sandbox entrypoint mapped from the backend's ``eval_hf`` cloud-job
 kind (see backend/internal/handler/cloud_jobs.go module whitelist).
 Invoked as ``python -m lqh.infer.eval_hf <config.json>``.
 
-Two use cases this serves:
+Three use cases this serves:
 
   1. **External eval** — "evaluate someone else's LoRA / full model
      (public or private HF repo) on our eval set + judge".
   2. **Baseline benchmarking** — "take an off-the-shelf LFM2 fine-tune
      from the hub and compare against our trained checkpoint".
+  3. **Re-eval of an LQH checkpoint** — "score the checkpoint a cloud
+     training run just produced against a second eval set", without
+     the HF round-trip. The model comes from the artifact store
+     instead of the hub: the config names ``checkpoint_artifact_id``
+     and the backend injects a presigned ``LQH_EVAL_CHECKPOINT_URL``
+     for it (a job token cannot sign another job's artifact itself).
 
-Config shape::
+Config shape (``hf_repo`` and ``checkpoint_artifact_id`` are mutually
+exclusive; exactly one names the model)::
 
     {
       "hf_repo":         "Qwen/Qwen3.5-3B-Instruct",
       "revision":        "main",                # optional, defaults to main
+      "checkpoint_artifact_id": "<uuid>",       # instead of hf_repo
       "training_method": "lora" | "full",
       "base_model":      "Qwen/Qwen3.5-3B-Instruct",   # required iff lora
       "eval_dataset":    "evals/translation.parquet",   # path inside bundle
@@ -27,8 +35,10 @@ Config shape::
 
 Flow:
 
-  1. Download the HF repo with ``huggingface_hub.snapshot_download``
-     (HF_TOKEN forwarded by the backend for private repos).
+  1. Download the checkpoint: ``huggingface_hub.snapshot_download``
+     for an ``hf_repo`` (HF_TOKEN forwarded by the backend for private
+     repos), or the presigned artifact tar for a
+     ``checkpoint_artifact_id``.
   2. Build a normal ``lqh.infer`` config pointing at the downloaded
      dir; for LoRA, also set ``base_override`` so the adapter merges
      onto the caller-specified base.
@@ -40,7 +50,8 @@ Flow:
      ``artifact_lineage`` row with HF repo / revision / training
      method / judge / hyperparams. The HF repo is recorded as
      ``base_model``; ``parent_ids`` is empty because the parent is
-     external (not an LQH artifact UUID).
+     external (not an LQH artifact UUID). For an artifact source the
+     parent IS an LQH artifact, so it lands in ``parent_ids``.
   5. Inline-score the predictions via ``lqh.train.cloud_score`` so the
      published ``eval_result.json`` artifact carries the judge summary.
      Scoring is load-bearing: a scoring failure (exception, no summary,
@@ -64,10 +75,40 @@ __all__ = ["main"]
 
 _VALID_TRAINING_METHODS = {"lora", "full"}
 
+# Env var the backend injects with a presigned GET for the checkpoint
+# artifact named by config.checkpoint_artifact_id (handler/cloud_jobs.go).
+CHECKPOINT_URL_ENV = "LQH_EVAL_CHECKPOINT_URL"
+
+
+def _artifact_source(config: dict[str, Any]) -> str:
+    """The LQH checkpoint artifact id this eval targets, or "" when the
+    model comes from Hugging Face instead."""
+    v = config.get("checkpoint_artifact_id")
+    return v.strip() if isinstance(v, str) else ""
+
 
 def _validate(config: dict[str, Any]) -> None:
-    if not isinstance(config.get("hf_repo"), str) or not config["hf_repo"].strip():
-        raise ValueError("eval_hf config.hf_repo is required (string)")
+    artifact_id = _artifact_source(config)
+    has_repo = isinstance(config.get("hf_repo"), str) and config["hf_repo"].strip()
+    if artifact_id and has_repo:
+        raise ValueError(
+            "eval_hf config names both hf_repo and checkpoint_artifact_id; "
+            "exactly one may specify the model"
+        )
+    if artifact_id:
+        if not os.environ.get(CHECKPOINT_URL_ENV):
+            raise ValueError(
+                f"eval_hf config.checkpoint_artifact_id is set but "
+                f"{CHECKPOINT_URL_ENV} is missing from the sandbox env — the "
+                "checkpoint cannot be fetched. Re-submit the eval (a signed "
+                "URL is minted per sandbox launch and is not restored when "
+                "the backend recovers a running job after a restart)."
+            )
+    elif not has_repo:
+        raise ValueError(
+            "eval_hf config.hf_repo is required (string) unless "
+            "checkpoint_artifact_id names an LQH checkpoint"
+        )
     method = config.get("training_method")
     if method not in _VALID_TRAINING_METHODS:
         raise ValueError(
@@ -112,6 +153,49 @@ def _download_checkpoint(repo: str, revision: str | None, dest_root: Path) -> Pa
     return target
 
 
+def _download_artifact_checkpoint(artifact_id: str, dest_root: Path) -> Path:
+    """Fetch the LQH checkpoint artifact named by ``artifact_id`` from the
+    presigned URL the backend injected, untar it under ``dest_root`` and
+    return the directory the model loads from.
+
+    The publisher tars a checkpoint directory rooted as its own name
+    (``model-lora/…``), so the weights land one level down; find the
+    directory that actually holds a model config, the same way the
+    merge worker does.
+    """
+    import tarfile
+
+    import httpx
+
+    url = os.environ[CHECKPOINT_URL_ENV]
+    target = dest_root / "checkpoint"
+    target.mkdir(parents=True, exist_ok=True)
+    tar_path = dest_root / "source.tar.gz"
+    logger.info("downloading checkpoint artifact %s → %s", artifact_id, target)
+    with httpx.stream("GET", url, timeout=httpx.Timeout(600.0)) as resp:
+        if resp.status_code != 200:
+            body = resp.read()
+            raise RuntimeError(
+                f"checkpoint artifact download failed ({resp.status_code}): {body[:200]!r}"
+            )
+        with tar_path.open("wb") as fh:
+            for piece in resp.iter_bytes(1 << 20):
+                fh.write(piece)
+    with tarfile.open(tar_path) as tf:
+        # filter="data" rejects absolute paths, traversal, links and
+        # device nodes — same guard the sandbox launcher applies to the
+        # input bundle.
+        tf.extractall(target, filter="data")
+    tar_path.unlink(missing_ok=True)
+    for cand in [target, *sorted(d for d in target.rglob("*") if d.is_dir())]:
+        if (cand / "adapter_config.json").exists() or (cand / "config.json").exists():
+            return cand
+    raise RuntimeError(
+        f"checkpoint artifact {artifact_id} contains no config.json or "
+        "adapter_config.json — it does not look like a model checkpoint"
+    )
+
+
 def _write_lineage_sidecar(
     run_dir: Path,
     config: dict[str, Any],
@@ -125,9 +209,18 @@ def _write_lineage_sidecar(
     pred_path = run_dir / "predictions.parquet"
     if not pred_path.exists():
         return
-    hf_repo = config["hf_repo"]
-    revision = config.get("revision") or "main"
-    base_model_id = f"{hf_repo}@{revision}"
+    artifact_id = _artifact_source(config)
+    if artifact_id:
+        # The parent is an LQH artifact, so it is expressible as
+        # parent_ids (unlike the HF case below). base_model still
+        # records what the weights sit on for a LoRA eval.
+        base_model_id = config.get("base_model") or f"lqh:{artifact_id}"
+        parent_ids = [artifact_id]
+    else:
+        hf_repo = config["hf_repo"]
+        revision = config.get("revision") or "main"
+        base_model_id = f"{hf_repo}@{revision}"
+        parent_ids = []
     lineage: dict[str, Any] = {
         "artifact_kind": "rollout",
         "training_method": config["training_method"],
@@ -137,10 +230,10 @@ def _write_lineage_sidecar(
             "max_new_tokens": int(config.get("max_new_tokens", 4096)),
             "system_prompt_present": bool(config.get("system_prompt")),
         },
-        # parent_ids stays empty: the parent is an external HF repo
-        # rather than an LQH artifact UUID. The repo + revision live
-        # in base_model above so it's still discoverable.
-        "parent_ids": [],
+        # For an HF source parent_ids stays empty: the parent is an
+        # external repo rather than an LQH artifact UUID. The repo +
+        # revision live in base_model above so it's still discoverable.
+        "parent_ids": parent_ids,
     }
     if config["training_method"] == "lora":
         lineage["hyperparams"]["lora_base"] = config["base_model"]
@@ -301,11 +394,18 @@ def main() -> None:
             phase="setup", phase_label="downloading checkpoint",
             overall_fraction=0, force=True,
         )
-        # 1. Download HF checkpoint to a sandbox-local dir.
-        dl_root = run_dir / "hf_checkpoints"
-        local_dir = _download_checkpoint(
-            config["hf_repo"], config.get("revision"), dl_root,
-        )
+        # 1. Download the checkpoint to a sandbox-local dir. Neither
+        #    destination is scanned by lqh.remote.publish (it looks for
+        #    model/, model-lora/, checkpoints/), so the downloaded
+        #    weights are never republished as a new artifact.
+        if artifact_id := _artifact_source(config):
+            local_dir = _download_artifact_checkpoint(
+                artifact_id, run_dir / "lqh_checkpoints",
+            )
+        else:
+            local_dir = _download_checkpoint(
+                config["hf_repo"], config.get("revision"), run_dir / "hf_checkpoints",
+            )
 
         # 2. Build a lqh.infer-shaped config pointing at the download.
         infer_config: dict[str, Any] = {

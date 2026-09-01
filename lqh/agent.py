@@ -235,18 +235,18 @@ machine, walk the user through `remote_add` → `remote_bind` → \
 ### Evaluating cloud-trained checkpoints
 
 Cloud-trained model weights live in cloud artifact storage, NOT on the \
-local filesystem. To evaluate one, prefer the cloud path:
+local filesystem. To evaluate one, use \
+`eval_hf_model(checkpoint_artifact_id=...)`: it runs inference + scoring \
+on cloud GPUs straight from the artifact store. Get the id from the \
+`artifacts` tool or the run's `training_status`. Nothing has to be \
+published to HuggingFace first — that is the path to use when the user \
+wants the same checkpoint scored on a second eval set. \
+`eval_hf_model(repo=...)` is the same tool pointed at a HuggingFace \
+repo instead, for models that already live there.
 
-  1. `hf_push(...)` — publish the trained model to HuggingFace.
-  2. `eval_hf_model(repo=...)` — run inference + scoring on cloud \
-     GPUs against the published HF repo. This is the supported \
-     end-to-end cloud eval path.
-
-`start_local_eval` does NOT yet route to cloud (artifact-aware cloud \
-eval is a pending gap). It runs on the project's configured SSH remote \
-if there is one, otherwise locally in-process — you still pass no \
-compute argument. If the user wants a cloud eval and the model isn't on \
-HuggingFace, push it first, then call `eval_hf_model`.
+`start_local_eval` does NOT route to cloud. It runs on the project's \
+configured SSH remote if there is one, otherwise locally in-process \
+(which needs the `train` extra) — you still pass no compute argument.
 
 ## General behavior
 
@@ -411,8 +411,8 @@ Scoring and evaluation artifacts:
 Data quality scores are co-located with datasets: datasets/{name}/scores.parquet.
 
 To score data quality: create a scorer .md file, then use run_scoring with mode='data_quality'. \
-To evaluate a Liquid checkpoint: use eval_hf_model (cloud, by HuggingFace id) or start_local_eval \
-(local/SSH checkpoint dir) — the router.liquid.ai API is retired, so run_scoring mode='model_eval' \
+To evaluate a Liquid checkpoint: use eval_hf_model (cloud, by HuggingFace id or LQH \
+checkpoint artifact id) or start_local_eval (local/SSH checkpoint dir) — the router.liquid.ai API is retired, so run_scoring mode='model_eval' \
 is reserved for pool baselines (small/medium/large/orchestration). \
 IMPORTANT: when evaluating a base/zero-shot model, ALWAYS pass a well-structured system \
 prompt (task instructions + expected output format); without one the base model is confused \
