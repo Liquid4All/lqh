@@ -232,6 +232,7 @@ class LqhApp:
             complete_while_typing=True,
             multiline=False,
             accept_handler=self._on_accept,
+            on_text_changed=self._on_input_text_changed,
         )
         input_window = Window(
             content=BufferControl(
@@ -414,7 +415,14 @@ class LqhApp:
             lambda: self._ask_user_multi_select and self._ask_user_options is not None
         )
 
-        @kb.add(" ", filter=is_multi_select, eager=True)
+        # Space only toggles while the input line is empty. Once the user has
+        # started typing an "Other" answer, space has to be a space again —
+        # otherwise the answer cannot contain more than one word.
+        input_empty = Condition(
+            lambda: not (self._input_buffer and self._input_buffer.text.strip())
+        )
+
+        @kb.add(" ", filter=is_multi_select & input_empty, eager=True)
         def _ask_toggle(event):
             """Space toggles the current option in multi-select mode."""
             if not self._ask_user_options:
@@ -507,8 +515,13 @@ class LqhApp:
                 parts.extend([
                     ("class:status.separator", " │ "),
                     ("class:status.spinner", "↑/↓ navigate"),
-                    ("class:status.separator", " │ "),
-                    ("class:status", "Space toggle"),
+                ])
+                if not (self._input_buffer and self._input_buffer.text.strip()):
+                    parts.extend([
+                        ("class:status.separator", " │ "),
+                        ("class:status", "Space toggle"),
+                    ])
+                parts.extend([
                     ("class:status.separator", " │ "),
                     ("class:status", "Enter confirm"),
                 ])
@@ -558,11 +571,25 @@ class LqhApp:
         self._managed_ansi = ansi_text
         self._invalidate()
 
+    def _on_input_text_changed(self, _buffer) -> None:
+        """Mirror typing into the multi-select "Other" row as it happens."""
+        if self._ask_user_options is not None and self._ask_user_multi_select:
+            if _buffer.text.strip():
+                self._ask_user_confirm_none = False
+            self._render_ask_user_options()
+
     def _render_ask_user_options(self) -> None:
         """Refresh the selectable ask-user list inside the managed area."""
         if self._ask_user_options is None:
             self._set_managed_text("")
             return
+
+        other_index = None
+        if self._ask_user_multi_select and self._ask_user_allow_other:
+            try:
+                other_index = self._ask_user_options.index(OTHER_OPTION)
+            except ValueError:
+                other_index = None
 
         self._set_managed_text(
             render_options(
@@ -571,6 +598,8 @@ class LqhApp:
                 checked=self._ask_user_checked if self._ask_user_multi_select else None,
                 warn_empty=self._ask_user_confirm_none,
                 allow_other=self._ask_user_allow_other,
+                other_index=other_index,
+                other_text=self._input_buffer.text if self._input_buffer else "",
             )
         )
 
@@ -824,6 +853,18 @@ class LqhApp:
                     self._invalidate()
                     return
                 response = selected
+        elif self._ask_user_options and self._ask_user_multi_select:
+            # Typed text with a multi-select list still open: that is the
+            # "Other" answer. Ship it *together* with whatever is ticked —
+            # dropping the ticks here is what made users doubt their typed
+            # answer was used at all.
+            checked_names = [
+                self._ask_user_options[i]
+                for i in sorted(self._ask_user_checked)
+                if i < len(self._ask_user_options)
+                and self._ask_user_options[i] != OTHER_OPTION
+            ]
+            response = ", ".join([*checked_names, text])
         else:
             # Free-text response — in multi-select "Other" mode, prepend checked items
             prefix_items = getattr(self, "_ask_user_checked_prefix", [])

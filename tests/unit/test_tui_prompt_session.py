@@ -293,6 +293,52 @@ class TestPromptSession:
         assert sum(_is_other_option(o) for o in rendered) == 1
         assert rendered == ["alpha", OTHER_OPTION]
 
+    async def test_keyboard_typed_other_keeps_spaces_and_ticks(
+        self, app: LqhApp,
+    ) -> None:
+        """Typing an Other answer in multi-select keeps spaces and the ticks.
+
+        Space toggles only while the input line is empty, so a typed answer can
+        be a real sentence; the checked rows ride along with it.
+        """
+
+        def _assert_echoed(a: LqhApp) -> None:
+            # The Other row mirrors what is being typed and ticks itself.
+            assert "Other: my own answer" in a._managed_ansi
+            assert a._ask_user_checked == {0}
+
+        res = await _drive_ask_user(
+            app,
+            ["alpha", "beta", OTHER_OPTION],
+            [
+                (SPACE, None),  # tick alpha (input line still empty)
+                ("my own answer", _assert_echoed),
+                (ENTER, None),
+            ],
+            allow_other=True,
+        )
+        assert res == "alpha, my own answer"
+
+    def test_multi_select_render_marks_other_row(self, app: LqhApp) -> None:
+        """The Other row is not a dead checkbox: it echoes and ticks on typing."""
+        empty = render_options(
+            ["alpha", OTHER_OPTION], 0, checked=set(), allow_other=True, other_index=1,
+        )
+        assert "[ ] Other (type your own answer)" in empty
+        assert "type your own answer for Other" in empty
+
+        typed = render_options(
+            ["alpha", OTHER_OPTION],
+            0,
+            checked=set(),
+            allow_other=True,
+            other_index=1,
+            other_text="something else",
+        )
+        assert "[✓] Other: something else" in typed
+        # Space is a space while typing, so it must not be advertised as toggle.
+        assert "Space" not in typed
+
     def test_single_select_render_shows_navigation_hint(self, app: LqhApp) -> None:
         """Single-select mode must spell out how to answer (it had no hint before)."""
         out = render_options(["alpha", "beta"], 0, allow_other=True)
