@@ -146,6 +146,24 @@ class Stubborn(Pipeline):
         ]
 """
 
+# A deterministic code bug (the shape that aborts a whole run) fires on
+# the third sample; everything else hangs, standing in for the in-flight
+# work a real run still has open at that moment.
+_ABORTING_PIPELINE = """
+import asyncio
+from lqh.pipeline import Pipeline, ChatMLMessage
+
+_calls = {"n": 0}
+
+class Aborts(Pipeline):
+    async def generate(self, client):
+        _calls["n"] += 1
+        if _calls["n"] == 3:
+            raise AttributeError("'list' object has no attribute 'keys'")
+        await asyncio.sleep(3600)
+        return [ChatMLMessage(role="user", content="hi")]
+"""
+
 _HANGING_PIPELINE = """
 import asyncio
 from lqh.pipeline import Pipeline, ChatMLMessage
@@ -405,6 +423,30 @@ def test_error_escaping_a_sample_surfaces_immediately(chdir_to_tmp: Path) -> Non
 
     # Two samples of this pipeline sleep an hour; the error must not wait
     # on them.
+    assert time.monotonic() - started < 10
+
+
+def test_abort_on_a_code_bug_does_not_hang_the_run(chdir_to_tmp: Path) -> None:
+    """A deterministic bug must end the run, not park it forever.
+
+    The abort path records the error and returns, which stops new work
+    but leaves the over-commit spares waiting on the tail gate — and
+    nothing completes after an abort, so nothing ever opens it. A cloud
+    data-gen run hit exactly this and sat silent for ~12h until its
+    wall-clock cap, losing the samples it had already paid for.
+    """
+    project = chdir_to_tmp
+    script = _write(project, _ABORTING_PIPELINE)
+
+    started = time.monotonic()
+    with pytest.raises(AttributeError, match="'list' object"):
+        _run_bounded(run_pipeline(
+            script_path=script,
+            num_samples=60,          # >= 50, so spares are queued
+            output_dir=project / "datasets" / "d",
+            client=object(),  # type: ignore[arg-type]
+            concurrency=4,
+        ))
     assert time.monotonic() - started < 10
 
 

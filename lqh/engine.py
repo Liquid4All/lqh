@@ -725,6 +725,17 @@ async def _run_pipeline_inner(
                     if isinstance(exc, (TypeError, AttributeError, NameError,
                                         SyntaxError, ValueError, ImportError)):
                         abort_error = exc
+                        # Signal the stop as well as recording the error.
+                        # Returning alone only stops *new* work from
+                        # starting — the over-commit spares are parked on
+                        # `tail`, which only a completion sets, and after
+                        # an abort nothing completes. The gather would
+                        # then never finish and the run would hang until
+                        # something outside killed it (a cloud job burns
+                        # its whole wall-clock cap in silence). `enough`
+                        # is what `_run_until_enough` waits on to cancel
+                        # the stragglers and hand the error back.
+                        enough.set()
                         return
                     if attempt >= max_retries:
                         break
