@@ -11,6 +11,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from lqh import __version__
+from lqh.tui.theme import active_palette
 
 BLOCK_INDENT = 2
 MIN_RENDER_WIDTH = 20
@@ -31,7 +32,6 @@ LIQUID_AI_LOGO = (
     "        LQHLQ   LQHLQHLQHLQ",
     "         LQ   LQHLQHLQHLQ",
 )
-LIQUID_AI_LOGO_STYLE = "bold #f8fafc"
 WELCOME_LOGO = (
     "██╗      ██████╗  ██╗  ██╗",
     "██║     ██╔═══██╗ ██║  ██║",
@@ -40,11 +40,12 @@ WELCOME_LOGO = (
     "███████╗╚██████╔╝ ██║  ██║",
     "╚══════╝ ╚══▀▀═╝  ╚═╝  ╚═╝",
 )
-# Fixed column spans and colors for the large L, Q, and H glyphs.
-WELCOME_LOGO_GLYPHS = (
-    (0, 8, "bold #38bdf8"),  # L — cyan
-    (9, 18, "bold #a78bfa"),  # Q — violet
-    (19, 27, "bold #fbbf24"),  # H — gold
+# Fixed column spans of the large L, Q, and H glyphs; their colors come from
+# the active palette (Palette.logo_glyphs) in the same order.
+WELCOME_LOGO_GLYPH_SPANS = (
+    (0, 8),  # L
+    (9, 18),  # Q
+    (19, 27),  # H
 )
 
 
@@ -117,21 +118,23 @@ def render_markdown(text: str, width: int = 100) -> str:
     console = Console(
         file=buf, force_terminal=True, width=_display_width(width), color_system="truecolor"
     )
-    console.print(Markdown(text))
+    console.print(Markdown(text, code_theme=active_palette().code_theme))
     return buf.getvalue()
 
 
 def _render_welcome_logo_line(line: str, *, base_style: str) -> Text:
     """Render one welcome banner row with a distinct color for each glyph."""
     text = Text(f"  {line}", style=base_style)
-    for start, end, style in WELCOME_LOGO_GLYPHS:
+    for (start, end), style in zip(
+        WELCOME_LOGO_GLYPH_SPANS, active_palette().logo_glyphs
+    ):
         text.stylize(style, 2 + start, 2 + end)
     return text
 
 
 def _render_liquid_ai_logo_line(line: str) -> Text:
-    """Render the Liquid AI mark in white."""
-    return Text(f"  {line}", style=LIQUID_AI_LOGO_STYLE)
+    """Render the Liquid AI mark in the palette's strongest foreground."""
+    return Text(f"  {line}", style=active_palette().logo_mark)
 
 
 def render_agent_message(text: str, width: int = 100) -> str:
@@ -139,7 +142,7 @@ def render_agent_message(text: str, width: int = 100) -> str:
     return _render_block(
         lambda console: (
             console.print(Text("💧 Liquid", style="bold magenta")),
-            console.print(Markdown(text)),
+            console.print(Markdown(text, code_theme=active_palette().code_theme)),
         ),
         width,
         indent_body_only=True,
@@ -403,7 +406,14 @@ def render_file_view(path: str, content: str, width: int = 100) -> str:
         lang = ext_to_lang.get(ext)
 
         if lang:
-            console.print(Syntax(content, lang, theme="monokai", line_numbers=True))
+            console.print(
+                Syntax(
+                    content,
+                    lang,
+                    theme=active_palette().code_theme,
+                    line_numbers=True,
+                )
+            )
         else:
             console.print(Panel(content, title=path))
 
@@ -429,8 +439,9 @@ def render_welcome(width: int = 100) -> str:
         color_system="truecolor",
     )
 
-    logo_style = "bold #94a3b8"
-    accent = "dim #94a3b8"
+    palette = active_palette()
+    logo_style = palette.logo_lqh
+    accent = palette.accent
 
     console.print()
     lqh_start_row = (len(LIQUID_AI_LOGO) - len(WELCOME_LOGO)) // 2
@@ -495,6 +506,8 @@ def render_resume_hint(session_id: str, width: int = 100) -> str:
     )
     console.print()
     console.print(Text("  Resume this conversation with:", style="dim"))
-    console.print(Text(f"    lqh --resume {session_id}", style="bold #60a5fa"))
+    console.print(
+        Text(f"    lqh --resume {session_id}", style=active_palette().resume_command)
+    )
     console.print()
     return buf.getvalue()

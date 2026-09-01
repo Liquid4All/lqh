@@ -123,7 +123,7 @@ Point lqh at a directory with a spec and walk away. It either delivers a checkpo
 Push and pull datasets from the Hub, publish checkpoints, and convert to GGUF for deployment.
 
 ### 🖥️ Interactive TUI
-Guide the agent, visualize progress, and inspect dataset samples — all from one terminal session with a slash-command palette and a live status bar.
+Guide the agent, visualize progress, and inspect dataset samples — all from one terminal session with a slash-command palette and a live status bar. Colors follow your terminal's background: LQH asks the terminal whether it is light or dark and picks a matching palette. Set `LQH_THEME=light` or `LQH_THEME=dark` to override the choice.
 
 ### 📦 Project-as-directory
 Any directory is a project — fully git-compatible, so you can version, branch, and collaborate on specs, datasets, and runs like any other code. `cd` to switch projects.

@@ -54,6 +54,7 @@ from lqh.tui.renderer import (
 )
 from lqh.tui.background_tasks import BackgroundTask, BackgroundTaskRegistry
 from lqh.tui.status_bar import StatusBar
+from lqh.tui.theme import active_palette
 from lqh.update_check import check_for_update, upgrade_command
 from lqh.telemetry import TELEMETRY_NOTICE, TelemetryClient, notice_needed, set_active_telemetry
 
@@ -63,25 +64,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-TUI_STYLE = Style.from_dict({
-    "status": "bg:#1a1a2e #e0e0e0",
-    "status.spinner": "bg:#1a1a2e #00ff88 bold",
-    "status.separator": "bg:#1a1a2e #555555",
-    "status.warning": "bg:#1a1a2e #ff4444 bold",
-    "status.caution": "bg:#1a1a2e #ffaa00",
-    "status.dim": "bg:#1a1a2e #666666",
-    "input-border": "#444444",
-    "input-prompt": "bold #888888",
-    "input-area": "bg:#16202a #f5f7fa",
-    # NB: deliberately NOT named "completion-menu" — that class exists in
-    # prompt_toolkit's default UI style (bg:#bbbbbb) and would bleed a light
-    # background through any partial override.
-    "slash-menu": "#c0c8d0",
-    "slash-menu.selected": "bg:#16202a #00ff88 bold",
-    "slash-menu.meta": "#777777",
-    "slash-menu.meta.selected": "bg:#16202a #aaaaaa",
-    "slash-menu.hint": "#555555 italic",
-})
+# Light and dark variants of these rules live in lqh/tui/theme.py; the one
+# matching the terminal's background is picked here, once, at startup.
+TUI_STYLE = Style.from_dict(active_palette().tui_style)
 
 OTHER_OPTION = "Other (type your own answer)"
 

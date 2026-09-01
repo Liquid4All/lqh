@@ -45,6 +45,8 @@ from rich.padding import Padding
 from rich.rule import Rule
 from rich.text import Text
 
+from lqh.tui.theme import active_palette
+
 SCORES_FILENAME = "scores.parquet"
 
 # Readability cap: on very wide terminals (4K full-screen) prose must not
@@ -613,7 +615,12 @@ class DatasetViewer:
             indent = (0, 0, 0, _CONTENT_INDENT)
             if content:
                 if role == "assistant" and isinstance(content, str):
-                    console.print(Padding(Markdown(content), indent))
+                    console.print(
+                        Padding(
+                            Markdown(content, code_theme=active_palette().code_theme),
+                            indent,
+                        )
+                    )
                 elif isinstance(content, list):
                     # Multi-part content (e.g., vision messages)
                     for part in content:
