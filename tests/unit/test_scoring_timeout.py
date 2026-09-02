@@ -32,8 +32,12 @@ from lqh.runner import RunnerResponse
 from lqh.scoring import (
     DEFAULT_MAX_RETRIES,
     PARTIAL_SUFFIX,
+    SCORE_STATUS_ERROR,
+    SCORE_STATUS_SCORED,
+    SCORE_STATUS_TIMEOUT,
     _RATE_LIMIT_WAIT_CAP_S,
     _rate_limit_wait,
+    _timeout_reasoning,
     FAILURE_WARN_FRACTION,
     _MAX_RATE_LIMIT_WAITS,
     failure_warning,
@@ -41,6 +45,7 @@ from lqh.scoring import (
     run_data_filter,
     run_data_scoring,
     run_scoring,
+    score_status,
 )
 
 CONVERSATION = [
@@ -1586,3 +1591,119 @@ class TestGoldenRateLimits:
         # It kept trying for the whole budget rather than quitting at a fixed
         # wait count — well past MAX_RATE_LIMIT_WAITS worth of attempts.
         assert client.chat.completions.create.await_count > 5
+
+
+# ---------------------------------------------------------------------------
+# status column (feedback #79)
+# ---------------------------------------------------------------------------
+
+
+def _mixed_judge_client(fail_indices: set[int], *, delay: float = 30.0) -> MagicMock:
+    """Judge that wedges on the Nth call for N in *fail_indices*, else scores 8.
+
+    Sample order isn't guaranteed under concurrency, so tests using this pin
+    counts by status rather than which sample got which outcome.
+    """
+    client = MagicMock()
+    response = MagicMock()
+    response.choices = [MagicMock(message=MagicMock(content='{"reasoning": "Good", "score": 8}'))]
+    calls = 0
+
+    async def _create(**_kwargs: Any) -> Any:
+        nonlocal calls
+        mine = calls
+        calls += 1
+        if mine in fail_indices:
+            await asyncio.sleep(delay)
+        return response
+
+    client.chat.completions.create = AsyncMock(side_effect=_create)
+    return client
+
+
+class TestScoreStatus:
+    """A timeout writes score 0.0. Without a status column that is
+    indistinguishable from the rubric's worst grade, so a downstream filter
+    deletes samples the judge merely never got to — and judge calls time out
+    on the longest, hardest samples."""
+
+    def test_maps_reasoning_to_a_status(self) -> None:
+        assert score_status("Clear and correct.") == SCORE_STATUS_SCORED
+        assert score_status(None) == SCORE_STATUS_SCORED
+        assert score_status(_timeout_reasoning(120.0)) == SCORE_STATUS_TIMEOUT
+        assert score_status("[Scoring error] connection reset") == SCORE_STATUS_ERROR
+        assert score_status("[Parse error] not json") == SCORE_STATUS_ERROR
+
+    async def test_data_scoring_marks_the_timed_out_sample(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet,
+    ) -> None:
+        dataset_dir = tmp_path / "ds"
+        dataset_dir.mkdir()
+        write_chatml_parquet(dataset_dir / "data.parquet", [CONVERSATION], num=4)
+
+        await asyncio.wait_for(
+            run_data_scoring(
+                dataset_dir=dataset_dir,
+                scorer_path=scorer,
+                client=_mixed_judge_client({0}),
+                sample_timeout=0.2,
+                max_retries=0,
+            ),
+            timeout=10,
+        )
+
+        table = pq.read_table(dataset_dir / "scores.parquet")
+        statuses = table.column("status").to_pylist()
+        assert statuses.count(SCORE_STATUS_TIMEOUT) == 1
+        assert statuses.count(SCORE_STATUS_SCORED) == 3
+        # The placeholder is still a 0.0 — the status is the only thing that
+        # tells a reader not to believe it.
+        scores = table.column("score").to_pylist()
+        timed_out = statuses.index(SCORE_STATUS_TIMEOUT)
+        assert scores[timed_out] == 0.0
+
+    async def test_filter_marks_the_kept_unjudged_row(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet,
+    ) -> None:
+        source = write_chatml_parquet(tmp_path / "in.parquet", [CONVERSATION], num=4)
+
+        result = await asyncio.wait_for(
+            run_data_filter(
+                input_path=source,
+                scorer_path=scorer,
+                output_dataset_dir=tmp_path / "out",
+                client=_mixed_judge_client({0}),
+                sample_timeout=0.2,
+                max_retries=0,
+            ),
+            timeout=10,
+        )
+
+        assert result.kept_unjudged == 1
+        table = pq.read_table(tmp_path / "out" / "scores.parquet")
+        rows = table.to_pylist()
+        unjudged = [r for r in rows if r["status"] == SCORE_STATUS_TIMEOUT]
+        assert len(unjudged) == 1
+        # Fail open: it is kept despite its 0.0.
+        assert unjudged[0]["kept"] is True
+
+    async def test_run_scoring_results_carry_a_status(
+        self, tmp_path: Path, scorer: Path, write_chatml_parquet,
+    ) -> None:
+        dataset = write_chatml_parquet(
+            tmp_path / "data.parquet", [CONVERSATION], num=3,
+        )
+
+        await asyncio.wait_for(
+            run_scoring(
+                dataset_path=dataset,
+                scorer_path=scorer,
+                output_dir=tmp_path / "out",
+                client=_judge_client(delay=30.0),
+                sample_timeout=0.2,
+            ),
+            timeout=10,
+        )
+
+        table = pq.read_table(tmp_path / "out" / "results.parquet")
+        assert table.column("status").to_pylist() == [SCORE_STATUS_TIMEOUT] * 3

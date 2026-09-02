@@ -72,7 +72,10 @@ If they want to *score* for evaluation (not to filter), use `evaluation`.
 
 Outputs under `datasets/<output_dataset>/`:
 - `data.parquet` — kept rows, same schema as input (drop-in for training).
-- `scores.parquet` — one row per input sample with score, reasoning, `kept`.
+- `scores.parquet` — one row per input sample with score, reasoning, `kept`,
+  and `status` (`scored` | `timeout` | `error`). Rows that aren't `scored`
+  carry a placeholder score of 0.0 the judge never assigned — they are kept
+  (fail open) and must never be read as a real zero.
 - `summary.json` — counts, threshold, mean score, keep-rate, judge model.
 
 ## Soft thresholds (defaults — adjust to the task)

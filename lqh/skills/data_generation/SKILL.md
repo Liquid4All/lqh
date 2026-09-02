@@ -905,6 +905,12 @@ samples. The samples you both considered good should score high; any you flagged
 as weak should score low, for the *right* reason stated in the reasoning. A scorer
 that gives everything a flat 8, or rewards the wrong thing, is not working yet.
 
+Read the `status` column before you read a score: a row with `status` of
+`timeout` or `error` never got a grade, and its 0.0 is a placeholder, not a
+verdict. Leave those rows out of any judgment about the scorer, and re-score
+them if there are many — judge calls time out on the longest samples, so what
+you lose is the hard cases, not a random sample.
+
 Optionally `show_file` the scores to the user to confirm the scorer matches their
 expectations before you rely on it downstream.
 

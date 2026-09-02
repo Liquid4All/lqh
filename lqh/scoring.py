@@ -34,6 +34,7 @@ __all__ = [
     "ScoringResult",
     "extract_failures",
     "failure_warning",
+    "score_status",
     "run_data_filter",
     "run_scoring",
     "run_data_scoring",
@@ -465,6 +466,39 @@ def is_scoring_error(reasoning: str | None) -> bool:
     return head.startswith("[Scoring error]") or head.startswith("[Parse error")
 
 
+# Per-sample outcome, written as an explicit ``status`` column next to every
+# score. A failed judge still writes score 0.0 (readers that predate this
+# column keep working), but 0.0 then means two different things — "the rubric
+# graded this worst" and "we never got a grade" — and telling them apart
+# required matching the ``[Scoring error]`` prefix on a free-text column.
+# Anything filtering an artifact on score must exclude the non-"scored" rows
+# from both numerator and denominator instead of treating them as zeros;
+# timeouts hit the longest, hardest samples, so scoring them zero deletes
+# exactly the data worth keeping.
+SCORE_STATUS_SCORED = "scored"
+SCORE_STATUS_TIMEOUT = "timeout"
+SCORE_STATUS_ERROR = "error"
+
+# Substring that marks the deadline path inside a ``[Scoring error]``
+# reasoning. Kept as a constant so :func:`_timeout_reasoning` and
+# :func:`score_status` cannot drift apart.
+_TIMEOUT_MARKER = "sample timed out after"
+
+
+def score_status(reasoning: str | None) -> str:
+    """Map a sample's reasoning to :data:`SCORE_STATUS_SCORED` /
+    ``…_TIMEOUT`` / ``…_ERROR``.
+
+    ``timeout`` is worth its own value: it is the one failure a re-score is
+    likely to fix, so a harness can decide to retry rather than proceed.
+    """
+    if not is_scoring_error(reasoning):
+        return SCORE_STATUS_SCORED
+    if _TIMEOUT_MARKER in (reasoning or ""):
+        return SCORE_STATUS_TIMEOUT
+    return SCORE_STATUS_ERROR
+
+
 def _parse_score_response(text: str) -> tuple[float, str]:
     """Parse the scoring LLM's JSON response into (score, reasoning).
 
@@ -694,7 +728,7 @@ def _timeout_reasoning(seconds: float) -> str:
     Carries the ``[Scoring error]`` marker so it flows through the existing
     failure path — excluded from mean/median, counted in ``failed``.
     """
-    return f"[Scoring error] sample timed out after {seconds:.0f}s"
+    return f"[Scoring error] {_TIMEOUT_MARKER} {seconds:.0f}s"
 
 
 # Interrupted runs write here instead of over the real artifact names. Callers
@@ -1119,22 +1153,28 @@ async def run_scoring(
                 "messages": [r["messages"] for r in rows],
                 "score": [r["score"] for r in rows],
                 "reasoning": [r["reasoning"] for r in rows],
+                "status": [score_status(r["reasoning"]) for r in rows],
             },
             schema=pa.schema([
                 pa.field("sample_index", pa.int64()),
                 pa.field("messages", pa.string()),
                 pa.field("score", pa.float64()),
                 pa.field("reasoning", pa.string()),
+                pa.field("status", pa.string()),
             ]),
         )
     else:
         table = pa.table(
-            {"sample_index": [], "messages": [], "score": [], "reasoning": []},
+            {
+                "sample_index": [], "messages": [], "score": [],
+                "reasoning": [], "status": [],
+            },
             schema=pa.schema([
                 pa.field("sample_index", pa.int64()),
                 pa.field("messages", pa.string()),
                 pa.field("score", pa.float64()),
                 pa.field("reasoning", pa.string()),
+                pa.field("status", pa.string()),
             ]),
         )
 
@@ -1675,12 +1715,14 @@ async def run_data_scoring(
             "score": [r["score"] for r in results],
             "reasoning": [r["reasoning"] for r in results],
             "scorer": [r["scorer"] for r in results],
+            "status": [score_status(r["reasoning"]) for r in results],
         },
         schema=pa.schema([
             pa.field("sample_index", pa.int64()),
             pa.field("score", pa.float64()),
             pa.field("reasoning", pa.string()),
             pa.field("scorer", pa.string()),
+            pa.field("status", pa.string()),
         ]),
     )
     pq.write_table(scores_table, dataset_dir / "scores.parquet")
@@ -1765,12 +1807,16 @@ async def run_data_filter(
         # Empty input — emit empty artifacts and short-circuit.
         pq.write_table(input_table, data_path)
         empty = pa.table(
-            {"sample_index": [], "score": [], "reasoning": [], "kept": []},
+            {
+                "sample_index": [], "score": [], "reasoning": [],
+                "kept": [], "status": [],
+            },
             schema=pa.schema([
                 pa.field("sample_index", pa.int64()),
                 pa.field("score", pa.float64()),
                 pa.field("reasoning", pa.string()),
                 pa.field("kept", pa.bool_()),
+                pa.field("status", pa.string()),
             ]),
         )
         pq.write_table(empty, scores_path)
@@ -1879,12 +1925,14 @@ async def run_data_filter(
             "score": [r["score"] for r in rows],
             "reasoning": [r["reasoning"] for r in rows],
             "kept": [r["kept"] for r in rows],
+            "status": [score_status(r["reasoning"]) for r in rows],
         },
         schema=pa.schema([
             pa.field("sample_index", pa.int64()),
             pa.field("score", pa.float64()),
             pa.field("reasoning", pa.string()),
             pa.field("kept", pa.bool_()),
+            pa.field("status", pa.string()),
         ]),
     )
     pq.write_table(scores_table, scores_path)
