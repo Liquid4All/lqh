@@ -288,16 +288,24 @@ def load_chatml_datasets_with_tools(
 
 def load_eval_sources(
     sources: str | list[Any],
-) -> list[tuple[str, list[list[dict[str, str]]]]]:
-    """Load eval sources, kept DISTINCT, as ``[(source_label, conversations)]``.
+) -> list[tuple[str, list[tuple[list[dict[str, Any]], list[dict[str, Any]] | None]]]]:
+    """Load eval sources, kept DISTINCT, as ``[(source_label, samples)]``.
+
+    Each sample is a ``(conversation, tools)`` pair — the tools travel with
+    the conversation so the eval generation pass can hand them to
+    ``apply_chat_template(tools=...)`` and tag the prediction rows with them
+    for the judge. ``tools`` is ``None`` for sources without a tools column.
 
     Used by the eval path to tag predictions with their source so they can be
     judge-scored separately. ``repeat`` is forced to 1 — over-sampling eval
     data would only distort the score.
     """
-    result: list[tuple[str, list[list[dict[str, str]]]]] = []
+    result: list[
+        tuple[str, list[tuple[list[dict[str, Any]], list[dict[str, Any]] | None]]]
+    ] = []
     for entry in normalize_sources(sources, allow_repeat=False):
-        result.append((entry["source"], load_chatml_dataset(entry["path"])))
+        convos, tools = load_chatml_dataset_with_tools(entry["path"])
+        result.append((entry["source"], list(zip(convos, tools))))
     return result
 
 
@@ -340,15 +348,32 @@ def chatml_to_sft_dataset(
     include a ``"tools"`` key alongside ``"messages"`` so the tokenizer's
     ``apply_chat_template(tools=...)`` can use them.
 
+    The tools are **JSON-encoded**, not passed as a list. trl decodes a
+    string column (``tools = json.loads(tools) if isinstance(tools, str)``
+    in both its SFT and DPO tokenize paths), and a raw list would have to
+    survive pyarrow's schema inference across every sample's JSON Schema
+    first — which it does not: two samples that describe the same argument
+    as ``"type": "string"`` and ``"type": ["string", "null"]`` fail the
+    ``Dataset.from_list`` with ``ArrowInvalid: cannot mix list and non-list``.
+
+    Every row carries the key once ANY sample has tools, ``None`` included:
+    ``Dataset.from_list`` infers its schema from the first row's keys alone
+    (`pa.Table.from_pylist`) and reads the rest as ``row.get(name)``. Add the
+    key only where tools exist and a set whose first sample happens to have
+    none loses the column for the whole dataset — silently, and depending on
+    a `Random(0)` shuffle. A ``None`` in the column is fine: trl's
+    ``json.loads(tools) if isinstance(tools, str)`` passes it straight
+    through to ``apply_chat_template(tools=None)``.
+
     Returns a list suitable for ``datasets.Dataset.from_list()``.
     """
+    any_tools = any(tools_per_sample) if tools_per_sample is not None else False
     result: list[dict[str, Any]] = []
     for i, conv in enumerate(conversations):
         entry: dict[str, Any] = {"messages": conv}
-        if tools_per_sample is not None and i < len(tools_per_sample):
-            tools = tools_per_sample[i]
-            if tools is not None:
-                entry["tools"] = tools
+        if any_tools:
+            tools = tools_per_sample[i] if i < len(tools_per_sample) else None
+            entry["tools"] = json.dumps(tools) if tools else None
         result.append(entry)
     return result
 

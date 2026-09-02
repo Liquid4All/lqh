@@ -484,13 +484,37 @@ class TestTrainingDataUtils:
     """Training data loading with tools."""
 
     def test_chatml_to_sft_with_tools(self) -> None:
+        """Tools ride the row JSON-encoded — trl json.loads a string column."""
         result = chatml_to_sft_dataset(
             [[{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hey"}]],
             tools_per_sample=[[{"type": "function", "function": {"name": "f1"}}]],
         )
         assert len(result) == 1
         assert "messages" in result[0]
-        assert result[0]["tools"][0]["function"]["name"] == "f1"
+        assert isinstance(result[0]["tools"], str)
+        assert json.loads(result[0]["tools"])[0]["function"]["name"] == "f1"
+
+    def test_sft_tools_survive_heterogeneous_schemas(self) -> None:
+        """A raw list column dies in pyarrow when two schemas disagree.
+
+        ``"type": "string"`` in one sample and ``"type": ["string", "null"]``
+        in another is valid JSON Schema and fails ``Dataset.from_list`` with
+        ``ArrowInvalid: cannot mix list and non-list``. JSON-encoding sidesteps
+        the inference entirely.
+        """
+        rows = chatml_to_sft_dataset(
+            [
+                [{"role": "user", "content": "a"}],
+                [{"role": "user", "content": "b"}],
+            ],
+            tools_per_sample=[
+                [{"function": {"name": "f", "parameters": {"properties": {"x": {"type": "string"}}}}}],
+                [{"function": {"name": "g", "parameters": {"properties": {"x": {"type": ["string", "null"]}}}}}],
+            ],
+        )
+        table = pa.Table.from_pylist(rows)
+        assert table.num_rows == 2
+        assert json.loads(table.column("tools")[1].as_py())[0]["function"]["name"] == "g"
 
     def test_chatml_to_sft_without_tools(self) -> None:
         result = chatml_to_sft_dataset([[{"role": "user", "content": "Hi"}]])
@@ -498,6 +522,7 @@ class TestTrainingDataUtils:
         assert "tools" not in result[0]
 
     def test_chatml_to_sft_mixed_tools(self) -> None:
+        """Every row carries the key — see the next test for why."""
         result = chatml_to_sft_dataset(
             [
                 [{"role": "user", "content": "Hi"}],
@@ -508,8 +533,36 @@ class TestTrainingDataUtils:
                 None,
             ],
         )
-        assert "tools" in result[0]
-        assert "tools" not in result[1]
+        assert json.loads(result[0]["tools"])[0]["function"]["name"] == "f1"
+        assert result[1]["tools"] is None
+
+    def test_mixed_dataset_keeps_the_tools_column_whatever_the_row_order(self) -> None:
+        """``Dataset.from_list`` types the table from the FIRST row's keys.
+
+        A mixed set whose first sample has no tools silently loses the column
+        for every other sample — and which sample lands first is decided by
+        the train/eval shuffle, so the loss is not even reproducible.
+        """
+        datasets = pytest.importorskip("datasets")
+        convos = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}]]
+        tools = [None, [{"type": "function", "function": {"name": "f1"}}]]
+
+        for order in ([0, 1], [1, 0]):
+            rows = chatml_to_sft_dataset(
+                [convos[i] for i in order], [tools[i] for i in order]
+            )
+            ds = datasets.Dataset.from_list(rows)
+            assert "tools" in ds.column_names
+            with_tools = [r for r in ds if r["tools"]]
+            assert len(with_tools) == 1
+            assert json.loads(with_tools[0]["tools"])[0]["function"]["name"] == "f1"
+
+    def test_no_tools_anywhere_adds_no_column(self) -> None:
+        """A non-tool dataset must be byte-identical to the pre-tools path."""
+        result = chatml_to_sft_dataset(
+            [[{"role": "user", "content": "Hi"}]], tools_per_sample=[None]
+        )
+        assert result == [{"messages": [{"role": "user", "content": "Hi"}]}]
 
     def test_load_chatml_dataset_with_tools(self, tmp_path: Path) -> None:
         """Write and read back a parquet with a ``tools`` column."""

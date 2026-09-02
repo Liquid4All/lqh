@@ -199,7 +199,12 @@ class TestPluralLoaders:
         )
         out = load_eval_sources([str(a), str(b)])
         assert [label for label, _ in out] == ["type_a", "type_b"]
-        assert [len(c) for _, c in out] == [2, 3]
+        assert [len(samples) for _, samples in out] == [2, 3]
+        # Each sample is a (conversation, tools) pair: the tools have to reach
+        # apply_chat_template and the prediction rows the judge reads.
+        conv, tools = out[0][1][0]
+        assert conv[0]["role"] == "user"
+        assert tools is None
 
     def test_eval_sources_with_tools_flattens_with_labels(
         self,

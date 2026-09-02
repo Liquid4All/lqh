@@ -36,7 +36,7 @@ from lqh.progress import (
 
 from lqh.train.data_utils import (
     chatml_to_sft_dataset,
-    load_chatml_datasets,
+    load_chatml_datasets_with_tools,
     load_eval_sources,
     split_train_eval,
 )
@@ -300,9 +300,9 @@ def mid_run_checkpoint_eval_samples(config: dict[str, Any]) -> int:
 
 
 def cap_eval_sources(
-    eval_srcs: list[tuple[str, list[list[dict[str, str]]]]],
+    eval_srcs: list[tuple[str, list[Any]]],
     limit: int,
-) -> list[tuple[str, list[list[dict[str, str]]]]]:
+) -> list[tuple[str, list[Any]]]:
     """Keep about *limit* conversations across the sources, proportionally.
 
     Sources stay DISTINCT and every non-empty one keeps at least one
@@ -316,21 +316,21 @@ def cap_eval_sources(
     compares like with like. A non-positive *limit*, or a set already at or
     under it, is returned untouched.
     """
-    total = sum(len(convos) for _, convos in eval_srcs)
+    total = sum(len(samples) for _, samples in eval_srcs)
     if limit <= 0 or total <= limit:
         return eval_srcs
-    capped: list[tuple[str, list[list[dict[str, str]]]]] = []
-    for label, convos in eval_srcs:
-        if not convos:
-            capped.append((label, convos))
+    capped: list[tuple[str, list[Any]]] = []
+    for label, samples in eval_srcs:
+        if not samples:
+            capped.append((label, samples))
             continue
-        keep = min(len(convos), max(1, round(limit * len(convos) / total)))
-        stride = len(convos) / keep
+        keep = min(len(samples), max(1, round(limit * len(samples) / total)))
+        stride = len(samples) / keep
         capped.append(
             (
                 label,
                 [
-                    convos[min(len(convos) - 1, int(i * stride))]
+                    samples[min(len(samples) - 1, int(i * stride))]
                     for i in range(keep)
                 ],
             )
@@ -396,11 +396,11 @@ def _run_checkpoint_eval(
     # them into a macro-average (see score_predictions_by_source).
     eval_srcs = load_eval_sources(eval_dataset_path)
     if checkpoint_dir.name != "final":
-        full_rows = sum(len(convos) for _, convos in eval_srcs)
+        full_rows = sum(len(samples) for _, samples in eval_srcs)
         eval_srcs = cap_eval_sources(
             eval_srcs, mid_run_checkpoint_eval_samples(config),
         )
-        kept_rows = sum(len(convos) for _, convos in eval_srcs)
+        kept_rows = sum(len(samples) for _, samples in eval_srcs)
         if kept_rows < full_rows:
             print(
                 f"  checkpoint eval ({checkpoint_dir.name}): generating over "
@@ -419,7 +419,7 @@ def _run_checkpoint_eval(
     phase_label = "evaluating final model"
     frac_start = 0.0
     frac_end = 0.0
-    total_eval = sum(len(convos) for _, convos in eval_srcs)
+    total_eval = sum(len(samples) for _, samples in eval_srcs)
     if checkpoint_dir.name == "final" and has_final_inference(config):
         frac_start = training_end_for(config)
         frac_end = FINAL_INFERENCE_END if has_final_scoring(config) else 1.0
@@ -452,10 +452,10 @@ def _run_checkpoint_eval(
 
     idx = 0
     out_of_time = False
-    for source_label, eval_convos in eval_srcs:
+    for source_label, eval_samples in eval_srcs:
         if out_of_time:
             break
-        for conv in eval_convos:
+        for conv, sample_tools in eval_samples:
             # Generation over the eval set is the least bounded thing in a
             # run (a 159-row set took 72 minutes on an L4) and it sits
             # between the saved model and the launcher's publish. Spending
@@ -497,11 +497,21 @@ def _run_checkpoint_eval(
                         max_new_tokens=min(max_seq, 1024),
                     )
                 else:
+                    # tools= is the ONLY way the tool list reaches the
+                    # prompt: LFM chat templates read the template
+                    # variable, never a per-message "tools" key. Generating
+                    # without it grades the model on calling tools it was
+                    # never shown.
+                    template_kwargs: dict[str, Any] = {
+                        "return_tensors": "pt",
+                        "add_generation_prompt": True,
+                        "return_dict": True,
+                    }
+                    if sample_tools is not None:
+                        template_kwargs["tools"] = sample_tools
                     inputs = tokenizer.apply_chat_template(
                         prompt_msgs,
-                        return_tensors="pt",
-                        add_generation_prompt=True,
-                        return_dict=True,
+                        **template_kwargs,
                     )
                     input_ids = inputs["input_ids"].to(model.device)
 
@@ -525,6 +535,10 @@ def _run_checkpoint_eval(
                 "messages": json.dumps(full_conv),
                 "source": source_label,
             }
+            # The judge reads this column (scoring._load_samples) to show the
+            # available tools alongside the calls it is grading.
+            if sample_tools is not None:
+                pred_entry["tools"] = json.dumps(sample_tools)
             # Gold answer for the judge (see lqh.scoring._load_references) —
             # prompt_msgs dropped it above so the model would generate.
             if conv and conv[-1].get("role") == "assistant":
@@ -559,6 +573,8 @@ def _run_checkpoint_eval(
     }
     if any(p.get("reference") for p in predictions):
         columns["reference"] = [p.get("reference") for p in predictions]
+    if any(p.get("tools") for p in predictions):
+        columns["tools"] = [p.get("tools") for p in predictions]
     table = pa.table(columns)
     pq.write_table(table, checkpoint_dir / "predictions.parquet")
 
@@ -731,7 +747,7 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # train-only and the sweep's proxy metric stays NaN, marking the
     # config "failed". That bit us on the before/after test.
     print(f"Loading dataset: {dataset_path}")
-    conversations = load_chatml_datasets(dataset_path)
+    conversations, tools_per_sample = load_chatml_datasets_with_tools(dataset_path)
     eval_dataset_path = config.get("eval_dataset")
     eval_split_ratio = float(training_cfg.get("eval_split_ratio", 0.1))
     if eval_dataset_path:
@@ -742,20 +758,32 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         eval_srcs = load_eval_sources(eval_dataset_path)
         print(
             "Loading explicit eval_dataset: "
-            + ", ".join(f"{label}({len(c)})" for label, c in eval_srcs)
+            + ", ".join(f"{label}({len(smp)})" for label, smp in eval_srcs)
         )
-        train_convos = conversations
-        eval_convos = [conv for _label, convos in eval_srcs for conv in convos]
+        train_convos, train_tools = conversations, tools_per_sample
+        eval_pairs = [pair for _label, samples in eval_srcs for pair in samples]
     elif eval_split_ratio > 0:
-        train_convos, eval_convos = split_train_eval(
-            conversations, eval_split_ratio, seed=0
+        # Split the (conversation, tools) pairs, not the conversations, so a
+        # sample keeps its tool definitions on whichever side it lands.
+        train_pairs, eval_pairs = split_train_eval(
+            list(zip(conversations, tools_per_sample)), eval_split_ratio, seed=0
         )
+        train_convos = [conv for conv, _tools in train_pairs]
+        train_tools = [tools for _conv, tools in train_pairs]
     else:
-        train_convos, eval_convos = conversations, []
+        train_convos, train_tools = conversations, tools_per_sample
+        eval_pairs = []
+    eval_convos = [conv for conv, _tools in eval_pairs]
+    eval_tools = [tools for _conv, tools in eval_pairs]
     print(
         f"  train={len(train_convos)} eval={len(eval_convos)} "
         f"(eval_dataset={'explicit' if eval_dataset_path else f'split:{eval_split_ratio}'})"
     )
+    n_with_tools = sum(1 for t in train_tools if t)
+    if n_with_tools:
+        # Silence here used to mean the tool definitions were dropped on the
+        # floor: they only reach the model through the dataset's tools column.
+        print(f"  tool definitions: {n_with_tools}/{len(train_convos)} train samples")
 
     if is_vision:
         # Vision rows carry compressed image bytes in a parallel column;
@@ -767,10 +795,14 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         if eval_convos:
             eval_dataset = Dataset.from_list(chatml_to_vlm_dataset(eval_convos))
     else:
-        train_dataset = Dataset.from_list(chatml_to_sft_dataset(train_convos))
+        train_dataset = Dataset.from_list(
+            chatml_to_sft_dataset(train_convos, train_tools)
+        )
         eval_dataset = None
         if eval_convos:
-            eval_dataset = Dataset.from_list(chatml_to_sft_dataset(eval_convos))
+            eval_dataset = Dataset.from_list(
+                chatml_to_sft_dataset(eval_convos, eval_tools)
+            )
 
     # Safe batch-size auto-tuning (GPU_TYPE.md §6). Mutates training_cfg
     # in place (per_device_batch_size + gradient_accumulation_steps) so

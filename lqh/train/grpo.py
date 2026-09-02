@@ -408,6 +408,17 @@ def grpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
     # --- dataset ----------------------------------------------------------
     print(f"Loading dataset: {dataset_path}")
     conversations, tools_per_sample = load_chatml_datasets_with_tools(dataset_path)
+    if any(tools_per_sample):
+        # `has_tools` reaches the reward guard, but the tool *definitions*
+        # never reach the prompt: trl's GRPOTrainer(tools=...) takes
+        # executable callables shared by the whole run, not the per-sample
+        # schemas a dataset carries, so there is nowhere to put them. The
+        # policy would be graded on calling tools it was never shown.
+        print(
+            "  WARNING: this dataset carries tool definitions, but GRPO does not "
+            "render them into the prompt — the policy generates tool calls "
+            "without seeing the tool list. Train tool use with SFT for now."
+        )
     rows = chatml_to_grpo_rows(conversations, tools_per_sample)
     max_seq_length = int(training_cfg.get("max_seq_length", 2048))
     max_completion_length = int(grpo_cfg["max_completion_length"])

@@ -408,7 +408,12 @@ class _FakeIds:
 
 
 class _FakeTokenizer:
+    def __init__(self) -> None:
+        # Every tools= value apply_chat_template was called with, in order.
+        self.tools_seen: list[object] = []
+
     def apply_chat_template(self, msgs, **kwargs):  # noqa: ANN001, ANN201
+        self.tools_seen.append(kwargs.get("tools"))
         return {"input_ids": _FakeIds([[1, 2, 3]])}
 
     def decode(self, ids, **kwargs) -> str:  # noqa: ANN001
@@ -787,3 +792,47 @@ def test_a_junk_sample_limit_falls_back_to_the_default(sft_module) -> None:  # n
     assert read({"checkpoint_eval_samples": "lots"}) == default
     assert read({"checkpoint_eval_samples": "8"}) == 8
     assert read({"checkpoint_eval_samples": 0}) == 0
+
+
+def test_checkpoint_eval_carries_tool_definitions(
+    tmp_path: Path,
+    sft_module,  # noqa: ANN001
+    write_chatml_parquet,  # noqa: ANN001
+) -> None:
+    """Tools must reach both the generation prompt and the judge.
+
+    They only reach the model through `apply_chat_template(tools=...)` — LFM
+    templates ignore a per-message "tools" key — and only reach the judge
+    through the predictions' own `tools` column (scoring._load_samples). A
+    checkpoint eval that drops either grades the model on calling tools it
+    was never shown.
+    """
+    run_dir = tmp_path / "sft_tools"
+    (run_dir / "checkpoints" / "final").mkdir(parents=True)
+    tools = [{"type": "function", "function": {"name": "get_weather"}}]
+    eval_path = write_chatml_parquet(
+        tmp_path / "eval" / "eval.parquet",
+        [
+            [{"role": "user", "content": "weather?"},
+             {"role": "assistant", "content": "sunny"}],
+            [{"role": "user", "content": "hi"},
+             {"role": "assistant", "content": "hello"}],
+        ],
+        tools=[tools, None],
+    )
+    import pyarrow.parquet as pq
+
+    tokenizer = _FakeTokenizer()
+    sft_module._run_checkpoint_eval(
+        model=_FakeModel(),
+        tokenizer=tokenizer,
+        config={"type": "sft", "eval_dataset": str(eval_path), "scorer": "judge:small"},
+        checkpoint_dir=run_dir / "checkpoints" / "final",
+    )
+
+    assert tokenizer.tools_seen == [tools, None]
+
+    table = pq.read_table(run_dir / "checkpoints" / "final" / "predictions.parquet")
+    assert "tools" in table.column_names
+    assert json.loads(table.column("tools")[0].as_py()) == tools
+    assert table.column("tools")[1].as_py() is None
