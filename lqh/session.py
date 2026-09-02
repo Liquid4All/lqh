@@ -83,6 +83,17 @@ def _pid_alive(pid: int | None, pid_start: int | None = None) -> bool:
     return True
 
 
+def _valid_pending(record: Any) -> dict[str, Any] | None:
+    """Return *record* if it is a usable pending-completion record, else None."""
+    if not isinstance(record, dict):
+        return None
+    cid = record.get("id")
+    seq = record.get("turn_seq")
+    if not isinstance(cid, str) or not cid or not isinstance(seq, int):
+        return None
+    return dict(record)
+
+
 def sessions_dir(project_dir: Path) -> Path:
     """Return the conversations directory for a project, creating it if needed."""
     path = project_dir / ".lqh" / "conversations"
@@ -106,6 +117,12 @@ class Session:
     # Preview of the first user message, frozen at first persist so it
     # survives compaction of the working view.
     _preview: str = ""
+    # An orchestration turn the server accepted for background execution
+    # and that has not produced its result yet (async completions):
+    # ``{"id", "model", "kind": "turn", "started_at", "turn_seq"}``.
+    # ``turn_seq`` is ``last_seq`` at submission; the record is only valid
+    # for resumption while the history has not moved past it.
+    pending_completion: dict[str, Any] | None = None
     # True once the on-disk directory exists (lazy creation: nothing is
     # written until the conversation has a user message).
     _persisted: bool = False
@@ -181,6 +198,7 @@ class Session:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "last_seq": self.last_seq,
+            "pending_completion": self.pending_completion,
         }
 
     def _write_meta_unlocked(self) -> bool:
@@ -300,6 +318,11 @@ class Session:
             return True
         self.updated_at = _now()
         return self._write_meta()
+
+    def set_pending_completion(self, record: dict[str, Any] | None) -> bool:
+        """Persist (or clear, with None) the in-flight async completion."""
+        self.pending_completion = _valid_pending(record)
+        return self.save()
 
     def mark_state(self, state: str) -> bool:
         """Atomically update the lifecycle state (active/interrupted/completed).
@@ -561,6 +584,7 @@ class Session:
         session.completion_tokens = int(meta.get("completion_tokens", 0) or 0)
         session.title = meta.get("title", "")
         session._preview = meta.get("preview", "")
+        session.pending_completion = _valid_pending(meta.get("pending_completion"))
         session.last_seq = max(
             int(meta.get("last_seq", 0) or 0),
             max((seq for seq, _ in entries), default=0),
@@ -763,6 +787,7 @@ class Session:
                 "state": meta.get("state", STATE_COMPLETED),
                 "prompt_tokens": meta.get("prompt_tokens", 0),
                 "completion_tokens": meta.get("completion_tokens", 0),
+                "pending_completion": _valid_pending(meta.get("pending_completion")) is not None,
             }
 
         # Fallback: v2 directories whose meta.json is missing/unreadable

@@ -551,3 +551,33 @@ def test_legacy_migration_quarantines_bad_lines(project_dir: Path) -> None:
     assert [m["content"] for m in loaded.messages] == ["ok", "fine"]
     quarantine = sessions_dir(project_dir) / "legacy-2" / "quarantine.log"
     assert "not json at all" in quarantine.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Pending async completion (server-side turn) survives reopen
+# ---------------------------------------------------------------------------
+
+
+def test_pending_completion_round_trips_and_clears(project_dir: Path) -> None:
+    session = _make_session(project_dir, n_messages=2)
+    record = {"id": "lqhc_" + "a" * 32, "model": "orchestration:15", "kind": "turn",
+              "started_at": "2026-09-02T10:00:00+00:00", "turn_seq": session.last_seq}
+    assert session.set_pending_completion(record)
+
+    loaded = Session.load(project_dir, session.id)
+    assert loaded.pending_completion == record
+    assert Session.list_sessions(project_dir)[0]["pending_completion"] is True
+
+    loaded.set_pending_completion(None)
+    assert Session.load(project_dir, session.id).pending_completion is None
+    assert Session.list_sessions(project_dir)[0]["pending_completion"] is False
+
+
+def test_malformed_pending_completion_loads_as_none(project_dir: Path) -> None:
+    session = _make_session(project_dir, n_messages=2)
+    meta_path = sessions_dir(project_dir) / session.id / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["pending_completion"] = {"model": "x"}  # no id / turn_seq
+    meta_path.write_text(json.dumps(meta))
+    assert Session.load(project_dir, session.id).pending_completion is None
+    assert session.set_pending_completion({"id": "", "turn_seq": 1}) and session.pending_completion is None
