@@ -29,7 +29,7 @@ This is why data generation and eval criteria creation are in the same skill.
 5. **Do NOT ask the user how many samples to generate or what content to cover.** You have the spec — design the pipeline yourself, generate drafts, and let the user react to concrete samples. Showing is better than asking.
 6. **Update SPEC.md based on feedback.** If draft review reveals new requirements or edge cases, update the spec files before proceeding.
 7. **Transient API errors are NOT code bugs.** If you see 405 or 502 errors, the pipeline code is fine — just re-run it. Do not rewrite the pipeline for API errors.
-8. **NO system messages in generated data.** Pipelines must only generate user + assistant turns. System prompts are managed separately (via `prompts/` files) and injected at eval time. This allows prompt optimization to test different system prompts on the same data.
+8. **NO system messages in generated data.** Pipelines must only generate user + assistant turns. System prompts are managed separately (via `prompts/` files) and injected at eval time. This allows prompt optimization to test different system prompts on the same data. **Exception: tool-calling data** — the tool definitions have to travel with the sample, and their only home is the system message (`ChatMLMessage("system", ..., tools=[...])`, see Pattern 4). Tool-calling pipelines emit that one system turn; everything else in this rule still applies.
 9. **Break out of failure loops.** If three consecutive `run_data_gen_pipeline` calls fail with the **same error message**, STOP retrying. Use `ask_user` to describe what you've tried and what the error says — the user may spot something you missed. Do not keep editing until you have a new hypothesis.
 
 <!-- lqh-docs-data:start -->
@@ -47,7 +47,7 @@ Do NOT use `from data_gen.base import ...`, `from data_gen import ...`, `from pi
 | `await client(messages=...)` | `await client.chat.completions.create(model=..., messages=...)` |
 | `client = AsyncOpenAI(...)` | `client` is the argument to `generate()` — never construct your own |
 | `Conversation(messages=[...])` | `[ChatMLMessage(...), ...]` (return a plain list) |
-| `ChatMLMessage("system", ...)` in the returned list | Only `user` and `assistant` turns; system prompts live in `prompts/` |
+| `ChatMLMessage("system", ...)` in the returned list | Only `user` and `assistant` turns; system prompts live in `prompts/` (tool-calling data is the exception — see Rule 8 and Pattern 4) |
 
 ⚠️ **CRITICAL: Conversation is a plain list!** `Conversation` is a type alias for `list[ChatMLMessage]`. Do NOT call `Conversation(messages=[...])` — that will fail. Return a plain list:
 ```python
@@ -70,6 +70,8 @@ class MyPipeline(Pipeline):
         # ... generate one training sample ...
         # NOTE: Do NOT include system messages. Only user + assistant turns.
         # System prompts are managed separately via prompts/ files.
+        # (Tool-calling data is the one exception: the tool defs ride on a
+        #  system message — see Rule 8 and Pattern 4.)
         return [
             ChatMLMessage("user", "..."),
             ChatMLMessage("assistant", "..."),
@@ -350,6 +352,11 @@ class StructuredExtraction(Pipeline):
 
 ### Pattern 4: Tool-Calling Conversations
 
+The pipeline below is the **single-round** base case (one assistant tool call,
+one tool result, one final answer). For multi-step / chained / agentic tasks,
+see "Multi-step tool calling" right after the invariants — same message types,
+more rounds.
+
 ```python
 class ToolCallingPipeline(Pipeline):
     async def generate(self, client, input=None) -> Conversation:
@@ -485,9 +492,75 @@ Invariants every tool-calling pipeline MUST satisfy:
    ```python
    ChatMLMessage("assistant", "Here's what I found...")
    ```
-6. Return a **flat list** (not a `Conversation(...)` constructor call) containing these turns in order: system → user → assistant(tool_call) → tool → assistant(text).
+6. Return a **flat list** (not a `Conversation(...)` constructor call) of turns
+   in this order:
+
+   ```
+   system → user → [ assistant(tool_calls) → tool (one per call) ] × N → assistant(text)
+   ```
+
+   `N = 1` is the single-round pipeline above. `N > 1` is a multi-step
+   trajectory and is fully supported — see below.
 
 If any invariant is unclear, open `data_gen/tool_calling.py` or `tests/benchmarks/orchestration/fixtures/broken_pipeline_system_msg.py` (for a counter-example of what NOT to do).
+
+#### Multi-step tool calling
+
+**If the spec describes chained, multi-step, or multi-app workflows ("read the
+email, add it to the calendar, then text him"), single-round samples do not
+teach it.** The model has to see the assistant call a tool, *read the result*,
+and decide the next call from it. A pipeline that emits one assistant turn per
+sample — or one that stuffs the whole plan into a single tool-call turn — trains
+one-shot planning, not step-by-step tool use. Generate real trajectories.
+
+Two independent things the format supports, both often needed:
+
+- **Parallel calls in one turn** — one assistant message with several
+  `tool_calls`, when the calls do not depend on each other's results. Each call
+  gets its own `tool` message.
+- **Sequential rounds** — assistant → tool → assistant → tool → …, when a call's
+  arguments depend on the previous result. This is what "multi-step" means.
+
+Extra invariants for multi-round conversations:
+
+7. **`tool_call.id` is unique across the whole conversation** (`call_1`,
+   `call_2`, … — not `call_1` again in round 2).
+8. **Every tool call is answered by exactly one `tool` message** with a matching
+   `tool_call_id`, before the next assistant turn. Emit them in the same order
+   as the calls.
+9. **Intermediate assistant turns** carry `content=None` + `tool_calls` (same as
+   invariant 3). Only the final assistant turn is plain text.
+
+Shape, with round 2 depending on round 1's result:
+
+```python
+return [
+    ChatMLMessage("system", self.system_prompt, tools=tool_defs),
+    ChatMLMessage("user", self.user_request),
+    # round 1
+    ChatMLMessage("assistant", None, tool_calls=[
+        ToolCall(id="call_1", function=FunctionCall(name="read_email", arguments=json.dumps({"sender": "John"}))),
+    ]),
+    ChatMLMessage("tool", self.email_json, tool_call_id="call_1", name="read_email"),
+    # round 2 — arguments come from call_1's result
+    ChatMLMessage("assistant", None, tool_calls=[
+        ToolCall(id="call_2", function=FunctionCall(name="create_event", arguments=json.dumps(self.event_args))),
+    ]),
+    ChatMLMessage("tool", self.event_json, tool_call_id="call_2", name="create_event"),
+    ChatMLMessage("assistant", self.final_response),
+]
+```
+
+Generate the trajectory **one round at a time**, never in one prompt: for each
+round, ask the generator model for the next tool call *given the conversation so
+far including the previous tool results*, then ask for that call's realistic
+result, then loop. Sample the number of rounds per sample (e.g. 1–4) so the
+dataset carries a mix of single- and multi-step examples, and let the scenario
+decide when the loop ends rather than fixing the count up front.
+
+When you inspect the drafts (Step 1.5), check the round count explicitly: if the
+spec asks for multi-step and every sample has exactly one assistant tool-call
+turn, the pipeline is wrong even when each individual call looks correct.
 
 ### Pattern 5: Bring-Your-Own-Data
 
