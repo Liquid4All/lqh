@@ -2091,6 +2091,24 @@ async def _execute_pipeline(
                     "failed to record data-gen validation", exc_info=True
                 )
 
+        # Round count is the question a tool-calling draft is usually wrong
+        # about: a spec that asks for chained, multi-step workflows and a set
+        # where every sample has exactly one round is a broken pipeline, even
+        # when each individual call looks right.
+        rounds_note = ""
+        if result.tool_call_rounds:
+            rounds = sorted(result.tool_call_rounds)
+            median = rounds[len(rounds) // 2]
+            rounds_note = (
+                f"\n  Tool calls: {len(rounds)} sample(s), "
+                f"rounds min {rounds[0]} / median {median} / max {rounds[-1]}"
+            )
+            if rounds[-1] == 1:
+                rounds_note += (
+                    "\n    ⚠️  every sample is single-round — if the spec asks for "
+                    "multi-step or chained tool use, the pipeline is not producing it"
+                )
+
         cloud_tip = ""
         if num_samples >= 500:
             cloud_tip = (
@@ -2105,6 +2123,7 @@ async def _execute_pipeline(
                 f"  Samples: {result.succeeded}/{result.total} succeeded"
                 + (f", {result.failed} failed" if result.failed else "")
                 + f"\n  Output:  {result.output_path}"
+                + rounds_note
                 + manifest_warning
                 + validation_note
                 + cloud_tip

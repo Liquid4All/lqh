@@ -26,6 +26,7 @@ from lqh.engine import (
     _serialize_conversation,
     _serialize_message,
     load_dataset_with_tools,
+    validate_tool_calling_shape,
 )
 from lqh.scoring import (
     _build_scoring_prompt,
@@ -670,3 +671,167 @@ class TestToolCallArgumentNormalization:
                 for call in msg.get("tool_calls") or []
             ]
             assert args == [{"q": "hotels"}, {"id": 7}]
+
+
+# ---------------------------------------------------------------------------
+# Generation-time shape validation
+# ---------------------------------------------------------------------------
+
+
+def _sys() -> ChatMLMessage:
+    return ChatMLMessage("system", "sys", tools=SAMPLE_TOOLS)
+
+
+def _call(call_id: str, name: str = "get_weather", args: str = '{"location": "SF"}') -> ToolCall:
+    return ToolCall(id=call_id, function=FunctionCall(name=name, arguments=args))
+
+
+class TestToolCallingShapeValidation:
+    """A malformed trajectory aborts the run instead of reaching a dataset."""
+
+    def test_single_round_is_valid(self, tool_call_conversation: Conversation) -> None:
+        validate_tool_calling_shape(tool_call_conversation)
+
+    def test_multi_round_and_parallel_calls_are_valid(self) -> None:
+        validate_tool_calling_shape([
+            _sys(),
+            ChatMLMessage("user", "weather and products"),
+            ChatMLMessage("assistant", None, tool_calls=[
+                _call("call_1"),
+                _call("call_2", "search_products", '{"query": "boots"}'),
+            ]),
+            # answered out of order — set equality is the invariant, not order
+            ChatMLMessage("tool", "{}", tool_call_id="call_2", name="search_products"),
+            ChatMLMessage("tool", "{}", tool_call_id="call_1", name="get_weather"),
+            ChatMLMessage("assistant", None, tool_calls=[_call("call_3")]),
+            ChatMLMessage("tool", "{}", tool_call_id="call_3", name="get_weather"),
+            ChatMLMessage("assistant", "Here you go."),
+        ])
+
+    def test_sample_may_end_on_the_tool_call(self) -> None:
+        """"Learn to emit the call" is an ordinary shape, not an error."""
+        validate_tool_calling_shape([
+            _sys(),
+            ChatMLMessage("user", "weather?"),
+            ChatMLMessage("assistant", None, tool_calls=[_call("call_1")]),
+        ])
+
+    def test_conversation_without_tools_is_ignored(self) -> None:
+        validate_tool_calling_shape([
+            ChatMLMessage("user", "hi"),
+            ChatMLMessage("assistant", "hello"),
+        ])
+
+    def test_duplicate_call_id_rejected(self) -> None:
+        with pytest.raises(ValueError, match="used more than once"):
+            validate_tool_calling_shape([
+                _sys(),
+                ChatMLMessage("user", "weather?"),
+                ChatMLMessage("assistant", None, tool_calls=[_call("call_1")]),
+                ChatMLMessage("tool", "{}", tool_call_id="call_1"),
+                ChatMLMessage("assistant", None, tool_calls=[_call("call_1")]),
+                ChatMLMessage("tool", "{}", tool_call_id="call_1"),
+                ChatMLMessage("assistant", "done"),
+            ])
+
+    def test_orphaned_tool_result_rejected(self) -> None:
+        with pytest.raises(ValueError, match="answers no preceding assistant tool call"):
+            validate_tool_calling_shape([
+                _sys(),
+                ChatMLMessage("user", "weather?"),
+                ChatMLMessage("tool", "{}", tool_call_id="call_1"),
+            ])
+
+    def test_mismatched_tool_call_id_rejected(self) -> None:
+        with pytest.raises(ValueError, match="matches no unanswered call"):
+            validate_tool_calling_shape([
+                _sys(),
+                ChatMLMessage("user", "weather?"),
+                ChatMLMessage("assistant", None, tool_calls=[_call("call_1")]),
+                ChatMLMessage("tool", "{}", tool_call_id="call_9"),
+            ])
+
+    def test_unanswered_call_before_a_continuing_turn_rejected(self) -> None:
+        with pytest.raises(ValueError, match="never answered"):
+            validate_tool_calling_shape([
+                _sys(),
+                ChatMLMessage("user", "weather?"),
+                ChatMLMessage("assistant", None, tool_calls=[_call("call_1")]),
+                ChatMLMessage("assistant", "It's sunny."),
+            ])
+
+    def test_call_answered_twice_rejected(self) -> None:
+        # The second result finds nothing open — one tool message per call.
+        with pytest.raises(ValueError, match="answers no preceding assistant tool call"):
+            validate_tool_calling_shape([
+                _sys(),
+                ChatMLMessage("user", "weather?"),
+                ChatMLMessage("assistant", None, tool_calls=[_call("call_1")]),
+                ChatMLMessage("tool", "{}", tool_call_id="call_1"),
+                ChatMLMessage("tool", "{}", tool_call_id="call_1"),
+            ])
+
+    def test_partly_answered_final_turn_rejected(self) -> None:
+        """Ending on the call is fine; ending on HALF the calls is an orphan."""
+        with pytest.raises(ValueError, match="partly answered"):
+            validate_tool_calling_shape([
+                _sys(),
+                ChatMLMessage("user", "weather and products"),
+                ChatMLMessage("assistant", None, tool_calls=[
+                    _call("call_1"),
+                    _call("call_2", "search_products", '{"query": "boots"}'),
+                ]),
+                ChatMLMessage("tool", "{}", tool_call_id="call_1", name="get_weather"),
+            ])
+
+    def test_sample_may_end_on_parallel_calls(self) -> None:
+        validate_tool_calling_shape([
+            _sys(),
+            ChatMLMessage("user", "weather and products"),
+            ChatMLMessage("assistant", None, tool_calls=[
+                _call("call_1"),
+                _call("call_2", "search_products", '{"query": "boots"}'),
+            ]),
+        ])
+
+    @pytest.mark.parametrize("empty", ["", "null", "{}", "  "])
+    def test_empty_argument_forms_accepted(self, empty: str) -> None:
+        """The chat templates whitelist these — a no-arg call, not a bug."""
+        validate_tool_calling_shape([
+            _sys(),
+            ChatMLMessage("user", "ping"),
+            ChatMLMessage("assistant", None, tool_calls=[_call("call_1", args=empty)]),
+        ])
+
+    def test_non_json_arguments_rejected(self) -> None:
+        with pytest.raises(ValueError, match="not valid JSON"):
+            validate_tool_calling_shape([
+                _sys(),
+                ChatMLMessage("user", "weather?"),
+                ChatMLMessage("assistant", None, tool_calls=[_call("call_1", args="location=SF")]),
+            ])
+
+    def test_non_object_arguments_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            validate_tool_calling_shape([
+                _sys(),
+                ChatMLMessage("user", "weather?"),
+                ChatMLMessage("assistant", None, tool_calls=[_call("call_1", args='["SF"]')]),
+            ])
+
+    def test_mapping_arguments_accepted(self) -> None:
+        """Already-parsed arguments are the shape the chat template wants."""
+        call = ToolCall(id="call_1", function=FunctionCall(name="get_weather", arguments={"location": "SF"}))
+        validate_tool_calling_shape([
+            _sys(),
+            ChatMLMessage("user", "weather?"),
+            ChatMLMessage("assistant", None, tool_calls=[call]),
+        ])
+
+    def test_calls_without_tool_definitions_rejected(self) -> None:
+        """The bug this whole path exists for: tools pasted into the prompt."""
+        with pytest.raises(ValueError, match="declares no tools"):
+            validate_tool_calling_shape([
+                ChatMLMessage("user", "Tools: get_weather(location). What's the weather in SF?"),
+                ChatMLMessage("assistant", None, tool_calls=[_call("call_1")]),
+            ])

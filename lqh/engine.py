@@ -32,6 +32,7 @@ from lqh.sources import hf_dataset_was_used, record_source_paths
 __all__ = [
     "load_pipeline",
     "load_dataset_with_tools",
+    "validate_tool_calling_shape",
     "EngineResult",
     "run_pipeline",
 ]
@@ -114,6 +115,12 @@ class EngineResult:
     # callers must not treat it as a complete observation (the cloud
     # validation gate skips recording when this is non-zero).
     resumed_samples: int = 0
+    # Per-sample count of assistant turns that carry tool calls, for the
+    # tool-calling samples only. Surfaced after a run so "why is there no
+    # multi-step data?" is answerable at draft time: a spec that asks for
+    # chained workflows and a set where every sample has exactly one round
+    # is a broken pipeline, however good the individual calls look.
+    tool_call_rounds: list[int] = field(default_factory=list)
     # Every work item that failed permanently, over-commit spares
     # included — the pipeline-reliability signal, which `failed` hides
     # once a spare has covered the loss. Always >= `failed`.
@@ -188,6 +195,106 @@ def _extract_tools(conv: Conversation) -> list[dict[str, Any]] | None:
                         },
                     })
     return tools if tools else None
+
+
+def validate_tool_calling_shape(conv: Conversation) -> None:
+    """Raise ``ValueError`` when a tool-calling conversation is malformed.
+
+    Checked at generation time, before the sample is serialized, because a
+    broken shape is a *pipeline* bug: retrying reproduces it exactly, and
+    ``ValueError`` is in the engine's abort set, so the run stops on sample
+    one instead of writing 500 unusable rows. A dataset that reaches
+    training with orphaned tool calls trains the model on a conversation
+    that could never occur at inference.
+
+    Structural checks only:
+
+    - tool-call ids are unique within the conversation;
+    - a ``tool`` message answers a call from the assistant turn just before
+      it, and no call is answered twice;
+    - a turn that continues the conversation cannot leave calls unanswered
+      (a sample that *ends* on the assistant's tool call is fine — that is
+      the ordinary "learn to emit the call" shape, but then EVERY call of
+      that last turn is open: answering one of two parallel calls and
+      stopping is an orphan, not a target);
+    - ``function.arguments`` is a JSON object (a string that parses to one,
+      or a mapping) — or one of the empty forms the templates accept;
+    - a sample with tool calls declares its tools somewhere.
+
+    Deliberately NOT checked: whether a called name appears in the declared
+    tools. That is a content judgement, and a run should not abort over a
+    sample a pipeline may have built on purpose.
+    """
+    seen_ids: set[str] = set()
+    pending: list[str] = []  # calls still awaiting their tool message
+    last_turn_calls = 0  # calls made by the most recent assistant turn
+    has_tool_defs = False
+
+    def _fail(index: int, problem: str) -> None:
+        raise ValueError(
+            f"malformed tool-calling conversation at message {index}: {problem}. "
+            "See the tool-calling invariants in the data_generation skill."
+        )
+
+    for index, msg in enumerate(conv):
+        role = getattr(msg, "role", None)
+        if getattr(msg, "tools", None):
+            has_tool_defs = True
+
+        if role == "assistant":
+            if pending:
+                _fail(index, f"the previous turn's tool call(s) {pending} were never answered")
+            last_turn_calls = 0
+            for call in getattr(msg, "tool_calls", None) or []:
+                last_turn_calls += 1
+                call_id = getattr(call, "id", None)
+                if not call_id:
+                    _fail(index, "a tool call has no id")
+                if call_id in seen_ids:
+                    _fail(index, f"tool-call id {call_id!r} is used more than once")
+                seen_ids.add(call_id)
+                args = getattr(getattr(call, "function", None), "arguments", None)
+                if isinstance(args, str):
+                    if args.strip() in ("", "null"):
+                        # The templates whitelist these alongside "{}" — a
+                        # no-argument call, not a malformed one.
+                        args = {}
+                    else:
+                        try:
+                            args = json.loads(args)
+                        except (json.JSONDecodeError, TypeError):
+                            _fail(index, f"arguments of {call_id!r} are not valid JSON: {args!r}")
+                if not isinstance(args, dict):
+                    _fail(index, f"arguments of {call_id!r} must be a JSON object, got {type(args).__name__}")
+                pending.append(call_id)
+        elif role == "tool":
+            call_id = getattr(msg, "tool_call_id", None)
+            if not pending:
+                _fail(index, "a tool result answers no preceding assistant tool call")
+            if call_id not in pending:
+                _fail(index, f"tool_call_id {call_id!r} matches no unanswered call (open: {pending})")
+            pending.remove(call_id)
+        else:
+            last_turn_calls = 0
+            if pending:
+                _fail(index, f"a {role} turn follows unanswered tool call(s) {pending}")
+
+    if pending and len(pending) != last_turn_calls:
+        # Ending on the assistant's call is allowed; ending having answered
+        # only some of that turn's parallel calls is an orphaned call.
+        raise ValueError(
+            f"malformed tool-calling conversation: tool call(s) {pending} are left "
+            "unanswered at the end of a turn that was partly answered. Give every "
+            "call its own tool message, or end the sample on the assistant turn."
+        )
+
+    if seen_ids and not has_tool_defs:
+        raise ValueError(
+            "malformed tool-calling conversation: it makes tool calls but declares "
+            "no tools. Put the definitions on the system message — "
+            'ChatMLMessage("system", ..., tools=[ToolDef(...)]) — they are the only '
+            "way the tool list reaches the model."
+        )
 
 
 def _serialize_conversation(conv: Conversation) -> dict[str, Any]:
@@ -672,6 +779,7 @@ async def _run_pipeline_inner(
                             conv = await instance.generate(client, input_item)
                         else:
                             conv = await instance.generate(client)
+                    validate_tool_calling_shape(conv)
                     result = _serialize_conversation(conv)
                     break
                 except TimeoutError:
@@ -806,6 +914,7 @@ async def _run_pipeline_inner(
     messages_col: list[str] = []
     audio_col: list[str | None] = []
     tools_col: list[str | None] = []
+    tool_call_rounds: list[int] = []
     spares_used = 0
     for i, r in enumerate(results):
         if r is None:
@@ -818,6 +927,9 @@ async def _run_pipeline_inner(
             continue
         if i >= target:
             spares_used += 1  # a spare that filled in for a lost sample
+        rounds = sum(1 for m in r["messages"] if m.get("tool_calls"))
+        if rounds:
+            tool_call_rounds.append(rounds)
         messages_col.append(json.dumps(r["messages"], ensure_ascii=False))
         audio_col.append(
             json.dumps(r["audio"], ensure_ascii=False) if r["audio"] is not None else None
@@ -858,6 +970,7 @@ async def _run_pipeline_inner(
         output_path=output_path,
         resumed_samples=min(len(done_indices), target),
         sample_failures=failed,
+        tool_call_rounds=tool_call_rounds,
     )
 
 
