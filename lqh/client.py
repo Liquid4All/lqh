@@ -6,12 +6,14 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 from openai import (
     APIConnectionError,
     APIStatusError,
+    APITimeoutError,
     AsyncOpenAI,
     AuthenticationError,
     BadRequestError,
@@ -22,6 +24,8 @@ from openai import (
     RateLimitError,
     UnprocessableEntityError,
 )
+from openai._constants import RAW_RESPONSE_HEADER
+from openai._types import NoneType
 from openai.types.chat import ChatCompletion
 
 from lqh.config import default_api_base_url
@@ -245,6 +249,13 @@ RETRYABLE_STATUS = frozenset({408, 500, 502, 503, 504, 524})
 
 def describe_api_error(exc: BaseException) -> str:
     """One short line naming what went wrong, for a user-facing notice."""
+    if isinstance(exc, CompletionLostError):
+        return "the running response was lost on the server"
+    if isinstance(exc, CompletionPollExhausted):
+        return (
+            f"lost contact with the running response after "
+            f"{POLL_MAX_CONSECUTIVE_FAILURES} polls"
+        )
     if isinstance(exc, APIStatusError):
         detail = ""
         body = getattr(exc, "body", None)
@@ -261,6 +272,293 @@ def describe_api_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {str(exc)[:160]}"
 
 
+# ---------------------------------------------------------------------------
+# Asynchronous completions (backend/CLI_API.md, "Async completions").
+#
+# Orchestration turns can reason for 30+ minutes. Instead of holding one HTTP
+# connection open that long, the client opts in with ``X-LQH-Async: 1``: the
+# server answers the normal body if the model finishes within its inline
+# window, otherwise ``202 {id, status: running}`` while the generation keeps
+# running server-side, and the client long-polls
+# ``GET /chat/completions/{id}?wait=30`` until the result is ready. A dropped
+# connection, a sleeping laptop or a CLI restart then costs nothing: the id
+# is all that is needed to pick the turn back up.
+# ---------------------------------------------------------------------------
+
+ASYNC_HEADER = "X-LQH-Async"
+# Seconds the server may hold one poll open before answering 202 again.
+POLL_WAIT_S = 30
+# httpx read timeout for a poll: comfortably above POLL_WAIT_S so a full
+# long-poll never trips the client side.
+POLL_READ_TIMEOUT_S = 50.0
+POLL_CONNECT_TIMEOUT_S = 10.0
+# Delay between polls when the server's ``poll_after_ms`` hint is missing,
+# and the cap applied to the hint.
+POLL_AFTER_DEFAULT_S = 2.0
+POLL_AFTER_MAX_S = 10.0
+# Consecutive failed polls (timeouts, 5xx, connection errors) before giving
+# up on THIS poll loop. The completion is still running server-side, so the
+# caller can keep the id and resume later; ~20 attempts with a 30s backoff
+# cap is roughly ten minutes of a fully unreachable API.
+POLL_MAX_CONSECUTIVE_FAILURES = 20
+POLL_BACKOFF_MAX_S = 30.0
+CANCEL_TIMEOUT_S = 10.0
+
+
+@dataclass
+class AsyncCompletionHooks:
+    """Callbacks for the async poll loop; every field is optional.
+
+    ``on_started(id)`` fires once when the server accepted the turn for
+    background execution — persist the id there so the turn can be resumed.
+    ``on_progress(tokens_so_far, elapsed_s)`` fires on every progress poll.
+    ``on_lost(id)`` fires when the server no longer knows the id (expired,
+    restarted); the request is about to be re-sent as a fresh turn.
+    ``on_poll_retry`` narrates poll failures the way ``on_retry`` narrates
+    request failures.
+    """
+    on_started: Callable[[str], Awaitable[None]] | None = None
+    on_progress: Callable[[int, float], None] | None = None
+    on_lost: Callable[[str], Awaitable[None]] | None = None
+    on_poll_retry: OnRetry = None
+
+
+class CompletionLostError(APIConnectionError):
+    """The server no longer has the running completion (404/410).
+
+    Subclasses APIConnectionError so every existing retry / reconnect ladder
+    treats it as transient: the right move is to re-send the request.
+    """
+
+    def __init__(self, completion_id: str, request: httpx.Request) -> None:
+        super().__init__(
+            message=f"completion {completion_id} was lost on the server", request=request,
+        )
+        self.completion_id = completion_id
+
+
+class CompletionPollExhausted(APIConnectionError):
+    """Too many consecutive poll failures; the completion may still be running.
+
+    Callers should keep the completion id (it is still valid server-side)
+    and resume polling once connectivity is back.
+    """
+
+    def __init__(self, completion_id: str, last_error: BaseException, request: httpx.Request) -> None:
+        super().__init__(
+            message=f"lost contact with completion {completion_id}: {last_error}", request=request,
+        )
+        self.completion_id = completion_id
+        self.last_error = last_error
+
+
+def _poll_url(completion_id: str) -> str:
+    return f"/chat/completions/{completion_id}"
+
+
+def _extract_async_handle(status_code: int, resp: Any) -> str | None:
+    """Return the completion id when *resp* is the 202 'running' envelope.
+
+    The SDK parses the envelope leniently into a ChatCompletion with the
+    extra fields kept; a real completion has ``choices``. The status-code
+    check is primary; the in-band shape (a heartbeat-committed 200 carrying
+    the envelope) is the fallback.
+    """
+    try:
+        if getattr(resp, "choices", None):
+            return None
+        cid = getattr(resp, "id", None)
+        if not isinstance(cid, str) or not cid:
+            return None
+        if status_code == 202:
+            return cid
+        if getattr(resp, "status", None) == "running":
+            return cid
+    except Exception:
+        logger.debug("async handle detection failed", exc_info=True)
+    return None
+
+
+def _is_lost_response(status_code: int, resp: Any) -> bool:
+    return status_code in (404, 410) or getattr(resp, "status", None) in ("lost", "cancelled")
+
+
+async def _submit_async(client: AsyncOpenAI, kwargs: dict[str, Any]) -> tuple[ChatCompletion | None, str | None]:
+    """POST with the async header. Returns (completion, None) or (None, id)."""
+    extra = dict(kwargs.get("extra_headers") or {})
+    extra[ASYNC_HEADER] = "1"
+    call_kwargs = {k: v for k, v in kwargs.items() if k != "extra_headers"}
+    raw = await client.chat.completions.with_raw_response.create(  # type: ignore[arg-type]
+        **call_kwargs, extra_headers=extra,
+    )
+    parsed = raw.parse()
+    err = _extract_inband_error(parsed)
+    if err is not None:
+        raise _inband_status_error(client, err)
+    handle = _extract_async_handle(raw.status_code, parsed)
+    if handle is not None:
+        return None, handle
+    return parsed, None
+
+
+def _poll_options() -> dict[str, Any]:
+    return {
+        "params": {"wait": POLL_WAIT_S},
+        "headers": {RAW_RESPONSE_HEADER: "true"},
+        "timeout": httpx.Timeout(POLL_READ_TIMEOUT_S, connect=POLL_CONNECT_TIMEOUT_S),
+    }
+
+
+async def _poll_completion(
+    client: AsyncOpenAI,
+    completion_id: str,
+    *,
+    hooks: AsyncCompletionHooks | None,
+    entry_base: dict[str, Any],
+) -> tuple[ChatCompletion, int]:
+    """Long-poll until the completion finishes. Returns (completion, polls).
+
+    Raises ``CompletionLostError`` when the server no longer has the id,
+    ``CompletionPollExhausted`` after ``POLL_MAX_CONSECUTIVE_FAILURES``
+    consecutive transport/5xx failures, and any non-retryable status as-is.
+    """
+    hooks = hooks or AsyncCompletionHooks()
+    request = httpx.Request("GET", str(client.base_url))
+    failures = 0
+    polls = 0
+    last_exc: BaseException | None = None
+
+    async def _failed(exc: BaseException, wait: float) -> None:
+        nonlocal failures, last_exc
+        failures += 1
+        last_exc = exc
+        _record_attempt({
+            **entry_base, "phase": "poll", "completion_id": completion_id, "polls": polls,
+            "error": type(exc).__name__, "error_msg": str(exc)[:200],
+            "status_code": getattr(exc, "status_code", None),
+        })
+        if failures > POLL_MAX_CONSECUTIVE_FAILURES:
+            raise CompletionPollExhausted(completion_id, exc, request)
+        notify = hooks.on_poll_retry
+        if notify is not None:
+            try:
+                await notify(describe_api_error(exc), failures, POLL_MAX_CONSECUTIVE_FAILURES, wait)
+            except Exception:
+                logger.debug("on_poll_retry callback failed", exc_info=True)
+        await asyncio.sleep(wait)
+
+    while True:
+        polls += 1
+        try:
+            raw = await client.get(_poll_url(completion_id), cast_to=ChatCompletion, options=_poll_options())
+        except RateLimitError as exc:
+            try:
+                wait = _parse_retry_after(exc)
+            except Exception:
+                wait = None
+            await _failed(exc, min(wait if wait is not None else 2.0, POLL_BACKOFF_MAX_S))
+            continue
+        except (APITimeoutError, APIConnectionError, httpx.TimeoutException) as exc:
+            await _failed(exc, min(2.0 ** (failures), POLL_BACKOFF_MAX_S))
+            continue
+        except APIStatusError as exc:
+            if exc.status_code in (404, 410):
+                if hooks.on_lost is not None:
+                    await hooks.on_lost(completion_id)
+                raise CompletionLostError(completion_id, request) from exc
+            if exc.status_code in RETRYABLE_STATUS:
+                await _failed(exc, min(2.0 ** (failures), POLL_BACKOFF_MAX_S))
+                continue
+            raise
+        parsed = raw.parse()
+        err = _extract_inband_error(parsed)
+        if err is not None:
+            raise _inband_status_error(client, err)
+        status_code = getattr(raw, "status_code", 200)
+        if _is_lost_response(status_code, parsed) and not getattr(parsed, "choices", None):
+            if hooks.on_lost is not None:
+                await hooks.on_lost(completion_id)
+            raise CompletionLostError(completion_id, request)
+        if _extract_async_handle(status_code, parsed) is not None:
+            failures = 0
+            tokens = getattr(parsed, "tokens_so_far", None)
+            elapsed_ms = getattr(parsed, "elapsed_ms", None)
+            if hooks.on_progress is not None:
+                try:
+                    hooks.on_progress(
+                        int(tokens) if isinstance(tokens, (int, float)) else 0,
+                        float(elapsed_ms) / 1000.0 if isinstance(elapsed_ms, (int, float)) else 0.0,
+                    )
+                except Exception:
+                    logger.debug("on_progress callback failed", exc_info=True)
+            hint = getattr(parsed, "poll_after_ms", None)
+            delay = (
+                float(hint) / 1000.0 if isinstance(hint, (int, float)) else POLL_AFTER_DEFAULT_S
+            )
+            await asyncio.sleep(max(0.0, min(delay, POLL_AFTER_MAX_S)))
+            continue
+        return parsed, polls
+
+
+async def _run_async_attempt(
+    client: AsyncOpenAI,
+    kwargs: dict[str, Any],
+    resume_id: str | None,
+    hooks: AsyncCompletionHooks | None,
+    entry: dict[str, Any],
+) -> ChatCompletion:
+    """One attempt in async mode: resume a pending id, else submit and poll."""
+    if resume_id:
+        try:
+            resp, polls = await _poll_completion(client, resume_id, hooks=hooks, entry_base=entry)
+        except CompletionLostError:
+            logger.info("pending completion %s is gone; sending a fresh request", resume_id)
+        else:
+            entry.update({"phase": "poll", "completion_id": resume_id, "polls": polls, "resumed": True})
+            return resp
+    resp, handle = await _submit_async(client, kwargs)
+    if resp is not None:
+        entry.update({"phase": "post"})
+        return resp
+    assert handle is not None
+    if hooks is not None and hooks.on_started is not None:
+        await hooks.on_started(handle)
+    resp, polls = await _poll_completion(client, handle, hooks=hooks, entry_base=entry)
+    entry.update({"phase": "poll", "completion_id": handle, "polls": polls})
+    return resp
+
+
+async def cancel_completion(
+    client: AsyncOpenAI, completion_id: str, *, timeout: float = CANCEL_TIMEOUT_S,
+) -> bool:
+    """Best-effort DELETE of a running completion. Never raises."""
+    try:
+        await asyncio.wait_for(
+            client.delete(_poll_url(completion_id), cast_to=NoneType, options={"timeout": timeout}),
+            timeout=timeout + 1.0,
+        )
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("cancel of completion %s failed", completion_id, exc_info=True)
+        return False
+
+
+def is_pending_resumable_error(exc: BaseException) -> bool:
+    """True when a failed async turn may still be running server-side.
+
+    The caller should then KEEP its persisted completion id so the next
+    attempt (a reconnect, /resume, or the next loop iteration) polls it
+    instead of re-sending — re-sending would pay for the turn twice.
+    """
+    if isinstance(exc, CompletionLostError):
+        return False
+    if isinstance(exc, (CompletionPollExhausted, APIConnectionError, RateLimitError)):
+        return True
+    return isinstance(exc, APIStatusError) and exc.status_code in RETRYABLE_STATUS
+
+
 MAX_RATE_LIMIT_WAITS = 5
 # Ceiling on a single honoured Retry-After when nobody above us owns a
 # deadline. Capping the wait COUNT alone does not bound the time: a server
@@ -274,9 +572,21 @@ async def chat_with_retry(
     on_retry: OnRetry = None,
     rate_limits_are_free: bool = False,
     max_rate_limit_waits: int | None = MAX_RATE_LIMIT_WAITS,
+    *,
+    async_mode: bool = False,
+    resume_id: str | None = None,
+    async_hooks: AsyncCompletionHooks | None = None,
     **kwargs: object,
 ) -> ChatCompletion:
     """Call chat completions with retry logic for transient errors.
+
+    *async_mode* sends ``X-LQH-Async: 1`` and, when the server answers 202,
+    long-polls the completion to its result (see ``AsyncCompletionHooks``).
+    Only callers prepared for that shape opt in — the agent's orchestration
+    turns — which is why this is a per-call flag rather than a client-wide
+    header. *resume_id* skips the POST on the first attempt and polls an
+    already-running completion instead; if the server has lost it the
+    request is sent fresh within the same attempt.
 
     Retries on:
       - 429 (rate limit): honours Retry-After header, falls back to 2^attempt seconds.
@@ -332,7 +642,12 @@ async def chat_with_retry(
         start = time.monotonic()
         entry: dict[str, Any] = {"attempt": attempt}
         try:
-            resp: ChatCompletion = await client.chat.completions.create(**kwargs)  # type: ignore[arg-type]
+            if async_mode:
+                resp: ChatCompletion = await _run_async_attempt(
+                    client, dict(kwargs), resume_id if attempt == 0 else None, async_hooks, entry,
+                )
+            else:
+                resp = await client.chat.completions.create(**kwargs)  # type: ignore[arg-type]
             # Record successful attempt with response shape
             try:
                 choice = resp.choices[0] if resp.choices else None
@@ -352,6 +667,32 @@ async def chat_with_retry(
                 pass
             _record_attempt(entry)
             return resp
+        except CompletionLostError as exc:
+            # The server dropped a running completion (restart, expiry). The
+            # request is re-sent right away as its own attempt — nothing to
+            # wait for, and the history is unchanged.
+            entry.update({
+                "duration_s": round(time.monotonic() - start, 3),
+                "error": "CompletionLostError", "error_msg": str(exc)[:200],
+                "status_code": None, "completion_id": exc.completion_id,
+            })
+            _record_attempt(entry)
+            if attempt >= max_retries:
+                raise
+            logger.warning("chat_with_retry: completion lost on attempt %d, re-sending", attempt)
+            await _notify(exc, attempt, 0.0)
+        except CompletionPollExhausted as exc:
+            # Connectivity, not the request, is what failed; the turn is
+            # still running server-side. Spending more attempts here would
+            # re-send and pay twice — surface it and let the caller resume
+            # the poll once it can reach the API again.
+            entry.update({
+                "duration_s": round(time.monotonic() - start, 3),
+                "error": "CompletionPollExhausted", "error_msg": str(exc)[:200],
+                "status_code": None, "completion_id": exc.completion_id,
+            })
+            _record_attempt(entry)
+            raise
         except RateLimitError as exc:
             entry.update({
                 "duration_s": round(time.monotonic() - start, 3),
