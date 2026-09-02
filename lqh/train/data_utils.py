@@ -142,6 +142,59 @@ def normalize_sources(
     return entries
 
 
+def normalize_tool_call_args(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Parse JSON-string tool-call arguments into mappings, in place.
+
+    Storage keeps ``function.arguments`` as a JSON *string* — that is the
+    OpenAI wire shape, it is what ``lqh.pipeline.FunctionCall`` declares,
+    and it is what the API and the judge path expect. Every LFM chat
+    template, however, refuses it::
+
+        {%- elif func_args is string and (func_args | trim) not in ["", "{}", "null"] -%}
+            {{- raise_exception("Tool call arguments must be a mapping, got a
+                JSON-encoded string: parse arguments with json.loads() ...") -}}
+
+    So a dataset that is correct on disk raises `TemplateError` the moment
+    `apply_chat_template` sees it — inside trl's `dataset.map(tokenize_fn)`,
+    which kills the whole training job, and inside the eval generation loop,
+    where the per-sample `except` turns every prediction into
+    "[generation error: ...]". Empty ``{}`` arguments are exempt, so a smoke
+    sample can pass while the real run dies.
+
+    Normalizing here — at the two parquet readers — covers SFT, DPO, GRPO,
+    `lqh.infer` and the sglang engine at once, and repairs datasets that are
+    already on disk. Deliberately NOT applied in ``lqh.scoring``: that path
+    forwards messages to an OpenAI-compatible API, where the string is the
+    correct shape.
+
+    A value that is not valid JSON is left untouched: the template's own
+    error message names the problem better than a guess here would, and the
+    generation-time check in ``lqh.engine`` rejects such samples before they
+    reach a dataset.
+    """
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        for call in msg.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            func = call.get("function")
+            if not isinstance(func, dict):
+                continue
+            args = func.get("arguments")
+            if not isinstance(args, str):
+                continue
+            try:
+                parsed = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(parsed, dict):
+                func["arguments"] = parsed
+    return messages
+
+
 def load_chatml_dataset(
     parquet_path: str | Path,
 ) -> list[list[dict[str, str]]]:
@@ -158,7 +211,7 @@ def load_chatml_dataset(
     for i in range(len(table)):
         raw = messages_col[i].as_py()
         msgs = json.loads(raw) if isinstance(raw, str) else raw
-        conversations.append(msgs)
+        conversations.append(normalize_tool_call_args(msgs))
 
     return conversations
 
@@ -181,7 +234,9 @@ def load_chatml_dataset_with_tools(
 
     for i in range(len(table)):
         raw = messages_col[i].as_py()
-        conversations.append(json.loads(raw) if isinstance(raw, str) else raw)
+        conversations.append(
+            normalize_tool_call_args(json.loads(raw) if isinstance(raw, str) else raw)
+        )
 
         if tools_col is not None:
             raw_tools = tools_col[i].as_py()
@@ -384,7 +439,9 @@ def load_preferences_parquet(
     result: list[dict[str, Any]] = []
     for i in range(len(table)):
         prompt_raw = table.column("prompt")[i].as_py()
-        prompt = json.loads(prompt_raw) if isinstance(prompt_raw, str) else prompt_raw
+        prompt = normalize_tool_call_args(
+            json.loads(prompt_raw) if isinstance(prompt_raw, str) else prompt_raw
+        )
         result.append(
             {
                 "prompt": prompt,

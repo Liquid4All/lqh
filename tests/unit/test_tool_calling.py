@@ -36,7 +36,9 @@ from lqh.scoring import (
 from lqh.train.tool_format import LFM2ToolFormatter, get_tool_formatter
 from lqh.train.data_utils import (
     chatml_to_sft_dataset,
+    load_chatml_dataset,
     load_chatml_dataset_with_tools,
+    normalize_tool_call_args,
 )
 
 
@@ -538,3 +540,80 @@ class TestTrainingDataUtils:
         conversations, tools_list = load_chatml_dataset_with_tools(path)
         assert len(conversations) == 1
         assert tools_list[0] is None
+
+
+# ---------------------------------------------------------------------------
+# Chat-template argument shape
+# ---------------------------------------------------------------------------
+
+
+class TestToolCallArgumentNormalization:
+    """``function.arguments`` must reach apply_chat_template as a mapping.
+
+    Storage keeps it as a JSON string (the OpenAI wire shape). Every LFM
+    chat template raises "Tool call arguments must be a mapping, got a
+    JSON-encoded string" on that, which kills a training run inside trl's
+    tokenize map. The training-side parquet readers convert it on load.
+    """
+
+    def test_json_string_arguments_become_mappings(self) -> None:
+        messages = [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "tool_calls": [_tc("call_1", "get_weather", '{"location": "SF"}')]},
+        ]
+        normalize_tool_call_args(messages)
+        assert messages[1]["tool_calls"][0]["function"]["arguments"] == {"location": "SF"}
+
+    def test_empty_and_dict_arguments_are_left_alone(self) -> None:
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                _tc("call_1", "ping", "{}"),
+                {"id": "call_2", "type": "function",
+                 "function": {"name": "pong", "arguments": {"already": "parsed"}}},
+            ]},
+        ]
+        normalize_tool_call_args(messages)
+        calls = messages[0]["tool_calls"]
+        assert calls[0]["function"]["arguments"] == {}
+        assert calls[1]["function"]["arguments"] == {"already": "parsed"}
+
+    def test_non_json_arguments_are_left_alone(self) -> None:
+        """The template's own error names the problem better than a guess."""
+        messages = [{"role": "assistant", "tool_calls": [_tc("call_1", "f", "not json")]}]
+        normalize_tool_call_args(messages)
+        assert messages[0]["tool_calls"][0]["function"]["arguments"] == "not json"
+
+    def test_messages_without_tool_calls_are_untouched(self) -> None:
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello", "tool_calls": None},
+        ]
+        assert normalize_tool_call_args(messages) == messages
+
+    def test_loaders_normalize_multi_round_conversations(self, tmp_path: Path) -> None:
+        """Both training-side parquet readers convert, over every round."""
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "book it"},
+            {"role": "assistant", "tool_calls": [_tc("call_1", "search", '{"q": "hotels"}')]},
+            {"role": "tool", "content": "[]", "tool_call_id": "call_1", "name": "search"},
+            {"role": "assistant", "tool_calls": [_tc("call_2", "book", '{"id": 7}')]},
+            {"role": "tool", "content": "ok", "tool_call_id": "call_2", "name": "book"},
+            {"role": "assistant", "content": "Booked."},
+        ]
+        path = _write_tool_parquet(
+            tmp_path / "data.parquet",
+            messages=messages,
+            tools=[{"type": "function", "function": {"name": "search"}}],
+        )
+
+        for conv in (
+            load_chatml_dataset(path)[0],
+            load_chatml_dataset_with_tools(path)[0][0],
+        ):
+            args = [
+                call["function"]["arguments"]
+                for msg in conv
+                for call in msg.get("tool_calls") or []
+            ]
+            assert args == [{"q": "hotels"}, {"id": 7}]
