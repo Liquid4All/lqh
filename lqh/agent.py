@@ -13,7 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
-from lqh.client import chat_with_retry, create_client
+from lqh.client import (
+    AsyncCompletionHooks,
+    cancel_completion,
+    chat_with_retry,
+    create_client,
+    is_pending_resumable_error,
+)
 from lqh.config import load_config
 from lqh.auth import get_token
 from lqh.context_stats import ContextStats, TurnStats
@@ -35,7 +41,7 @@ logger = logging.getLogger("lqh.agent")
 # context summaries) can be written in one call. Backend per-model caps may
 # clamp this lower; see the finish_reason / completion-size handling in the
 # agent loop for recovery when that happens.
-ORCHESTRATION_MAX_TOKENS = 62_000
+ORCHESTRATION_MAX_TOKENS = 131_072
 
 # Retries the agent loop performs per orchestration call when nothing above it
 # will retry. This is the standalone figure — headless `lqh run`, the SDK, the
@@ -540,6 +546,32 @@ class AgentCallbacks:
     # evidence that something went wrong. Appended for the same positional-
     # compatibility reason as the fields above.
     on_transient_error: Callable[[str], Awaitable[None]] | None = None
+    # Progress of an orchestration turn running asynchronously on the
+    # server: (completion_tokens_so_far, elapsed_seconds). Fires on every
+    # poll while the model is still reasoning, so a 20-minute turn shows
+    # movement instead of a bare spinner. Appended for the same positional-
+    # compatibility reason as the fields above.
+    on_completion_progress: Callable[[int, float], None] | None = None
+
+
+def _has_unparseable_tool_call(message: Any) -> bool:
+    """True when any tool call carries arguments that are not a JSON object.
+
+    Used as the budget-cut signal for finish_reason="tool_calls": a call
+    whose arguments were truncated mid-content cannot parse. Well-formed
+    calls of any size never trip this.
+    """
+    for tc in getattr(message, "tool_calls", None) or []:
+        args = getattr(getattr(tc, "function", None), "arguments", None)
+        if not args:
+            continue
+        try:
+            parsed = json.loads(args)
+        except (TypeError, ValueError):
+            return True
+        if not isinstance(parsed, dict):
+            return True
+    return False
 
 
 def _strip_thinking(msg: dict[str, Any]) -> dict[str, Any]:
@@ -628,6 +660,8 @@ class Agent:
         # and was deferred; the loop re-raises the cancellation after the
         # tool's result has been recorded in the session.
         self._deferred_interrupt = False
+        # The "this turn moved to the server" notice is shown once per agent.
+        self._async_notice_shown = False
 
         # Behavior policy (CLI_PLAN §4.2): the auto_mode boolean is a preset
         # selector — TUI behavior unchanged. An explicit policy (e.g. the
@@ -723,6 +757,115 @@ class Agent:
             # agent loop happens in chat_with_retry, which can narrate it.
             self._client = create_client(token, config.api_base_url, max_retries=0)
         return self._client
+
+    # ------------------------------------------------------------------
+    # Asynchronous orchestration turns (backend/CLI_API.md, "Async
+    # completions"). The server may run a long reasoning turn in the
+    # background; the completion id is persisted in the session so the turn
+    # survives disconnects and restarts.
+    # ------------------------------------------------------------------
+
+    def _async_hooks(self) -> AsyncCompletionHooks:
+        return AsyncCompletionHooks(
+            on_started=self._on_async_started,
+            on_progress=self._on_async_progress,
+            on_lost=self._on_async_lost,
+            on_poll_retry=self._notify_poll_retry,
+        )
+
+    def _resumable_pending(self) -> dict[str, Any] | None:
+        """The persisted completion this turn can resume, if still valid.
+
+        The record is only meaningful while the history is exactly what
+        the server was given: every append (user text, tool results, the
+        repairs ``abort_turn`` makes) bumps ``last_seq``, so a mismatch
+        means the answer would no longer fit the conversation. A stale
+        record is dropped and its server-side generation cancelled so
+        nobody keeps paying for it.
+        """
+        rec = self.session.pending_completion
+        if not rec:
+            return None
+        if (
+            rec.get("kind") == "turn"
+            and rec.get("model") == self.orchestration_model
+            and rec.get("turn_seq") == self.session.last_seq
+        ):
+            return rec
+        logger.info("dropping stale pending completion %s", rec.get("id"))
+        self._clear_pending_completion()
+        try:
+            asyncio.get_running_loop().create_task(
+                cancel_completion(self._get_client(), str(rec.get("id")))
+            )
+        except Exception:
+            logger.debug("could not schedule cancel of stale completion", exc_info=True)
+        return None
+
+    async def _on_async_started(self, completion_id: str) -> None:
+        self.session.set_pending_completion({
+            "id": completion_id,
+            "model": self.orchestration_model,
+            "kind": "turn",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "turn_seq": self.session.last_seq,
+        })
+        if not self._async_notice_shown and self.callbacks.on_transient_error:
+            self._async_notice_shown = True
+            try:
+                await self.callbacks.on_transient_error(
+                    "⏳ Long reasoning turn — running on the server; safe to "
+                    "lose connection, resume with /resume"
+                )
+            except Exception:
+                logger.debug("async notice callback failed", exc_info=True)
+
+    def _on_async_progress(self, tokens: int, elapsed_s: float) -> None:
+        if self.callbacks.on_completion_progress:
+            try:
+                self.callbacks.on_completion_progress(tokens, elapsed_s)
+            except Exception:
+                logger.debug("progress callback failed", exc_info=True)
+
+    async def _on_async_lost(self, completion_id: str) -> None:
+        rec = self.session.pending_completion
+        if rec and rec.get("id") == completion_id:
+            self._clear_pending_completion()
+
+    async def _notify_poll_retry(
+        self, detail: str, attempt: int, total: int, wait: float
+    ) -> None:
+        if self.callbacks.on_transient_error is None:
+            return
+        try:
+            await self.callbacks.on_transient_error(
+                f"Lost contact with the running response ({detail}) — "
+                f"reconnecting in {wait:.0f}s (attempt {attempt} of {total}). "
+                "The model keeps working on the server."
+            )
+        except Exception:
+            logger.debug("poll retry callback failed", exc_info=True)
+
+    def _clear_pending_completion(self) -> None:
+        if self.session.pending_completion is not None:
+            self.session.set_pending_completion(None)
+
+    async def cancel_pending_completion(self) -> None:
+        """Stop a server-side turn the user no longer wants (Ctrl-C).
+
+        Best effort: the record is cleared whether or not the DELETE lands,
+        because the next turn's history will not match it anyway.
+        """
+        rec = self.session.pending_completion
+        if not rec:
+            return
+        self._clear_pending_completion()
+        try:
+            await cancel_completion(self._get_client(), str(rec.get("id")))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("cancel of pending completion failed", exc_info=True)
 
     async def _notify_transient_error(
         self, detail: str, attempt: int, total: int, wait: float
@@ -889,6 +1032,10 @@ class Agent:
             # Same ladder policy as the main loop: compaction is an ordinary
             # orchestration call, and a surface that retries turns itself must
             # not have this one quietly retrying four times underneath it.
+            # Kept synchronous: a summary is short, the sync path streams
+            # from the provider internally (no 10-minute wall), and a
+            # per-call flag keeps SDK-shaped client doubles (tests, SDK
+            # users) on the plain `.create` contract.
             response = await chat_with_retry(
                 client, model=self.orchestration_model, messages=summary_msgs,
                 max_retries=self.api_retries,
@@ -1034,10 +1181,17 @@ class Agent:
                 self._current_operation = f"awaiting_chat_completion (turn {self._turn_number + 1})"
                 _api_call_start = time.monotonic()
                 self._llm_calls_made += 1
+                # A completion the server is still running for exactly this
+                # history (a reconnect, /resume, or a restart mid-turn) is
+                # polled instead of re-sent, so the turn is never paid twice.
+                pending = self._resumable_pending()
                 response = await chat_with_retry(
                     client,
                     max_retries=self.api_retries,
                     on_retry=self._notify_transient_error,
+                    async_mode=True,
+                    resume_id=str(pending["id"]) if pending else None,
+                    async_hooks=self._async_hooks(),
                     model=self.orchestration_model,
                     messages=self._build_messages(),
                     tools=get_all_tools(auto_mode=self.policy.terminal_tools),
@@ -1047,12 +1201,18 @@ class Agent:
                 )
                 _api_call_duration = time.monotonic() - _api_call_start
                 self._current_operation = None
+                self._clear_pending_completion()
                 from lqh.telemetry import active_telemetry
                 if telemetry := active_telemetry():
                     await telemetry.run_deferred(telemetry.record_agent_turn)
             except Exception as e:
                 if self.callbacks.on_spinner_stop:
                     self.callbacks.on_spinner_stop()
+                # Keep the pending record only when the turn may still be
+                # running server-side (connectivity, 5xx, rate limit); any
+                # other failure means it will not produce a usable answer.
+                if not is_pending_resumable_error(e):
+                    self._clear_pending_completion()
                 # Handle 401 specifically
                 from openai import AuthenticationError
                 if isinstance(e, AuthenticationError):
@@ -1146,23 +1306,19 @@ class Agent:
             #
             # Two signals can indicate truncation:
             #   1. finish_reason == "length" — the obvious case.
-            #   2. finish_reason == "tool_calls" but completion_tokens is
-            #      close to our ORCHESTRATION_MAX_TOKENS setting (>=90%).
-            #      When a response ends with a tool_call whose arguments were
-            #      cut off, the API still reports finish_reason="tool_calls"
-            #      and closes the JSON gracefully, so we must detect it via
-            #      size. Small tool calls never trip this heuristic.
+            #   2. finish_reason == "tool_calls" with a tool call whose
+            #      arguments are not valid JSON: the API closes the call
+            #      gracefully when the budget runs out mid-arguments, so the
+            #      cut-off shows up as unparseable arguments rather than as
+            #      finish_reason. (A size threshold against our own
+            #      max_tokens no longer works: the backend clamps the budget
+            #      per model, so the effective cap is unknown here.)
             finish_reason = getattr(choice, "finish_reason", None)
-            _completion_tok = (
-                response.usage.completion_tokens
-                if response.usage and response.usage.completion_tokens
-                else 0
-            )
             truncated_by_length = (
                 finish_reason == "length"
                 or (
                     finish_reason == "tool_calls"
-                    and _completion_tok >= int(ORCHESTRATION_MAX_TOKENS * 0.9)
+                    and _has_unparseable_tool_call(message)
                 )
             )
             empty_tool_call_response = (
