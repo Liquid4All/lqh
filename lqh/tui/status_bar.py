@@ -37,6 +37,13 @@ class StatusBar:
         self.recent_completion: tuple[str, float] | None = None
         self._spinner_frame: int = 0
         self._spin_start: float = 0.0
+        # Async orchestration turn progress: tokens the server has generated
+        # so far, and the server-reported age of the turn at the moment of
+        # the last poll (so a resumed poll shows the true age, not the time
+        # since this process started waiting).
+        self.thinking_tokens: int | None = None
+        self._thinking_elapsed_base: float | None = None
+        self._thinking_progress_at: float = 0.0
         # Compute-aware HF indicator. Two independent sources now:
         #
         #   hf_cloud_configured — a token STORED on the backend, used by
@@ -92,12 +99,22 @@ class StatusBar:
         """Stop spinning and reset timer."""
         self.spinning = False
         self._spin_start = 0.0
+        self.set_thinking_progress(None, None)
+
+    def set_thinking_progress(self, tokens: int | None, elapsed_s: float | None) -> None:
+        """Record server-side progress of the running turn (None clears)."""
+        self.thinking_tokens = tokens
+        self._thinking_elapsed_base = elapsed_s
+        self._thinking_progress_at = time.monotonic() if elapsed_s is not None else 0.0
 
     def _format_elapsed(self) -> str:
         """Format elapsed time since spin started."""
-        if self._spin_start <= 0:
+        if self._thinking_elapsed_base is not None:
+            elapsed = self._thinking_elapsed_base + (time.monotonic() - self._thinking_progress_at)
+        elif self._spin_start > 0:
+            elapsed = time.monotonic() - self._spin_start
+        else:
             return ""
-        elapsed = time.monotonic() - self._spin_start
         if elapsed < 60:
             return f"{elapsed:.0f}s"
         minutes = int(elapsed) // 60
@@ -156,9 +173,12 @@ class StatusBar:
             frame = SPINNER_FRAMES[self._spinner_frame]
             elapsed = self._format_elapsed()
             timer = f" ({elapsed})" if elapsed else ""
+            tokens = (
+                f" {self.thinking_tokens:,} tok" if self.thinking_tokens is not None else ""
+            )
             parts.append((
                 "class:status.spinner",
-                f" {frame} thinking...{timer}{bg_suffix} ",
+                f" {frame} thinking...{tokens}{timer}{bg_suffix} ",
             ))
         elif self.recent_completion is not None and self.recent_completion[1] > time.time():
             parts.append(("class:status.spinner", f" ✅ {self.recent_completion[0]} completed "))

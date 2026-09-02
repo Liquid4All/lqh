@@ -617,10 +617,21 @@ async def _run_async(
                         await agent_task
                     except BaseException:
                         pass
+                    # The wall clock ended the run; a turn still reasoning on
+                    # the server would only cost money nobody collects.
+                    try:
+                        await agent.cancel_pending_completion()
+                    except BaseException:
+                        pass
             else:
                 await agent_task
         except (asyncio.CancelledError, KeyboardInterrupt):
             interrupted = True
+            # Nobody will resume a headless run: stop paying for the turn.
+            try:
+                await agent.cancel_pending_completion()
+            except BaseException:
+                pass
         except Exception as e:  # noqa: BLE001 — result JSON is the contract
             import traceback
 

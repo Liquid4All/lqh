@@ -695,6 +695,16 @@ class LqhApp:
             # The cancel can land while the spinner / pipeline status is live.
             self._on_spinner_stop()
             self._on_pipeline_done()
+            # Ctrl-C means "stop": a turn still reasoning on the server is
+            # cancelled so nobody pays for tokens that will not be read. On
+            # quit the record is kept instead — the turn keeps running and
+            # the next start offers to pick it up.
+            cancel_pending = getattr(self._agent, "cancel_pending_completion", None)
+            if cancel_pending is not None and not self._shutdown_requested:
+                try:
+                    await cancel_pending()
+                except asyncio.CancelledError:
+                    pass
             self._save_session()
             if not self._shutdown_requested:
                 await self._emit(render_system_message("⏹ Interrupted."))
@@ -2002,8 +2012,9 @@ class LqhApp:
             return
         newest = sessions[0]
         preview = (newest.get("preview") or "(no preview)")[:60]
+        running = " · model response still running" if newest.get("pending_completion") else ""
         choice = await self._wait_for_user_response(options=[
-            f"Resume interrupted session: {preview} ({newest.get('updated_at', '?')})",
+            f"Resume interrupted session: {preview} ({newest.get('updated_at', '?')}){running}",
             "Start a new session",
         ])
         if not choice.startswith("Resume"):
@@ -2071,6 +2082,36 @@ class LqhApp:
         # Stored messages are restored verbatim; the current project state
         # arrives as the agent's ephemeral context prefix.
         await self._prepare_agent_context()
+        await self._resume_pending_completion()
+
+    async def _resume_pending_completion(self) -> None:
+        """Reconnect to a turn the server is still running for this session.
+
+        Called after the agent context is prepared (a lost completion turns
+        into a fresh request built from the current history). No-op when
+        the session has no valid pending record.
+        """
+        if self._agent is None or self._session is None:
+            return
+        resumable = getattr(self._agent, "_resumable_pending", None)
+        if resumable is None or resumable() is None:
+            return
+        await self._emit(render_system_message(
+            "⏳ Reconnecting to a model response still running on the server…"
+        ))
+        self._lock_input()
+        try:
+            await self._run_interruptible(
+                lambda: self._run_agent_with_reconnect(
+                    self._agent.continue_after_interruption,
+                    self._agent.continue_after_interruption,
+                )
+            )
+        except AgentInterrupted:
+            pass
+        finally:
+            self._unlock_input()
+            self._save_session()
 
     def _create_agent(self) -> Agent:
         """Create an agent with TUI callbacks."""
@@ -2089,6 +2130,7 @@ class LqhApp:
             on_token_update=self._on_token_update,
             on_skill_loaded=self._on_skill_loaded,
             on_transient_error=self._on_transient_error,
+            on_completion_progress=self._on_completion_progress,
             on_pipeline_progress=self._on_pipeline_progress,
             legacy_pipeline_progress_callback=False,
             on_pipeline_done=self._on_pipeline_done,
@@ -2499,6 +2541,11 @@ class LqhApp:
         """Start the spinner animation."""
         self._status_bar.start_spinning()
         self._ensure_spinner_task()
+        self._invalidate()
+
+    def _on_completion_progress(self, tokens: int, elapsed_s: float) -> None:
+        """Show how far a server-side reasoning turn has come."""
+        self._status_bar.set_thinking_progress(tokens, elapsed_s)
         self._invalidate()
 
     def _on_spinner_stop(self) -> None:
@@ -3043,6 +3090,7 @@ class LqhApp:
             await self._teardown(app_task)
             return
         await self._prepare_agent_context()
+        await self._resume_pending_completion()
 
         self._job_watcher_task = asyncio.create_task(self._watch_jobs())
 
@@ -3114,7 +3162,12 @@ class LqhApp:
             await self._wait_for_app_task(app_task)
         self._save_session()
         if self._session is not None:
-            self._session.mark_state("completed")
+            # A turn still running on the server is worth coming back for:
+            # leave the session resumable so the next start offers it.
+            if self._session.pending_completion:
+                self._session.mark_state("interrupted")
+            else:
+                self._session.mark_state("completed")
         await self._finish_telemetry()
         await self._emit_resume_hint()
 
