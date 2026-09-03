@@ -184,9 +184,10 @@ class TestTrainingE2EShellHelper:
         assert status.state == "completed", f"Training failed: {status.error}"
         print(f"Training completed at step {status.step}")
 
-        model_dir = run / "model"
+        # LoRA runs save the adapter alone (model-lora), not a merged model.
+        model_dir = run / "model-lora"
         assert model_dir.exists()
-        assert (model_dir / "config.json").exists()
+        assert (model_dir / "adapter_config.json").exists()
 
         entries = read_progress(run, last_n=100)
         training_entries = [e for e in entries if "step" in e and "status" not in e]
@@ -275,9 +276,15 @@ class TestTrainingE2ECrashRecovery:
     def crash_workspace(
         self, tmp_path: Path, write_chatml_parquet,
     ) -> dict[str, Path]:
+        # ~5k tokens per row: 20 such rows in one micro-batch of a full
+        # fine-tune without gradient checkpointing exhaust any card (an 80 GB
+        # H100 included). Short rows would fit on a big GPU and the test
+        # would pass or fail by hardware. The assistant turn stays inside the
+        # 8192-token limit so the row is trainable and the OOM is genuine.
+        filler = "Also run ls -la in the working directory. " * 500
         convos = [
             [
-                {"role": "user", "content": f"Convert file_{i}.mp4 to mp3"},
+                {"role": "user", "content": f"Convert file_{i}.mp4 to mp3. {filler}"},
                 {"role": "assistant", "content": f"ffmpeg -i file_{i}.mp4 file_{i}.mp3"},
             ]
             for i in range(20)
@@ -312,6 +319,10 @@ class TestTrainingE2ECrashRecovery:
                 "bf16": True,
                 "max_seq_length": 8192,
                 "dataloader_num_workers": 0,
+                # The batch-size calibration would catch the OOM, back the
+                # micro-batch off and finish the run; this test is about the
+                # crash reaching the manager, so the probe is disabled.
+                "auto_batch": False,
             },
         }
 

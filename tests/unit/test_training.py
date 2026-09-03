@@ -1270,9 +1270,10 @@ class TestSFTEndToEnd:
         assert entries
         assert entries[-1].get("status") == "completed"
 
-        model_dir = run / "model"
+        # LoRA runs save the adapter alone (model-lora), not a merged model.
+        model_dir = run / "model-lora"
         assert model_dir.exists()
-        assert (model_dir / "config.json").exists()
+        assert (model_dir / "adapter_config.json").exists()
 
         final_cp = run / "checkpoints" / "final"
         if final_cp.exists():
@@ -1471,7 +1472,7 @@ class TestSFTWithEvalLoop:
             assert msgs[-1]["role"] == "assistant"
             assert len(msgs[-1]["content"]) > 0
 
-        assert (run / "model").exists()
+        assert (run / "model-lora").exists()  # LoRA run: adapter-only output
 
 
 @pytest.mark.gpu
@@ -1594,9 +1595,10 @@ class TestDPOEndToEnd:
         assert entries
         assert entries[-1].get("status") == "completed"
 
-        model_dir = run / "model"
+        # LoRA runs save the adapter alone (model-lora), not a merged model.
+        model_dir = run / "model-lora"
         assert model_dir.exists()
-        assert (model_dir / "config.json").exists()
+        assert (model_dir / "adapter_config.json").exists()
 
 
 class TestGrpoStartTraining:
