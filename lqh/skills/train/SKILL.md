@@ -368,6 +368,7 @@ Defaults live in `lqh/train/defaults.py`; a sweep overrides `learning_rate` /
   for ~20 updates and look like bad data. Two caveats: the 16 floor means a
   few-hundred-row dataset still lands below the target, and the ~100 target is a
   judgement call rather than a measured optimum (see `defaults.py`).
+- **`max_seq_length`** (default: 2048, `MAX_SEQ_LENGTH` in `defaults.py`; 512–131072) — SFT only: prompt plus response token budget; raise it only when rows exceed it. DPO/GRPO reject it — their internal budgets mean the total-length contract would not hold.
 - **`num_iterations`** (default: 5) — DPO only.
 - **`dpo_beta`** (default: 0.1) — DPO KL anchor strength.
 

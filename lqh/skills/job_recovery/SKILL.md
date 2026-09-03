@@ -45,7 +45,7 @@ Never diagnose from the run name or from memory. Read the status card first.
 | **preempted** | the provider reclaimed the GPU | Infrastructure. One fresh attempt is reasonable — smaller if the run is long. On a second preemption, shrink the exposure instead of retrying. |
 | **orphaned** | the sandbox stopped appearing in the provider's live list, with no terminal event | An observation, not a cause. Usually a preemption — but a workload that died while the backend was restarting looks identical from here. Check `artifacts` and `stderr.log` FIRST; if nothing points at the run, treat it as preempted. |
 | **timeout** | hit the wall-clock cap | Sizing, NOT infrastructure — the cap was consented to at submit time and the job outgrew it. An identical resubmit fails identically. Shrink first, always. |
-| **oom** | memory exceeded | Config. Lower `per_device_train_batch_size` (raise `gradient_accumulation_steps` to keep the effective batch size), lower `max_seq_length`, enable gradient checkpointing, or use a smaller model. |
+| **oom** | memory exceeded | Config. Lower `per_device_train_batch_size` (raise `gradient_accumulation_steps` to keep the effective batch size), lower `max_seq_length` (a `start_training` argument, SFT only), enable gradient checkpointing, or use a smaller model. |
 | **crashed** | the trainer raised | Read `stderr.log`. Fix the exception. Do not resubmit unchanged. |
 | **config** | bad input | Fix the input. Do not blame infrastructure. |
 
