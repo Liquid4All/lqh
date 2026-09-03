@@ -4766,6 +4766,105 @@ def _looks_like_hub_id(value: str) -> bool:
     return len(parts) == 2 and all(parts) and not Path(value).exists()
 
 
+# LFM Open License v1.0 — the licence every LiquidAI LFM checkpoint ships
+# under and which its fine-tunes inherit. Model cards are usually written by
+# the agent, which otherwise guesses a permissive default (apache-2.0) and
+# mislicenses the derivative, so the fields are stamped at push time.
+# license_link points at the hosted copy rather than the repo-relative
+# LICENSE the base cards use — a fine-tune repo has no such file.
+_LFM_LICENSE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("license", "other"),
+    ("license_name", "lfm1.0"),
+    ("license_link", "https://www.liquid.ai/lfm-license"),
+)
+_LFM_LICENSE_KEYS = frozenset(k for k, _ in _LFM_LICENSE_FIELDS)
+
+
+def _is_lfm_derived(target: Path, base_model: str | None) -> bool:
+    """Whether a checkpoint folder is a fine-tune of a Liquid LFM model.
+
+    ``base_model`` comes from ``adapter_config.json`` for adapters; merged
+    and full fine-tunes are identified from ``config.json`` instead
+    (``model_type: lfm2``/``lfm2_vl``, ``Lfm2*`` architectures).
+    """
+    from lqh.models import is_liquid_model_name
+
+    if is_liquid_model_name(base_model):
+        return True
+    cfg_path = target / "config.json"
+    if not cfg_path.is_file():
+        return False
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(cfg, dict):
+        return False
+    if str(cfg.get("model_type") or "").lower().startswith("lfm"):
+        return True
+    if any(str(a).lower().startswith("lfm") for a in cfg.get("architectures") or []):
+        return True
+    return is_liquid_model_name(cfg.get("_name_or_path"))
+
+
+def _split_frontmatter(text: str) -> tuple[list[str], str]:
+    """Split a model card into (YAML frontmatter lines, body).
+
+    An absent or unterminated frontmatter block yields ``([], text)``.
+    """
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return [], text
+    for i in range(1, len(lines)):
+        if lines[i].strip() in ("---", "..."):
+            return lines[1:i], "\n".join(lines[i + 1:])
+    return [], text
+
+
+def _is_frontmatter_key(line: str) -> bool:
+    """True for a top-level ``key: value`` line (not a list item or a
+    nested/continuation line)."""
+    return bool(line) and not line[:1].isspace() and not line.startswith("-") and ":" in line
+
+
+def _stamp_lfm_license(text: str) -> tuple[str, str | None]:
+    """Force the LFM Open License fields into a model card's frontmatter.
+
+    Returns ``(new_text, replaced)``; *replaced* is the ``license:`` value
+    that was overwritten, or None when the card was already correct or
+    carried no license at all.
+    """
+    fm, body = _split_frontmatter(text)
+
+    current: dict[str, str] = {}
+    for line in fm:
+        if not _is_frontmatter_key(line):
+            continue
+        key, _, value = line.partition(":")
+        current.setdefault(key.strip(), value.strip())
+    if all(current.get(k) == v for k, v in _LFM_LICENSE_FIELDS):
+        return text, None
+
+    kept: list[str] = []
+    dropping = False
+    for line in fm:
+        if _is_frontmatter_key(line):
+            dropping = line.split(":", 1)[0].strip() in _LFM_LICENSE_KEYS
+            if dropping:
+                continue
+        elif dropping:
+            continue  # nested/continuation lines of a dropped key
+        kept.append(line)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    kept.extend(f"{k}: {v}" for k, v in _LFM_LICENSE_FIELDS)
+
+    new = "---\n" + "\n".join(kept) + "\n---\n"
+    if body:
+        new += body if body.startswith("\n") else "\n" + body
+    return new, (current.get("license") or None)
+
+
 def _prepare_adapter_for_upload(
     target: Path, repo_id: str,
 ) -> tuple[bool, str | None]:
@@ -4849,6 +4948,19 @@ async def _execute_hf_push_model(
     except RuntimeError as exc:
         return ToolResult.fail("runtime", f"Error preparing adapter for upload: {exc}")
 
+    license_note = ""
+    readme_path = target / "README.md"
+    if readme_path.is_file() and _is_lfm_derived(target, base_model):
+        try:
+            original = readme_path.read_text()
+            stamped, replaced = _stamp_lfm_license(original)
+            if stamped != original:
+                readme_path.write_text(stamped)
+                was = f" (was: {replaced})" if replaced else ""
+                license_note = f"\n  Card:   licensed LFM Open License v1.0{was}"
+        except (OSError, UnicodeDecodeError):
+            pass  # unreadable card: leave it to upload_folder to report
+
     try:
         api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
 
@@ -4877,7 +4989,8 @@ async def _execute_hf_push_model(
                 f"  Repo:   {repo_id} ({visibility})"
                 f"{adapter_note}\n"
                 f"  Files:  {file_count}"
-                f"{' (incl. README.md)' if has_readme else ''}\n"
+                f"{' (incl. README.md)' if has_readme else ''}"
+                f"{license_note}\n"
                 f"  URL:    {url}"
             )
         )

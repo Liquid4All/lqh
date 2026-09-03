@@ -704,3 +704,143 @@ class TestSampledCheckpointScoreIsLabelled:
         ):
             (cp_dir / "eval_sampling.json").write_text(payload)
             assert _checkpoint_eval_sampling(cp_dir) is None, payload
+
+
+class TestLfmLicenseStamp:
+    """An LFM fine-tune must be published under the LFM Open License.
+
+    Model cards are agent-written and the agent guesses `apache-2.0`, which
+    mislicenses a derivative of an LFM checkpoint; the push corrects it.
+    """
+
+    def test_wrong_license_is_replaced_and_the_rest_of_the_card_survives(
+        self,
+    ) -> None:
+        from lqh.tools.handlers import _stamp_lfm_license
+
+        card = (
+            "---\n"
+            "base_model: LiquidAI/LFM2.5-1.2B-Instruct\n"
+            "library_name: peft\n"
+            "tags:\n"
+            "- lora\n"
+            "- sft\n"
+            "license: apache-2.0\n"
+            "---\n"
+            "\n"
+            "# My model\n"
+            "\n"
+            "Body text.\n"
+        )
+        new, replaced = _stamp_lfm_license(card)
+        assert replaced == "apache-2.0"
+        assert "apache" not in new
+        assert "license: other" in new
+        assert "license_name: lfm1.0" in new
+        assert "license_link: https://www.liquid.ai/lfm-license" in new
+        # Untouched frontmatter keys, list items and body all survive.
+        assert "base_model: LiquidAI/LFM2.5-1.2B-Instruct" in new
+        assert "- lora" in new
+        assert new.endswith("\n# My model\n\nBody text.\n")
+
+    def test_correct_card_is_left_byte_identical(self) -> None:
+        from lqh.tools.handlers import _stamp_lfm_license
+
+        card = (
+            "---\n"
+            "license: other\n"
+            "license_name: lfm1.0\n"
+            "license_link: https://www.liquid.ai/lfm-license\n"
+            "---\n\n# Model\n"
+        )
+        new, replaced = _stamp_lfm_license(card)
+        assert new == card
+        assert replaced is None
+
+    def test_card_without_frontmatter_gets_one(self) -> None:
+        from lqh.tools.handlers import _stamp_lfm_license
+
+        new, replaced = _stamp_lfm_license("# Model\n\nNo frontmatter here.\n")
+        assert replaced is None
+        assert new.startswith("---\nlicense: other\n")
+        assert new.endswith("---\n\n# Model\n\nNo frontmatter here.\n")
+
+    def test_detects_lfm_from_adapter_base_and_from_config(
+        self, tmp_path: Path
+    ) -> None:
+        from lqh.tools.handlers import _is_lfm_derived
+
+        assert _is_lfm_derived(tmp_path, "LiquidAI/LFM2.5-1.2B-Instruct")
+        assert not _is_lfm_derived(tmp_path, "Qwen/Qwen3-1.7B")
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "lfm2", "architectures": ["Lfm2ForCausalLM"]})
+        )
+        assert _is_lfm_derived(tmp_path, None)
+
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+        assert not _is_lfm_derived(tmp_path, None)
+
+        (tmp_path / "config.json").write_text("{not json")
+        assert not _is_lfm_derived(tmp_path, None)
+
+    @pytest.mark.asyncio
+    async def test_push_stamps_the_card_of_an_lfm_adapter(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from lqh.tools.handlers import _execute_hf_push_model
+
+        target = tmp_path / "runs" / "sft_001" / "adapter"
+        target.mkdir(parents=True)
+        (target / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": "LiquidAI/LFM2.5-1.2B-Instruct"})
+        )
+        (target / "adapter_model.safetensors").write_bytes(b"x")
+        (target / "README.md").write_text(
+            "---\nlibrary_name: peft\nlicense: apache-2.0\n---\n\n# Card\n"
+        )
+
+        uploaded: dict[str, str] = {}
+
+        class FakeApi:
+            def create_repo(self, **kwargs):
+                return None
+
+            def upload_folder(self, *, folder_path, **kwargs):
+                uploaded["readme"] = (Path(folder_path) / "README.md").read_text()
+
+        result = await _execute_hf_push_model(
+            tmp_path, target, "runs/sft_001/adapter", "tester/demo", True, None, FakeApi(),
+        )
+        assert result.error_kind is None, result.content
+        # The corrected card is what actually went up.
+        assert "license_name: lfm1.0" in uploaded["readme"]
+        assert "apache" not in uploaded["readme"]
+        assert "LFM Open License v1.0 (was: apache-2.0)" in result.content
+
+    @pytest.mark.asyncio
+    async def test_push_leaves_a_non_lfm_card_alone(
+        self, tmp_path: Path
+    ) -> None:
+        from lqh.tools.handlers import _execute_hf_push_model
+
+        target = tmp_path / "models" / "qwen-ft"
+        target.mkdir(parents=True)
+        (target / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+        (target / "model.safetensors").write_bytes(b"x")
+        card = "---\nlicense: apache-2.0\n---\n\n# Card\n"
+        (target / "README.md").write_text(card)
+
+        class FakeApi:
+            def create_repo(self, **kwargs):
+                return None
+
+            def upload_folder(self, **kwargs):
+                return None
+
+        result = await _execute_hf_push_model(
+            tmp_path, target, "models/qwen-ft", "tester/demo", True, None, FakeApi(),
+        )
+        assert result.error_kind is None, result.content
+        assert (target / "README.md").read_text() == card
+        assert "LFM Open License" not in result.content
