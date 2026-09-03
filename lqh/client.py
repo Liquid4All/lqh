@@ -5,6 +5,7 @@ import contextvars
 import logging
 import os
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -251,6 +252,8 @@ def describe_api_error(exc: BaseException) -> str:
     """One short line naming what went wrong, for a user-facing notice."""
     if isinstance(exc, CompletionLostError):
         return "the running response was lost on the server"
+    if isinstance(exc, CompletionCancelledError):
+        return "the running response was cancelled"
     if isinstance(exc, CompletionPollExhausted):
         return (
             f"lost contact with the running response after "
@@ -286,6 +289,14 @@ def describe_api_error(exc: BaseException) -> str:
 # ---------------------------------------------------------------------------
 
 ASYNC_HEADER = "X-LQH-Async"
+# Client-chosen idempotency id for one submission. Persisted BEFORE the POST
+# so a connection drop inside the server's inline window (the generation may
+# already be running) is re-sent with the same id and attaches to that
+# completion instead of starting a second paid one.
+REQUEST_ID_HEADER = "X-LQH-Request-Id"
+# Poll/attach responses name the completion's own state here; on an error
+# status it tells a terminal result apart from a failing poll endpoint.
+COMPLETION_STATUS_HEADER = "X-LQH-Completion-Status"
 # Seconds the server may hold one poll open before answering 202 again.
 POLL_WAIT_S = 30
 # httpx read timeout for a poll: comfortably above POLL_WAIT_S so a full
@@ -305,10 +316,17 @@ POLL_BACKOFF_MAX_S = 30.0
 CANCEL_TIMEOUT_S = 10.0
 
 
+def new_request_id() -> str:
+    """A fresh submission id (see REQUEST_ID_HEADER)."""
+    return "lqhr_" + uuid.uuid4().hex
+
+
 @dataclass
 class AsyncCompletionHooks:
     """Callbacks for the async poll loop; every field is optional.
 
+    ``on_submitting(request_id)`` fires before every POST — persist the id
+    so a submission whose response never arrived can be re-sent with it.
     ``on_started(id)`` fires once when the server accepted the turn for
     background execution — persist the id there so the turn can be resumed.
     ``on_progress(tokens_so_far, elapsed_s)`` fires on every progress poll.
@@ -321,6 +339,25 @@ class AsyncCompletionHooks:
     on_progress: Callable[[int, float], None] | None = None
     on_lost: Callable[[str], Awaitable[None]] | None = None
     on_poll_retry: OnRetry = None
+    on_submitting: Callable[[str], Awaitable[None]] | None = None
+
+
+class CompletionCancelledError(APIStatusError):
+    """The running completion was cancelled (by another process/device).
+
+    Terminal and NOT retryable: re-sending would pay for a turn the user
+    stopped on purpose. Surfaces as a 410 so no ladder treats it as
+    transient.
+    """
+
+    def __init__(self, completion_id: str, base_url: str) -> None:
+        response = httpx.Response(410, request=httpx.Request("GET", base_url))
+        super().__init__(
+            f"completion {completion_id} was cancelled", response=response,
+            body={"code": 410, "type": "completion_cancelled"},
+        )
+        self.status_code = 410  # type: ignore[misc]
+        self.completion_id = completion_id
 
 
 class CompletionLostError(APIConnectionError):
@@ -379,18 +416,65 @@ def _extract_async_handle(status_code: int, resp: Any) -> str | None:
     return None
 
 
-def _is_lost_response(status_code: int, resp: Any) -> bool:
-    return status_code in (404, 410) or getattr(resp, "status", None) in ("lost", "cancelled")
+def _completion_state(exc: BaseException) -> str | None:
+    """The completion's own state named on an error response, if any."""
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return None
+    try:
+        return headers.get(COMPLETION_STATUS_HEADER) or None
+    except Exception:
+        return None
 
 
-async def _submit_async(client: AsyncOpenAI, kwargs: dict[str, Any]) -> tuple[ChatCompletion | None, str | None]:
-    """POST with the async header. Returns (completion, None) or (None, id)."""
+def _error_type(exc: BaseException) -> str:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error", body)
+        if isinstance(err, dict):
+            return str(err.get("type") or "")
+    return ""
+
+
+@dataclass
+class _SubmissionState:
+    """The request id in flight across retries of one chat_with_retry call.
+
+    Kept while a POST produced no response at all (the server may be
+    generating under it); dropped as soon as any response — 200, 202 or an
+    HTTP error — proves the server has seen or rejected that submission.
+    """
+    request_id: str | None = None
+
+
+async def _submit_async(
+    client: AsyncOpenAI,
+    kwargs: dict[str, Any],
+    state: _SubmissionState,
+    hooks: AsyncCompletionHooks | None,
+) -> tuple[ChatCompletion | None, str | None]:
+    """POST with the async headers. Returns (completion, None) or (None, id)."""
     extra = dict(kwargs.get("extra_headers") or {})
     extra[ASYNC_HEADER] = "1"
+    if state.request_id is None:
+        state.request_id = new_request_id()
+    if hooks is not None and hooks.on_submitting is not None:
+        await hooks.on_submitting(state.request_id)
+    extra[REQUEST_ID_HEADER] = state.request_id
     call_kwargs = {k: v for k, v in kwargs.items() if k != "extra_headers"}
-    raw = await client.chat.completions.with_raw_response.create(  # type: ignore[arg-type]
-        **call_kwargs, extra_headers=extra,
-    )
+    try:
+        raw = await client.chat.completions.with_raw_response.create(  # type: ignore[arg-type]
+            **call_kwargs, extra_headers=extra,
+        )
+    except APIConnectionError:
+        # No response: the server may or may not have started the turn.
+        # Keep the id so the retry attaches instead of duplicating.
+        raise
+    except APIStatusError:
+        state.request_id = None
+        raise
+    state.request_id = None
     parsed = raw.parse()
     err = _extract_inband_error(parsed)
     if err is not None:
@@ -451,34 +535,56 @@ async def _poll_completion(
         polls += 1
         try:
             raw = await client.get(_poll_url(completion_id), cast_to=ChatCompletion, options=_poll_options())
-        except RateLimitError as exc:
-            try:
-                wait = _parse_retry_after(exc)
-            except Exception:
-                wait = None
-            await _failed(exc, min(wait if wait is not None else 2.0, POLL_BACKOFF_MAX_S))
-            continue
-        except (APITimeoutError, APIConnectionError, httpx.TimeoutException) as exc:
+        except (APITimeoutError, httpx.TimeoutException) as exc:
             await _failed(exc, min(2.0 ** (failures), POLL_BACKOFF_MAX_S))
             continue
         except APIStatusError as exc:
+            # A status with the completion's own state attached is the
+            # turn's terminal result, not the poll endpoint failing: hand it
+            # to the caller's ladder (which may re-send, with a fresh
+            # request id) and drop the record.
+            state = _completion_state(exc)
+            if state == "cancelled" or _error_type(exc) == "completion_cancelled":
+                if hooks.on_lost is not None:
+                    await hooks.on_lost(completion_id)
+                raise CompletionCancelledError(completion_id, str(client.base_url)) from exc
+            if state == "error":
+                if hooks.on_lost is not None:
+                    await hooks.on_lost(completion_id)
+                raise
             if exc.status_code in (404, 410):
                 if hooks.on_lost is not None:
                     await hooks.on_lost(completion_id)
                 raise CompletionLostError(completion_id, request) from exc
+            if isinstance(exc, RateLimitError):
+                try:
+                    wait = _parse_retry_after(exc)
+                except Exception:
+                    wait = None
+                await _failed(exc, min(wait if wait is not None else 2.0, POLL_BACKOFF_MAX_S))
+                continue
             if exc.status_code in RETRYABLE_STATUS:
                 await _failed(exc, min(2.0 ** (failures), POLL_BACKOFF_MAX_S))
                 continue
             raise
+        except APIConnectionError as exc:
+            await _failed(exc, min(2.0 ** (failures), POLL_BACKOFF_MAX_S))
+            continue
         parsed = raw.parse()
         err = _extract_inband_error(parsed)
         if err is not None:
             raise _inband_status_error(client, err)
         status_code = getattr(raw, "status_code", 200)
-        if _is_lost_response(status_code, parsed) and not getattr(parsed, "choices", None):
-            if hooks.on_lost is not None:
-                await hooks.on_lost(completion_id)
-            raise CompletionLostError(completion_id, request)
+        if not getattr(parsed, "choices", None):
+            inband = getattr(parsed, "status", None)
+            if inband == "cancelled":
+                if hooks.on_lost is not None:
+                    await hooks.on_lost(completion_id)
+                raise CompletionCancelledError(completion_id, str(client.base_url))
+            if inband == "lost" or status_code in (404, 410):
+                if hooks.on_lost is not None:
+                    await hooks.on_lost(completion_id)
+                raise CompletionLostError(completion_id, request)
         if _extract_async_handle(status_code, parsed) is not None:
             failures = 0
             tokens = getattr(parsed, "tokens_so_far", None)
@@ -504,6 +610,7 @@ async def _run_async_attempt(
     client: AsyncOpenAI,
     kwargs: dict[str, Any],
     resume_id: str | None,
+    state: _SubmissionState,
     hooks: AsyncCompletionHooks | None,
     entry: dict[str, Any],
 ) -> ChatCompletion:
@@ -516,7 +623,7 @@ async def _run_async_attempt(
         else:
             entry.update({"phase": "poll", "completion_id": resume_id, "polls": polls, "resumed": True})
             return resp
-    resp, handle = await _submit_async(client, kwargs)
+    resp, handle = await _submit_async(client, kwargs, state, hooks)
     if resp is not None:
         entry.update({"phase": "post"})
         return resp
@@ -552,7 +659,7 @@ def is_pending_resumable_error(exc: BaseException) -> bool:
     attempt (a reconnect, /resume, or the next loop iteration) polls it
     instead of re-sending — re-sending would pay for the turn twice.
     """
-    if isinstance(exc, CompletionLostError):
+    if isinstance(exc, (CompletionLostError, CompletionCancelledError)):
         return False
     if isinstance(exc, (CompletionPollExhausted, APIConnectionError, RateLimitError)):
         return True
@@ -575,6 +682,7 @@ async def chat_with_retry(
     *,
     async_mode: bool = False,
     resume_id: str | None = None,
+    request_id: str | None = None,
     async_hooks: AsyncCompletionHooks | None = None,
     **kwargs: object,
 ) -> ChatCompletion:
@@ -586,7 +694,9 @@ async def chat_with_retry(
     turns — which is why this is a per-call flag rather than a client-wide
     header. *resume_id* skips the POST on the first attempt and polls an
     already-running completion instead; if the server has lost it the
-    request is sent fresh within the same attempt.
+    request is sent fresh within the same attempt. *request_id* re-sends a
+    submission whose response never arrived (see REQUEST_ID_HEADER): the
+    server attaches it to the completion that POST started, if any.
 
     Retries on:
       - 429 (rate limit): honours Retry-After header, falls back to 2^attempt seconds.
@@ -620,6 +730,7 @@ async def chat_with_retry(
     attempt (success or failure) with timing, error type, and response shape.
     """
     total_attempts = max_retries + 1
+    submission = _SubmissionState(request_id=request_id)
 
     async def _notify(
         exc: BaseException, attempt: int, wait: float,
@@ -644,7 +755,8 @@ async def chat_with_retry(
         try:
             if async_mode:
                 resp: ChatCompletion = await _run_async_attempt(
-                    client, dict(kwargs), resume_id if attempt == 0 else None, async_hooks, entry,
+                    client, dict(kwargs), resume_id if attempt == 0 else None,
+                    submission, async_hooks, entry,
                 )
             else:
                 resp = await client.chat.completions.create(**kwargs)  # type: ignore[arg-type]

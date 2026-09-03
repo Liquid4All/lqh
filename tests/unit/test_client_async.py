@@ -21,6 +21,7 @@ from lqh.client import (
     POLL_MAX_CONSECUTIVE_FAILURES,
     POLL_WAIT_S,
     AsyncCompletionHooks,
+    CompletionCancelledError,
     CompletionLostError,
     CompletionPollExhausted,
     cancel_completion,
@@ -316,3 +317,113 @@ def test_is_pending_resumable_error_table():
     assert not is_pending_resumable_error(_status_error(400))
     assert not is_pending_resumable_error(_status_error(401))
     assert not is_pending_resumable_error(ValueError("x"))
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: terminal results on the poll endpoint, cancellation, and
+# idempotent submission.
+# ---------------------------------------------------------------------------
+
+
+def _terminal_error(status: int, cls: type = APIStatusError, state: str = "error") -> APIStatusError:
+    exc = _status_error(status, cls)
+    exc.response.headers["X-LQH-Completion-Status"] = state
+    return exc
+
+
+async def test_terminal_error_on_poll_goes_to_the_ladder_not_the_poll_loop(monkeypatch):
+    """A 429/502 that IS the completion's result must not be retried as a poll."""
+    monkeypatch.setattr("lqh.client.asyncio.sleep", AsyncMock())
+    client = _client()
+    cid = "lqhc_" + "4" * 32
+    raw_create, get, _ = _wire(
+        client,
+        post=[_raw(202, _running(cid)), _raw(200, _completion("second"))],
+        polls=[_terminal_error(429, RateLimitError)],
+    )
+    lost: list[str] = []
+
+    async def on_lost(c: str) -> None:
+        lost.append(c)
+
+    resp = await chat_with_retry(
+        client, async_mode=True, max_retries=1, async_hooks=AsyncCompletionHooks(on_lost=on_lost),
+        model="orchestration:15", messages=[],
+    )
+    assert resp.choices[0].message.content == "second"
+    assert get.call_count == 1  # not polled again
+    assert lost == [cid]  # record dropped
+    assert raw_create.call_count == 2
+    first = raw_create.call_args_list[0].kwargs["extra_headers"]["X-LQH-Request-Id"]
+    second = raw_create.call_args_list[1].kwargs["extra_headers"]["X-LQH-Request-Id"]
+    assert first != second, "a re-send after a terminal result must use a fresh request id"
+
+    # With no attempts left the terminal status escapes as itself.
+    _wire(client, post=[_raw(202, _running(cid))], polls=[_terminal_error(502)])
+    with pytest.raises(APIStatusError) as exc:
+        await chat_with_retry(client, async_mode=True, max_retries=0, model="orchestration:15", messages=[])
+    assert exc.value.status_code == 502
+
+
+@pytest.mark.parametrize("cancelled", [
+    lambda: _terminal_error(410, state="cancelled"),
+    lambda: (lambda e: (setattr(e, "body", {"error": {"type": "completion_cancelled", "code": 410}}), e)[1])(_status_error(410)),
+    lambda: _raw(200, ChatCompletion.construct(id="lqhc_" + "5" * 32, status="cancelled")),
+])
+async def test_cancelled_completion_is_terminal_and_not_resent(monkeypatch, cancelled):
+    monkeypatch.setattr("lqh.client.asyncio.sleep", AsyncMock())
+    client = _client()
+    cid = "lqhc_" + "5" * 32
+    raw_create, _, _ = _wire(client, post=[_raw(202, _running(cid))], polls=[cancelled()])
+    lost: list[str] = []
+
+    async def on_lost(c: str) -> None:
+        lost.append(c)
+
+    with pytest.raises(CompletionCancelledError) as exc:
+        await chat_with_retry(client, async_mode=True, max_retries=3,
+                              async_hooks=AsyncCompletionHooks(on_lost=on_lost), model="orchestration:15", messages=[])
+    assert exc.value.status_code == 410 and exc.value.completion_id == cid
+    assert raw_create.call_count == 1, "a cancelled turn must never be re-sent"
+    assert lost == [cid]
+    assert not is_pending_resumable_error(exc.value)
+    assert "cancelled" in describe_api_error(exc.value)
+
+
+async def test_request_id_is_persisted_before_the_post_and_reused_only_without_a_response(monkeypatch):
+    monkeypatch.setattr("lqh.client.asyncio.sleep", AsyncMock())
+    client = _client()
+    submitted: list[str] = []
+    order: list[str] = []
+
+    async def on_submitting(rid: str) -> None:
+        submitted.append(rid)
+        order.append("persist")
+
+    async def create(*a: Any, **k: Any) -> Any:
+        order.append("post:" + k["extra_headers"]["X-LQH-Request-Id"])
+        item = script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    # Connection error (no response) -> same id; HTTP error -> new id; success ends it.
+    script: list[Any] = [_conn_error(), _status_error(503), _raw(200, _completion("ok"))]
+    client.chat.completions.with_raw_response.create = AsyncMock(side_effect=create)  # type: ignore[method-assign]
+    client.get = AsyncMock()  # type: ignore[method-assign]
+    resp = await chat_with_retry(client, async_mode=True, max_retries=3,
+                                 async_hooks=AsyncCompletionHooks(on_submitting=on_submitting),
+                                 model="orchestration:15", messages=[])
+    assert resp.choices[0].message.content == "ok"
+    assert all(s.startswith("lqhr_") for s in submitted)
+    assert submitted[0] == submitted[1], "no response: the retry must reuse the id so the server can attach"
+    assert submitted[2] != submitted[1], "an HTTP error proves the server rejected it: rotate"
+    assert order[0] == "persist" and order[1].startswith("post:" + submitted[0])
+
+    # A caller-supplied request id (from a persisted record) is used first.
+    script = [_raw(200, _completion("attached"))]
+    submitted.clear()
+    await chat_with_retry(client, async_mode=True, request_id="lqhr_persisted0001",
+                          async_hooks=AsyncCompletionHooks(on_submitting=on_submitting),
+                          model="orchestration:15", messages=[])
+    assert submitted == ["lqhr_persisted0001"]

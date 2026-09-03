@@ -88,8 +88,11 @@ def _valid_pending(record: Any) -> dict[str, Any] | None:
     if not isinstance(record, dict):
         return None
     cid = record.get("id")
+    rid = record.get("request_id")
     seq = record.get("turn_seq")
-    if not isinstance(cid, str) or not cid or not isinstance(seq, int):
+    has_id = isinstance(cid, str) and cid
+    has_rid = isinstance(rid, str) and rid
+    if not (has_id or has_rid) or not isinstance(seq, int):
         return None
     return dict(record)
 
@@ -117,9 +120,12 @@ class Session:
     # Preview of the first user message, frozen at first persist so it
     # survives compaction of the working view.
     _preview: str = ""
-    # An orchestration turn the server accepted for background execution
-    # and that has not produced its result yet (async completions):
-    # ``{"id", "model", "kind": "turn", "started_at", "turn_seq"}``.
+    # An orchestration turn submitted for background execution that has
+    # not produced its result yet (async completions):
+    # ``{"request_id", "id"?, "model", "kind": "turn", "started_at",
+    # "turn_seq"}``. ``request_id`` is written before the POST (so a
+    # submission whose 202 never arrived can be re-sent and attached);
+    # ``id`` once the server accepted the turn.
     # ``turn_seq`` is ``last_seq`` at submission; the record is only valid
     # for resumption while the history has not moved past it.
     pending_completion: dict[str, Any] | None = None

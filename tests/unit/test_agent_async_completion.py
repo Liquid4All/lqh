@@ -213,3 +213,73 @@ async def test_cut_off_tool_call_triggers_the_recovery_notice(project_dir, monke
     await agent.process_user_input("hi")
     notices = [m for m in agent.session.messages if m.get("role") == "user" and "cut off" in str(m.get("content"))]
     assert notices, "a cut-off tool call must inject the truncation recovery notice"
+
+
+async def test_request_id_is_persisted_before_the_completion_id(project_dir, monkeypatch):
+    stages: list[dict | None] = []
+
+    async def fake(_client, **kwargs):
+        hooks = kwargs["async_hooks"]
+        await hooks.on_submitting("lqhr_" + "1" * 32)
+        stages.append(dict(agent.session.pending_completion or {}))
+        await hooks.on_started("lqhc_" + "1" * 32)
+        stages.append(dict(agent.session.pending_completion or {}))
+        return _completion()
+
+    agent = _agent(project_dir, monkeypatch, fake)
+    await agent.process_user_input("hi")
+    assert stages[0]["request_id"] == "lqhr_" + "1" * 32 and "id" not in stages[0]
+    assert stages[1]["request_id"] == "lqhr_" + "1" * 32 and stages[1]["id"] == "lqhc_" + "1" * 32
+    assert agent.session.pending_completion is None
+
+
+async def test_resume_passes_request_id_without_completion_id(project_dir, monkeypatch):
+    seen: list[dict] = []
+
+    async def fake(_client, **kwargs):
+        seen.append(kwargs)
+        return _completion()
+
+    agent = _agent(project_dir, monkeypatch, fake)
+    agent.session.add_message({"role": "user", "content": "hi"})
+    agent.session.set_pending_completion({
+        "request_id": "lqhr_" + "2" * 32, "model": agent.orchestration_model, "kind": "turn",
+        "started_at": "now", "turn_seq": agent.session.last_seq,
+    })
+    await agent.continue_after_interruption()
+    assert seen[0]["resume_id"] is None
+    assert seen[0]["request_id"] == "lqhr_" + "2" * 32
+
+
+async def test_cancelled_elsewhere_ends_the_turn_with_a_message(project_dir, monkeypatch):
+    messages: list[str] = []
+
+    async def on_agent_message(text: str) -> None:
+        messages.append(text)
+
+    from lqh.client import CompletionCancelledError
+
+    async def fake(_client, **kwargs):
+        await kwargs["async_hooks"].on_started("lqhc_" + "3" * 32)
+        raise CompletionCancelledError("lqhc_" + "3" * 32, "https://api.lqh.ai/v1")
+
+    agent = _agent(project_dir, monkeypatch, fake, AgentCallbacks(on_agent_message=on_agent_message))
+    await agent.process_user_input("hi")  # must not raise
+    assert any("cancelled" in m for m in messages)
+    assert agent.session.pending_completion is None
+
+
+async def test_failed_persist_skips_the_safety_notice(project_dir, monkeypatch):
+    notices: list[str] = []
+
+    async def on_transient_error(text: str) -> None:
+        notices.append(text)
+
+    async def fake(_client, **kwargs):
+        await kwargs["async_hooks"].on_started("lqhc_" + "4" * 32)
+        return _completion()
+
+    agent = _agent(project_dir, monkeypatch, fake, AgentCallbacks(on_transient_error=on_transient_error))
+    monkeypatch.setattr(type(agent.session), "set_pending_completion", lambda self, rec: False)
+    await agent.process_user_input("hi")
+    assert not any("safe to lose connection" in n for n in notices)

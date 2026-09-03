@@ -15,6 +15,7 @@ from typing import Any, Callable, Awaitable
 
 from lqh.client import (
     AsyncCompletionHooks,
+    CompletionCancelledError,
     cancel_completion,
     chat_with_retry,
     create_client,
@@ -767,11 +768,34 @@ class Agent:
 
     def _async_hooks(self) -> AsyncCompletionHooks:
         return AsyncCompletionHooks(
+            on_submitting=self._on_async_submitting,
             on_started=self._on_async_started,
             on_progress=self._on_async_progress,
             on_lost=self._on_async_lost,
             on_poll_retry=self._notify_poll_retry,
         )
+
+    def _pending_record(self, **fields: Any) -> dict[str, Any]:
+        return {
+            "model": self.orchestration_model,
+            "kind": "turn",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "turn_seq": self.session.last_seq,
+            **fields,
+        }
+
+    async def _on_async_submitting(self, request_id: str) -> None:
+        """Persist the submission id BEFORE the POST goes out.
+
+        If the connection drops while the server is already generating,
+        the next attempt re-sends with this id and attaches to that
+        completion instead of paying for a second one.
+        """
+        rec = self.session.pending_completion or {}
+        if rec.get("request_id") == request_id and rec.get("turn_seq") == self.session.last_seq:
+            return
+        if not self.session.set_pending_completion(self._pending_record(request_id=request_id)):
+            logger.warning("could not persist the submission id; a crash mid-turn may re-run it")
 
     def _resumable_pending(self) -> dict[str, Any] | None:
         """The persisted completion this turn can resume, if still valid.
@@ -792,24 +816,28 @@ class Agent:
             and rec.get("turn_seq") == self.session.last_seq
         ):
             return rec
-        logger.info("dropping stale pending completion %s", rec.get("id"))
+        logger.info("dropping stale pending completion %s", rec.get("id") or rec.get("request_id"))
         self._clear_pending_completion()
-        try:
-            asyncio.get_running_loop().create_task(
-                cancel_completion(self._get_client(), str(rec.get("id")))
-            )
-        except Exception:
-            logger.debug("could not schedule cancel of stale completion", exc_info=True)
+        if rec.get("id"):
+            try:
+                asyncio.get_running_loop().create_task(
+                    cancel_completion(self._get_client(), str(rec.get("id")))
+                )
+            except Exception:
+                logger.debug("could not schedule cancel of stale completion", exc_info=True)
         return None
 
     async def _on_async_started(self, completion_id: str) -> None:
-        self.session.set_pending_completion({
-            "id": completion_id,
-            "model": self.orchestration_model,
-            "kind": "turn",
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "turn_seq": self.session.last_seq,
-        })
+        rec = self.session.pending_completion or {}
+        saved = self.session.set_pending_completion(
+            self._pending_record(request_id=rec.get("request_id"), id=completion_id)
+        )
+        if not saved:
+            # Do not promise a safety we cannot keep: without the record on
+            # disk a restart would re-send (the server dedups by request id
+            # only while it remembers it).
+            logger.warning("could not persist the completion id; resume after a crash is not guaranteed")
+            return
         if not self._async_notice_shown and self.callbacks.on_transient_error:
             self._async_notice_shown = True
             try:
@@ -860,6 +888,8 @@ class Agent:
         if not rec:
             return
         self._clear_pending_completion()
+        if not rec.get("id"):
+            return  # never accepted server-side: nothing to cancel
         try:
             await cancel_completion(self._get_client(), str(rec.get("id")))
         except asyncio.CancelledError:
@@ -1190,7 +1220,8 @@ class Agent:
                     max_retries=self.api_retries,
                     on_retry=self._notify_transient_error,
                     async_mode=True,
-                    resume_id=str(pending["id"]) if pending else None,
+                    resume_id=str(pending["id"]) if pending and pending.get("id") else None,
+                    request_id=str(pending["request_id"]) if pending and pending.get("request_id") else None,
                     async_hooks=self._async_hooks(),
                     model=self.orchestration_model,
                     messages=self._build_messages(),
@@ -1213,6 +1244,15 @@ class Agent:
                 # other failure means it will not produce a usable answer.
                 if not is_pending_resumable_error(e):
                     self._clear_pending_completion()
+                if isinstance(e, CompletionCancelledError):
+                    # Stopped on purpose (another process/device): a fresh
+                    # user message continues from the saved history.
+                    if self.callbacks.on_agent_message:
+                        await self.callbacks.on_agent_message(
+                            "⏹ The model response was cancelled elsewhere. "
+                            "Send your message again to continue."
+                        )
+                    return
                 # Handle 401 specifically
                 from openai import AuthenticationError
                 if isinstance(e, AuthenticationError):
