@@ -98,3 +98,16 @@ def test_collator_masks_every_non_assistant_token(tokenizer):
     )
     labels = batch["labels"][0]
     assert (labels == -100).tolist() == [m == 0 for m in mask]
+
+
+def test_rows_truncated_past_their_assistant_turn_are_dropped(tokenizer):
+    from lqh.train.data_utils import drop_rows_without_assistant_labels
+
+    rows = [{"messages": MESSAGES}]
+    first_label = encode(tokenizer)["assistant_masks"].index(1)
+
+    kept, dropped = drop_rows_without_assistant_labels(rows, tokenizer, first_label)
+    assert (kept, dropped) == ([], 1)
+    kept, dropped = drop_rows_without_assistant_labels(rows, tokenizer, first_label + 1)
+    assert (kept, dropped) == (rows, 0)
+    assert drop_rows_without_assistant_labels(rows, tokenizer, None) == (rows, 0)

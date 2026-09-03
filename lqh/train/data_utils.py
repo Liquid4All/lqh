@@ -475,3 +475,33 @@ def load_preferences_parquet(
             }
         )
     return result
+
+
+def drop_rows_without_assistant_labels(
+    rows: list[dict[str, Any]],
+    tokenizer: Any,
+    max_length: int | None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Drop rows whose assistant tokens all sit past *max_length*.
+
+    trl builds the assistant mask before truncation, so a row with a long
+    prompt reaches the loss with every label masked out and contributes a
+    zero-or-NaN batch instead of being rejected. The extra tokenization
+    pass is cheap (~0.7 ms/row on the LFM2.5 fast tokenizer).
+    """
+    if not max_length:
+        return rows, 0
+    kept = [
+        row
+        for row in rows
+        if any(
+            tokenizer.apply_chat_template(
+                row["messages"],
+                tools=row.get("tools"),
+                tokenize=True,
+                return_dict=True,
+                return_assistant_tokens_mask=True,
+            )["assistant_masks"][:max_length]
+        )
+    ]
+    return kept, len(rows) - len(kept)

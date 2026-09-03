@@ -36,6 +36,7 @@ from lqh.progress import (
 
 from lqh.train.data_utils import (
     chatml_to_sft_dataset,
+    drop_rows_without_assistant_labels,
     load_chatml_datasets_with_tools,
     load_eval_sources,
     split_train_eval,
@@ -796,14 +797,32 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         if eval_convos:
             eval_dataset = Dataset.from_list(chatml_to_vlm_dataset(eval_convos))
     else:
-        train_dataset = Dataset.from_list(
-            chatml_to_sft_dataset(train_convos, train_tools)
+        train_rows = chatml_to_sft_dataset(train_convos, train_tools)
+        eval_rows = (
+            chatml_to_sft_dataset(eval_convos, eval_tools) if eval_convos else []
         )
-        eval_dataset = None
-        if eval_convos:
-            eval_dataset = Dataset.from_list(
-                chatml_to_sft_dataset(eval_convos, eval_tools)
+        if training_cfg.get("assistant_only_loss"):
+            max_length = training_cfg.get("max_seq_length", 2048)
+            train_rows, dropped = drop_rows_without_assistant_labels(
+                train_rows, tokenizer, max_length
             )
+            eval_rows, eval_dropped = drop_rows_without_assistant_labels(
+                eval_rows, tokenizer, max_length
+            )
+            if dropped or eval_dropped:
+                print(
+                    f"  assistant_only_loss: dropped {dropped} train and "
+                    f"{eval_dropped} eval rows whose assistant turn falls "
+                    f"past max_seq_length={max_length}"
+                )
+            if not train_rows:
+                raise ValueError(
+                    "assistant_only_loss left no trainable rows: every "
+                    f"assistant turn falls past max_seq_length={max_length}. "
+                    "Raise max_seq_length or shorten the prompts."
+                )
+        train_dataset = Dataset.from_list(train_rows)
+        eval_dataset = Dataset.from_list(eval_rows) if eval_rows else None
 
     # Safe batch-size auto-tuning (GPU_TYPE.md §6). Mutates training_cfg
     # in place (per_device_batch_size + gradient_accumulation_steps) so
