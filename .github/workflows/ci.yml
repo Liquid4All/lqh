@@ -63,9 +63,9 @@ jobs:
           cache-dependency-glob: uv.lock
       - run: uv python install 3.12
       # transformers/trl/torch are train extras, so the default job skips
-      # every assertion in this file.
+      # every torch-gated test; this job runs the whole unit suite with them.
       - run: uv sync --frozen --group dev --extra train --python 3.12
-      - run: uv run pytest tests/unit/test_sft_assistant_only_loss.py -v
+      - run: uv run pytest tests/unit -v
 
   json-lint:
     name: json lint

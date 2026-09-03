@@ -2,11 +2,11 @@
 
 Only runs inside the ``grpo`` cloud image (vLLM base + TRL): this module
 is imported by ``lqh.train.__main__`` on ``type == "grpo"`` and never by
-the main lqh process. Unlike the shared training image, the grpo image
-pins a NEWER TRL than lqh_py's ``trl<1.1`` range — LFM2 needs
-vLLM >= 0.23 and trl 1.0's vllm extra caps at 0.17.1, so the pinned
-combination cannot serve LFM2 (see the backend's grpo image build,
-GRPO_RUNTIME_DEPS). Code here targets that newer GRPOTrainer API.
+the main lqh process. The grpo image is distinct because vLLM comes from
+its own base; its TRL is the same release lqh_py pins (``trl>=1.12,<1.13``,
+whose vllm extra bounds the base at 0.27.1 — see the backend's grpo image
+build, GRPO_RUNTIME_DEPS). Code here targets the TRL >= 1.10 GRPOTrainer
+API (no ``max_prompt_length``, ``warmup_steps`` not ``warmup_ratio``).
 
 Structure mirrors ``sft_loop`` deliberately: same adapter-continuation
 semantics, same checkpoint fallback, same final-eval shape
@@ -451,9 +451,9 @@ def grpo_loop(run_dir: Path, config: dict[str, Any]) -> None:
         per_device_train_batch_size=micro_batch,
         gradient_accumulation_steps=grad_accum,
         learning_rate=training_cfg["learning_rate"],
-        # warmup_steps, not warmup_ratio: transformers 5.2 removed the
-        # ratio argument (the grpo image's 5.1 only deprecation-warned).
-        # With max_steps always set, steps express the same 3% schedule.
+        # warmup_steps, not warmup_ratio: transformers 5.x removed the
+        # ratio argument (sft.py makes the same conversion). With max_steps
+        # always set, steps express the same 3% schedule.
         warmup_steps=int(
             training_cfg.get("warmup_steps", max(1, round(max_steps * 0.03)))
         ),

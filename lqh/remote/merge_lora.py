@@ -105,7 +105,7 @@ def _merge(
     # construction — and the merge child exits before sglang claims the
     # card. Mirrors the pod's device pick.
     device = "cuda" if prefer_gpu and torch.cuda.is_available() else None
-    load_kwargs: dict = {"torch_dtype": torch.bfloat16}
+    load_kwargs: dict = {"dtype": torch.bfloat16}
     if device:
         load_kwargs["device_map"] = device
 

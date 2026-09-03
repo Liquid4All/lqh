@@ -101,17 +101,45 @@ def test_template_marks_only_the_assistant_replies(tokenizer):
     assert "<|im_start|>assistant" in masked
 
 
-def test_collator_masks_every_non_assistant_token(tokenizer):
+def test_trainer_prepares_labels_from_the_assistant_mask(tokenizer, tmp_path):
+    """trl >= 1.7 builds the labels in SFTTrainer._prepare_dataset (the
+    collator no longer reads mask columns): go through the real trainer on a
+    tiny random model and check the prepared row."""
     pytest.importorskip("torch")
-    from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
+    from datasets import Dataset
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from trl import SFTConfig, SFTTrainer
 
+    model = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=len(tokenizer),
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    )
+    trainer = SFTTrainer(
+        model=model,
+        args=SFTConfig(
+            output_dir=str(tmp_path),
+            assistant_only_loss=True,
+            max_length=None,
+            report_to=[],
+            use_cpu=True,
+            bf16=False,
+        ),
+        train_dataset=Dataset.from_list([{"messages": MESSAGES}]),
+        processing_class=tokenizer,
+    )
     encoded = encode(tokenizer)
     ids, mask = encoded["input_ids"], encoded["assistant_masks"]
-    batch = DataCollatorForLanguageModeling(pad_token_id=tokenizer.pad_token_id)(
-        [{"input_ids": ids, "assistant_masks": mask}]
-    )
-    labels = batch["labels"][0]
-    assert (labels == -100).tolist() == [m == 0 for m in mask]
+    row = trainer.train_dataset[0]
+    assert row["input_ids"][: len(ids)] == ids
+    labels = row["labels"][: len(ids)]
+    assert [lab == -100 for lab in labels] == [m == 0 for m in mask]
 
 
 def test_rows_truncated_past_their_assistant_turn_are_dropped(tokenizer):

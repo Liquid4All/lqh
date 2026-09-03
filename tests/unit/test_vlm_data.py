@@ -253,7 +253,7 @@ class TestVLMCollator:
                 "input_ids": torch.ones((len(convs), 999), dtype=torch.long)
             }
         )
-        with pytest.raises(ValueError, match="max_length"):
+        with pytest.raises(ValueError, match="10-token training limit"):
             VLMCollator(processor, max_length=10)(rows)
 
 

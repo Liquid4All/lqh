@@ -15,13 +15,13 @@ Fork of ``tests.benchmarks.dpo_value`` with the DPO arm replaced by GRPO
 
 Environments: SFT/continued-SFT/eval run in the dev environment like
 every other benchmark (local subprocesses). The GRPO trainer CANNOT run
-there — it needs vLLM + trl 1.10 (see GRPO_IMPLEMENTATION.md) — so it
+there — it needs vLLM + trl 1.12 (see GRPO_IMPLEMENTATION.md) — so it
 runs as a subprocess of ``--grpo-python``, a dedicated venv mirroring
 the production grpo image:
 
     uv venv ~/grpo-venv -p 3.12
-    uv pip install --python ~/grpo-venv/bin/python vllm==0.26.0 \
-        trl==1.10.0 "peft>=0.15" accelerate datasets pyarrow \
+    uv pip install --python ~/grpo-venv/bin/python vllm==0.27.1 \
+        trl==1.12.0 "peft>=0.20" accelerate datasets pyarrow \
         "openai>=1.0" "httpx>=0.27" "prompt_toolkit>=3.0" "rich>=13.0" \
         "pillow>=10.0" "packaging>=24.0" "huggingface_hub>=0.20" \
         "lm-format-enforcer>=0.11" hf_transfer

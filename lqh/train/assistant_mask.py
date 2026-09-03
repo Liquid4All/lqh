@@ -19,9 +19,14 @@ fixed upstream; the trainer never silently falls back to full-sequence loss):
   tokenizer loads: renders a two-turn probe through the real template with
   ``return_assistant_tokens_mask=True`` and raises when no token is marked.
 
-Vision SFT is excluded: trl 1.0 refuses ``assistant_only_loss`` for VLMs, so
-those runs keep full-sequence loss (``lqh/train/sft.py`` does not pass the
-flag there).
+Vision SFT is excluded: trl (through 1.12) refuses ``assistant_only_loss``
+for vision datasets, so those runs keep full-sequence loss
+(``lqh/train/sft.py`` does not pass the flag there).
+
+trl >= 1.10 would itself swap in a ``{% generation %}``-capable training
+template for LFM2 / LFM2.5 models whose own template lacks one. lqh
+deliberately fails before that: a substituted template can differ from the
+one the model sees at inference, and the fix belongs in the model's template.
 """
 
 from __future__ import annotations

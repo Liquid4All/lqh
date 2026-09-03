@@ -40,7 +40,8 @@ Install the optional training dependencies:
 uv tool install "lqh[train]"   # or: pipx install --force "lqh[train]" / pip install lqh[train]
 ```
 
-This installs `torch`, `transformers`, `trl`, and `peft`. If unavailable, training tools will show a clear error. All other lqh features work without them.
+This installs `torch`, `transformers`, `trl`, and `peft` (versions pinned in
+`pyproject.toml`; the cloud images run the same ones). If unavailable, training tools will show a clear error. All other lqh features work without them.
 
 ## Training Strategy: Validate → Scale → Polish
 
@@ -378,7 +379,9 @@ Defaults live in `lqh/train/defaults.py`; a sweep overrides `learning_rate` /
   template lacks it is rejected at launch (or by the trainer before its first
   step, when the template could not be read locally); there is no fallback to
   full-sequence loss. Report such a model so its template can be fixed upstream.
-  Vision SFT trains on the full sequence (trl does not support the mask for VLMs).
+  Vision SFT trains on the full sequence (trl refuses the mask for vision datasets).
+- **`lora.target_modules`** must not include `lm_head`: the default SFT loss
+  (`chunked_nll`) rejects it; such a config falls back to plain `nll` with a note.
 
 ### Combining multiple data sources
 

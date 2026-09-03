@@ -5222,14 +5222,14 @@ async def handle_start_training(
 
     is_grpo = type in ("grpo", "on_policy_grpo")
     # GRPO runs only on LQH Cloud: the distinct `grpo` image carries the
-    # vLLM + newer-TRL runtime that the local/SSH training environments do
-    # not (and cannot — trl<1.1 is pinned there; see GRPO_IMPLEMENTATION.md).
+    # vLLM rollout engine that the local/SSH training environments do not
+    # (lqh[train] installs no vLLM; see GRPO_IMPLEMENTATION.md).
     if is_grpo and not (remote and _is_cloud_target(remote)):
         return ToolResult.fail(
             "config",
             (
                 "Error: GRPO training runs only on LQH Cloud — it needs the "
-                "dedicated grpo image (vLLM rollout engine + TRL 1.10), which "
+                "dedicated grpo image (vLLM rollout engine + TRL), which "
                 "local and SSH environments do not have. This project's compute "
                 f"target is {'local' if remote is None else remote!r}."
             ),

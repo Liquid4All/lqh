@@ -28,8 +28,8 @@ The GRPO trainer cannot run in the dev environment (needs vLLM + trl
 
 ```bash
 uv venv ~/grpo-venv -p 3.12
-uv pip install --python ~/grpo-venv/bin/python vllm==0.26.0 trl==1.10.0 \
-    "peft>=0.15" accelerate datasets pyarrow "openai>=1.0" "httpx>=0.27" \
+uv pip install --python ~/grpo-venv/bin/python vllm==0.27.1 trl==1.12.0 \
+    "peft>=0.20" accelerate datasets pyarrow "openai>=2.0,<3" "httpx>=0.27" \
     "prompt_toolkit>=3.0" "rich>=13.0" "pillow>=10.0" "packaging>=24.0" \
     "huggingface_hub>=0.20" "lm-format-enforcer>=0.11" hf_transfer
 uv pip install --python ~/grpo-venv/bin/python --no-deps -e <lqh_py checkout>

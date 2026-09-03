@@ -831,6 +831,19 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
             task_type="CAUSAL_LM",
         )
 
+    # TRL >= 1.7 defaults the SFT loss to chunked_nll: the same NLL, with the
+    # logits chunked so a 32k-token row does not materialize a full-vocab
+    # logit tensor. Pinned explicitly so a TRL default change cannot alter
+    # training silently. chunked_nll rejects lm_head as a LoRA target (it
+    # hooks the output embedding), so such a config falls back to plain nll.
+    sft_loss_type = "chunked_nll"
+    _targets = lora_cfg.get("target_modules") or []
+    if isinstance(_targets, str):
+        _targets = [_targets]
+    if lora_enabled and "lm_head" in _targets:
+        print("  lm_head is a LoRA target: loss_type=nll (chunked_nll rejects it)")
+        sft_loss_type = "nll"
+
     # Load training set. The eval set is resolved with this order
     # of precedence:
     #   1. explicit ``config["eval_dataset"]`` — separate parquet,
@@ -1093,13 +1106,28 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         per_device_train_batch_size=training_cfg.get("per_device_batch_size", 4),
         gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", 4),
         learning_rate=training_cfg["learning_rate"],
-        warmup_ratio=training_cfg.get("warmup_ratio", 0.1),
+        # warmup_steps, not warmup_ratio: transformers 5.x removed the ratio
+        # argument (grpo.py made the same switch). warmup_ratio stays the
+        # user-facing knob and is turned into steps from the optimizer-step
+        # estimate above; an explicit warmup_steps wins. 0 when the step
+        # count is unknown.
+        warmup_steps=int(
+            training_cfg.get(
+                "warmup_steps",
+                round(total_steps * float(training_cfg.get("warmup_ratio", 0.1)))
+                if total_steps
+                else 0,
+            )
+        ),
         logging_steps=training_cfg.get("logging_steps", default_logging_steps),
         gradient_checkpointing=training_cfg.get("gradient_checkpointing", True),
         bf16=training_cfg.get("bf16", True),
         max_length=training_cfg.get("max_seq_length", 2048),
-        # Always on for text; trl 1.0 refuses it for VLMs, which keep the
-        # full-sequence loss. Not configurable (lqh.train.assistant_mask).
+        loss_type=sft_loss_type,
+        # Always on for text. TRL (through 1.12) refuses it for vision
+        # datasets (rows with an images column): multimodal assistant masks
+        # are still broken upstream (transformers #44521), so VLM runs keep
+        # the full-sequence loss. Not configurable (lqh.train.assistant_mask).
         assistant_only_loss=not is_vision,
         dataloader_num_workers=training_cfg.get("dataloader_num_workers", 4),
         dataloader_pin_memory=True,

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lqh"
-version = "0.16.0"
+version = "0.17.0"
 description = "LQH – customize Liquid AI foundation models into task-specific models."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,19 +40,28 @@ dependencies = [
 
 [project.optional-dependencies]
 train = [
-    "torch",
+    # 2.13 is the torch the vLLM 0.27.1 (grpo image) and sglang 0.5.18
+    # (inference/eval images) bases ship, so every image and the laptop run
+    # one torch. [tool.uv] below pins the lock to 2.13.0 exactly; the range
+    # here is what pip users get.
+    "torch>=2.13,<2.15",
     # Lfm2VlImageProcessor (LFM2.5-VL) requires torchvision at processor
-    # load time — keep it version-paired with torch.
-    "torchvision",
-    # <5.4: transformers 5.12 broke lfm2_vl generation (generate() rejects
-    # the processor's pixel_attention_mask/spatial_shapes, and dropping
-    # them crashes the vision tower). 5.3.0 is validated end-to-end with
-    # LFM2.5-VL SFT + generation; revisit the cap on a deliberate bump.
-    "transformers>=5.0,<5.4",
-    # <1.1: the VLM SFT path relies on the custom-collator +
-    # dataset_kwargs={"skip_prepare_dataset"} contract validated on 1.0.
-    "trl>=1.0,<1.1",
-    "peft>=0.15",
+    # load time — keep it version-paired with torch (0.28 <-> 2.13).
+    "torchvision>=0.28",
+    # 5.16: current. 5.15 removed lfm2_vl's own prepare_inputs_for_generation;
+    # LFM2.5-VL generate() is validated by tests/function/test_vlm_training_e2e.py
+    # and lqh/train/vlm_data.py's drop-and-retry stays as the safety net. The
+    # eval/inference images inherit sglang's transformers (5.12.1), so shared
+    # code (load_model, merge_lora, lqh/infer) must work on both.
+    "transformers>=5.16,<5.17",
+    # 1.12: SFT labels/truncation are built in _prepare_dataset, loss_type
+    # defaults to chunked_nll, assistant_only_loss is still refused for
+    # vision datasets. The VLM path (custom VLMCollator + dataset_kwargs=
+    # {"skip_prepare_dataset"}) is honoured because the 1.7+ guard only fires
+    # for TRL's own collator. Same TRL as the grpo image (vllm extra caps at
+    # 0.27.1).
+    "trl>=1.12,<1.13",
+    "peft>=0.20",
     # Constrained JSON-schema decoding for local eval; integrates with HF
     # transformers via prefix_allowed_tokens_fn. Pure Python, small.
     # NOTE: lm-format-enforcer ≤0.11.3 ships a broken transformers shim that
@@ -60,6 +69,12 @@ train = [
     # in ``lqh/infer/__main__.py`` so any version compatible with v5 works.
     "lm-format-enforcer>=0.11",
 ]
+
+# Resolve the lock to the exact torch the Modal bases ship (see the train
+# extra) instead of the newest release; uv sync --frozen in CI then matches
+# the cloud images.
+[tool.uv]
+constraint-dependencies = ["torch==2.13.0", "torchvision==0.28.0"]
 
 [dependency-groups]
 dev = [

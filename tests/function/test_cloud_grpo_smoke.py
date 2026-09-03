@@ -7,7 +7,7 @@ has the `grpo` image promoted (submit hard-gates on it — a 503 mentioning
 
 What this proves:
   - `_infer_kind` maps type="grpo" → train_grpo and the backend accepts it
-  - the sandbox boots the grpo image (vLLM base + trl 1.10 + lqh_py)
+  - the sandbox boots the grpo image (vLLM base + trl 1.12 + lqh_py)
   - grpo_loop runs: prompt-only conversion, GRPOTrainer + vLLM colocate
     rollouts, group-rank judge rewards through the scoped chat.score
     token, a few real optimizer steps
