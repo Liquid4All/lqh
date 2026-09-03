@@ -41,6 +41,7 @@ def list_available_skills() -> list[dict[str, str]]:
         {
             "name": "train",
             "description": "Fine-tune a model on generated data (requires torch)",
+            "command": "/train",
         },
         {
             "name": "rl",

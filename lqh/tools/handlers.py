@@ -2746,7 +2746,7 @@ async def handle_list_skills(**kwargs: Any) -> ToolResult:
     skills = list_available_skills()
     lines = ["Available skills:\n"]
     for s in skills:
-        lines.append(f"  {s['command']:12s} {s['description']}")
+        lines.append(f"  {s.get('command', ''):12s} {s['description']}")
     return ToolResult(content="\n".join(lines))
 
 
