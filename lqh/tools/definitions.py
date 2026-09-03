@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from lqh.train.defaults import MAX_SEQ_LENGTH, MAX_SEQ_LENGTH_BOUNDS
+
 
 METADATA_KEY = "x-lqh"
 
@@ -1744,6 +1746,16 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                             "likely mechanical than a low rate, so report it instead of "
                             "raising the rate. Full rules: the failure_analysis skill\'s "
                             "\'training isn\'t working\' branch."
+                        ),
+                    },
+                    "max_seq_length": {
+                        "type": "integer",
+                        "minimum": MAX_SEQ_LENGTH_BOUNDS[0],
+                        "maximum": MAX_SEQ_LENGTH_BOUNDS[1],
+                        "description": (
+                            "SFT only: max tokens for prompt plus response "
+                            f"(default {MAX_SEQ_LENGTH}). Raise only when "
+                            "rows exceed it."
                         ),
                     },
                     "num_iterations": {

@@ -5101,6 +5101,7 @@ async def handle_start_training(
     lora: bool = True,
     num_epochs: int | None = None,
     learning_rate: float | None = None,
+    max_seq_length: int | None = None,
     num_iterations: int = 5,
     dpo_beta: float = 0.1,
     golden_source: str = "dataset",
@@ -5168,6 +5169,26 @@ async def handle_start_training(
     on-policy DPO builds its preference pairs from scored rollouts every
     iteration, so a scorer is mandatory for DPO to run at all.
     """
+    if max_seq_length is not None:
+        # DPO and GRPO consume training.max_seq_length with different
+        # semantics (rollout max_new_tokens; prompt cap next to a separate
+        # completion budget), so the documented prompt-plus-response
+        # contract holds for SFT alone.
+        if type != "sft":
+            return ToolResult.fail(
+                "config",
+                "Error: max_seq_length applies to SFT only.",
+            )
+        from lqh.train.defaults import MAX_SEQ_LENGTH_BOUNDS
+
+        lo, hi = MAX_SEQ_LENGTH_BOUNDS
+        if not lo <= max_seq_length <= hi:
+            return ToolResult.fail(
+                "config",
+                f"Error: max_seq_length must be between {lo} and {hi} "
+                f"tokens, got {max_seq_length}.",
+            )
+
     # Compute target is fixed per project — there is no per-call override.
     # When the project has a real choice to make (a BYOC remote and/or a
     # local GPU) but hasn't pinned a target yet, defer to the one-time
@@ -5480,6 +5501,8 @@ async def handle_start_training(
     }
     if epochs is not None:
         config["training"]["num_epochs"] = epochs
+    if max_seq_length is not None:
+        config["training"]["max_seq_length"] = max_seq_length
     if is_vision:
         config["modality"] = "vision"
         # Per-image token budget for the processor. Effective text budget

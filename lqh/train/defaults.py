@@ -87,6 +87,12 @@ VISION_MAX_IMAGE_TOKENS = 256
 
 MAX_SEQ_LENGTH = 2048
 
+# Accepted range for a caller's max_seq_length override (start_training).
+# The ceiling is the LFM2.5 architectural limit (max_position_embeddings);
+# whether a run fits in memory is the calibration probe's problem, not this
+# guard's — it exists to catch nonsense values, not to police training.
+MAX_SEQ_LENGTH_BOUNDS = (512, 131072)
+
 # NOT measured — carried over unchanged, and the study cannot settle it.
 # hpd-stageA's 3-epoch configs did win, but that comparison is confounded: its
 # sweep derived one batch from the 3-epoch default and then overrode epochs

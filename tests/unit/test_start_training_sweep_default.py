@@ -190,3 +190,45 @@ def test_dpo_config_carries_no_num_epochs(launch):
     rec = launch(type="on_policy_dpo")
     assert "num_epochs" not in rec["config"]["base_config"]["training"]
     assert rec["config"]["base_config"]["num_iterations"] == 5
+
+
+def test_max_seq_length_defaults_to_the_defaults_module(launch):
+    from lqh.train import defaults
+
+    training = launch(type="sft")["config"]["training"]
+    assert training["max_seq_length"] == defaults.MAX_SEQ_LENGTH
+
+
+def test_explicit_max_seq_length_wins_over_the_default(launch):
+    training = launch(type="sft", max_seq_length=4096)["config"]["training"]
+    assert training["max_seq_length"] == 4096
+
+
+def test_max_seq_length_out_of_bounds_is_rejected_before_launch(launch):
+    from lqh.train.defaults import MAX_SEQ_LENGTH_BOUNDS
+
+    lo, hi = MAX_SEQ_LENGTH_BOUNDS
+    for bad in (lo - 1, hi + 1):
+        rec = launch(type="sft", max_seq_length=bad)
+        assert rec["result"].ok is False
+        assert rec["result"].error_kind == "config"
+        assert "max_seq_length" in rec["result"].content
+        assert "config" not in rec
+
+
+def test_max_seq_length_is_rejected_outside_sft(launch):
+    rec = launch(type="on_policy_dpo", max_seq_length=4096)
+    assert rec["result"].ok is False
+    assert rec["result"].error_kind == "config"
+    assert "SFT only" in rec["result"].content
+    assert "config" not in rec
+
+
+def test_max_seq_length_schema_bounds_match_the_handler():
+    from lqh.tools.definitions import get_all_tools
+    from lqh.train.defaults import MAX_SEQ_LENGTH_BOUNDS
+
+    tool = next(t for t in get_all_tools() if t["function"]["name"] == "start_training")
+    prop = tool["function"]["parameters"]["properties"]["max_seq_length"]
+    assert prop["type"] == "integer"
+    assert (prop["minimum"], prop["maximum"]) == MAX_SEQ_LENGTH_BOUNDS
