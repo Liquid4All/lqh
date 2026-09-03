@@ -306,3 +306,40 @@ def test_dpo_config_carries_no_num_epochs(launch):
     rec = launch(type="on_policy_dpo")
     assert "num_epochs" not in rec["config"]["base_config"]["training"]
     assert rec["config"]["base_config"]["num_iterations"] == 5
+
+
+def test_assistant_only_loss_is_not_a_switch(launch):
+    """Text SFT always trains on assistant turns only: the config carries no
+    flag for it, so nothing downstream can read one and turn it off."""
+    training = launch(type="sft")["config"]["training"]
+    assert "assistant_only_loss" not in training
+
+
+def test_sft_launch_fails_quickly_on_a_template_without_a_generation_block(
+    launch, monkeypatch
+):
+    from lqh.tools import handlers
+    from lqh.train.assistant_mask import NO_GENERATION_BLOCK
+
+    monkeypatch.setattr(
+        handlers,
+        "_assistant_mask_unsupported",
+        lambda project_dir, base_model: NO_GENERATION_BLOCK,
+    )
+    rec = launch(type="sft")
+    assert rec["result"].ok is False
+    assert rec["result"].error_kind == "config"
+    assert "{% generation %}" in rec["result"].content
+    assert "LiquidAI/LFM2.5-1.2B-Instruct" in rec["result"].content
+    assert "config" not in rec  # nothing was submitted
+
+
+def test_dpo_launch_skips_the_assistant_mask_check(launch, monkeypatch):
+    from lqh.tools import handlers
+
+    def never(project_dir, base_model):
+        raise AssertionError("assistant-mask check must not run for DPO")
+
+    monkeypatch.setattr(handlers, "_assistant_mask_unsupported", never)
+    rec = launch(type="on_policy_dpo")
+    assert rec["module"] == "lqh.train.sweep"

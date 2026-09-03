@@ -370,6 +370,15 @@ Defaults live in `lqh/train/defaults.py`; a sweep overrides `learning_rate` /
   judgement call rather than a measured optimum (see `defaults.py`).
 - **`num_iterations`** (default: 5) — DPO only.
 - **`dpo_beta`** (default: 0.1) — DPO KL anchor strength.
+- **loss on assistant turns only** is not a knob: text SFT always masks system,
+  user and tool tokens out of the loss (trl `assistant_only_loss`), so the model
+  learns to produce replies, not prompts. The base model's chat template must
+  mark its assistant turns with a `{% generation %}` block — every LFM2.5
+  instruct/thinking template does, the `-Base` checkpoints do not. A model whose
+  template lacks it is rejected at launch (or by the trainer before its first
+  step, when the template could not be read locally); there is no fallback to
+  full-sequence loss. Report such a model so its template can be fixed upstream.
+  Vision SFT trains on the full sequence (trl does not support the mask for VLMs).
 
 ### Combining multiple data sources
 

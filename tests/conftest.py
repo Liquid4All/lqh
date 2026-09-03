@@ -140,6 +140,11 @@ def _no_hub_tokenizer_download(monkeypatch, request):
     the estimator falls back to its character count, and tests that exercise
     the tokenizer path point ``base_model`` at a local dir with a
     ``tokenizer.json`` instead.
+
+    The assistant-mask launch check (``lqh/train/assistant_mask.py``) reads
+    the base model's chat template the same way; offline it defers to the
+    trainer, so a Hub name launches as before. Tests of the check itself stub
+    ``_hub_file`` with their own template or use a local checkpoint dir.
     """
     if "unit" not in Path(str(request.node.fspath)).parts:
         return
@@ -147,6 +152,11 @@ def _no_hub_tokenizer_download(monkeypatch, request):
         "lqh.train.seq_length._hub_tokenizer_file",
         lambda repo_id, project_dir: None,
     )
+
+    def _offline(repo_id, filename, project_dir):
+        raise OSError("unit tests run offline")
+
+    monkeypatch.setattr("lqh.train.assistant_mask._hub_file", _offline)
 
 
 @pytest.fixture(autouse=True)

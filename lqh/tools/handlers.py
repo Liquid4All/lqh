@@ -5096,6 +5096,33 @@ def _budget_base_model(project_dir: Path, name: str) -> str:
     return current
 
 
+def _assistant_mask_unsupported(project_dir: Path, base_model: str) -> str | None:
+    """Why *base_model* cannot train with assistant-only loss, or None.
+
+    Text SFT always masks non-assistant tokens out of the loss
+    (lqh.train.assistant_mask), which needs a ``{% generation %}`` block in
+    the chat template. trl raises during dataset tokenization, after a cloud
+    job has been provisioned, so the template text is checked here first. A
+    local checkpoint without tokenizer files (an adapter dir) is resolved to
+    its base through lineage. Unreadable (offline, gated) returns None: the
+    trainer's probe is the authoritative check and runs regardless.
+    """
+    from lqh.train.assistant_mask import (
+        NO_GENERATION_BLOCK,
+        read_chat_template,
+        template_lacks_generation_block,
+    )
+
+    template = read_chat_template(base_model, project_dir)
+    if template is None:
+        resolved = _budget_base_model(project_dir, base_model)
+        if resolved != base_model:
+            template = read_chat_template(resolved, project_dir)
+    if template is not None and template_lacks_generation_block(template):
+        return NO_GENERATION_BLOCK
+    return None
+
+
 async def handle_start_training(
     project_dir: Path,
     *,
@@ -5402,6 +5429,14 @@ async def handle_start_training(
                 f"only SFT is. Train {base_model} with type='sft'."
             ),
         )
+    if type == "sft" and not is_vision:
+        unsupported = _assistant_mask_unsupported(project_dir, base_model)
+        if unsupported:
+            from lqh.train.assistant_mask import unsupported_message
+
+            return ToolResult.fail(
+                "config", "Error: " + unsupported_message(base_model, unsupported)
+            )
 
     # Select the name used in the permission prompt without claiming it yet.
     # The agent re-invokes this handler after the user approves the launch; a

@@ -34,6 +34,10 @@ from lqh.progress import (
     write_progress_event,
 )
 
+from lqh.train.assistant_mask import (
+    drop_rows_without_assistant_labels,
+    require_assistant_mask_support,
+)
 from lqh.train.data_utils import (
     chatml_to_sft_dataset,
     load_chatml_datasets_with_tools,
@@ -73,6 +77,10 @@ def _write_checkpoint_lineage(
         "per_device_batch_size": training_cfg.get("per_device_batch_size"),
         "gradient_accumulation_steps": training_cfg.get("gradient_accumulation_steps"),
         "effective_batch_size": training_cfg.get("effective_batch_size"),
+        # Not a knob: text SFT always trains on assistant tokens only
+        # (lqh.train.assistant_mask). Recorded so checkpoints from before the
+        # switch, whose lineage lacks the key, stay distinguishable.
+        "assistant_only_loss": config.get("modality", "text") != "vision",
     }
     if lora_cfg.get("enabled", True):
         hyperparams.update(
@@ -163,6 +171,45 @@ def _resolve_text_seq_length(
             rows["eval_dropped_too_long"] = res.dropped_eval
         _persist_resolved_config(run_dir, config)
     return res.train_rows, res.eval_rows
+
+
+def _drop_rows_without_assistant_labels(
+    run_dir: Path,
+    config: dict[str, Any],
+    training_cfg: dict[str, Any],
+    tokenizer: Any,
+    train_rows: list[dict[str, Any]],
+    eval_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """A row whose assistant turn sits entirely past ``max_seq_length`` would
+    train on nothing (every label masked): drop it and count it in
+    ``dataset_rows``, next to the too-long counts. A no-op when the length was
+    derived from the data (over-long rows are already gone); it matters for a
+    pinned ``max_seq_length``."""
+    max_length = training_cfg.get("max_seq_length")
+    train_rows, dropped_train = drop_rows_without_assistant_labels(
+        train_rows, tokenizer, max_length
+    )
+    eval_rows, dropped_eval = drop_rows_without_assistant_labels(
+        eval_rows, tokenizer, max_length
+    )
+    if dropped_train or dropped_eval:
+        print(
+            f"  skipped {dropped_train} train / {dropped_eval} eval conversations "
+            f"whose assistant turn starts past the training limit "
+            f"({max_length} tokens): nothing to learn from them"
+        )
+        rows = config.setdefault("dataset_rows", {})
+        rows["train_dropped_no_assistant_labels"] = dropped_train
+        rows["eval_dropped_no_assistant_labels"] = dropped_eval
+        _persist_resolved_config(run_dir, config)
+    if not train_rows:
+        raise ValueError(
+            "No trainable conversations: every assistant turn starts past the "
+            f"training limit ({max_length} tokens). Raise max_seq_length or "
+            "shorten the prompts."
+        )
+    return train_rows, eval_rows
 
 
 def _no_fit_message(training_cfg: dict[str, Any], base_model: str) -> str:
@@ -738,6 +785,11 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    if not is_vision:
+        # Fail quickly, before the dataset is touched: text SFT trains on
+        # assistant tokens only, and a chat template without a
+        # {% generation %} block cannot mark them (lqh.train.assistant_mask).
+        require_assistant_mask_support(tokenizer, base_model)
 
     # LoRA config. Defaults are per-modality: the vision recipe
     # (docs.liquid.ai/lfm/fine-tuning/trl) uses a lower rank and targets
@@ -851,6 +903,10 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         # below reads training_cfg["max_seq_length"].
         train_rows_sft, eval_rows_sft = _resolve_text_seq_length(
             run_dir, config, training_cfg, tokenizer, model,
+            train_rows_sft, eval_rows_sft,
+        )
+        train_rows_sft, eval_rows_sft = _drop_rows_without_assistant_labels(
+            run_dir, config, training_cfg, tokenizer,
             train_rows_sft, eval_rows_sft,
         )
         train_dataset = Dataset.from_list(train_rows_sft)
@@ -1040,6 +1096,9 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         gradient_checkpointing=training_cfg.get("gradient_checkpointing", True),
         bf16=training_cfg.get("bf16", True),
         max_length=training_cfg.get("max_seq_length", 2048),
+        # Always on for text; trl 1.0 refuses it for VLMs, which keep the
+        # full-sequence loss. Not configurable (lqh.train.assistant_mask).
+        assistant_only_loss=not is_vision,
         dataloader_num_workers=training_cfg.get("dataloader_num_workers", 4),
         dataloader_pin_memory=True,
         ddp_find_unused_parameters=False,

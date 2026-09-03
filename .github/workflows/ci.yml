@@ -52,6 +52,21 @@ jobs:
       - run: uv run python -m tests.benchmarks.base_vs_instruct.run --help > /dev/null
       - run: uv run python -m tests.experiments.experiment_e2e_pipeline --help > /dev/null
 
+  train-tests:
+    name: train-extra tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv python install 3.12
+      # transformers/trl/torch are train extras, so the default job skips
+      # every assertion in this file.
+      - run: uv sync --frozen --group dev --extra train --python 3.12
+      - run: uv run pytest tests/unit/test_sft_assistant_only_loss.py -v
+
   json-lint:
     name: json lint
     runs-on: ubuntu-latest
