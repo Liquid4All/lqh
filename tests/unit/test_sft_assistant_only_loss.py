@@ -111,3 +111,21 @@ def test_rows_truncated_past_their_assistant_turn_are_dropped(tokenizer):
     kept, dropped = drop_rows_without_assistant_labels(rows, tokenizer, first_label + 1)
     assert (kept, dropped) == (rows, 0)
     assert drop_rows_without_assistant_labels(rows, tokenizer, None) == (rows, 0)
+
+
+def test_a_template_without_a_generation_block_is_rejected_before_launch(tmp_path):
+    from lqh.tools.handlers import _assistant_mask_unsupported
+
+    blocked = TEMPLATE.replace("{%- generation -%}", "").replace(
+        "{%- endgeneration -%}", ""
+    )
+    make_tokenizer(blocked).save_pretrained(tmp_path / "tok")
+    # base_model given project-relative, as a local checkpoint would be
+    assert _assistant_mask_unsupported(tmp_path, "tok") == (
+        "its chat template has no {% generation %} block"
+    )
+
+    make_tokenizer().save_pretrained(tmp_path / "tok")
+    assert _assistant_mask_unsupported(tmp_path, "tok") is None
+    # unloadable tokenizer fails open: the trainer is the backstop
+    assert _assistant_mask_unsupported(tmp_path, str(tmp_path / "absent")) is None

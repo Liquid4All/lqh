@@ -55,6 +55,11 @@ def launch(tmp_path, isolated_home, monkeypatch):
     project.mkdir()
     grant_training_permission(project, project_wide=True)
     monkeypatch.setattr(handlers, "_local_gpu_available", lambda: False)
+    # The template probe loads a real tokenizer; its behavior is unit-tested
+    # in test_sft_assistant_only_loss.py — keep launches hub-free here.
+    monkeypatch.setattr(
+        handlers, "_assistant_mask_unsupported", lambda project_dir, base_model: None
+    )
 
     scorer = project / "evals" / "scorers" / "s.md"
     scorer.parent.mkdir(parents=True)
@@ -208,6 +213,21 @@ def test_assistant_only_loss_is_rejected_for_vision_models(launch):
     )
     assert rec["result"].ok is False
     assert rec["result"].error_kind == "config"
+    assert "config" not in rec
+
+
+def test_assistant_only_loss_needs_a_maskable_chat_template(launch, monkeypatch):
+    from lqh.tools import handlers
+
+    monkeypatch.setattr(
+        handlers,
+        "_assistant_mask_unsupported",
+        lambda project_dir, base_model: "its chat template has no {% generation %} block",
+    )
+    rec = launch(type="sft", assistant_only_loss=True)
+    assert rec["result"].ok is False
+    assert rec["result"].error_kind == "config"
+    assert "{% generation %}" in rec["result"].content
     assert "config" not in rec
 
 

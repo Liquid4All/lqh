@@ -5088,6 +5088,41 @@ def _budget_base_model(project_dir: Path, name: str) -> str:
     return current
 
 
+def _assistant_mask_unsupported(project_dir: Path, base_model: str) -> str | None:
+    """Why *base_model* cannot label assistant turns only, or None if it can.
+
+    trl raises during dataset tokenization — after a cloud job has been
+    provisioned — so a chat template that marks no assistant tokens is
+    cheaper to reject at launch. Local checkpoint paths resolve against the
+    project dir. Fails open when the tokenizer will not load here (e.g. no
+    network): the trainer is the backstop then.
+    """
+    try:
+        from transformers import AutoTokenizer
+
+        local = project_dir / base_model
+        tokenizer = AutoTokenizer.from_pretrained(
+            local if local.is_dir() else base_model
+        )
+    except Exception:  # noqa: BLE001 — fail open; the trainer is the backstop
+        return None
+    try:
+        encoded = tokenizer.apply_chat_template(
+            [
+                {"role": "user", "content": "ping"},
+                {"role": "assistant", "content": "pong"},
+            ],
+            tokenize=True,
+            return_dict=True,
+            return_assistant_tokens_mask=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — any template failure is the reason
+        return str(exc).strip() or exc.__class__.__name__
+    if not any(encoded.get("assistant_masks") or []):
+        return "its chat template has no {% generation %} block"
+    return None
+
+
 async def handle_start_training(
     project_dir: Path,
     *,
@@ -5387,11 +5422,20 @@ async def handle_start_training(
     from lqh.models import is_vlm_model_name
 
     is_vision = is_vlm_model_name(base_model)
-    if assistant_only_loss and (is_vision or type != "sft"):
-        return ToolResult.fail(
-            "config",
-            "Error: assistant_only_loss applies to text SFT only.",
-        )
+    if assistant_only_loss:
+        if is_vision or type != "sft":
+            return ToolResult.fail(
+                "config",
+                "Error: assistant_only_loss applies to text SFT only.",
+            )
+        unsupported = _assistant_mask_unsupported(project_dir, base_model)
+        if unsupported:
+            return ToolResult.fail(
+                "config",
+                f"Error: {base_model} cannot mask assistant tokens: "
+                f"{unsupported}. Drop assistant_only_loss or pick a base "
+                "model whose chat template marks its assistant turns.",
+            )
     if is_vision and type != "sft":
         return ToolResult.fail(
             "validation",
