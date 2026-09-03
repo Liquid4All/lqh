@@ -130,6 +130,26 @@ def _no_ambient_hf_token(monkeypatch, request, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _no_hub_tokenizer_download(monkeypatch, request):
+    """Keep the submit-time sequence-length estimate off the network.
+
+    ``start_training`` counts tokens with the base model's ``tokenizer.json``
+    (``lqh/train/seq_length.py``), fetched from the Hub on first use. Dozens of
+    unit tests submit runs against ``LiquidAI/...`` names with HOME pointed at
+    a fresh tmp dir, so each would download afresh. Stub the one Hub call:
+    the estimator falls back to its character count, and tests that exercise
+    the tokenizer path point ``base_model`` at a local dir with a
+    ``tokenizer.json`` instead.
+    """
+    if "unit" not in Path(str(request.node.fspath)).parts:
+        return
+    monkeypatch.setattr(
+        "lqh.train.seq_length._hub_tokenizer_file",
+        lambda repo_id, project_dir: None,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _fixed_render_width(monkeypatch):
     """Pin the TUI render width so assertions don't depend on the terminal.
 

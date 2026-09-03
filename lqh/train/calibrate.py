@@ -370,19 +370,26 @@ def maybe_autotune_batch_size(
     method: str,
     lora_rank: int = 0,
     modality: str = "text",
-) -> None:
+) -> str:
     """Calibrate per_device_batch_size in place when auto-tuning is on.
 
     Enabled by ``training.auto_batch`` (default: on). Never raises.
+
+    Returns what happened, so a caller can act on the one outcome that must
+    not be ignored: ``"cached"`` (profile applied), ``"probed"`` (measured and
+    applied), ``"no_fit"`` (the probe could not fit even micro-batch 1 at the
+    configured sequence length — training_cfg is left untouched, and a run
+    that proceeds anyway will OOM) or ``"skipped"`` (auto-tuning off, no GPU,
+    or the probe itself failed).
     """
     try:
         enabled = bool(training_cfg.get("auto_batch", True))
         if not enabled:
-            return
+            return "skipped"
         import torch
 
         if not torch.cuda.is_available():
-            return
+            return "skipped"
 
         seq_len = int(training_cfg.get("max_seq_length", 2048))
         dtype = "bf16" if training_cfg.get("bf16", True) else "fp32"
@@ -440,7 +447,7 @@ def maybe_autotune_batch_size(
                 f"(effective {realized}{requested}, gpu={gpu_type})",
                 flush=True,
             )
-            return
+            return "cached"
 
         # Probe what MEMORY allows, not what this run's effective-batch target
         # happens to be. The profile the probe writes back is shared across runs
@@ -472,8 +479,12 @@ def maybe_autotune_batch_size(
             pair_batch=method.startswith("dpo"),
         )
         if not measured:
-            print("calibrate: probe found no safe batch; keeping configured default", flush=True)
-            return
+            print(
+                f"calibrate: probe found no safe batch at seq_len={seq_len} "
+                f"(gpu={gpu_type}); keeping configured default",
+                flush=True,
+            )
+            return "no_fit"
         measured = min(int(measured), probe_cap)
         accum = _apply(training_cfg, measured, target_effective)
         applied = int(training_cfg["per_device_batch_size"])
@@ -501,8 +512,10 @@ def maybe_autotune_batch_size(
             f"(effective {realized}{requested}, gpu={gpu_type})",
             flush=True,
         )
+        return "probed"
     except Exception as exc:  # noqa: BLE001 — telemetry must never crash the run
         print(f"calibrate: auto-tune skipped ({exc})", flush=True)
+        return "skipped"
 
 
 def report_oom_downgrade(config: dict[str, Any]) -> None:

@@ -5439,6 +5439,46 @@ async def handle_start_training(
     # them with a data-only edit; explicit tool arguments still win.
     from lqh.train import defaults as hp_defaults
 
+    # Text SFT sizes its sequence length from the data: the longest row,
+    # rounded up, capped at the ceiling (defaults.derived_seq_length). The
+    # backend planner reads the value to pick a GPU that fits it, and the
+    # trainer re-measures it exactly before its calibration probe. There is
+    # deliberately no tool argument for this; LQH_MAX_SEQ_LENGTH is a hidden
+    # expert override that pins the value instead.
+    seq_len: int | None = None
+    auto_seq = False
+    rows_over_limit = 0
+    if type == "sft" and not is_vision:
+        pinned = os.environ.get("LQH_MAX_SEQ_LENGTH", "").strip()
+        if pinned:
+            lo, hi = hp_defaults.SEQ_LENGTH_GRANULARITY, hp_defaults.MAX_SEQ_LENGTH_HARD_LIMIT
+            try:
+                seq_len = int(pinned)
+            except ValueError:
+                seq_len = -1
+            if not lo <= seq_len <= hi:
+                return ToolResult.fail(
+                    "config",
+                    f"Error: LQH_MAX_SEQ_LENGTH must be an integer between {lo} "
+                    f"and {hi}, got {pinned!r}.",
+                )
+        else:
+            from lqh.train.seq_length import estimate_longest_row_tokens
+
+            estimate = estimate_longest_row_tokens(
+                [*train_resolved, *eval_resolved],
+                base_model=_budget_base_model(project_dir, base_model),
+                project_dir=project_dir,
+            )
+            seq_len = hp_defaults.derived_seq_length(estimate.longest_tokens)
+            auto_seq = True
+            rows_over_limit = estimate.rows_over_ceiling
+            logger.debug(
+                "seq length estimate: longest=%d rows=%d over=%d source=%s -> %d",
+                estimate.longest_tokens, estimate.rows, estimate.rows_over_ceiling,
+                estimate.source, seq_len,
+            )
+
     recommended = hp_defaults.recommended(
         run_type=type,
         lora=lora,
@@ -5449,6 +5489,8 @@ async def handle_start_training(
         # enough optimizer steps to learn.
         train_rows=train_rows_effective,
         num_epochs=num_epochs,
+        max_seq_length=seq_len,
+        auto_seq_length=auto_seq,
     )
     lr = learning_rate if learning_rate is not None else recommended.learning_rate
     epochs = num_epochs if num_epochs is not None else recommended.num_epochs
@@ -5480,6 +5522,10 @@ async def handle_start_training(
     }
     if epochs is not None:
         config["training"]["num_epochs"] = epochs
+    if rows_over_limit:
+        # Surfaced by _training_data_line; the trainer drops these rows
+        # (exact count in its log) rather than truncating them.
+        config["dataset_rows"]["over_limit"] = rows_over_limit
     if is_vision:
         config["modality"] = "vision"
         # Per-image token budget for the processor. Effective text budget
@@ -6183,6 +6229,12 @@ def _training_data_line(config: dict[str, Any]) -> str:
         line += f" (eff. {eff:,})"
     if rows.get("eval"):
         line += f" · eval {rows['eval']:,} rows"
+    if rows.get("over_limit"):
+        n = rows["over_limit"]
+        line += (
+            f" · ⚠ {n:,} conversation{'s' if n != 1 else ''} too long for "
+            "training, will be skipped"
+        )
     return line
 
 

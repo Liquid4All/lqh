@@ -260,8 +260,60 @@ def test_training_config_shape():
         "gradient_accumulation_steps": 1,
         "effective_batch_size": 256,
         "auto_batch": True,
+        "auto_seq_length": False,
         "num_epochs": 3,
     }
+
+
+# ---------------------------------------------------------------------------
+# Data-derived sequence length (text SFT)
+# ---------------------------------------------------------------------------
+
+
+def test_derived_seq_length_rounds_up_floors_and_caps():
+    gran, ceiling = defaults.SEQ_LENGTH_GRANULARITY, defaults.MAX_SEQ_LENGTH_CEILING
+    assert defaults.derived_seq_length(0) == gran
+    assert defaults.derived_seq_length(1) == gran
+    assert defaults.derived_seq_length(gran) == gran
+    assert defaults.derived_seq_length(gran + 1) == 2 * gran
+    assert defaults.derived_seq_length(5_930) == 6 * gran
+    assert defaults.derived_seq_length(ceiling) == ceiling
+    assert defaults.derived_seq_length(ceiling + 1) == ceiling
+    assert defaults.derived_seq_length(10**7) == ceiling
+
+
+def test_derived_seq_length_matches_the_calibration_bucket():
+    """One derived value must map onto exactly one batch-profile cache bucket."""
+    from lqh.train.calibrate import seq_len_bucket
+
+    for n in (1, 1024, 1025, 4096, 4097, 20_000, 32_768):
+        assert seq_len_bucket(defaults.derived_seq_length(n)) == defaults.derived_seq_length(n)
+
+
+def test_recommended_uses_the_derived_length_for_sft_and_flags_it():
+    hp = defaults.recommended(
+        run_type="sft", lora=True, max_seq_length=6144, auto_seq_length=True
+    )
+    assert hp.max_seq_length == 6144
+    assert hp.auto_seq_length is True
+    training = hp.training_config()
+    assert training["max_seq_length"] == 6144
+    assert training["auto_seq_length"] is True
+
+
+def test_recommended_pinned_length_is_not_flagged_auto():
+    """An expert override is used as-is; the trainer must not re-measure it."""
+    hp = defaults.recommended(run_type="sft", lora=True, max_seq_length=8192)
+    assert hp.max_seq_length == 8192
+    assert hp.auto_seq_length is False
+
+
+def test_recommended_without_a_length_keeps_the_fixed_default():
+    """DPO / GRPO / vision keep training at MAX_SEQ_LENGTH, never auto."""
+    for run_type in ("sft", "on_policy_dpo", "grpo"):
+        hp = defaults.recommended(run_type=run_type, auto_seq_length=True)
+        assert hp.max_seq_length == defaults.MAX_SEQ_LENGTH
+        assert hp.auto_seq_length is False
 
 
 def test_training_config_omits_num_epochs_for_dpo():

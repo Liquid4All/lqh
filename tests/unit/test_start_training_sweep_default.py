@@ -140,6 +140,122 @@ def test_batch_size_is_derived_from_the_dataset(launch):
     assert training["per_device_batch_size"] <= training["effective_batch_size"]
 
 
+# ---------------------------------------------------------------------------
+# Sequence length is derived from the data for text SFT — no tool argument,
+# nothing in the confirmation unless rows will be skipped.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_estimate(monkeypatch):
+    """Pin the submit-time estimate so tests don't depend on the fixture's
+    2-message parquet or on a tokenizer."""
+    from lqh.train import seq_length
+
+    state = {"longest": 5_930, "over": 0}
+
+    def _estimate(paths, *, base_model, project_dir, ceiling=None):
+        state["paths"] = [str(p) for p in paths]
+        state["base_model"] = base_model
+        return seq_length.SeqEstimate(
+            longest_tokens=state["longest"], rows=1,
+            rows_over_ceiling=state["over"], source="tokenizer",
+        )
+
+    monkeypatch.setattr(seq_length, "estimate_longest_row_tokens", _estimate)
+    return state
+
+
+def test_sft_sequence_length_is_derived_from_the_data(launch, fake_estimate):
+    from lqh.train import defaults
+
+    training = launch(type="sft")["config"]["training"]
+    assert training["max_seq_length"] == defaults.derived_seq_length(5_930) == 6144
+    assert training["auto_seq_length"] is True
+    # Train AND eval files feed the estimate; the longest eval row matters too.
+    assert any("ds_eval" in p for p in fake_estimate["paths"])
+    assert any("/ds/" in p for p in fake_estimate["paths"])
+
+
+def test_sft_sequence_length_without_a_tokenizer_still_derives(launch):
+    """No stub: the conftest blocks the Hub, so the character fallback runs.
+    The 2-message fixture row lands on the 1024 floor."""
+    from lqh.train import defaults
+
+    training = launch(type="sft")["config"]["training"]
+    assert training["max_seq_length"] == defaults.SEQ_LENGTH_GRANULARITY
+    assert training["auto_seq_length"] is True
+
+
+def test_sequence_length_is_capped_at_the_ceiling_and_skips_are_announced(
+    launch, fake_estimate
+):
+    from lqh.train import defaults
+
+    fake_estimate["longest"] = 90_000
+    fake_estimate["over"] = 3
+    rec = launch(type="sft")
+    assert rec["config"]["training"]["max_seq_length"] == defaults.MAX_SEQ_LENGTH_CEILING
+    assert rec["config"]["dataset_rows"]["over_limit"] == 3
+    from lqh.tools.handlers import _training_data_line
+
+    line = _training_data_line(rec["config"])
+    assert "3 conversations too long" in line
+    assert "seq" not in line.lower()
+
+
+def test_no_skip_note_in_the_normal_case(launch, fake_estimate):
+    from lqh.tools.handlers import _training_data_line
+
+    rec = launch(type="sft")
+    assert "over_limit" not in rec["config"]["dataset_rows"]
+    line = _training_data_line(rec["config"])
+    assert "too long" not in line
+    assert "seq" not in line.lower()
+
+
+def test_dpo_keeps_the_fixed_length_and_is_never_auto(launch, fake_estimate):
+    from lqh.train import defaults
+
+    training = launch(type="on_policy_dpo")["config"]["base_config"]["training"]
+    assert training["max_seq_length"] == defaults.MAX_SEQ_LENGTH
+    assert training["auto_seq_length"] is False
+    assert "paths" not in fake_estimate  # the estimator did not even run
+
+
+def test_sweep_children_inherit_the_derived_length(launch, fake_estimate):
+    rec = launch(type="sft", enable_sweep=True)
+    assert rec["config"]["base_config"]["training"]["max_seq_length"] == 6144
+
+
+def test_expert_env_override_pins_the_length(launch, fake_estimate, monkeypatch):
+    monkeypatch.setenv("LQH_MAX_SEQ_LENGTH", "16384")
+    training = launch(type="sft")["config"]["training"]
+    assert training["max_seq_length"] == 16384
+    assert training["auto_seq_length"] is False
+    assert "paths" not in fake_estimate  # pinned: no estimate needed
+
+
+def test_expert_env_override_rejects_nonsense(launch, monkeypatch):
+    for bad in ("abc", "12", "9999999"):
+        monkeypatch.setenv("LQH_MAX_SEQ_LENGTH", bad)
+        rec = launch(type="sft")
+        assert rec["result"].ok is False
+        assert rec["result"].error_kind == "config"
+        assert "LQH_MAX_SEQ_LENGTH" in rec["result"].content
+        assert "config" not in rec
+
+
+def test_start_training_schema_has_no_sequence_length_argument():
+    """The whole point: users never see the knob."""
+    from lqh.tools.definitions import get_all_tools
+
+    tool = next(t for t in get_all_tools() if t["function"]["name"] == "start_training")
+    props = tool["function"]["parameters"]["properties"]
+    assert "max_seq_length" not in props
+    assert not any("seq_len" in k or "context_length" in k for k in props)
+
+
 def test_batch_size_scales_with_rows_and_honours_the_epoch_override(
     launch, tmp_path
 ):

@@ -307,7 +307,7 @@ def _shrink_menu(f: JobFailure) -> str:
         )
     if "eval" in kind or "infer" in kind:
         return (
-            "fewer eval samples, a shorter max_seq_length, or splitting the "
+            "fewer eval samples, shorter conversations, or splitting the "
             "eval set into batches"
         )
     if "grpo" in kind:
@@ -446,7 +446,7 @@ def describe_failure(f: JobFailure | None, run_name: str) -> str:
             "message, and check whether the config is near the memory limit for this "
             "GPU. If memory is plausible, lower per_device_train_batch_size (raise "
             "gradient_accumulation_steps to keep the effective batch size) or "
-            "max_seq_length before resubmitting. If it is not, treat it as an "
+            "shorten the longest conversations before resubmitting. If it is not, treat it as an "
             "interruption: resubmit under a NEW run name, which starts from step 0."
             + _cost_tail(f)
         )
@@ -479,7 +479,8 @@ def describe_failure(f: JobFailure | None, run_name: str) -> str:
             f"OUT OF MEMORY{gpu}: the trainer exceeded device or host memory."
             f"{repeated} This IS a config lever, not infrastructure. RECOVERY: "
             "lower per_device_train_batch_size (raise gradient_accumulation_steps "
-            "to keep the effective batch size), lower max_seq_length, enable "
+            "to keep the effective batch size), shorten or split the longest "
+            "conversations in the dataset, enable "
             "gradient checkpointing, or reduce the model size. Do NOT resubmit "
             "the identical config — it will OOM again."
         )

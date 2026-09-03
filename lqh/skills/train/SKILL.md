@@ -251,7 +251,7 @@ arguments** — the harness detects the VL base and switches automatically:
   α=16, lr 5e-4, expanded target modules including the multimodal projector).
   The sweep works as usual.
 - **Token budget**: each image costs up to `training.max_image_tokens`
-  (default 256) of the `max_seq_length` (2048) budget. Samples that render
+  (default 256) of the per-sample token budget. Samples that render
   over-long are dropped with a warning, never truncated (truncation through
   image tokens corrupts training) — keep conversations short or images few.
 - **Eval** works unchanged: checkpoint eval generates with the image inputs

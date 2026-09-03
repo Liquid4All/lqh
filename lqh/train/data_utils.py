@@ -335,6 +335,44 @@ def load_eval_sources_with_tools(
     return convos, tools, sources_per_sample
 
 
+def tokenized_row_lengths(
+    rows: list[dict[str, Any]],
+    tokenizer: Any,
+) -> list[int]:
+    """Exact token length of each SFT row, rendered through the chat template.
+
+    *rows* are :func:`chatml_to_sft_dataset` rows (``messages`` plus an
+    optional JSON-encoded ``tools`` string). This is the same call trl's SFT
+    path makes when it tokenizes the dataset, so the lengths match what the
+    trainer will see. Cheap enough to run over the whole set once at start-up
+    (~0.7 ms/row on the LFM2.5 fast tokenizer).
+
+    Kept as a plain function so the assistant-only-loss work can extend it to
+    report assistant-mask presence from the same pass.
+    """
+    lengths: list[int] = []
+    for row in rows:
+        tools = row.get("tools")
+        if isinstance(tools, str):
+            tools = json.loads(tools) if tools else None
+        try:
+            ids = tokenizer.apply_chat_template(
+                row["messages"], tools=tools, tokenize=True,
+            )
+        except TypeError as exc:
+            # Older tokenizers without a ``tools`` kwarg — and only that, and
+            # only when the row has no tools to lose. Any other TypeError is
+            # a real template failure trl would hit too, and a tool-bearing
+            # row measured without its tools would be under-counted.
+            if "tools" not in str(exc) or tools is not None:
+                raise
+            ids = tokenizer.apply_chat_template(row["messages"], tokenize=True)
+        if isinstance(ids, dict):
+            ids = ids.get("input_ids") or []
+        lengths.append(len(ids))
+    return lengths
+
+
 def chatml_to_sft_dataset(
     conversations: list[list[dict[str, str]]],
     tools_per_sample: list[list[dict[str, Any]] | None] | None = None,

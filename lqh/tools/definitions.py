@@ -1535,7 +1535,7 @@ def _build_all_tools(*, auto_mode: bool = False) -> list[dict]:
                 "collation, the VLM LoRA recipe). The dataset must carry its images "
                 "inline as image_url data-URLs in the messages (the standard vision "
                 "data-gen output). Token budget note: each image costs up to "
-                "training.max_image_tokens (default 256) of the max_seq_length budget. "
+                "training.max_image_tokens (default 256) of the per-sample token budget. "
                 "Run names are unique and cannot be reused, and a resubmit always "
                 "starts from step 0: there is no way to resume a previous cloud run's "
                 "checkpoints from here. After an interrupted run, submit a NEW, "

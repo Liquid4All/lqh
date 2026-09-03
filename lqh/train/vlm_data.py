@@ -214,8 +214,9 @@ class VLMCollator:
                     self._dropped += 1
             if not kept:
                 raise ValueError(
-                    f"every sample in the batch renders longer than "
-                    f"max_length={self.max_length}; raise training.max_seq_length "
+                    f"every sample in the batch renders longer than the "
+                    f"{self.max_length}-token training limit; use fewer or "
+                    f"smaller images per sample, shorten the conversations, "
                     f"or lower training.max_image_tokens"
                 )
             if len(kept) < len(convs):

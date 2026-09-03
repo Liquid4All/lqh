@@ -433,3 +433,80 @@ def test_autotune_caps_the_probe_when_it_cannot_publish(monkeypatch):
     assert seen["max_micro_batch"] == 64
     assert cfg["per_device_batch_size"] == 64
     assert posted == {}
+
+
+# ---------------------------------------------------------------------------
+# maybe_autotune_batch_size reports its outcome so sft.py can fail fast on
+# the one that must not be ignored ("no_fit").
+# ---------------------------------------------------------------------------
+
+
+def test_autotune_reports_skipped_when_disabled():
+    cfg = {"auto_batch": False, "per_device_batch_size": 256}
+    status = calibrate.maybe_autotune_batch_size(
+        cfg, model=None, tokenizer=None, base_model="m", method="lora"
+    )
+    assert status == "skipped"
+    assert cfg["per_device_batch_size"] == 256
+
+
+def _fake_torch(monkeypatch):
+    import sys
+    import types
+
+    cuda = types.SimpleNamespace(
+        is_available=lambda: True, get_device_name=lambda i=0: "FakeGPU"
+    )
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+
+
+def test_autotune_reports_no_fit_and_leaves_the_config_alone(monkeypatch):
+    """Micro-batch 1 did not fit at this sequence length. The config must be
+    untouched (the caller raises) — silently training on the default 256
+    is exactly the OOM this status exists to prevent."""
+    _fake_torch(monkeypatch)
+    monkeypatch.setattr(calibrate, "_get_cached_profile", lambda key: None)
+    monkeypatch.setattr(calibrate, "_profile_writes_enabled", lambda: False)
+    monkeypatch.setattr(
+        calibrate, "_probe_micro_batch", lambda *a, **k: (None, None)
+    )
+    cfg = {
+        "auto_batch": True, "max_seq_length": 32768,
+        "per_device_batch_size": 256, "gradient_accumulation_steps": 1,
+        "effective_batch_size": 256,
+    }
+    status = calibrate.maybe_autotune_batch_size(
+        cfg, model=object(), tokenizer=object(), base_model="m", method="lora"
+    )
+    assert status == "no_fit"
+    assert cfg["per_device_batch_size"] == 256
+
+
+def test_autotune_reports_probed_and_cached(monkeypatch):
+    _fake_torch(monkeypatch)
+    monkeypatch.setattr(calibrate, "_get_cached_profile", lambda key: None)
+    monkeypatch.setattr(calibrate, "_profile_writes_enabled", lambda: False)
+    monkeypatch.setattr(calibrate, "_probe_micro_batch", lambda *a, **k: (4, 1000))
+    cfg = {
+        "auto_batch": True, "max_seq_length": 8192,
+        "per_device_batch_size": 256, "gradient_accumulation_steps": 1,
+        "effective_batch_size": 16,
+    }
+    assert calibrate.maybe_autotune_batch_size(
+        cfg, model=object(), tokenizer=object(), base_model="m", method="lora"
+    ) == "probed"
+    assert cfg["per_device_batch_size"] == 4
+    assert cfg["gradient_accumulation_steps"] == 4
+
+    monkeypatch.setattr(
+        calibrate, "_get_cached_profile", lambda key: {"measured_micro_batch": 2}
+    )
+    cfg = {
+        "auto_batch": True, "max_seq_length": 8192,
+        "per_device_batch_size": 256, "gradient_accumulation_steps": 1,
+        "effective_batch_size": 16,
+    }
+    assert calibrate.maybe_autotune_batch_size(
+        cfg, model=object(), tokenizer=object(), base_model="m", method="lora"
+    ) == "cached"
+    assert cfg["per_device_batch_size"] == 2

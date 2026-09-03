@@ -28,6 +28,9 @@ dependencies = [
     "liquidrandom",
     "datasets",
     "huggingface_hub>=0.20",
+    # Submit-time token counting for the data-derived SFT sequence length
+    # (lqh/train/seq_length.py). The Rust wheel alone — no transformers.
+    "tokenizers>=0.20",
     "pyarrow",
     # Image preprocessing for VLM data-gen (resize/re-encode before base64).
     "pillow>=10.0",

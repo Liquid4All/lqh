@@ -134,6 +134,54 @@ def _persist_resolved_config(run_dir: Path, config: dict[str, Any]) -> None:
         print(f"  WARNING: could not persist resolved config: {exc}")
 
 
+def _resolve_text_seq_length(
+    run_dir: Path,
+    config: dict[str, Any],
+    training_cfg: dict[str, Any],
+    tokenizer: Any,
+    model: Any,
+    train_rows: list[dict[str, Any]],
+    eval_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Exact data-derived sequence length (lqh.train.seq_length) plus the
+    run-directory bookkeeping that belongs to the trainer: the dropped-row
+    counts land in ``dataset_rows`` and the resolved config reaches disk so
+    training_status, lineage, publish and a resume all report the length this
+    run actually trained at."""
+    from lqh.train.seq_length import resolve_text_seq_length
+
+    model_cfg = getattr(model, "config", None)
+    max_positions = getattr(model_cfg, "max_position_embeddings", None)
+    res = resolve_text_seq_length(
+        training_cfg, tokenizer, train_rows, eval_rows,
+        model_max_positions=int(max_positions) if max_positions else None,
+    )
+    if res.changed:
+        rows = config.setdefault("dataset_rows", {})
+        if res.dropped_train or res.dropped_eval:
+            rows["train_dropped_too_long"] = res.dropped_train
+            rows["eval_dropped_too_long"] = res.dropped_eval
+        _persist_resolved_config(run_dir, config)
+    return res.train_rows, res.eval_rows
+
+
+def _no_fit_message(training_cfg: dict[str, Any], base_model: str) -> str:
+    """Plain-language explanation for a probe that could not fit micro-batch 1."""
+    import os
+
+    gpu = os.environ.get("LQH_GPU_TYPE") or (
+        torch.cuda.get_device_name(0) if torch.cuda.is_available() else "this GPU"
+    )
+    longest = training_cfg.get("longest_row_tokens") or training_cfg.get(
+        "max_seq_length", 0
+    )
+    return (
+        f"The longest conversation in the dataset (~{int(longest):,} tokens) does "
+        f"not fit on {gpu} with {base_model}, even one at a time. Shorten or "
+        "split the longest conversations, or use a smaller model."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Callback: writes progress.jsonl and handles checkpoint eval
 # ---------------------------------------------------------------------------
@@ -795,14 +843,18 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
         if eval_convos:
             eval_dataset = Dataset.from_list(chatml_to_vlm_dataset(eval_convos))
     else:
-        train_dataset = Dataset.from_list(
-            chatml_to_sft_dataset(train_convos, train_tools)
+        train_rows_sft = chatml_to_sft_dataset(train_convos, train_tools)
+        eval_rows_sft = (
+            chatml_to_sft_dataset(eval_convos, eval_tools) if eval_convos else []
         )
-        eval_dataset = None
-        if eval_convos:
-            eval_dataset = Dataset.from_list(
-                chatml_to_sft_dataset(eval_convos, eval_tools)
-            )
+        # Exact sequence length from the data, BEFORE the calibration probe
+        # below reads training_cfg["max_seq_length"].
+        train_rows_sft, eval_rows_sft = _resolve_text_seq_length(
+            run_dir, config, training_cfg, tokenizer, model,
+            train_rows_sft, eval_rows_sft,
+        )
+        train_dataset = Dataset.from_list(train_rows_sft)
+        eval_dataset = Dataset.from_list(eval_rows_sft) if eval_rows_sft else None
 
     # Safe batch-size auto-tuning (GPU_TYPE.md §6). Mutates training_cfg
     # in place (per_device_batch_size + gradient_accumulation_steps) so
@@ -844,7 +896,7 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
             from peft import get_peft_model
 
             probe_model = get_peft_model(model, peft_config)
-        maybe_autotune_batch_size(
+        calibration = maybe_autotune_batch_size(
             training_cfg,
             model=probe_model,
             tokenizer=tokenizer,
@@ -852,6 +904,36 @@ def sft_loop(run_dir: Path, config: dict[str, Any]) -> None:
             method="lora" if lora_enabled else "full",
             lora_rank=int(lora_cfg.get("r", 32)) if lora_enabled else 0,
         )
+        if calibration == "no_fit":
+            # Even micro-batch 1 exceeded the budget at this run's sequence
+            # length. Proceeding would train on the configured default
+            # (256 for LoRA) and OOM after the model load — fail now, with
+            # the reason, instead.
+            raise RuntimeError(_no_fit_message(training_cfg, base_model))
+        from lqh.train.defaults import MAX_SEQ_LENGTH
+
+        if (
+            calibration == "skipped"
+            and torch.cuda.is_available()
+            and bool(training_cfg.get("auto_batch", True))
+            and int(training_cfg.get("max_seq_length", 0)) > MAX_SEQ_LENGTH
+        ):
+            # Auto-tuning was on but produced no measurement (probe or
+            # backend error). The configured micro-batch is the dataset-
+            # derived throughput value (up to 256), which is only known to
+            # be safe at the default length. Above it, micro-batch 1 is the
+            # one assumption that cannot OOM more than the probe would have;
+            # the effective batch is preserved through accumulation.
+            from lqh.train.calibrate import _apply
+
+            target = int(training_cfg.get("effective_batch_size", 1))
+            _apply(training_cfg, 1, target)
+            print(
+                "  calibrate: no measurement at "
+                f"max_seq_length={training_cfg['max_seq_length']}; using "
+                f"micro-batch 1 x {training_cfg['gradient_accumulation_steps']} "
+                "accumulation as the safe default"
+            )
         if probe_model is not model:
             model = probe_model.unload()
             # PEFT leaves these markers on some transformers versions after

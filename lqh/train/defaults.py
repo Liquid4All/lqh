@@ -85,7 +85,46 @@ VISION_TARGET_MODULES: tuple[str, ...] = (
 # max_seq_length − n_images × max_image_tokens.
 VISION_MAX_IMAGE_TOKENS = 256
 
+# Fixed sequence length for the runs that do NOT derive it from their data:
+# DPO (where the field doubles as the rollout max_new_tokens), GRPO (split
+# into prompt + completion budgets) and vision SFT (the VLMCollator drops
+# over-long samples against it). Text SFT no longer trains at this value —
+# see derived_seq_length below.
 MAX_SEQ_LENGTH = 2048
+
+# Text SFT: the run's max_seq_length is derived from the dataset (longest
+# tokenized row, rounded up to SEQ_LENGTH_GRANULARITY) and capped at this
+# ceiling. The ceiling is NOT the value a run trains at — the calibration
+# probe (lqh/train/calibrate.py) measures memory at the configured
+# max_seq_length, so a run that always assumed 32k would probe at 32k, land on
+# micro-batch 1 for a 500-token dataset and fragment the shared batch-profile
+# cache under one bucket. Deriving per run keeps short datasets exactly as
+# fast as before and lets long ones use what they need.
+#
+# Why 32k and not the 131k architectural limit: at micro-batch 1 the logits
+# alone (65k vocab × seq × ~6 bytes for bf16 + fp32 upcast) cost ~0.4 GB per
+# 1k tokens, so 32k already needs an 80GB card for the 8B base. Beyond it the
+# probe fails at micro-batch 1 for most model/GPU pairs. Raising the ceiling is
+# a one-line change here once the trainer avoids materialising full logits.
+MAX_SEQ_LENGTH_CEILING = 32768
+SEQ_LENGTH_GRANULARITY = 1024
+
+# Absolute bound for the hidden expert override (LQH_MAX_SEQ_LENGTH on the
+# client): the LFM2.5 max_position_embeddings. Not user-facing.
+MAX_SEQ_LENGTH_HARD_LIMIT = 131072
+
+
+def derived_seq_length(longest_row_tokens: int) -> int:
+    """The text-SFT ``max_seq_length`` for a dataset whose longest row has
+    ``longest_row_tokens`` tokens: rounded up to the granularity, floored at
+    one granularity step, capped at the ceiling.
+
+    Same rounding as ``lqh.train.calibrate.seq_len_bucket`` so a derived
+    value maps 1:1 onto a batch-profile cache bucket.
+    """
+    n = max(1, int(longest_row_tokens or 0))
+    rounded = int(math.ceil(n / SEQ_LENGTH_GRANULARITY) * SEQ_LENGTH_GRANULARITY)
+    return max(SEQ_LENGTH_GRANULARITY, min(MAX_SEQ_LENGTH_CEILING, rounded))
 
 # NOT measured — carried over unchanged, and the study cannot settle it.
 # hpd-stageA's 3-epoch configs did win, but that comparison is confounded: its
@@ -196,6 +235,11 @@ class HParams:
     effective_batch_size: int
     max_seq_length: int
     lora: dict[str, Any] = field(default_factory=dict)
+    # True when max_seq_length was derived from the dataset (text SFT). The
+    # trainer then re-measures it exactly from the tokenized rows before the
+    # calibration probe runs; a pinned value (expert override, DPO/GRPO/
+    # vision, hand-written config) is used as-is.
+    auto_seq_length: bool = False
 
     @property
     def gradient_accumulation_steps(self) -> int:
@@ -226,6 +270,7 @@ class HParams:
             # The GPU calibration probe may shrink the micro-batch for memory
             # safety; it never raises the effective target.
             "auto_batch": True,
+            "auto_seq_length": self.auto_seq_length,
         }
         if self.num_epochs is not None:
             training["num_epochs"] = self.num_epochs
@@ -278,6 +323,8 @@ def recommended(
     base_model: str | None = None,
     train_rows: int | None = None,
     num_epochs: int | None = None,
+    max_seq_length: int | None = None,
+    auto_seq_length: bool = False,
 ) -> HParams:
     """Return the recommended hyperparameters for a run.
 
@@ -286,6 +333,11 @@ def recommended(
     epoch override, if any) size the text LoRA batch so the run takes enough
     optimizer steps — see :func:`sft_effective_batch`. Pass them whenever they
     are known; omitting them keeps the old fixed-256 batch.
+
+    ``max_seq_length`` is the per-run sequence length for text SFT, derived
+    from the dataset by the caller (:func:`derived_seq_length`); ``None`` keeps
+    the fixed :data:`MAX_SEQ_LENGTH` that DPO, GRPO and vision train at.
+    ``auto_seq_length`` marks a derived value so the trainer re-measures it.
 
     ``base_model`` is accepted but currently unused: the hp_defaults study
     exists precisely to determine whether model size / base-vs-instruct deserve
@@ -359,8 +411,11 @@ def recommended(
         num_epochs=None if (is_dpo or is_grpo) else (num_epochs or DEFAULT_SFT_EPOCHS),
         per_device_batch_size=micro_batch,
         effective_batch_size=effective_batch,
-        max_seq_length=MAX_SEQ_LENGTH,
+        max_seq_length=(
+            int(max_seq_length) if max_seq_length else MAX_SEQ_LENGTH
+        ),
         lora=lora_config,
+        auto_seq_length=bool(auto_seq_length and max_seq_length),
     )
 
 
