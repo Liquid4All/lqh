@@ -166,8 +166,10 @@ def main() -> None:
             )
         )
     except Exception as exc:
-        # Deterministic pipeline bugs (the engine aborts fast on those)
-        # and unexpected crashes both land here. status.json + logs are
+        # Pipeline bugs that leave the run with nothing (the engine
+        # aborts fast on those) and unexpected crashes both land here.
+        # A bug that only costs some samples does not: the run finishes
+        # short and reports below. status.json + logs are
         # published by the launcher regardless of our exit code.
         if isinstance(exc, FileNotFoundError):
             # The most common cloud-only failure: the pipeline read a

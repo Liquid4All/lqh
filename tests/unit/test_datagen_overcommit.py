@@ -623,3 +623,63 @@ def test_sample_watchdog_bounds_a_wedged_pipeline(chdir_to_tmp: Path) -> None:
     assert time.monotonic() - started < 10
     assert result.succeeded == 0
     assert result.failed == 2
+
+
+# Bring-your-data: the two "bad" records trip a code bug (the shape an
+# LLM returning an unexpected type produces), every other record
+# succeeds. Run with concurrency=1 so the good records are in hand
+# before a bad one is reached.
+_INPUT_DEPENDENT_BUG_PIPELINE = """
+from lqh.pipeline import Pipeline, ChatMLMessage
+from lqh.sources import prompts
+
+class SometimesBuggy(Pipeline):
+    @classmethod
+    def source(cls, project_dir):
+        return prompts("seeds.txt")
+
+    async def generate(self, client, input=None):
+        if input.prompt.startswith("bad"):
+            raise AttributeError("'int' object has no attribute 'get'")
+        return [
+            ChatMLMessage(role="user", content=input.prompt),
+            ChatMLMessage(role="assistant", content="ok"),
+        ]
+"""
+
+
+def test_a_code_bug_after_successes_does_not_discard_the_run(
+    chdir_to_tmp: Path,
+) -> None:
+    """An input-dependent bug must cost its sample, not the whole run.
+
+    A cloud run reached 4770/5000 samples over ~2h before one sample hit
+    an AttributeError; the abort raised it past the parquet write, so
+    every paid sample was thrown away. Once samples have succeeded the
+    pipeline demonstrably works, so a code bug is input-dependent and
+    belongs in the retry ladder like any other failure.
+    """
+    project = chdir_to_tmp
+    script = _write(project, _INPUT_DEPENDENT_BUG_PIPELINE)
+    (project / "seeds.txt").write_text(
+        "\n".join([f"ok{i}" for i in range(58)] + ["bad0", "bad1"])
+    )
+    out_dir = project / "datasets" / "d"
+
+    result = _run_bounded(run_pipeline(
+        script_path=script,
+        num_samples=60,
+        output_dir=out_dir,
+        client=object(),  # type: ignore[arg-type]
+        concurrency=1,
+        max_retries=0,
+    ))
+
+    # No spares in bring-your-data mode, so the duds are a real shortfall
+    # — and the 58 samples already paid for still reach the dataset.
+    assert (result.total, result.succeeded, result.failed) == (60, 58, 2)
+    assert result.sample_failures == 2
+    assert len(pq.read_table(out_dir / "data.parquet")) == 58
+    # The traceback goes to the log; the result has to name the bug, or a
+    # local run shows the agent a bare failure count.
+    assert result.first_code_bug == "AttributeError: 'int' object has no attribute 'get'"

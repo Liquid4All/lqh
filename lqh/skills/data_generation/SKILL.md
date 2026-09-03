@@ -88,7 +88,7 @@ class MyPipeline(Pipeline):
 
 ### Handling `message.content = None`
 
-`resp.choices[0].message.content` can be `None` even on an otherwise successful response (some upstream models return an empty content field). Calling `.strip()` on `None` raises `AttributeError`, which the engine treats as a code bug and aborts the whole run — not transient, not retried. This is **not** a bug in your pipeline.
+`resp.choices[0].message.content` can be `None` even on an otherwise successful response (some upstream models return an empty content field). Calling `.strip()` on `None` raises `AttributeError`, which the engine treats as a code bug: it aborts the whole run if no sample has succeeded yet, and otherwise costs that sample (retried, then counted as a permanent failure — the run finishes short). This is **not** a bug in your pipeline.
 
 Use the `safe_content` helper from `lqh.pipeline`:
 

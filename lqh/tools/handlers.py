@@ -2117,11 +2117,19 @@ async def _execute_pipeline(
                 "dataset auto-downloads on completion)."
             )
 
+        # A code bug that hits one sample in dozens no longer aborts the
+        # run, so the traceback is in the log and not in this result —
+        # name it here or the agent sees a bare failure count.
+        bug_note = (
+            f"\n  Error:   {result.first_code_bug} (in one or more samples)"
+            if result.first_code_bug else ""
+        )
         return ToolResult(
             content=(
                 f"✅ Pipeline completed\n"
                 f"  Samples: {result.succeeded}/{result.total} succeeded"
                 + (f", {result.failed} failed" if result.failed else "")
+                + bug_note
                 + f"\n  Output:  {result.output_path}"
                 + rounds_note
                 + manifest_warning

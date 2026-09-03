@@ -125,6 +125,12 @@ class EngineResult:
     # included — the pipeline-reliability signal, which `failed` hides
     # once a spare has covered the loss. Always >= `failed`.
     sample_failures: int = 0
+    # First code bug (TypeError/AttributeError/...) a sample hit, as
+    # "Type: message". A bug that fires on one sample in hundreds no
+    # longer aborts the run, so this is how the caller names it: the
+    # traceback goes to the log, but a local run's log isn't what the
+    # agent reads — the tool result is.
+    first_code_bug: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -744,14 +750,20 @@ async def _run_pipeline_inner(
         with open(partial_path, "w") as f:
             f.write(json.dumps({"_meta": True, "total": target, "digest": digest}) + "\n")
 
-    # Set when a deterministic code bug is detected — signals all tasks to abort.
+    # Set when a code bug is detected before any sample has succeeded —
+    # signals all tasks to abort.
     abort_error: Exception | None = None
+    # First code bug seen, reported on the result. Its traceback is
+    # logged once: past the first occurrence the line is already on the
+    # record, and an input-dependent bug can fire hundreds of times in a
+    # long run.
+    first_code_bug: str | None = None
     # Set once the run stops accepting results, so a sample that outlives
     # its cancellation can't write into a finished run.
     closed = False
 
     async def _run_one(index: int, input_item: Any) -> None:
-        nonlocal succeeded, failed, completed, abort_error
+        nonlocal succeeded, failed, completed, abort_error, first_code_bug
         if index >= target:
             # A spare. Hold it outside the semaphore until the run reaches
             # its tail: a healthy run should not pay for spares it will
@@ -814,8 +826,9 @@ async def _run_pipeline_inner(
                         index, max_retries + 1, exc,
                     )
                 except Exception as exc:
-                    # Deterministic code bugs — abort the entire run
-                    # immediately so the agent gets the error fast.
+                    # Code bugs — abort the entire run immediately so the
+                    # agent gets the error fast, but only while nothing has
+                    # succeeded yet (see below).
                     # Exclude JSONDecodeError (transient: LLM returned bad JSON).
                     import json as _json
                     if isinstance(exc, _json.JSONDecodeError):
@@ -826,12 +839,29 @@ async def _run_pipeline_inner(
                         if attempt >= max_retries:
                             break
                         continue
+                    code_bug = isinstance(exc, (TypeError, AttributeError, NameError,
+                                                SyntaxError, ValueError, ImportError))
+                    # The traceback is how the agent finds the offending
+                    # line. The abort path used to supply it by letting the
+                    # exception propagate; a bug that no longer aborts must
+                    # log it here or the file and line are lost.
+                    log_traceback = code_bug and first_code_bug is None
+                    if log_traceback:
+                        first_code_bug = f"{type(exc).__name__}: {exc}"
                     logger.error(
                         "Sample %d error: %s: %s",
                         index, type(exc).__name__, exc,
+                        exc_info=log_traceback,
                     )
-                    if isinstance(exc, (TypeError, AttributeError, NameError,
-                                        SyntaxError, ValueError, ImportError)):
+                    if code_bug and succeeded == 0:
+                        # Nothing has worked yet, so the bug looks uniform:
+                        # stop now rather than pay for a run that can't
+                        # produce anything. Once samples have succeeded the
+                        # bug is input-dependent (an LLM returning an
+                        # unexpected shape on one sample in hundreds) —
+                        # aborting there throws away every sample already
+                        # paid for, so let it fail like any other sample and
+                        # let the run finish with a shortfall.
                         abort_error = exc
                         # Signal the stop as well as recording the error.
                         # Returning alone only stops *new* work from
@@ -971,6 +1001,7 @@ async def _run_pipeline_inner(
         resumed_samples=min(len(done_indices), target),
         sample_failures=failed,
         tool_call_rounds=tool_call_rounds,
+        first_code_bug=first_code_bug,
     )
 
 

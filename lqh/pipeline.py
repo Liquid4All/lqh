@@ -41,9 +41,10 @@ def safe_content(resp: Any) -> str:
     callers can ``if not safe_content(resp): raise GenerationError``
     and rely on the engine's retry path. Without this helper, an
     ``AttributeError`` from a malformed API response would be treated
-    by ``lqh.engine`` as a deterministic bug and abort the whole run
-    (see ``engine.py``: TypeError/AttributeError/ValueError are in the
-    abort list because they typically indicate code bugs, not
+    by ``lqh.engine`` as a code bug — aborting the whole run if it
+    lands before any sample has succeeded, and otherwise losing that
+    sample (see ``engine.py``: TypeError/AttributeError/ValueError are
+    in the abort list because they typically indicate code bugs, not
     transient data).
 
     Use as the first line after every ``client.chat.completions.create``::
