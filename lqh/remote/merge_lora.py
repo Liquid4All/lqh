@@ -69,9 +69,15 @@ def _tokenizer_source(base_model: str, adapter_dir: Path, modality: str) -> str:
     base's would silently change behavior. Falls back to the base. Same
     rule the backend's inference pod applies (kind=merge).
     """
-    marker = ("preprocessor_config.json" if modality == "vision"
-              else "tokenizer_config.json")
-    if (adapter_dir / marker).exists():
+    # transformers >= 5.16 folds the image-processor config into
+    # processor_config.json (no separate preprocessor_config.json); older
+    # trainers wrote both. Either file means the adapter ships a processor.
+    markers = (
+        ("processor_config.json", "preprocessor_config.json")
+        if modality == "vision"
+        else ("tokenizer_config.json",)
+    )
+    if any((adapter_dir / m).exists() for m in markers):
         return str(adapter_dir)
     return base_model
 

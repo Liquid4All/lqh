@@ -208,7 +208,7 @@ class TestVLMCollator:
         assert kwargs["tokenize"] is True
         assert kwargs["return_dict"] is True
         assert kwargs["return_tensors"] == "pt"
-        assert kwargs["padding"] is True
+        assert kwargs["processor_kwargs"] == {"padding": True}
 
     def test_drops_overlong_samples_instead_of_truncating(self) -> None:
         import torch

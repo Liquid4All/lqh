@@ -170,9 +170,11 @@ class TestVLMTrainingE2E:
         # Adapter saved with processor config (image preprocessing must travel).
         adapter_dir = run / "model-lora"
         assert (adapter_dir / "adapter_config.json").is_file()
-        assert (adapter_dir / "preprocessor_config.json").is_file(), (
-            "processor (image preprocessor) config missing from the saved adapter"
-        )
+        # transformers >= 5.16 folds the image processor into
+        # processor_config.json; older versions wrote preprocessor_config.json.
+        assert (adapter_dir / "processor_config.json").is_file() or (
+            adapter_dir / "preprocessor_config.json"
+        ).is_file(), "processor (image preprocessor) config missing from the saved adapter"
 
         # Final checkpoint eval produced predictions.
         final_preds = run / "checkpoints" / "final" / "predictions.parquet"

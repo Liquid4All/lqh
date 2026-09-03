@@ -189,12 +189,15 @@ class VLMCollator:
             images = [decode_image(b) for b in sample.get("images", [])]
             convs.append(_reinsert_images(msgs, images))
 
+        # padding rides in processor_kwargs: transformers >= 5.16 warns on
+        # every batch when it arrives as a loose kwarg (still honoured), and
+        # 5.12 (the eval image) accepts the dict form too.
         batch = self.processor.apply_chat_template(
             convs,
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
-            padding=True,
+            processor_kwargs={"padding": True},
         )
 
         if self.max_length is not None and batch["input_ids"].shape[1] > self.max_length:
@@ -206,7 +209,7 @@ class VLMCollator:
                     tokenize=True,
                     return_dict=True,
                     return_tensors="pt",
-                    padding=True,
+                    processor_kwargs={"padding": True},
                 )
                 if single["input_ids"].shape[1] <= self.max_length:
                     kept.append(conv)
@@ -234,7 +237,7 @@ class VLMCollator:
                 tokenize=True,
                 return_dict=True,
                 return_tensors="pt",
-                padding=True,
+                processor_kwargs={"padding": True},
             )
 
         labels = batch["input_ids"].clone()
