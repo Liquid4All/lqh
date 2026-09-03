@@ -52,6 +52,9 @@ async def test_failed_reconnect_says_what_survived_and_how_to_resume(
     blob = "\n".join(emitted)
     # The retry notices name the failure instead of just "Connection interrupted".
     assert "502" in blob
+    # ...and which endpoint produced it (feedback #110).
+    assert "POST /v1/chat/completions" in blob
+    assert "POST /v1/chat/completions" in emitted[-1]
     # The final message answers both halves of the user's question.
     final = emitted[-1]
     assert "/reconnect" in final

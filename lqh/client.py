@@ -189,14 +189,26 @@ _STATUS_ERROR_CLASSES: dict[int, type[APIStatusError]] = {
 }
 
 
-def _inband_status_error(client: AsyncOpenAI, err: dict[str, Any]) -> APIStatusError:
-    """Build the APIStatusError an in-band error body would have been."""
+def _inband_status_error(
+    client: AsyncOpenAI,
+    err: dict[str, Any],
+    *,
+    method: str = "POST",
+    path: str = "/chat/completions",
+) -> APIStatusError:
+    """Build the APIStatusError an in-band error body would have been.
+
+    *method* and *path* name the call this error stands in for. The synthetic
+    request is what tells the user which endpoint failed
+    (``describe_api_error``), so it must be the real one — a poll that fails
+    is a GET on the completion, not the POST that submitted it.
+    """
     code = err.get("code")
     status = code if isinstance(code, int) and 400 <= code <= 599 else 502
     message = str(err.get("message") or "upstream error")
     response = httpx.Response(
         status,
-        request=httpx.Request("POST", str(client.base_url)),
+        request=httpx.Request(method, str(client.base_url).rstrip("/") + path),
     )
     cls = _STATUS_ERROR_CLASSES.get(
         status, InternalServerError if status >= 500 else APIStatusError
@@ -248,6 +260,27 @@ OnRetry = Callable[[str, int, int, float], Awaitable[None]] | None
 RETRYABLE_STATUS = frozenset({408, 500, 502, 503, 504, 524})
 
 
+def _endpoint_of_error(exc: BaseException) -> str:
+    """``METHOD /path`` of the call that failed, or "" when unknown.
+
+    The CLI talks to a dozen backend endpoints in one turn (completions, the
+    async poll, jobs, artifacts, snapshots). A notice that says only
+    "HTTP 502" leaves the user — and whoever reads their bug report — with no
+    way to tell which one broke, so name it whenever the exception carries a
+    request. Both openai's ``APIError`` and httpx's transport errors hang one
+    off ``.request``.
+    """
+    try:
+        # httpx's transport errors raise from ``.request`` when it was never
+        # attached, so a plain getattr default is not enough here.
+        req = getattr(exc, "request", None)
+        if req is None:
+            return ""
+        return f"{req.method} {req.url.path}"
+    except Exception:
+        return ""
+
+
 def describe_api_error(exc: BaseException) -> str:
     """One short line naming what went wrong, for a user-facing notice."""
     if isinstance(exc, CompletionLostError):
@@ -259,6 +292,7 @@ def describe_api_error(exc: BaseException) -> str:
             f"lost contact with the running response after "
             f"{POLL_MAX_CONSECUTIVE_FAILURES} polls"
         )
+    where = _endpoint_of_error(exc)
     if isinstance(exc, APIStatusError):
         detail = ""
         body = getattr(exc, "body", None)
@@ -269,10 +303,12 @@ def describe_api_error(exc: BaseException) -> str:
         detail = detail.strip().replace("\n", " ")
         if len(detail) > 160:
             detail = detail[:157] + "..."
-        return f"HTTP {exc.status_code}" + (f": {detail}" if detail else "")
+        head = f"HTTP {exc.status_code}" + (f" on {where}" if where else "")
+        return head + (f": {detail}" if detail else "")
     if isinstance(exc, APIConnectionError):
-        return "connection to api.lqh.ai failed"
-    return f"{type(exc).__name__}: {str(exc)[:160]}"
+        return "connection to api.lqh.ai failed" + (f" on {where}" if where else "")
+    base = f"{type(exc).__name__}: {str(exc)[:160]}"
+    return base + (f" (on {where})" if where else "")
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +609,9 @@ async def _poll_completion(
         parsed = raw.parse()
         err = _extract_inband_error(parsed)
         if err is not None:
-            raise _inband_status_error(client, err)
+            raise _inband_status_error(
+                client, err, method="GET", path=_poll_url(completion_id),
+            )
         status_code = getattr(raw, "status_code", 200)
         if not getattr(parsed, "choices", None):
             inband = getattr(parsed, "status", None)

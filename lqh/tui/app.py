@@ -1209,8 +1209,10 @@ class LqhApp:
             return True
 
         self._pending_reconnect = retry
+        # Same description the retry notices used, so the paused-turn message
+        # names the endpoint that failed instead of just the exception class.
         self._pending_reconnect_error = (
-            f"{type(last_error).__name__}: {last_error}" if last_error else "Unknown error"
+            self._describe_error(last_error) if last_error else "Unknown error"
         )
         # Persist before telling the user their work survived — not every
         # caller of this helper saves on the way out (the /skill path does

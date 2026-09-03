@@ -24,6 +24,7 @@ from lqh.client import (
     _install_inband_error_check,
     chat_with_retry,
     create_client,
+    describe_api_error,
 )
 
 
@@ -59,6 +60,20 @@ class TestInbandStatusError:
         exc = _inband_status_error(_client(), {"code": 524, "message": "edge timeout"})
         assert isinstance(exc, APIStatusError)
         assert exc.status_code == 524
+
+    def test_names_the_call_it_stands_in_for(self):
+        # Feedback #110: the in-band shape IS the long-turn upstream timeout
+        # the user kept hitting, so its description must name the real
+        # endpoint — not the client's base_url, and not POST for a poll.
+        client = _client()
+        submit = _inband_status_error(client, {"code": 502, "message": "boom"})
+        assert "POST /v1/chat/completions" in describe_api_error(submit)
+
+        poll = _inband_status_error(
+            client, {"code": 502, "message": "boom"},
+            method="GET", path="/chat/completions/cmpl-9",
+        )
+        assert "GET /v1/chat/completions/cmpl-9" in describe_api_error(poll)
 
 class TestExtractInbandError:
     def test_dict_envelope_detected(self):

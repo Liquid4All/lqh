@@ -75,13 +75,33 @@ class TestDescribeApiError:
         assert got.startswith("HTTP 502")
         assert "upstream model did not respond" in got
 
+    def test_names_the_endpoint_that_failed(self) -> None:
+        # Feedback #110: "it is not clear which endpoint is exactly causing
+        # the issue" — a turn hits many endpoints, so the status alone is not
+        # enough to act on.
+        assert "POST /v1/chat/completions" in describe_api_error(_status_error(502))
+
+    def test_names_the_endpoint_on_a_connection_failure(self) -> None:
+        exc = APIConnectionError(
+            request=httpx.Request("GET", "https://api.lqh.ai/v1/chat/completions/cmpl-1")
+        )
+        got = describe_api_error(exc)
+        assert "GET /v1/chat/completions/cmpl-1" in got
+
     def test_truncates_a_long_message(self) -> None:
         got = describe_api_error(_status_error(500, "x" * 500))
-        assert len(got) < 200
+        # The cap bounds the backend's message; the status and endpoint that
+        # precede it are short and always worth showing in full.
+        assert len(got) < 260
         assert got.endswith("...")
 
     def test_falls_back_to_the_exception_name(self) -> None:
         assert "ValueError" in describe_api_error(ValueError("boom"))
+
+    def test_survives_an_httpx_error_with_no_request_attached(self) -> None:
+        # httpx raises from ``.request`` rather than returning None when the
+        # request was never attached; describing the error must not blow up.
+        assert "ReadTimeout" in describe_api_error(httpx.ReadTimeout("slow"))
 
 
 class TestChatWithRetry:
