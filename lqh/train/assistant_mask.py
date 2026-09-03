@@ -205,30 +205,56 @@ def require_assistant_mask_support(tokenizer: Any, base_model: str) -> None:
         raise ValueError(unsupported_message(base_model, reason))
 
 
+def _unmarked_row_message(index: int, row: dict[str, Any]) -> str:
+    messages = row.get("messages") or []
+    roles = [m.get("role", "?") for m in messages if isinstance(m, dict)]
+    n_assistant = sum(1 for r in roles if r == "assistant")
+    if not n_assistant:
+        why = "it has no assistant turn, so there is nothing to learn from it"
+    else:
+        why = (
+            f"the chat template marks no assistant tokens for it although it "
+            f"has {n_assistant} assistant turn(s); the template does not cover "
+            "this message shape (tool calls, structured content, ...)"
+        )
+    return (
+        f"Row {index} cannot be trained with assistant-only loss: {why}. "
+        f"Roles: {', '.join(roles) or 'none'}. Fix or drop the row, or report "
+        "the model so its chat template can be fixed upstream."
+    )
+
+
 def drop_rows_without_assistant_labels(
     rows: list[dict[str, Any]],
     tokenizer: Any,
     max_length: int | None,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Drop rows whose assistant tokens all sit past *max_length*.
+    """Drop rows whose assistant tokens all sit past *max_length*; raise on a
+    row that has none at all.
 
     trl truncates in the collator, after the mask is built, so a row with a
     prompt longer than the limit reaches the loss with every label masked
     out: a zero-or-NaN batch instead of a rejected row. The data-derived
     sequence length (``lqh.train.seq_length``) already drops over-long rows,
-    which makes this a no-op there; it matters for a pinned
-    ``max_seq_length``. One extra tokenization pass (~0.7 ms/row on the
-    LFM2.5 fast tokenizer).
+    which makes the drop a no-op there; it matters for a pinned
+    ``max_seq_length``.
+
+    A row with no assistant token *before* truncation is a different thing:
+    malformed data (no assistant turn) or a template that fails to mark this
+    particular message shape. That is not silently dropped (it would hide the
+    problem behind a truncation count) but raised, the way trl itself raises
+    on such an example, so it can be fixed. One extra tokenization pass
+    (~0.7 ms/row on the LFM2.5 fast tokenizer).
     """
-    if not max_length:
-        return rows, 0
     kept = []
-    for row in rows:
+    for index, row in enumerate(rows):
         mask = _assistant_mask(
             render_row(
                 tokenizer, row, return_dict=True, return_assistant_tokens_mask=True
             )
         )
-        if mask and 1 in mask[:max_length]:
+        if not mask or 1 not in mask:
+            raise ValueError(_unmarked_row_message(index, row))
+        if not max_length or 1 in mask[:max_length]:
             kept.append(row)
     return kept, len(rows) - len(kept)

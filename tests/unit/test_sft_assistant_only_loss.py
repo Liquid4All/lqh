@@ -123,6 +123,12 @@ def test_rows_truncated_past_their_assistant_turn_are_dropped(tokenizer):
     assert drop_rows_without_assistant_labels(rows, tokenizer, None) == (rows, 0)
 
 
+def test_a_row_without_an_assistant_turn_raises_on_the_real_tokenizer(tokenizer):
+    rows = [{"messages": MESSAGES}, {"messages": MESSAGES[:1]}]
+    with pytest.raises(ValueError, match="Row 1 .*no assistant turn"):
+        drop_rows_without_assistant_labels(rows, tokenizer, None)
+
+
 def test_trainer_probe_fails_fast_on_a_template_without_a_generation_block():
     assert assistant_mask_unsupported(make_tokenizer()) is None
     assert assistant_mask_unsupported(make_tokenizer(BLOCKED)) == NO_GENERATION_BLOCK

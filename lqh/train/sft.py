@@ -185,7 +185,9 @@ def _drop_rows_without_assistant_labels(
     train on nothing (every label masked): drop it and count it in
     ``dataset_rows``, next to the too-long counts. A no-op when the length was
     derived from the data (over-long rows are already gone); it matters for a
-    pinned ``max_seq_length``."""
+    pinned ``max_seq_length``. A row with no assistant tokens at all (no
+    assistant turn, or a template that does not mark this row's shape) raises
+    instead: that is a data or template problem, not a length one."""
     max_length = training_cfg.get("max_seq_length")
     train_rows, dropped_train = drop_rows_without_assistant_labels(
         train_rows, tokenizer, max_length

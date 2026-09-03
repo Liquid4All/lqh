@@ -120,9 +120,12 @@ class FakeTokenizer:
     assistant content is masked 1 when ``marks`` is set. Mirrors what
     transformers returns for ``return_assistant_tokens_mask=True``."""
 
-    def __init__(self, marks: bool = True, accepts_tools: bool = True):
+    def __init__(
+        self, marks: bool = True, accepts_tools: bool = True, marks_tool_calls: bool = True
+    ):
         self.marks = marks
         self.accepts_tools = accepts_tools
+        self.marks_tool_calls = marks_tool_calls
         self.calls: list[dict] = []
 
     def apply_chat_template(self, messages, tokenize=True, return_dict=False, **kw):
@@ -132,9 +135,12 @@ class FakeTokenizer:
         ids: list[int] = []
         mask: list[int] = []
         for m in messages:
-            n = len(m["content"])
-            ids.extend([ord(c) for c in m["content"]])
-            mask.extend([1 if (self.marks and m["role"] == "assistant") else 0] * n)
+            content = m["content"] or json.dumps(m.get("tool_calls"))
+            marked = self.marks and m["role"] == "assistant"
+            if m.get("tool_calls") and not self.marks_tool_calls:
+                marked = False  # a template whose generation block skips tool calls
+            ids.extend([ord(c) for c in content])
+            mask.extend([1 if marked else 0] * len(content))
         if not return_dict:
             return ids
         out = {"input_ids": ids}
@@ -179,6 +185,28 @@ def test_rows_truncated_past_their_assistant_turn_are_dropped():
     assert drop_rows_without_assistant_labels(rows, tok, 10) == ([rows[1]], 1)
     assert drop_rows_without_assistant_labels(rows, tok, 11) == (rows, 0)
     assert drop_rows_without_assistant_labels(rows, tok, None) == (rows, 0)
+
+
+def test_a_row_without_assistant_tokens_raises_instead_of_being_dropped():
+    """Not a truncation case: malformed data or a per-row template gap must
+    surface (trl raises on such an example too), not vanish into a count."""
+    good = {"messages": [{"role": "user", "content": "q"},
+                         {"role": "assistant", "content": "a"}]}
+    no_assistant = {"messages": [{"role": "system", "content": "s"},
+                                 {"role": "user", "content": "q"}]}
+    with pytest.raises(ValueError, match=r"Row 1 .*no assistant turn.*Roles: system, user"):
+        drop_rows_without_assistant_labels([good, no_assistant], FakeTokenizer(), 100)
+    with pytest.raises(ValueError, match="Row 1"):  # max_length None still scans
+        drop_rows_without_assistant_labels([good, no_assistant], FakeTokenizer(), None)
+
+    tool_call_only = {"messages": [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+    ]}
+    tok = FakeTokenizer(marks_tool_calls=False)
+    assert drop_rows_without_assistant_labels([good], tok, 100) == ([good], 0)
+    with pytest.raises(ValueError, match=r"Row 1 .*has 1 assistant turn.*message shape"):
+        drop_rows_without_assistant_labels([good, tool_call_only], tok, 100)
 
 
 def test_tools_column_is_decoded_before_rendering():
